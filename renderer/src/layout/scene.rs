@@ -1,6 +1,6 @@
 //! Resolve/reconcile transaction for the retained scene. [`prepare`] resolves and parses in
 //! declaration order, matches ids within each parent (id-less children remain positional), and
-//! retires removed subtrees child-first. [`solve`] delegates layout to taffy; [`finish`] reads
+//! drops removed subtrees. [`solve`] delegates layout to taffy; [`finish`] reads
 //! geometry back and performs scroll writeback and text elision. The seam that defines `row` and
 //! `Fill` is [`taffy_style`] (ADR-0077).
 
@@ -174,9 +174,6 @@ impl RetainedNode {
 #[derive(Default)]
 pub struct Scene {
     surfaces: HashMap<String, RetainedNode>,
-    /// Removed subtrees in child-first order until [`Scene::release`] finalizes the drop
-    /// (`CONTEXT.md`, Lease). `Vec` preserves that order; production has no release caller yet.
-    retiring: Vec<(NodeId, RetainedNode)>,
     next_id: u64,
 }
 
@@ -221,7 +218,7 @@ impl Scene {
     ///
     /// `admit` vetoes the finished apply after all instances, asking whether the whole resolved
     /// lock tree remains authenticatable; it rolls back on error. The snapshot restores exactly the
-    /// pre-call state because a failing getter may already have changed `next_id`, `retiring`, or
+    /// pre-call state because a failing getter may already have changed `next_id` or
     /// the trees (`CONTEXT.md`, Rollback; `socket.rs::handle_reevaluate`).
     ///
     /// ponytail: every apply deep-clones the tree, even on success; the dirty flag limits this to
@@ -235,7 +232,6 @@ impl Scene {
         admit: impl Fn(&Scene) -> Result<(), LayoutError>,
     ) -> Result<(), LayoutError> {
         let next_id_snapshot = self.next_id;
-        let retiring_snapshot_len = self.retiring.len();
         let surfaces_snapshot = self.surfaces.clone();
 
         // One budget for the whole pass: the hook covers gaps where a resolved table's `__index`
@@ -253,21 +249,18 @@ impl Scene {
             if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua) {
                 self.surfaces = surfaces_snapshot;
                 self.next_id = next_id_snapshot;
-                self.retiring.truncate(retiring_snapshot_len);
                 return Err(blame_the_budget(err));
             }
         }
         if let Err(err) = admit(self) {
             self.surfaces = surfaces_snapshot;
             self.next_id = next_id_snapshot;
-            self.retiring.truncate(retiring_snapshot_len);
             return Err(blame_the_budget(err));
         }
         // Lua can catch the hook error with `pcall`; the final deadline check cannot be caught.
         if budget.exceeded() {
             self.surfaces = surfaces_snapshot;
             self.next_id = next_id_snapshot;
-            self.retiring.truncate(retiring_snapshot_len);
             return Err(LayoutError::PassBudgetExceeded);
         }
         Ok(())
@@ -370,46 +363,8 @@ impl Scene {
     /// from `crate::wayland::App::destroy_surface_by_id`, and it is the only thing that removes a
     /// surface from this map. Without it an unplugged output stays resident for the life of the
     /// process, one tree per output name ever seen.
-    ///
-    /// Dropped rather than retired: [`Self::release_all_retired`] empties the lease bag after every
-    /// apply and no animation consumer extends it (`CONTEXT.md`, Lease), so a whole surface on its
-    /// way out has nothing to lease it to.
     pub fn forget(&mut self, instance_id: &str) {
         self.surfaces.remove(instance_id);
-    }
-
-    /// Finalizes the drop of one retired subtree. Returns `false` if `id` isn't currently
-    /// retiring (already released, or never retired).
-    ///
-    /// ponytail: no production caller yet, nothing in this codebase owns a per-node GPU resource
-    /// to guard. Built ahead of that consumer (ADR-0023), matching
-    /// `supervisor/src/socket.rs`'s `GenerationRegistry::send_to` precedent. Exercised by this
-    /// module's own tests only.
-    #[allow(dead_code)]
-    pub fn release(&mut self, id: NodeId) -> bool {
-        if let Some(pos) = self.retiring.iter().position(|(rid, _)| *rid == id) {
-            self.retiring.remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Releases every retired subtree at once, in the child-first order
-    /// [`Self::retire_child_first`] established. `crate::socket`'s `RendererClient` calls this
-    /// after each successful `Scene::apply`, stopping the lease bag growing forever now that apply
-    /// runs at capability-push cadence (ADR-0044 decision 2), not once per config edit: every
-    /// re-resolve that shortens a `children` list retires the tail, and each retired `RetainedNode`
-    /// holds a `HashMap<String, mlua::Value>`, so an undrained bag leaks Lua heap and Rust memory
-    /// in a process meant to live a whole session. Unconditional, correct only because nothing here
-    /// holds a lease today, so nothing can be mid-teardown when this runs (ADR-0023,
-    /// [`Self::release`]'s own ponytail).
-    ///
-    /// ponytail: wrong once a real lease holder exists, a paint stage owning per-node GPU resources
-    /// would have a texture freed out from under it here. Upgrade path: release driven by the
-    /// holder's own `release` calls per node, `apply` no longer the trigger.
-    pub fn release_all_retired(&mut self) {
-        self.retiring.clear();
     }
 
     /// Node count per retained surface, largest first, for `crate::wayland::memory_profile`. The
@@ -432,44 +387,18 @@ impl Scene {
         per_surface
     }
 
-    /// Surfaces, total nodes across every retained tree, live `properties` values, and the lease
-    /// bag's depth, for `crate::wayland::memory_profile`. Counts `properties` because that map is
-    /// the one place a retained tree holds `mlua::Value`s, so it is where scene growth shows up in
-    /// the Lua heap rather than the Rust one. Walks every tree, which is why the profile calls it
-    /// once per report window and never per turn.
-    pub fn census(&self) -> (usize, usize, usize, usize) {
+    /// Surfaces, total nodes across every retained tree, and live `properties` values, for
+    /// `crate::wayland::memory_profile`. Counts `properties` because that map is the one place a
+    /// retained tree holds `mlua::Value`s, so it is where scene growth shows up in the Lua heap
+    /// rather than the Rust one. Walks every tree, which is why the profile calls it once per
+    /// report window and never per turn.
+    pub fn census(&self) -> (usize, usize, usize) {
         let mut nodes = 0;
         let mut properties = 0;
         for tree in self.surfaces.values() {
             census_walk(tree, &mut nodes, &mut properties);
         }
-        // Retired subtrees keep their own `properties` until `release_all_retired`, so they are
-        // counted too: an apply caught mid-flight must not read as a drop in live nodes.
-        for (_, tree) in &self.retiring {
-            census_walk(tree, &mut nodes, &mut properties);
-        }
-        (self.surfaces.len(), nodes, properties, self.retiring.len())
-    }
-
-    /// Ids currently held in the lease bag, in child-first insertion order. A diagnostic/future
-    /// consumer accessor, not needed by `apply`/`release` themselves.
-    ///
-    /// ponytail: no production caller yet, same reason as [`Self::release`]. Exercised by this
-    /// module's own tests only.
-    #[allow(dead_code)]
-    pub fn retiring_ids(&self) -> Vec<NodeId> {
-        self.retiring.iter().map(|(id, _)| *id).collect()
-    }
-
-    /// Moves `node` and all its descendants into `retiring`, children before their parent
-    /// (`CONTEXT.md`, Lease: "tears down removed subtrees child-first so a parent never frees a
-    /// resource a child still holds").
-    fn retire_child_first(&mut self, node: RetainedNode) {
-        let RetainedNode { id, kind, rect, style, properties, paint, children } = node;
-        for child in children {
-            self.retire_child_first(child);
-        }
-        self.retiring.push((id, RetainedNode { id, kind, rect, style, properties, paint, children: Vec::new() }));
+        (self.surfaces.len(), nodes, properties)
     }
 }
 
@@ -568,19 +497,17 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
 /// Pairs children by identity (ADR-0045 decisions 1-2): an `id` matches only the same `id`, while
 /// id-less children match positionally among other id-less children. An id miss is new, never a
 /// positional fallback, so it cannot inherit an unrelated `NodeId`/subtree. Unclaimed retained
-/// nodes retire child-first. The linear match uses one `HashMap<&str, usize>` per parent; sibling
+/// nodes are dropped. The linear match uses one `HashMap<&str, usize>` per parent; sibling
 /// count is unbounded (`1..10000` is legal Lua), and this runs on the Wayland dispatch thread at
 /// capability-push cadence (ADR-0044 decision 2).
 fn pair_children_by_id_then_position(
-    scene: &mut Scene,
     fresh_children: &[VirtualNode],
     old_children: Vec<RetainedNode>,
 ) -> Result<Vec<Option<RetainedNode>>, LayoutError> {
     let fresh_ids: Vec<Option<String>> =
         fresh_children.iter().map(|c| node::parse_node_id(&c.properties)).collect::<Result<_, _>>()?;
 
-    // Decision 1: reject duplicate sibling ids before touching `old_children`, so failure retires
-    // nothing.
+    // Decision 1: reject duplicate sibling ids before matching `old_children`.
     let mut seen: HashSet<&str> = HashSet::with_capacity(fresh_ids.len());
     for id in fresh_ids.iter().flatten() {
         if !seen.insert(id.as_str()) {
@@ -621,13 +548,6 @@ fn pair_children_by_id_then_position(
             && let Some(index) = unidentified_old.next()
         {
             *slot = old_slots[index].take();
-        }
-    }
-
-    // Unclaimed nodes, including vanished ids, retire child-first in their old order.
-    for slot in &mut old_slots {
-        if let Some(leftover) = slot.take() {
-            scene.retire_child_first(leftover);
         }
     }
 
@@ -673,7 +593,7 @@ struct PreparedNode {
     taffy: taffy::NodeId,
     children: Vec<PreparedNode>,
     /// The retained children of a node that is not `visible` this pass, carried through untouched
-    /// (ADR-0124): not rebuilt, not laid out, not retired. `children` is empty whenever this is
+    /// (ADR-0124): not rebuilt, not laid out, not dropped. `children` is empty whenever this is
     /// not.
     frozen: Vec<RetainedNode>,
 }
@@ -945,7 +865,7 @@ fn prepare(
     }
 
     let fresh_children = children_of(kind, &properties)?;
-    let matched_candidates = pair_children_by_id_then_position(scene, &fresh_children, old_children)?;
+    let matched_candidates = pair_children_by_id_then_position(&fresh_children, old_children)?;
     let own_axis = main_axis_of(kind, &properties)?;
 
     let mut children = Vec::with_capacity(fresh_children.len());
@@ -956,14 +876,7 @@ fn prepare(
         // same variant, kind and level the recursive call raises (see `ensure_node_admissible`).
         ensure_node_admissible(&fresh_child.kind, depth + 1)?;
 
-        let reusable = match candidate {
-            Some(c) if c.kind == fresh_child.kind => Some(c),
-            Some(stale) => {
-                scene.retire_child_first(stale);
-                None
-            }
-            None => None,
-        };
+        let reusable = candidate.filter(|c| c.kind == fresh_child.kind);
 
         // This child's one resolve and one parse for this pass, both here rather than inside the
         // recursive call, because the style the call is handed is built from them and a second
@@ -1821,7 +1734,6 @@ pub(super) mod tests {
         let frozen: Vec<NodeId> = hidden.children[0].children[0].children.iter().map(|c| c.id).collect();
         assert_eq!(frozen, ids_before, "the hidden subtree keeps what it had");
         assert_eq!(built(), 2, "no item function ran for a hidden list");
-        assert!(scene.retiring_ids().is_empty(), "nothing was retired");
 
         lua.load(r#"state("open", true):set(true)"#).exec().unwrap();
         apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
@@ -3033,7 +2945,6 @@ pub(super) mod tests {
             vec![root.id, row.id, row.children[0].id, row.children[1].id]
         };
         let next_id_before = scene.next_id;
-        let retiring_before = scene.retiring_ids();
 
         let lua2 = mlua::Lua::new();
         register_node_constructors(&lua2).unwrap();
@@ -3060,7 +2971,6 @@ pub(super) mod tests {
         let ids_after = vec![root.id, row.id, row.children[0].id, row.children[1].id];
         assert_eq!(ids_after, ids_before, "NodeIds must be stable across a failed apply, not reallocated");
         assert_eq!(scene.next_id, next_id_before, "next_id must not be left bumped by the aborted pass");
-        assert_eq!(scene.retiring_ids(), retiring_before, "retiring must not gain entries from the aborted pass");
         assert_eq!(row.children[1].rect.width, 20.0, "the first tree's geometry must still be intact");
     }
 
@@ -3088,22 +2998,22 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_kind_change_at_the_same_index_replaces_and_retires_the_old_node() {
+    fn a_kind_change_at_the_same_index_allocates_a_new_identity() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(r#"panel { id = "bar", child = rect { width = 10, height = 10 } }"#);
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        assert!(scene.retiring_ids().is_empty());
+        let old_id = scene.surface("bar@TEST").unwrap().children[0].id;
 
         let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = text { content = "hi" } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar@TEST").unwrap().children[0].kind, "text");
-        assert_eq!(scene.retiring_ids().len(), 1, "the replaced rect must be retired, not dropped");
+        assert_ne!(scene.surface("bar@TEST").unwrap().children[0].id, old_id);
     }
 
     #[test]
-    fn a_shrinking_child_list_retires_the_removed_tail() {
+    fn a_shrinking_child_list_removes_the_tail() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -3116,43 +3026,83 @@ pub(super) mod tests {
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
         assert_eq!(scene.surface("bar@TEST").unwrap().children[0].children.len(), 1);
-        assert_eq!(scene.retiring_ids().len(), 1);
+        assert_eq!(scene.census().1, 3, "only the panel, row, and remaining rect survive");
     }
 
     #[test]
-    fn child_first_teardown_order_visits_children_before_their_parent() {
+    fn removed_subtree_values_survive_rollback_and_are_reclaimed_on_success() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) = surface_from(
-            r#"panel { id = "bar", child = row { children = { rect { width = 1, height = 1, children = { rect { width = 1, height = 1 } } } } } }"#,
+        let (lua, original) = surface_from(
+            r#"panel { id = "bar", child = row { children = {
+                rect { id = "gone", children = { rect {} } },
+            } } }"#,
         );
-        apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        let outer_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].id;
-        let inner_id = scene.surfaces.get("bar@TEST").unwrap().children[0].children[0].children[0].id;
+        apply_at(&mut scene, &[original], full(), &shaping, &lua).unwrap();
 
-        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
-        apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
+        // Only the retained properties own these tables. No VirtualNode, resolved snapshot,
+        // or Lua closure keeps them alive; the observer has weak values.
+        let weak: mlua::Table = lua.load(r#"return setmetatable({}, { __mode = "v" })"#).eval().unwrap();
+        let outer = &mut scene.surfaces.get_mut("bar@TEST").unwrap().children[0].children[0];
+        for (index, node) in
+            std::iter::once(&mut outer.properties).chain(std::iter::once(&mut outer.children[0].properties)).enumerate()
+        {
+            let value = lua.create_table().unwrap();
+            weak.set(index + 1, value.clone()).unwrap();
+            node.insert("lifetime_probe".to_string(), Value::Table(value));
+        }
+        let next_id_before = scene.next_id;
+        let instances = [SurfaceInstance {
+            instance_id: "bar@TEST".to_string(),
+            declared_id: "bar".to_string(),
+            output: "TEST".to_string(),
+            available: full(),
+        }];
+        let parse = |source: &str| {
+            let table: mlua::Table = lua.load(source).eval().unwrap();
+            deserialize_lua_table(&table).unwrap()
+        };
 
-        let order = scene.retiring_ids();
-        let inner_pos = order.iter().position(|id| *id == inner_id).unwrap();
-        let outer_pos = order.iter().position(|id| *id == outer_id).unwrap();
-        assert!(inner_pos < outer_pos, "the child must be retired before its parent");
-    }
+        // Matching drops the old subtree before the second fresh child fails its parse.
+        let invalid = parse(
+            r#"return panel { id = "bar", child = row { children = {
+            rect { id = "new" }, rect { width = "invalid" },
+        } } }"#,
+        );
+        assert!(matches!(
+            scene.apply(&[invalid], &instances, &shaping, &lua),
+            Err(LayoutError::InvalidProperty { property, .. }) if property == "width"
+        ));
+        lua.gc_collect().unwrap();
+        assert!(weak.get::<Option<mlua::Table>>(1).unwrap().is_some());
+        assert!(weak.get::<Option<mlua::Table>>(2).unwrap().is_some());
+        assert_eq!(scene.next_id, next_id_before);
 
-    #[test]
-    fn release_removes_exactly_one_retiring_entry_and_is_false_on_an_unknown_id() {
-        let mut scene = Scene::new();
-        let shaping = ShapingHandle::spawn();
-        let (_lua1, surface_v1) = surface_from(r#"panel { id = "bar", child = rect { width = 1, height = 1 } }"#);
-        apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = text { content = "x" } }"#);
-        apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
+        let replacement = parse(
+            r#"return panel { id = "bar", child = row { children = {
+            rect { id = "new" },
+        } } }"#,
+        );
+        let error = scene
+            .apply_admitting(std::slice::from_ref(&replacement), &instances, &shaping, &lua, |_| {
+                lua.gc_collect().unwrap();
+                assert!(weak.get::<Option<mlua::Table>>(1).unwrap().is_some());
+                assert!(weak.get::<Option<mlua::Table>>(2).unwrap().is_some());
+                Err(node::invalid("child", "veto"))
+            })
+            .unwrap_err();
+        assert!(matches!(error, LayoutError::InvalidProperty { property, .. } if property == "child"));
+        lua.gc_collect().unwrap();
+        assert!(weak.get::<Option<mlua::Table>>(1).unwrap().is_some());
+        assert!(weak.get::<Option<mlua::Table>>(2).unwrap().is_some());
+        assert_eq!(scene.next_id, next_id_before);
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].children[0].children.len(), 1);
 
-        let id = scene.retiring_ids()[0];
-        assert!(scene.release(id));
-        assert!(scene.retiring_ids().is_empty());
-        assert!(!scene.release(id), "releasing an already-released id must return false");
-        assert!(!scene.release(NodeId(9999)), "releasing an id that never existed must return false");
+        scene.apply(&[replacement], &instances, &shaping, &lua).unwrap();
+        lua.gc_collect().unwrap();
+        assert!(weak.get::<Option<mlua::Table>>(1).unwrap().is_none());
+        assert!(weak.get::<Option<mlua::Table>>(2).unwrap().is_none());
+        assert_eq!(scene.census().1, 3);
     }
 
     #[test]
@@ -3433,7 +3383,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_retained_identified_child_whose_id_vanishes_is_retired_child_first_when_the_fresh_list_empties() {
+    fn an_empty_child_list_removes_the_identified_subtree() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -3442,26 +3392,15 @@ pub(super) mod tests {
             } } }"#,
         );
         apply_at(&mut scene, &[surface_v1], full(), &shaping, &_lua1).unwrap();
-        let (outer_id, inner_id) = {
-            let root = scene.surfaces.get("bar@TEST").unwrap();
-            let outer = &root.children[0].children[0];
-            (outer.id, outer.children[0].id)
-        };
-
         let (_lua2, surface_v2) = surface_from(r#"panel { id = "bar", child = row { children = {} } }"#);
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
 
-        let order = scene.retiring_ids();
-        let inner_pos = order.iter().position(|id| *id == inner_id).unwrap();
-        let outer_pos = order.iter().position(|id| *id == outer_id).unwrap();
-        assert!(
-            inner_pos < outer_pos,
-            "the id-matched subtree's retirement is still child-first, same as the positional path"
-        );
+        assert!(scene.surface("bar@TEST").unwrap().children[0].children.is_empty());
+        assert_eq!(scene.census().1, 2);
     }
 
     #[test]
-    fn a_fresh_id_that_matches_nothing_gets_a_new_node_id_and_the_vanished_id_is_retired() {
+    fn a_fresh_id_gets_a_new_node_id_and_the_vanished_id_is_removed() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -3493,11 +3432,7 @@ pub(super) mod tests {
             row[2].id != a_id && row[2].id != b_id && row[2].id != c_id,
             "d declared a new id, so it must get a fresh NodeId rather than adopt a retained one"
         );
-        assert!(
-            scene.retiring_ids().contains(&a_id),
-            "a's id vanished from the config, so a must be retired rather than reused: {:?}",
-            scene.retiring_ids()
-        );
+        assert!(row.iter().all(|child| child.id != a_id));
     }
 
     #[test]
@@ -3530,15 +3465,11 @@ pub(super) mod tests {
             "the unidentified subsequence pairs among itself, so the retained anonymous node lands in slot 0"
         );
         assert!(row[1].id != x_id && row[1].id != anon_id, "slot 1 has no unidentified counterpart left, so it is new");
-        assert!(
-            scene.retiring_ids().contains(&x_id),
-            "x's id is gone from the fresh tree, so x is retired rather than adopted by an anonymous child: {:?}",
-            scene.retiring_ids()
-        );
+        assert!(row.iter().all(|child| child.id != x_id));
     }
 
     #[test]
-    fn removing_an_id_retires_the_old_node_and_allocates_a_new_one() {
+    fn removing_an_id_replaces_the_old_node_with_a_new_identity() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -3553,15 +3484,11 @@ pub(super) mod tests {
         let row = &scene.surfaces.get("bar@TEST").unwrap().children[0].children;
 
         assert_ne!(row[0].id, x_id, "dropping the id allocates a new node rather than silently preserving identity");
-        assert!(
-            scene.retiring_ids().contains(&x_id),
-            "the identified node that vanished must be retired: {:?}",
-            scene.retiring_ids()
-        );
+        assert!(row.iter().all(|child| child.id != x_id));
     }
 
     #[test]
-    fn a_vanished_id_is_retired_child_first_even_when_fresh_slots_are_still_unmatched() {
+    fn a_vanished_id_removes_its_subtree_even_when_fresh_slots_are_unmatched() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (_lua1, surface_v1) = surface_from(
@@ -3583,12 +3510,10 @@ pub(super) mod tests {
         apply_at(&mut scene, &[surface_v2], full(), &shaping, &_lua2).unwrap();
         let row = &scene.surfaces.get("bar@TEST").unwrap().children[0].children;
 
-        assert!(row[0].id != outer_id, "`other` is a new id, so it must not adopt `gone`'s retained node");
-        let order = scene.retiring_ids();
-        let inner_pos =
-            order.iter().position(|id| *id == inner_id).expect("the vanished subtree's child must be retired");
-        let outer_pos = order.iter().position(|id| *id == outer_id).expect("the vanished node must be retired");
-        assert!(inner_pos < outer_pos, "retirement stays child-first even with a same-length fresh list");
+        assert_ne!(row[0].id, outer_id, "`other` must not adopt `gone`'s retained node");
+        assert_ne!(row[0].id, inner_id);
+        assert!(row[0].children.is_empty());
+        assert_eq!(scene.census().1, 3);
     }
 
     #[test]
@@ -3623,7 +3548,7 @@ pub(super) mod tests {
             assert_eq!(after[slot + 1], before[i], "n{i} must keep its NodeId across the reversal");
         }
         assert!(!before.contains(&after[0]), "the never-seen `fresh` id must allocate rather than inherit n0's node");
-        assert!(scene.retiring_ids().contains(&before[0]), "n0 left the config, so it is retired");
+        assert!(!after.contains(&before[0]), "n0 left the config");
     }
 
     /// The three tests below share one shape: a `margin` that is a `computed` signal counting its

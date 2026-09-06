@@ -649,6 +649,8 @@ requirement.
 
 Superseded by ADR-0077: taffy owns the layout math.
 
+ADR-0143 supersedes the retained-subtree lease bag and child-first teardown contract.
+
 ## 0024. In-place reload: the Renderer self-diffs topology, the Supervisor only dispatches
 
 Phase 13 wires a Supervisor-side `inotify` watcher on `~/.config/oblisk/` that, on a debounced edit,
@@ -1206,6 +1208,8 @@ List expansion remained deferred in this pass.
 
 List implementation was still deferred. Top-level surface IDs remained required and unique.
 
+ADR-0143 supersedes decision 2's child-first retirement requirement; identity matching stays.
+
 ## 0046. Rescue renders out of band when no scene survives
 
 1. Reload failure retains the working scene and reports through oblisk.rescue. Startup failure
@@ -1616,6 +1620,8 @@ not its unrelated deferred features.
 
 Build a fresh solver tree per apply; persistent solver caching would need another reconciliation
 lifetime and waits for measurement.
+
+ADR-0143 removes the lease ownership in decision 1; transaction rollback stays.
 
 ## 0078. `exclusive` is three answers, not a boolean
 
@@ -2291,6 +2297,8 @@ Reject arena limiting and background allocator machinery for gains not supported
 Neither compared renderer implemented general damage tracking. Correct ADR-0129's CachedLayer
 claim; binary sizes are not comparable without their shared dependencies.
 
+ADR-0143 supersedes decision 5's lease assumption; retained node identity stays.
+
 ## 0131. What Noctalia has that is worth taking for memory, CPU and latency, measured
 
 Measured release resolution: median 1.38 ms, p95 3.38 ms, max 5.48 ms over 62 samples.
@@ -2458,3 +2466,12 @@ ownership. Precreated symlinks could redirect startup sweeping or PNG writes.
 
 Reject extra shared-directory hardening and mtime sweeping when a private directory solves the
 ownership problem directly. This is a cross-user boundary, not a same-UID threat.
+
+## 0143. Removed scene nodes need no lease without a holder
+
+The retirement bag had no production holder, and all three successful transaction paths immediately
+drained it. Remove the bag, per-node release protocol and child-first destruction requirement;
+ordinary ownership drops unmatched nodes while the independent rollback snapshot preserves the
+working scene through admission and budget checks. Supersedes the lease clauses of ADR-0023,
+ADR-0045, ADR-0077 and ADR-0130; keep node identity and design deferred retention only when an
+actual animation or resource owner needs it.

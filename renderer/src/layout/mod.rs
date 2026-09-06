@@ -1,10 +1,11 @@
-//! Retained layout scene, per `CONTEXT.md`'s "Retained scene", "Retained-scene transaction", and
-//! "Lease" entries. `taffy` 0.14 owns sizing/positioning; this module owns identity and
-//! reconcile, child-first leases, the depth cap, once-per-node resolution, scroll writeback, and
+//! Retained layout scene, per `CONTEXT.md`'s "Retained scene" and "Retained-scene transaction"
+//! entries. `taffy` 0.14 owns sizing/positioning; this module owns identity and
+//! reconciliation, the depth cap, once-per-node resolution, scroll writeback, and
 //! text elision (ADR-0077). `node` parses/resolves properties; `scene` applies them to the
 //! persistent tree: each generation's `Loader::evaluate` output reconciles into it on `apply`, not
 //! from scratch. Stacking is a one-cell `Display::Grid` with independently aligned children
-//! and a bounding-union container (ADR-0023); retiring has no GPU resource to guard yet.
+//! and a bounding-union container (ADR-0023). Removed nodes drop through ordinary ownership
+//! (ADR-0143).
 
 pub mod hit;
 pub mod hover;

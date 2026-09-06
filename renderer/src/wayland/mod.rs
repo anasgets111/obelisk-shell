@@ -556,7 +556,7 @@ impl ShmHandler for App {
 fn census(app: &App) -> (memory_profile::Census, memory_profile::Surfaces) {
     let (image_bytes, ready, pending, failed, evicted, landed) = app.image_cache.census();
     let (shape_entries, shape_bytes) = app.shaping.census();
-    let (surfaces, nodes, properties, retiring) = app.client.scene().census();
+    let (surfaces, nodes, properties) = app.client.scene().census();
     let census = memory_profile::Census {
         image_bytes: image_bytes as u64,
         image_ready: ready as u64,
@@ -570,7 +570,6 @@ fn census(app: &App) -> (memory_profile::Census, memory_profile::Surfaces) {
         scene_surfaces: surfaces as u64,
         scene_nodes: nodes as u64,
         scene_properties: properties as u64,
-        scene_retiring: retiring as u64,
         malloc: memory_profile::Malloc::default(),
     };
     (census, memory_profile::Surfaces(app.client.scene().census_by_surface()))

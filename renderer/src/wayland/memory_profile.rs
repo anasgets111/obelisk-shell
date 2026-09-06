@@ -83,11 +83,9 @@ pub struct Census {
     /// `mlua::Lua::used_memory`: the Lua VM's own heap, which the config's tables and closures
     /// live in. Rust allocations the VM merely points at are not counted here.
     pub lua_bytes: u64,
-    /// Retained surface trees, their total node count, and the lease bag's depth. `retiring` is
-    /// cleared after every apply, so a nonzero reading means an apply is mid-flight.
+    /// Retained surface trees and their total node count.
     pub scene_surfaces: u64,
     pub scene_nodes: u64,
-    pub scene_retiring: u64,
     /// Live `mlua::Value`s across every retained node's `properties` map, the one place scene
     /// growth reaches the Lua heap.
     pub scene_properties: u64,
@@ -170,7 +168,7 @@ fn render(uptime: Duration, now: &Census, previous: Option<&Census>, first: Opti
         "memory t={:.0}s: malloc arena={:.1} in_use={:.1} free={:.1} mmap={:.1} MiB \
          | image {:.1} MiB ready={} pending={} failed={} evicted={} landed={} \
          | shape entries={} approx={:.1} MiB | lua {:.1} MiB \
-         | scene surfaces={} nodes={} props={} retiring={}",
+         | scene surfaces={} nodes={} props={}",
         uptime.as_secs_f64(),
         mib(now.malloc.arena),
         mib(now.malloc.in_use),
@@ -188,7 +186,6 @@ fn render(uptime: Duration, now: &Census, previous: Option<&Census>, first: Opti
         now.scene_surfaces,
         now.scene_nodes,
         now.scene_properties,
-        now.scene_retiring,
     );
     if let Some(previous) = previous {
         line.push_str(&format!(" | step {}", deltas(now, previous)));

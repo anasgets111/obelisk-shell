@@ -17,8 +17,8 @@ The grill must test the requested design against the existing ownership rules:
 - A candidate needs presentation evidence from every targeted output before it
   becomes authoritative.
 - The loader and watcher consume one dependency snapshot.
-- The retained-scene transaction owns node identity, leases, writes, and
-  child-first cleanup.
+- The retained-scene transaction owns node identity, writes, and the removal of
+  unmatched subtrees.
 - The capability authority rejects stale generation IDs and revisions.
 
 Use `domain-modeling` to update `CONTEXT.md` when a term changes. Write an ADR

@@ -414,8 +414,6 @@ impl RendererClient {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
-                // No lease can hold a subtree this apply retired.
-                self.scene.release_all_retired();
                 self.set_rescue_state(false, "");
                 // Consume `set_screens`'s pre-evaluation seed (ADR-0041 decision 2) only after
                 // success; a failed apply leaves it for the next one.
@@ -548,7 +546,6 @@ impl RendererClient {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
-                self.scene.release_all_retired();
                 // `ApplyPendingReload` follows only `Unchanged`, so this matches the earlier write.
                 self.state.applied_topology = Some(topology);
                 // ADR-0044 decision 2 re-resolve target.
@@ -590,8 +587,6 @@ impl RendererClient {
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
             return false;
         }
-        // The cadence leak: shortening `children` retires its tail on every push-bearing poll turn.
-        self.scene.release_all_retired();
         dump_layout_if_asked(&self.scene);
         true
     }
@@ -2664,10 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_re_resolves_that_retire_nodes_do_not_grow_the_lease_bag() {
-        // `Scene::apply` runs at most once per poll turn; `retire_child_first` adds removed
-        // subtrees to `Scene::retiring`, which production never drains (ADR-0023). Alternating a
-        // children signal would leak a `RetainedNode` at push cadence over a session.
+    fn repeated_re_resolves_remove_nodes_and_preserve_the_remaining_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2684,6 +2676,7 @@ mod tests {
         run_startup(&mut client);
         assert!(client.scene.surface("bar@TEST").is_some(), "startup must have applied");
 
+        let first_id = client.scene.surface("bar@TEST").unwrap().children[0].children[0].id;
         for revision in 1..=20 {
             let count = if revision % 2 == 0 { 1 } else { 3 };
             client
@@ -2693,18 +2686,17 @@ mod tests {
                     payload: serde_json::json!(count),
                 })
                 .unwrap();
-            client.re_resolve_if_dirty();
+            assert!(client.re_resolve_if_dirty());
+            let root = client.scene.surface("bar@TEST").unwrap();
+            assert_eq!(root.children[0].children.len(), count);
+            assert_eq!(root.children[0].children[0].id, first_id);
+            assert_eq!(client.scene.census().1, count + 2);
         }
 
         assert_eq!(
             client.scene.surface("bar@TEST").unwrap().children[0].children.len(),
             1,
             "the last push shrank the row back to one child"
-        );
-        assert!(
-            client.scene.retiring_ids().is_empty(),
-            "a successful apply must drain the lease bag, since nothing holds a lease today; got {} entries after 20 re-resolves",
-            client.scene.retiring_ids().len()
         );
     }
 

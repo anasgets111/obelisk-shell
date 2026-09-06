@@ -391,7 +391,7 @@ pub fn parse_surface_id(properties: &HashMap<String, Value>) -> Result<String, L
 /// (ADR-0045 decisions 1-2). `None` means "no id", not an error:
 /// `pair_children_by_id_then_position` pairs an id-less child positionally against its id-less
 /// siblings (ADR-0023's rule applied to that subsequence). Adding or dropping an `id` changes
-/// identity, retiring the retained counterpart and allocating a new node. Rejects a `Signal` via
+/// identity, dropping the retained counterpart and allocating a new node. Rejects a `Signal` via
 /// [`reject_signal_in_structural_field`], same as [`parse_surface_id`]: reconcile identity is
 /// decided once at match time, not left to drift.
 ///

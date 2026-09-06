@@ -48,9 +48,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/oblisk-
 
 **Retained scene**: A generation's persistent node tree, reconciled across evaluations. _Avoid_: scene graph, node tree
 
-**Retained-scene transaction**: An atomic reconciliation and resolution of the retained scene, matching nodes by identity and retiring removed subtrees. _Avoid_: reload apply, tree diff
-
-**Lease**: The retention of a removed subtree until its resources can be released. There is currently no animation consumer extending that lifetime. _Avoid_: keepalive, grace period
+**Retained-scene transaction**: An atomic reconciliation and resolution of the retained scene, matching nodes by identity and removing unmatched subtrees. _Avoid_: reload apply, tree diff
 
 **Resolved style**: A node's geometry properties after signal resolution and type validation for a layout pass. _Avoid_: style, computed style, layout cache
 
