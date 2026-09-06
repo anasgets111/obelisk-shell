@@ -2078,6 +2078,10 @@ Same-day amendment, retaining the original decision numbers:
     Keep privileged install command fixed; interpretation, thresholds and result dismissal are Lua policy.
 14. Add scalar system-state writes through temp/rename and allow namespaced keys. Remembered
     checked_at seeds but never overrides fresher checks. Automatic persistence still needed a push hook.
+    Later amendment (2026-09-06): the package list seeds beside checked_at under the same rule, and
+    is ignored without it. Skipping the first check while showing an empty list read as "up to
+    date" for the rest of the hour; the mirror never had the gap because its list lives in the
+    persisted state object.
 15. Build the update panel in Lua over those facts. No spinner or copy-log without animation/
     clipboard support; reuse the existing action-button pattern.
 

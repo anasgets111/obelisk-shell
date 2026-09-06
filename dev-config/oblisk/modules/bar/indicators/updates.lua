@@ -41,17 +41,22 @@ local store = require("lib.store")
 -- (ADR-0113 amendment).
 --
 -- Seed on `oblisk.storage`'s first push, which carries the file `lib/store.lua` declared
--- (ADR-0115, ADR-0136). Persisted `checked_at` prevents a restart within the hour from rerunning;
+-- (ADR-0115, ADR-0136). Persisted `checked_at` prevents a restart within the hour from rerunning,
+-- and the list it stamps rides along so the skipped check still has an answer to show;
 -- `previous == nil` is the first push, so reloads still seed once per process.
 local UPDATE_INTERVAL = 3600
 oblisk.storage:on_change(function(_, previous)
     if previous == nil then
-        local checked_at = store.updates_checked_at:get()
-        oblisk.updates:invoke("configure", { interval = UPDATE_INTERVAL, checked_at = checked_at })
+        oblisk.updates:invoke("configure", {
+            interval = UPDATE_INTERVAL,
+            checked_at = store.updates_checked_at:get(),
+            packages = store.updates_packages:get(),
+        })
     end
 end)
 
--- On a completed check, remember when it ran and announce what is new, as `UpdateService.qml` does.
+-- On a completed check, remember when it ran and what it found, and announce what is new, as
+-- `UpdateService.qml` does.
 --
 -- "New" compares package names with the stored announced key, like `notifiedPackagesKey`: restarts
 -- do not repeat the same twelve packages, and upgraded packages drop out on the next check.
@@ -60,6 +65,7 @@ oblisk.updates:on_change(function(u, previous)
     -- time, and writing it back would touch the store on every start.
     if u.last_successful_check and u.last_successful_check ~= store.updates_checked_at:get() then
         store:set("updates_checked_at", u.last_successful_check)
+        store:set("updates_packages", u.packages)
     end
     if u.checking or previous == nil or previous.checking ~= true then
         -- Only the push that ends a check has a fresh list.

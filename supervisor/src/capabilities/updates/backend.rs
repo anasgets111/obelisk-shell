@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 /// One installed package with a newer version, also the `updates.packages` Lua shape.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateCandidate {
     /// The package name, as the package manager spells it.
     pub name: String,

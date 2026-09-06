@@ -68,8 +68,8 @@ pub enum UpdatesSignal {
     Changed,
 }
 
-/// What `updates:configure({ interval, checked_at })` carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What `updates:configure({ interval, checked_at, packages })` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatesConfigure {
     /// Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
     pub interval_secs: u64,
@@ -78,6 +78,10 @@ pub struct UpdatesConfigure {
     /// not override: used only before this process has checked, so restarts can answer "has an hour
     /// passed?" without starting over.
     pub checked_at: Option<i64>,
+    /// Remembered list from the check `checked_at` stamps, under the same seed rule: a restart
+    /// inside the interval skips its first check, and without this it would show "up to date" for
+    /// the rest of the hour. Ignored without `checked_at`, since a list with no age is unusable.
+    pub packages: Vec<UpdateCandidate>,
 }
 
 /// `updates:configure({interval})` takes one table argument (ADR-0034). A wrong-typed present key
@@ -89,7 +93,15 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesCo
         Some(value) => Some(value.as_i64()?),
         None => None,
     };
-    Some(UpdatesConfigure { interval_secs, checked_at })
+    let packages = match table.get("packages") {
+        // An empty Lua table has no shape, and mlua sends it as `{}`. That is the empty list
+        // `store.lua` writes before any check, so read it as one rather than drop the call and
+        // leave the scheduler dormant.
+        None => Vec::new(),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => Vec::new(),
+        Some(value) => serde::Deserialize::deserialize(value).ok()?,
+    };
+    Some(UpdatesConfigure { interval_secs, checked_at, packages })
 }
 
 /// Tail length for [`UpdatesState::install_log`]. Enough to hold a failure and nearby lines; a
@@ -153,6 +165,8 @@ impl UpdatesController {
             let mut guard = self.state.lock().unwrap();
             if guard.last_successful_check.is_none() {
                 guard.last_successful_check = Some(checked_at);
+                guard.count = configure.packages.len() as u32;
+                guard.packages = configure.packages;
                 drop(guard);
                 let _ = self.events.send(UpdatesSignal::Changed);
             }
@@ -462,7 +476,10 @@ mod tests {
     #[test]
     fn parse_configure_args_reads_the_interval_from_a_table() {
         let args = vec![serde_json::json!({"interval": 3600})];
-        assert_eq!(parse_configure_args(&args), Some(UpdatesConfigure { interval_secs: 3600, checked_at: None }));
+        assert_eq!(
+            parse_configure_args(&args),
+            Some(UpdatesConfigure { interval_secs: 3600, checked_at: None, packages: vec![] })
+        );
     }
 
     #[test]
@@ -470,7 +487,36 @@ mod tests {
         let args = vec![serde_json::json!({"interval": 3600, "checked_at": 1_800_000_000_i64})];
         assert_eq!(
             parse_configure_args(&args),
-            Some(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000) })
+            Some(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000), packages: vec![] })
+        );
+    }
+
+    #[test]
+    fn parse_configure_args_reads_a_remembered_package_list_in_the_lua_shape() {
+        // The list is `updates.packages` written back verbatim, so the wire shape is the
+        // `UpdateCandidate` serialization and nothing else.
+        let args = vec![serde_json::json!({
+            "interval": 3600,
+            "checked_at": 1_800_000_000_i64,
+            "packages": [serde_json::to_value(candidate()).unwrap()],
+        })];
+        assert_eq!(
+            parse_configure_args(&args),
+            Some(UpdatesConfigure {
+                interval_secs: 3600,
+                checked_at: Some(1_800_000_000),
+                packages: vec![candidate()]
+            })
+        );
+        assert_eq!(
+            parse_configure_args(&[serde_json::json!({"interval": 3600, "packages": {}})]),
+            Some(UpdatesConfigure { interval_secs: 3600, checked_at: None, packages: vec![] }),
+            "an empty Lua table arrives as an empty object and is the empty list, not a wrong-typed key"
+        );
+        assert_eq!(
+            parse_configure_args(&[serde_json::json!({"interval": 3600, "packages": [{"name": "linux"}]})]),
+            None,
+            "a malformed list drops the call like any other wrong-typed key"
         );
     }
 
@@ -486,20 +532,45 @@ mod tests {
         );
     }
 
+    fn candidate() -> UpdateCandidate {
+        UpdateCandidate {
+            name: "linux".into(),
+            old_version: "6.1".into(),
+            new_version: "6.2".into(),
+            download_size: 42,
+            installed_size: 0,
+        }
+    }
+
     #[tokio::test]
-    async fn a_remembered_check_time_seeds_an_empty_slot_and_never_overwrites_a_real_one() {
+    async fn a_remembered_check_seeds_an_empty_slot_with_its_list_and_never_overwrites_a_real_one() {
         let (controller, mut events_rx) = failing_controller().await;
 
-        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_800_000_000) });
-        assert_eq!(controller.snapshot().last_successful_check, Some(1_800_000_000));
+        // Without a time the list has no age and is dropped, so a badge cannot light up from a
+        // list nobody can call fresh.
+        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: None, packages: vec![candidate()] });
+        assert_eq!(controller.snapshot().count, 0);
+
+        controller.configure(UpdatesConfigure {
+            interval_secs: 0,
+            checked_at: Some(1_800_000_000),
+            packages: vec![candidate()],
+        });
+        let seeded = controller.snapshot();
+        assert_eq!(seeded.last_successful_check, Some(1_800_000_000));
+        assert_eq!(seeded.packages, vec![candidate()]);
+        assert_eq!(seeded.count, 1, "`count` is always `#packages`, seeded or checked");
         assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed), "a seed is Lua-visible, so it pushes");
 
-        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_700_000_000) });
+        // A second seed is a later config reload, not a later check: the slot is taken.
+        controller.configure(UpdatesConfigure { interval_secs: 0, checked_at: Some(1_700_000_000), packages: vec![] });
+        let kept = controller.snapshot();
         assert_eq!(
-            controller.snapshot().last_successful_check,
+            kept.last_successful_check,
             Some(1_800_000_000),
             "this must never move the last-check time backwards"
         );
+        assert_eq!(kept.count, 1);
     }
 
     #[test]
@@ -601,7 +672,11 @@ mod tests {
         assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed));
         assert_eq!(controller.snapshot().package_manager, None);
 
-        controller.configure(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000) });
+        controller.configure(UpdatesConfigure {
+            interval_secs: 3600,
+            checked_at: Some(1_800_000_000),
+            packages: vec![],
+        });
         controller.check_now();
         controller.install().await;
 

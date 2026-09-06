@@ -115,7 +115,7 @@ Positional arguments validated by capability dispatch. Read-only capabilities ha
 | `applications` | `refresh()`, `launch(id)`, `open_url(url)` |
 | `files` | `watch(path, extensions?)`, `unwatch(path)` |
 | `sysinfo` | `configure({ cpu_interval?, ram_interval?, temp_interval? })` |
-| `updates` | `check()`, `configure({ interval, checked_at? })`, `install()` |
+| `updates` | `check()`, `configure({ interval, checked_at?, packages? })`, `install()` |
 | `power` | `set_profile(name)` |
 | `tray` | `activate(id, x, y)`, `secondary_activate(id, x, y)`, `scroll(id, delta, orientation)`, `menu_will_show(id, submenu_id)`, `activate_menu_item(id, menu_item_id)` |
 | `lock` | `lock()` |

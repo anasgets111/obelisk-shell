@@ -19,9 +19,12 @@ return persistent_table {
     defaults = {
         -- One entry per output, `{ path = ..., fit = ... }`. `Settings.data.wallpapers` verbatim.
         wallpapers = {},
-        -- Last successful check and already-announced package names (`UpdateService.qml`'s
-        -- `lastSuccessfulCheck` and `notifiedPackagesKey`).
+        -- Last successful check, its package list and already-announced package names
+        -- (`UpdateService.qml`'s `lastSuccessfulCheck`, `packages` and `notifiedPackagesKey`). The
+        -- list travels with the time: a restart inside the interval skips its check, and without
+        -- the list it would say "up to date" for the rest of the hour.
         updates_checked_at = 0,
+        updates_packages = {},
         updates_notified = "",
         -- `Settings.data.idleService`, flattened and modelled as two profiles keyed by UPower mains
         -- state. Each has per-stage `<stage>_on`/`<stage>_sec` fields and both share `order`.
