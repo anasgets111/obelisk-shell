@@ -1,40 +1,32 @@
 //! Theme name to file path, in the Renderer (ADR-0054 decision 1).
 //!
-//! The resolver was originally planned for the Supervisor, and the plan could not be built: a
-//! synchronous lookup would have to block the dispatch thread on a round trip the control socket
-//! has no shape for -- it carries one-way commands and one-way `StateSnapshot`s, no
-//! request/response. So it resolves here, in-process, where the answer is already local.
+//! The Supervisor plan failed because synchronous lookup would block its dispatch thread on a
+//! control-socket round trip. That socket carries one-way commands and `StateSnapshot`s, not
+//! request/response pairs, so the answer is resolved locally here.
 //!
-//! `app_id` to `.desktop` file to `Icon=` key is deferred and has no caller, and no Lua
-//! `find_icon` exists to ask for one (ADR-0054 decision 5): with `name` resolving theme names
-//! here, nothing is left for such a call to do.
+//! `app_id` -> `.desktop` -> `Icon=` remains deferred with no caller, and no Lua `find_icon`
+//! exists (ADR-0054 decision 5): `name` resolution leaves it nothing to do.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// The file for `name` at `size` pixels, or `None` if the active theme and its inheritance chain
-/// have nothing under that name.
+/// The file for `name` at `size` pixels, or `None` if the active theme chain has no match.
 ///
-/// An absolute `name` is returned directly. The `Icon=` key in every `.desktop` file accepts either
-/// spelling. This lets the tray collapse to `icon { name = item.icon_name or item.icon_path }`
-/// instead of branching between two node kinds.
+/// An absolute `name` is returned directly. `.desktop` `Icon=` accepts either spelling, letting the
+/// tray use `icon { name = item.icon_name or item.icon_path }` without two node kinds.
 ///
-/// Existence is not checked for the absolute case: `ImageCache::image` is about to open the file
-/// anyway, and already logs once and caches the failure.
+/// Absolute paths are not checked: `ImageCache::image` opens them, logs once, and caches failure.
 ///
-/// Memoized, and that is not a micro-optimization. `ImageCache` keys on the resolved *path*, so
-/// the uploaded texture was already cached while this lookup ran again on every frame for every
-/// icon. Measured on an idle bar, release build, over 30 seconds: 62 calls, 101.6ms, a mean of
-/// 1.6ms and a worst case of 5.5ms, which was 62% of all the time `layout::paint::execute` spent
-/// recording draw commands -- more than text, boxes and images put together. A miss is the
-/// expensive case, since "not found" means the whole inheritance chain was walked and every
-/// candidate stat'd, so a `None` is memoized too.
+/// Memoized because `ImageCache` keys on the resolved *path*: the texture was cached while this
+/// ran every frame for every icon. Idle bar, release build, 30 seconds: 62 calls, 101.6ms, mean
+/// 1.6ms, worst 5.5ms, or 62% of `layout::paint::execute` draw-command time, more than text,
+/// boxes, and images combined. Misses walk the inheritance chain and `stat` every candidate, so
+/// `None` is memoized too.
 ///
-/// `with_cache` is `freedesktop-icons`' own cache and stays: it caches parsed theme *indexes*,
-/// which is what keeps the first lookup for a name from reading every `index.theme` under
-/// `/usr/share/icons`. It does not cache the per-name search those indexes are then used for,
-/// which is the cost this map removes.
+/// Keep `freedesktop-icons`' `with_cache`: it caches parsed theme *indexes*, avoiding reads of
+/// every `index.theme` under `/usr/share/icons` on the first lookup, but not the per-name search
+/// this map removes.
 pub fn resolve(name: &str, size: u16) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
@@ -45,65 +37,54 @@ pub fn resolve(name: &str, size: u16) -> Option<PathBuf> {
     memoized(name, size, || freedesktop_icons::lookup(name).with_theme(theme()).with_size(size).with_cache().find())
 }
 
-/// [`resolve`]'s memo, with the filesystem walk passed in so a test can count how often it runs.
-/// That count is the whole behaviour: an answer that is right but re-derived every frame is the
-/// defect this closes.
+/// [`resolve`]'s memo, with the filesystem walk injected so tests can count it. A correct answer
+/// re-derived every frame is the defect.
 fn memoized(name: &str, size: u16, lookup: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
     if let Some(hit) = memo().lock().expect("icon memo poisoned").get(&size).and_then(|by_name| by_name.get(name)) {
         return hit.clone();
     }
     let found = lookup();
-    // Re-locked rather than held across `lookup`: it walks the filesystem, and holding the map for
-    // that would serialize every other caller behind the slowest possible path.
+    // Do not hold the map across `lookup`: its filesystem walk would serialize callers.
     memo().lock().expect("icon memo poisoned").entry(size).or_default().insert(name.to_string(), found.clone());
     found
 }
 
-/// Resolved lookups for the life of the process, keyed by size then name so a hit can be found
-/// from a `&str` without allocating one.
+/// Process-lifetime resolved lookups, keyed by size then name so hits borrow a `&str`.
 ///
-/// Process lifetime is the right scope because [`theme`] already has it: the active theme is read
-/// once, so what this maps cannot change without the reload that replaces the whole Renderer
-/// process (ADR-0054). A `Mutex` rather than a `thread_local!` because nothing about the
-/// function says render thread, and an uncontended lock is nanoseconds against a lookup that
-/// measured 1.6 *milli*seconds.
+/// Process scope matches [`theme`]: the active theme is read once and changes only when reload
+/// replaces the Renderer (ADR-0054). Use `Mutex`, not `thread_local!`, because callers are not
+/// limited to the render thread; an uncontended lock is nanoseconds against the measured 1.6ms
+/// lookup.
 ///
-/// ponytail: unbounded, and bounded in practice by how many distinct icon names one session shows
-/// -- tray items and whatever the config names. Each entry is a name and a path. A session that
-/// cycled through thousands of distinct icon names would grow it, and the generation swap is what
-/// frees it, which is the same bargain `ImageCache` takes one layer down.
+/// ponytail: unbounded, bounded by distinct tray/config icon names. Each entry is a name and path;
+/// thousands of names grow it. Generation swap frees it, as with `ImageCache`.
 fn memo() -> &'static Mutex<Memo> {
     static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(Memo::new()))
 }
 
-/// Size to name to resolved path, nested so a lookup can borrow a `&str` for the inner key rather
-/// than allocate a `String` per hit.
+/// Size -> name -> path, nested so hits borrow the inner `&str` without allocating.
 type Memo = HashMap<u16, HashMap<String, Option<PathBuf>>>;
 
-/// The active icon theme's *directory* name, read once per process: this runs behind a paint, and
-/// re-reading a settings file per frame is not a thing to do there. Changing icon theme mid-session
-/// shows up at the next reload rather than immediately, the same cadence the font chain has.
+/// The active theme's *directory* name, read once per process. Theme changes appear on reload, the
+/// font-chain cadence, rather than rereading settings behind every paint.
 fn theme() -> &'static str {
     static THEME: OnceLock<String> = OnceLock::new();
     THEME.get_or_init(|| gtk_icon_theme_name().unwrap_or_else(|| "hicolor".to_string()))
 }
 
-/// `freedesktop-icons` ships `default_theme_gtk()` for this and it cannot be used: it shells out
-/// to `gsettings get org.gnome.desktop.interface icon-theme` (a process spawn per call, from the
-/// render thread, which since ADR-0039 is also the Wayland dispatch thread), and it does not
-/// return what `with_theme` takes -- it maps the setting through the theme's `index.theme` and
-/// returns the `Name=` field (`"Tela circle dracula"`), while `with_theme` is keyed by directory
-/// name (`"Tela-circle-dracula"`). The mismatch fails silently: every lookup returns `None`.
+/// Do not use `freedesktop-icons::default_theme_gtk()`: it spawns
+/// `gsettings get org.gnome.desktop.interface icon-theme` per render-thread call (the Wayland
+/// dispatch thread since ADR-0039), maps the setting through `index.theme` to `Name=`
+/// (`"Tela circle dracula"`), while `with_theme` needs the directory name
+/// (`"Tela-circle-dracula"`). The mismatch silently returns `None`.
 ///
-/// So the setting is read directly, from the file that holds the directory name in the first
-/// place. GTK 4 before GTK 3 because a machine with both usually has the newer one current, and
-/// neither before `hicolor`, the icon theme spec's implicit final fallback.
+/// Read the directory name directly from settings, GTK 4 before GTK 3, then `hicolor`, the spec's
+/// implicit fallback.
 ///
-/// ponytail: GTK's settings file only. A KDE session sets `Icons/Theme` in `kdeglobals` and would
-/// land on `hicolor`, which has app icons and almost no status icons, so a Plasma user's bar would
-/// draw app icons and nothing else. The upgrade is another arm in the `find_map` below; not built
-/// because this is not tested on Plasma and a second untested parser is worse than one honest gap.
+/// ponytail: GTK settings only. KDE uses `Icons/Theme` in `kdeglobals`, so Plasma falls to
+/// `hicolor`, drawing app icons but almost no status icons. Upgrade: another `find_map` arm; not
+/// built because Plasma is untested and a second untested parser is worse than this gap.
 fn gtk_icon_theme_name() -> Option<String> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -114,8 +95,7 @@ fn gtk_icon_theme_name() -> Option<String> {
     })
 }
 
-/// The `gtk-icon-theme-name` value out of a `settings.ini` body. Split out from the file reading so
-/// the parse is testable without a home directory to arrange.
+/// The `gtk-icon-theme-name` value from `settings.ini`, split out so parsing needs no home dir.
 fn icon_theme_from_settings(text: &str) -> Option<String> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix("gtk-icon-theme-name"))
@@ -130,24 +110,23 @@ mod tests {
 
     #[test]
     fn an_absolute_name_is_its_own_path() {
-        // The tray case: `dbus/shm_icons.rs` spools here and reports the path as `icon_path`.
+        // `dbus/shm_icons.rs` spools tray icons here as `icon_path`.
         let spooled = "/dev/shm/oblisk-1000/tray/telegram.png";
         assert_eq!(resolve(spooled, 16), Some(PathBuf::from(spooled)));
-        // Not stat'd: a path that does not exist still comes back as itself.
+        // No stat: nonexistent absolute paths still return themselves.
         assert_eq!(resolve("/nonexistent/x.png", 16), Some(PathBuf::from("/nonexistent/x.png")));
     }
 
     #[test]
     fn an_empty_name_resolves_to_nothing() {
-        // `icon` with no `name` defaults to `""`, and a `name` bound to an unhydrated capability
-        // signal is `nil` until its first push (ADR-0037). Both land here.
+        // Missing `icon.name` is `""`; an unhydrated capability is `nil` until its first push
+        // (ADR-0037). Both land here.
         assert_eq!(resolve("", 16), None);
     }
 
     #[test]
     fn a_relative_name_is_not_treated_as_a_path() {
-        // Only an absolute path short-circuits, so `./x.png` goes to the lookup and finds
-        // nothing rather than resolving against the Renderer's working directory.
+        // Only absolute paths short-circuit; `./x.png` is looked up, not resolved against CWD.
         assert_eq!(resolve("./oblisk-does-not-exist.png", 16), None);
     }
 
@@ -155,7 +134,7 @@ mod tests {
     fn the_settings_parse_returns_the_directory_name_gtk_wrote() {
         let ini = "[Settings]\ngtk-theme-name=Adwaita-dark\ngtk-icon-theme-name=Tela-circle-dracula\ngtk-font-name=Cantarell 11\n";
         assert_eq!(icon_theme_from_settings(ini).as_deref(), Some("Tela-circle-dracula"));
-        // Spacing around `=` is legal in a GLib key file; quotes are how some tools write it.
+        // GLib permits spaces around `=`; some tools quote the value.
         assert_eq!(icon_theme_from_settings("gtk-icon-theme-name = Papirus").as_deref(), Some("Papirus"));
         assert_eq!(icon_theme_from_settings("gtk-icon-theme-name=\"Papirus\"").as_deref(), Some("Papirus"));
     }
@@ -164,7 +143,7 @@ mod tests {
     fn a_settings_file_without_the_key_falls_through_rather_than_matching_a_prefix() {
         assert_eq!(icon_theme_from_settings("[Settings]\ngtk-theme-name=Adwaita\n"), None);
         assert_eq!(icon_theme_from_settings(""), None);
-        // An empty value is not a theme: `with_theme("")` would silently lose every icon.
+        // Empty is not a theme: `with_theme("")` silently loses every icon.
         assert_eq!(icon_theme_from_settings("gtk-icon-theme-name="), None);
     }
 
@@ -184,16 +163,15 @@ mod tests {
         });
         assert_eq!(found, Some(PathBuf::from("/memo/alpha-16")));
         assert_eq!(calls.get(), 1);
-        // The point of the memo: the second ask must not reach the walk at all. That walk measured
-        // a 1.6ms mean per call, once per icon per frame, before this landed.
+        // The second ask must skip the walk, measured at 1.6ms mean per icon per frame before this.
         let again = memoized("oblisk-test-alpha", 16, || panic!("a remembered name must not be looked up again"));
         assert_eq!(again, Some(PathBuf::from("/memo/alpha-16")));
     }
 
     #[test]
     fn the_memo_keys_on_both_name_and_size() {
-        // A collision here draws the *wrong* icon rather than none, which is the harder failure to
-        // notice: a bar full of plausible-looking icons that are not the ones asked for.
+        // A collision draws the *wrong* icon, harder to notice than a missing one: a plausible bar
+        // full of icons other than the requested ones.
         assert_eq!(
             memoized("oblisk-test-beta", 16, || Some(PathBuf::from("/memo/beta-16"))),
             Some(PathBuf::from("/memo/beta-16"))
@@ -214,9 +192,8 @@ mod tests {
 
     #[test]
     fn a_name_the_theme_does_not_have_is_remembered_as_absent() {
-        // The miss is the expensive case, not the cheap one: "not found" is what the whole
-        // inheritance chain being walked and every candidate stat'd looks like. Worst single call
-        // measured 5.5ms. So `None` is memoized exactly like a hit.
+        // Misses walk the whole inheritance chain and stat every candidate; worst call was 5.5ms.
+        // Memoize `None` exactly like a hit.
         assert_eq!(memoized("oblisk-test-missing", 16, || None), None);
         assert_eq!(memoized("oblisk-test-missing", 16, || panic!("an absent name must not be looked up again")), None);
     }

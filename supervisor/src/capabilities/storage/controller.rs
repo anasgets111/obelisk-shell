@@ -1,5 +1,5 @@
-//! [`StorageController`]: every JSON file a config declared with `persistent_table`, keyed by the
-//! absolute path it named (ADR-0136).
+//! [`StorageController`] owns JSON files declared with `persistent_table`, keyed by absolute path
+//! (ADR-0136).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -9,16 +9,15 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-/// How long after the last write a file is rewritten. A scroll offset or a search draft is one
-/// `:set()` per keystroke, and each one is a serialize, a write and a rename without this.
+/// Delay after the last write before rewriting. Scroll offsets and search drafts can call `:set()`
+/// per keystroke; each otherwise serializes, writes, and renames.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(1000);
 
 /// `oblisk.storage`'s payload (ADR-0136).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct StorageState {
-    /// One entry per `persistent_table` a config declared, keyed by the absolute path it joined
-    /// from `path` and `name`. Absent until that declaration is seen, so a config reads `nil`
-    /// rather than an empty table for a file nobody opened.
+    /// One entry per declared `persistent_table`, keyed by the absolute `path` joined from `path`
+    /// and `name`. Absent until declared, so unopened files read as `nil`, not an empty table.
     pub files: BTreeMap<String, serde_json::Value>,
 }
 
@@ -29,9 +28,8 @@ pub enum StorageSignal {
 
 pub struct StorageController {
     state: Arc<Mutex<StorageState>>,
-    /// One pending save per file, aborted and replaced by the next write to it. Not a single
-    /// writer task: two files debounce independently, and a config that writes one every second
-    /// must not keep the other's save from ever landing.
+    /// One pending save per file, replaced by its next write. Files debounce independently; one
+    /// file written every second cannot starve another's save.
     saves: Mutex<HashMap<PathBuf, JoinHandle<()>>>,
     signal_tx: UnboundedSender<StorageSignal>,
 }
@@ -45,13 +43,11 @@ impl StorageController {
         self.state.lock().expect("storage state mutex poisoned").clone()
     }
 
-    /// `persistent_table { path, name, defaults }`'s declaration, re-sent by every evaluation
-    /// (ADR-0136 decision 1). The first one for a path reads the file; later ones do not, since
-    /// the in-memory copy is the newer of the two by then.
+    /// `persistent_table { path, name, defaults }`, re-sent each evaluation (ADR-0136 decision 1).
+    /// The first declaration reads the file; later ones use the newer in-memory copy.
     ///
-    /// `defaults` fills keys the file does not have and never overwrites one it does, so adding a
-    /// default to a config that has already run is a new key rather than a reset. A merge that
-    /// changed anything schedules a save, which is what creates the file on a first run.
+    /// `defaults` fills missing keys without overwriting stored ones, so adding a default is a new
+    /// key, not a reset. A changed merge schedules a save, creating the file on first run.
     pub fn open(&self, path: &str, defaults: &serde_json::Value) {
         let Some(path) = absolute_path(path) else {
             eprintln!("storage: refused to open {path:?}; a store's path must be absolute");
@@ -71,10 +67,10 @@ impl StorageController {
         let _ = self.signal_tx.send(StorageSignal::Changed);
     }
 
-    /// `store:set(key, value)` (ADR-0136 decision 2): stores one key, pushes immediately so the
-    /// config sees its own write on the next resolve, and saves once the writes stop.
+    /// `store:set(key, value)` (ADR-0136 decision 2): stores one key, pushes immediately for the
+    /// next resolve, and saves after writes stop.
     ///
-    /// A JSON `null` deletes the key, which is how a Lua `nil` arrives here.
+    /// JSON `null` deletes the key; this is how Lua `nil` arrives.
     pub fn set(&self, path: &str, key: &str, value: serde_json::Value) {
         let Some(path) = absolute_path(path) else {
             eprintln!("storage: refused a write to {path:?}; a store's path must be absolute");
@@ -107,10 +103,8 @@ impl StorageController {
 
     /// Replaces this file's pending save with one [`SAVE_DEBOUNCE`] away.
     ///
-    /// ponytail: a save still in the window when the session ends is lost, since nothing flushes
-    /// on the way out. The mirror's `saveTimer` has the same hole and the same one-second window.
-    /// The upgrade is a flush on the Supervisor's shutdown path, which is where every controller
-    /// would want one and where none has one yet.
+    /// ponytail: a save still in the window at session end is lost. The mirror's `saveTimer` has
+    /// the same one-second hole. Upgrade with a Supervisor shutdown flush shared by controllers.
     fn schedule_save(&self, path: &Path) {
         let state = Arc::clone(&self.state);
         let key = path.to_string_lossy().into_owned();
@@ -120,8 +114,8 @@ impl StorageController {
             let Some(contents) = state.lock().expect("storage state mutex poisoned").files.get(&key).cloned() else {
                 return;
             };
-            // Off the Supervisor's own loop: `create_dir_all` plus a write plus a rename is three
-            // syscalls on a filesystem that can be a spun-down disk or an NFS mount.
+            // Off the Supervisor loop: directory creation, write, and rename are three syscalls,
+            // potentially on a spun-down disk or NFS mount.
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(err) = save(&target, &contents) {
                     eprintln!("storage: could not save {}: {err}", target.display());
@@ -137,18 +131,17 @@ impl StorageController {
     }
 }
 
-/// The path a config named, or `None` when it is not absolute. A relative path resolves against
-/// the Supervisor's working directory, which nothing sets, so it would land somewhere neither the
-/// config author nor the next session can name (ADR-0136 decision 6).
+/// The named path, or `None` when relative. Relative paths use the unset Supervisor working
+/// directory and would land somewhere neither the author nor next session can name
+/// (ADR-0136 decision 6).
 fn absolute_path(path: &str) -> Option<PathBuf> {
     let path = PathBuf::from(path);
     path.is_absolute().then_some(path)
 }
 
-/// Every failure collapses to an empty object rather than an error: a missing file is the ordinary
-/// first run, and an unreadable or malformed one must not stop a shell from starting. The defaults
-/// [`StorageController::open`] merges in are then the whole table, and the next save rewrites the
-/// file, which is the only repair a config could have asked for anyway.
+/// All failures become an empty object: missing is normal on first run, and unreadable/malformed
+/// data must not stop the shell. [`StorageController::open`] then merges defaults, and the next
+/// save rewrites the file as the only repair a config can request.
 fn load(path: &Path) -> serde_json::Value {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -159,9 +152,8 @@ fn load(path: &Path) -> serde_json::Value {
     }
 }
 
-/// Copies every key of `defaults` that `stored` does not already have, and answers whether it
-/// copied any. Top level only: a table value is one key's value, replaced whole, so a nested
-/// default does not merge into a nested stored table.
+/// Copies missing top-level keys from `defaults` into `stored` and reports whether it changed.
+/// Values, including tables, replace as one key; nested tables do not merge.
 fn fill_missing(stored: &mut serde_json::Value, defaults: &serde_json::Value) -> bool {
     let (Some(stored), Some(defaults)) = (stored.as_object_mut(), defaults.as_object()) else {
         return false;
@@ -176,10 +168,9 @@ fn fill_missing(stored: &mut serde_json::Value, defaults: &serde_json::Value) ->
     changed
 }
 
-/// Writes pretty JSON through a temporary file in the same directory and a rename, which is atomic
-/// on any single filesystem: a debounced writer must not be able to leave a half-written file
-/// behind a crash, since the next boot reads whatever is there and a truncated file loads as an
-/// empty table.
+/// Writes pretty JSON to a same-directory temporary file, then renames atomically within one
+/// filesystem. A crash cannot leave a half-written file; a truncated file would load empty next
+/// boot.
 fn save(path: &Path, contents: &serde_json::Value) -> std::io::Result<()> {
     let Some(dir) = path.parent() else {
         return Err(std::io::Error::other(format!("{} has no parent directory", path.display())));
@@ -216,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_key_wins_over_a_default_and_a_new_default_is_added_beside_it() {
-        // The reload case: an author adds a default to a config that has already run once.
+        // Reload: an author adds a default after the config already ran.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{ "theme": "latte" }"#).unwrap();

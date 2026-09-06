@@ -1,40 +1,34 @@
-//! Connected outputs (`wl_output`), the `screens` signal payload, and presentation feedback.
-//! `Screen`/`OutputFacts` and their conversions are the single source both the `screens` Lua
-//! signal and `layout::instance`'s monitor matching read (ADR-0041 decision 2).
+//! Connected outputs (`wl_output`), the `screens` payload, and presentation feedback.
+//! `Screen`/`OutputFacts` feed both the Lua signal and `layout::instance` monitor matching
+//! (ADR-0041 decision 2).
 
 use super::*;
 use crate::wayland::surface::TrackedRole;
 
-/// One connected output, exactly as `wl_output` reports it (ADR-0041 decision 2): the source both
-/// the `screens` Lua signal and `layout::instance::expand_instances`'s `monitor` matching read.
+/// One connected output, the source for the `screens` signal and `monitor` matching
+/// (ADR-0041 decision 2).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Screen {
     name: String,
     width: i32,
     height: i32,
     scale: i32,
-    /// Hz. `wl_output`'s `mode` event reports millihertz, which is not the unit anyone writes a
-    /// config against, so the division happens once here rather than in every config.
+    /// Hz; `wl_output::mode` reports millihertz, so conversion happens once here.
     refresh: f64,
 }
-/// The `smithay_client_toolkit::output::OutputInfo` fields [`screen_entry`] reads, lifted off it by
-/// [`App::screens`]. A separate struct since `OutputInfo` is `#[non_exhaustive]` with no public
-/// constructor, so a function taking one could never be unit-tested, unlike this conversion.
+/// The `OutputInfo` fields [`screen_entry`] reads, copied by [`App::screens`] because SCTK's type
+/// is `#[non_exhaustive]` and has no public constructor for unit tests.
 struct OutputFacts {
     name: Option<String>,
     logical_size: Option<(i32, i32)>,
-    /// The *current* `Mode`'s `(dimensions, refresh_rate)`, or `None` if none is advertised. Both
-    /// fields travel together so they can't disagree about which mode they describe.
+    /// The current `Mode`'s `(dimensions, refresh_rate)`, or `None`; the pair stays coherent.
     current_mode: Option<((i32, i32), i32)>,
     scale_factor: i32,
 }
-/// One output's `screens` entry, or `None` for an output whose size cannot be known.
-/// `logical_size` first (`xdg_output`/`wl_output` v4's compositor-space size, the space a layer
-/// surface's own coordinates are in), falling back to the current `Mode`'s `dimensions`. Neither
-/// present yields nothing rather than a made-up size; the caller logs the miss.
-/// ponytail: a nameless output (below `wl_output` v4) takes a positional `"output-{index}"` id,
-/// carried over from the deleted `wallpaper_surface_id`. `monitor = "DP-1"` can never match there;
-/// no client-side upgrade path exists, since the name genuinely does not exist.
+/// One `screens` entry, or `None` if size is unknown. Prefer `logical_size` (`xdg_output`/
+/// `wl_output` v4 compositor space), then the current `Mode` dimensions; never invent a size.
+/// ponytail: below `wl_output` v4, nameless outputs use positional `"output-{index}"` ids, so
+/// `monitor = "DP-1"` cannot match; no client-side upgrade exists without a compositor name.
 fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
     let (width, height) = facts.logical_size.or_else(|| facts.current_mode.map(|(dimensions, _)| dimensions))?;
     Some(Screen {
@@ -42,14 +36,12 @@ fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
         width,
         height,
         scale: facts.scale_factor,
-        // `Mode`'s own docs already allow a zero refresh rate ("if an output has no correct
-        // refresh rate, such as a virtual output"), so no current mode reads the same way.
+        // `Mode` allows zero when an output has no correct refresh rate, such as a virtual output.
         refresh: facts.current_mode.map_or(0.0, |(_, rate)| f64::from(rate) / 1000.0),
     })
 }
-/// The `screens` signal's payload: § 2.9's per-output fields as a JSON array, pushed into Lua
-/// through the same `Loader::to_lua_value` every capability's `StateSnapshot` goes through
-/// (ADR-0041 decision 2: Renderer-sourced, but not a second marshalling path).
+/// § 2.9's per-output fields as a JSON array, pushed through the same `Loader::to_lua_value` as
+/// capability `StateSnapshot`s (ADR-0041 decision 2).
 pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
     serde_json::Value::Array(
         screens
@@ -66,8 +58,7 @@ pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
             .collect(),
     )
 }
-/// The same screen list `layout::instance` needs: a name to match `monitor` against, a size to
-/// seed `available` with.
+/// The same names and sizes `layout::instance` uses for `monitor` matching and `available`.
 pub(super) fn geometries_from(screens: &[Screen]) -> Vec<OutputGeometry> {
     screens
         .iter()
@@ -79,10 +70,8 @@ pub(super) fn geometries_from(screens: &[Screen]) -> Vec<OutputGeometry> {
 }
 
 impl App {
-    /// Every connected output as [`Screen`], skipping (with a log) any whose size `wl_output`
-    /// cannot answer for. `departing` is the output an `output_destroyed` event is announcing,
-    /// excluded by hand: SCTK's `remove_global` calls `OutputHandler::output_destroyed` before
-    /// removing it from its own `OutputState`, so `outputs()` here still lists it. `None` else.
+    /// Every connected output as [`Screen`]. A departing output is excluded because SCTK calls
+    /// `output_destroyed` before removing it from `OutputState`, so `outputs()` still lists it.
     pub(super) fn screens(&self, departing: Option<&wl_output::WlOutput>) -> Vec<Screen> {
         let mut screens = Vec::new();
         for (index, output) in self.output_state.outputs().enumerate() {
@@ -114,29 +103,22 @@ impl App {
         screens
     }
 
-    /// One `wl_output` appeared, changed, or went away. One event, three jobs.
+    /// Handles an output appearing, changing, or leaving: update `screens` only when its payload
+    /// changed. `update_output` also fires for things `screens` does not carry; re-running the
+    /// rest for one would ask the Supervisor for an unjustified reload. Reconcile `monitor = "All"`
+    /// instances in place (ADR-0038 decision 3), then ask the Supervisor for a generation swap
+    /// when a config's `screens` loop changes surface ids
+    /// (ADR-0041 decisions 2-3). Candidates build their own set, so the two paths do not conflict.
     ///
-    /// The `screens` signal (ADR-0041 decision 2), gated on that push reporting a real change:
-    /// `update_output` also fires for things `screens` does not carry, and re-running the rest for
-    /// one of those would ask the Supervisor for an unjustified reload. Then the instance set
-    /// (ADR-0038 decision 3): a `monitor = "All"` declaration expands to one instance per output,
-    /// so appearing or leaving adds or removes one in place, no generation swap, since plugging
-    /// in a monitor is not a config edit. Finally
-    /// [`crate::socket::RendererClient::request_reload`], the half this cannot do itself: a config
-    /// looping over `screens` declares different surface ids before and after, a topology change
-    /// and so a generation swap (ADR-0041 decision 3), decided only by the Supervisor; a candidate
-    /// builds its own surface set from its own evaluation, so the two do not conflict.
-    ///
-    /// ponytail: a hotplug inside a PBA Candidate's own ready window is not handled.
-    /// `maybe_send_ready_signal` announces surfaces once, so one added after would trip
-    /// `PbaFailure::UnexpectedEvidence`, and a `RequestReload` while draining `inbound_frames` is
-    /// skipped by `SocketCandidateLink::recv_matching`. Window: `PBA_TIMINGS`'s seconds. Fix: defer
-    /// like `apply_visibility` defers `visible`; not built until this is actually hit.
+    /// ponytail: hotplug inside a PBA Candidate's ready window is unsupported. A late surface would
+    /// trip `PbaFailure::UnexpectedEvidence` after the one-shot `maybe_send_ready_signal`; then
+    /// `RequestReload` is skipped while `SocketCandidateLink::recv_matching` drains
+    /// `inbound_frames`. Window: `PBA_TIMINGS` seconds.
+    /// Upgrade: defer like `apply_visibility` defers `visible`, when this is hit.
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
         if !self.client.set_screens(screens_payload(&screens)) || !self.startup_complete {
-            // Pushed either way: seeding it from the initial output burst is the point (see
-            // `App::startup_complete`), but nothing below it applies yet.
+            // Seed from the initial output burst; `startup_complete` gates the rest.
             return;
         }
         eprintln!(
@@ -151,9 +133,8 @@ impl App {
         for instance_id in &reconcile.removed {
             self.destroy_surface_by_id(instance_id);
         }
-        // A surviving panel's `output_size` is what `SizeMode::Percent` resolves against, so a
-        // resize must move it: `fresh` has the output's current logical size, the instance set the
-        // size the compositor configured (see `reconcile_instances`). `window` has none: § 6.
+        // Percent resolves against the output's logical size, not the compositor-configured panel
+        // size. Windows have no output size (§ 6).
         for instance in &fresh {
             if let Some(TrackedRole::Panel { output_size, .. }) =
                 self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)
@@ -161,8 +142,7 @@ impl App {
                 *output_size = instance.available;
             }
         }
-        // Before `create_surfaces`, which reads the scene by instance id for a new surface's
-        // `visible`.
+        // Before `create_surfaces`, which reads the scene for a new surface's `visible`.
         self.client.set_instances(reconcile.instances);
         self.create_surfaces(qh, &specs, &reconcile.added);
         self.client.request_reload();
@@ -174,9 +154,8 @@ impl PresentationTimeHandler for App {
         &mut self.presentation_time
     }
 
-    /// Supervisor services § 14.2: the compositor confirmed `surface`'s committed frame physically
-    /// hit the screen. Queues a `shared::PresentationEvidence` frame for the socket thread to
-    /// write.
+    /// § 14.2 evidence: the compositor confirmed `surface`'s committed frame reached the screen;
+    /// queue `shared::PresentationEvidence` for the socket thread.
     fn presented(
         &mut self,
         _conn: &Connection,
@@ -204,8 +183,8 @@ impl PresentationTimeHandler for App {
         }
     }
 
-    /// The content update was never displayed. Logged only: the Supervisor's `evidence_timeout`
-    /// catches this surface never presenting (ADR-0025). Does **not** queue `PresentationEvidence`.
+    /// The update was never displayed. Log only; `evidence_timeout` catches it (ADR-0025), so do
+    /// not queue `PresentationEvidence`.
     fn discarded(
         &mut self,
         _conn: &Connection,
@@ -263,21 +242,18 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
-    // All three: update the `screens` signal, then ask for a re-evaluation (ADR-0041 decisions 2
-    // and 4). See [`App::handle_output_change`].
+    // Update `screens`, then ask for a re-evaluation (ADR-0041 decisions 2 and 4).
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
         self.handle_output_change(qh, None);
     }
 
-    // Not only mode/scale changes: SCTK also routes an output's *first* `xdg_output` arrival here,
-    // not to `new_output`, when the `wl_output` was already known.
+    // SCTK also routes an output's first `xdg_output` here, not to `new_output`.
     fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
         self.handle_output_change(qh, None);
     }
 
     fn output_destroyed(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        // Passed through explicitly: SCTK's `remove_global` calls this before removing the output
-        // from its own `OutputState`, so `outputs()` here still lists it (see [`App::screens`]).
+        // `remove_global` calls this before removing the output from SCTK's `OutputState`.
         self.handle_output_change(qh, Some(&output));
     }
 }

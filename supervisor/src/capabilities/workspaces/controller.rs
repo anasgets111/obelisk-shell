@@ -1,10 +1,8 @@
-//! [`WorkspacesController`]: the `oblisk.workspaces` state owner and its one write action, plus
-//! the compositor-neutral reduction behind them. Split from `workspaces`, see `workspaces/mod.rs`
-//! for the module-level doc.
+//! [`WorkspacesController`]: `oblisk.workspaces` state owner, write action, and compositor-neutral
+//! reduction. See `workspaces/mod.rs`.
 //!
-//! Nothing here names a compositor's own type: [`derive_state`] takes [`WorkspaceRow`]s and a
-//! [`FocusedWindow`], the shape any compositor's IPC reduces to; `workspaces::niri` and
-//! `workspaces::hyprland` do the reducing.
+//! [`derive_state`] knows no compositor type. It consumes [`WorkspaceRow`]s and a
+//! [`FocusedWindow`]; `niri` and `hyprland` reduce their IPC into those rows.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,43 +14,39 @@ use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_r
 
 use super::{hyprland, niri};
 
-/// `oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
-/// `active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
+/// `oblisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
+/// omitted, not `null` (§ 2.9 says `nil` when unfocused).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
-    /// Which compositor these came from, `"niri"` or `"hyprland"` (ADR-0119). Display policy
-    /// differs by compositor where the state does not: Hyprland creates a numbered workspace on
-    /// focus, so a strip pads empty slots there and not on niri, which keeps its own trailing
-    /// empty workspace.
+    /// Source compositor, `"niri"` or `"hyprland"` (ADR-0119). Hyprland creates a numbered
+    /// workspace on focus, so strips pad empty slots there; niri keeps its trailing empty one.
     pub compositor: String,
-    /// One entry per output, keyed by connector name; empty until the compositor first answers.
+    /// One entry per output, keyed by connector name; empty until the first compositor answer.
     pub outputs: Vec<OutputWorkspaces>,
-    /// The focused toplevel, or `nil` if none. One window per session, not per output: there is
-    /// no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
+    /// Focused toplevel, or `nil` if none. One window per session, not per output; an unfocused
+    /// monitor cannot be queried (ADR-0056 decision 4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_client: Option<ActiveClient>,
-    /// The compositor's special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119).
-    /// Absent on a compositor that has none, so `special == nil` hides the control and an empty
-    /// list means none exist right now. Hyprland lists a special only while it holds a window or
-    /// is shown.
+    /// Compositor special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119). Absent
+    /// when unsupported (`special == nil`); an empty list means supported but none exist. Hyprland
+    /// lists a special only while it holds a window or is shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub special: Option<Vec<SpecialWorkspace>>,
 }
 
-/// One special workspace (ADR-0119). Identified by `name`, which is what
-/// `workspaces:toggle_special(name)` takes, since Hyprland addresses them by name and their ids
-/// are negative.
+/// One special workspace (ADR-0119), identified by `name`, the argument to
+/// `workspaces:toggle_special(name)`; Hyprland uses names and negative ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SpecialWorkspace {
-    /// The compositor's full name, `"special:scratch"` or the unnamed `"special"`.
+    /// Full compositor name, `"special:scratch"` or unnamed `"special"`.
     pub name: String,
-    /// At least one window sits on it.
+    /// Whether at least one window sits on it.
     pub populated: bool,
-    /// The `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
+    /// `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
-    /// The connector of the output currently showing it, absent while it is hidden. A special
-    /// shows on one output at a time.
+    /// Connector currently showing it, absent while hidden; a special shows on one output at a
+    /// time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shown_on: Option<String>,
 }
@@ -60,108 +54,101 @@ pub struct SpecialWorkspace {
 /// One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
-    /// The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a
-    /// surface's `monitor`.
+    /// Connector name, e.g. `"eDP-1"`; matches `oblisk.screens.name` and a surface's `monitor`.
     pub name: String,
-    /// The [`WorkspaceEntry::id`] of the workspace visible on this output; every output has one.
+    /// [`WorkspaceEntry::id`] visible on this output; every output has one.
     pub active_workspace: u64,
-    /// ADR-0056 decision 4: present only on the output that actually holds focus, so
-    /// `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
+    /// Present only on the focused output (ADR-0056 decision 4); `out.focused_workspace ~= nil`
+    /// tests whether this is the focused monitor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_workspace: Option<u64>,
-    /// The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the
-    /// two ids above are opaque on their own and name nothing a user would recognise.
+    /// Workspaces on this output, ordered by [`WorkspaceEntry::idx`]; the strip draws these because
+    /// the two ids above are opaque.
     pub workspaces: Vec<WorkspaceEntry>,
 }
 
-/// `id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
-/// `focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
-/// position on that output (what a keybind/button label means), not stable across a reorder.
+/// `id` is the stable, monitor-independent identity used by `active_workspace`,
+/// `focused_workspace`, and `workspaces:focus(id)`. `idx` is the output-local 1-based position,
+/// useful for labels but unstable across reorders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceEntry {
-    /// Stable identity, independent of which output the workspace sits on. What the two ids on
-    /// [`OutputWorkspaces`] refer to and what `workspaces:focus(id)` takes.
+    /// Stable identity independent of output; the ids on [`OutputWorkspaces`] and
+    /// `workspaces:focus(id)` use it.
     pub id: u64,
-    /// 1-based position on this output. Not stable: a reorder renumbers it, which is why it is the
-    /// thing to draw and [`WorkspaceEntry::id`] is the thing to send.
+    /// 1-based position on this output. Reorders renumber it, so draw `idx` but send `id`.
     pub idx: u8,
-    /// The compositor's own name for the workspace, or `nil` when it has none. Most do not.
+    /// Compositor name, or `nil` when it has none; most do not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// At least one window sits on this workspace (ADR-0117). What a strip dims an empty
-    /// workspace by.
+    /// Whether a window sits here (ADR-0117); strips dim empty workspaces.
     pub populated: bool,
-    /// The Wayland `app_id` of the window that stands for this workspace: the focused one when
-    /// focus is here, else the compositor's first. Absent when the workspace is empty or its
-    /// windows report no id, so `nil` and "draw the number" are the same test.
+    /// Wayland `app_id` of its representative window: focused when focused, otherwise the
+    /// compositor's first. Absent for empty workspaces or windows without an id; `nil` means draw
+    /// the number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
 }
 
-/// § 2.9's `active_client`. `is_fullscreen` is present only from a compositor that reports it
-/// (ADR-0056 decision 5 refused to fabricate `false`, ADR-0119 lets Hyprland say); `class` is
-/// Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
+/// § 2.9's `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
+/// rejects fabricated `false`; ADR-0119 lets Hyprland provide it). `class` is Wayland `app_id`;
+/// Wayland has no X11 `WM_CLASS` equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct ActiveClient {
-    /// The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
+    /// Window title, e.g. `"src/main.rs - Neovim"`; empty when unset.
     pub title: String,
-    /// The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland
-    /// toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
+    /// Wayland `app_id`, e.g. `"firefox"`. Named `class` for X11 familiarity; use it with
+    /// `applications.by_app_id`.
     pub class: String,
-    /// The compositor has this window floating rather than tiled.
+    /// Whether the compositor floats this window rather than tiles it.
     pub is_floating: bool,
-    /// The window covers its whole output. Absent when the compositor does not say (niri-ipc has
-    /// no such field, ADR-0056 decision 5); Hyprland reports it (ADR-0119).
+    /// Whether the window covers its whole output. Absent when unreported (niri-ipc has no field,
+    /// ADR-0056 decision 5); Hyprland reports it (ADR-0119).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_fullscreen: Option<bool>,
 }
 
-/// One workspace as a compositor reports it, reduced to the fields [`derive_state`] reads.
-/// The input type of the reduction, so the reduction and its tests belong to no compositor.
+/// One compositor workspace reduced to [`derive_state`]'s input fields; owned by neither adaptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRow {
     pub id: u64,
     pub idx: u8,
     pub name: Option<String>,
-    /// The connector this workspace sits on, or `None` when the compositor has no output to put
-    /// it on at all (niri reports that with no monitor connected). Such a row is dropped.
+    /// Connector, or `None` when no output exists (niri reports this with no monitor); dropped.
     pub output: Option<String>,
-    /// The workspace its own output is showing. Per output: every output has exactly one.
+    /// Workspace shown on its own output; every output has exactly one.
     pub is_active: bool,
-    /// The workspace holding keyboard focus. Global: exactly one across the whole session, which
-    /// is what makes `OutputWorkspaces::focused_workspace` optional (ADR-0056 decision 4).
+    /// Workspace holding keyboard focus. Exactly one is global, making
+    /// `OutputWorkspaces::focused_workspace` optional (ADR-0056 decision 4).
     pub is_focused: bool,
-    /// Whether any window sits here, and which one stands for the workspace (ADR-0117). Picked by
-    /// the adaptor, which holds the window list this module never sees; an empty id is `None`.
+    /// Whether a window sits here and which `app_id` represents it (ADR-0117). The adaptor chooses
+    /// it from its private window list; an empty id is `None`.
     pub populated: bool,
     pub app_id: Option<String>,
 }
 
-/// The focused toplevel, reduced to the three fields § 2.9's `active_client` carries.
+/// The focused toplevel reduced to § 2.9's three `active_client` fields.
 ///
-/// *Which* window holds focus is the adaptor's question, not this module's: niri flags it on each
-/// window, another compositor may query it separately. What that window becomes in the payload is
-/// this module's job, done by [`derive_state`].
+/// The adaptor decides which window is focused (niri flags each one); [`derive_state`] maps the
+/// winner into the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedWindow {
     pub title: String,
-    /// Wayland's `app_id`, filling § 2.9's `class` (ADR-0056 decision 5).
+    /// Wayland `app_id`, filling § 2.9's `class` (ADR-0056 decision 5).
     pub app_id: String,
     pub is_floating: bool,
-    /// `None` from a compositor that does not report it, and it stays absent in the payload.
+    /// `None` when unreported; it stays absent in the payload.
     pub is_fullscreen: Option<bool>,
 }
 
-/// One shared signal, `Changed` only.
+/// Shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspacesSignal {
     Changed,
 }
 
-/// Folds a compositor's rows into § 2.9's payload. Pure, so the whole mapping is unit tested
-/// without a compositor. Outputs sort by connector name and workspaces by `idx`, since rows
-/// arrive in whatever order the adaptor's map iterated, not an order; an output with no active
-/// workspace is omitted rather than given a fabricated id (should be unreachable).
+/// Folds rows into § 2.9's payload. Pure and unit-tested without a compositor. Sorts outputs by
+/// connector and workspaces by `idx`; omits an output with no active workspace rather than
+/// fabricating an id (should be unreachable).
 pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> WorkspacesState {
     let mut by_output: HashMap<&str, Vec<&WorkspaceRow>> = HashMap::new();
     for workspace in workspaces {
@@ -200,9 +187,8 @@ pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>
     WorkspacesState { compositor: String::new(), outputs, active_client, special: None }
 }
 
-/// The half of a compositor reader that isn't about the compositor: reduce, drop a no-op update,
-/// store, and wake `main.rs`, shared by every adaptor through [`StatePublisher::publish`] so the
-/// logic is written, and agreed on, exactly once.
+/// Compositor-neutral reader half: reduce, drop equal updates, store, and wake `main.rs`, shared
+/// through [`StatePublisher::publish`].
 pub struct StatePublisher {
     state: Arc<Mutex<WorkspacesState>>,
     events: UnboundedSender<WorkspacesSignal>,
@@ -219,14 +205,12 @@ impl StatePublisher {
         Self { state, events, compositor, previous: WorkspacesState::default() }
     }
 
-    /// `false` once nothing is listening, a reader loop's exit condition. Deliberately not
-    /// debounced: a compositor replaying startup state as several events pushes several times,
-    /// each real (niri sends workspaces and windows separately, so the first push predates any
-    /// known window).
+    /// `false` once no one listens, ending the reader loop. Not debounced: startup replays are
+    /// separate real events (niri sends workspaces and windows separately, so the first push has
+    /// no known window).
     ///
-    /// `special` is `None` from a compositor that has no such thing and `Some` (possibly empty)
-    /// from one that does; the key's presence is the feature test (ADR-0119). Sorted here by
-    /// name, since the adaptor's list comes in wire order.
+    /// `special == None` means unsupported; `Some` including empty means supported (ADR-0119).
+    /// Sort by name because the adaptor's list is wire-ordered.
     pub fn publish(
         &mut self,
         workspaces: &[WorkspaceRow],
@@ -249,31 +233,28 @@ impl StatePublisher {
     }
 }
 
-/// `workspaces:focus(id)`'s `arguments: [id]`. Shape check only: whether the id names a
-/// workspace that exists is the compositor's question, answered by doing nothing.
+/// `workspaces:focus(id)`'s `arguments: [id]`; only shape is checked. The compositor decides
+/// whether the workspace exists and does nothing otherwise.
 pub fn parse_focus_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
 
-/// `workspaces:toggle_special(name)`'s `arguments: [name]`: the `name` of a `special` entry. A
-/// name no special has is Hyprland's to refuse, and it creates one instead, which is how a
-/// scratchpad is first opened from a keybind too.
+/// `workspaces:toggle_special(name)`'s `arguments: [name]`, the `special` entry name. Hyprland
+/// refuses unknown names or creates one, which also opens a scratchpad from a keybind.
 pub fn parse_toggle_special_args(arguments: &[serde_json::Value]) -> Option<&str> {
     arguments.first()?.as_str().filter(|name| !name.is_empty())
 }
 
-/// `Clone` is deliberately absent: nothing here is handed to a spawned future. The adaptor
-/// spawns its own OS thread and moves only what it needs, because niri's socket is a blocking
-/// `std::net::UnixStream`, not tokio-aware.
+/// No `Clone`: adaptors spawn OS threads and move only what they need because niri's socket is a
+/// blocking `std::net::UnixStream`, not tokio-aware.
 pub struct WorkspacesController {
     state: Arc<Mutex<WorkspacesState>>,
     compositor: Option<CompositorKind>,
 }
 
 impl WorkspacesController {
-    /// Returns immediately: a session with no implementor never spawns a reader and so never
-    /// pushes (ADR-0056 decision 1). The match is exhaustive, not defaulted, so a new
-    /// `CompositorKind` fails this build at the arm this file exists to add.
+    /// Returns immediately without a reader when no compositor implements the session, so nothing
+    /// pushes (ADR-0056 decision 1). Exhaustive matching makes a new `CompositorKind` fail here.
     pub fn new(events: UnboundedSender<WorkspacesSignal>) -> Self {
         let state = Arc::new(Mutex::new(WorkspacesState::default()));
         let compositor = detect_compositor();
@@ -296,8 +277,7 @@ impl WorkspacesController {
         self.state.lock().expect("workspaces state mutex poisoned").clone()
     }
 
-    /// `workspaces:focus(id)`, routed to whichever adaptor is live. Exhaustive for the same
-    /// reason [`WorkspacesController::new`] is.
+    /// `workspaces:focus(id)`, routed to the live adaptor; exhaustive like [`Self::new`].
     pub fn focus(&self, id: u64) {
         match self.compositor {
             Some(CompositorKind::Niri) => niri::focus(id),
@@ -306,8 +286,8 @@ impl WorkspacesController {
         }
     }
 
-    /// `workspaces:toggle_special(name)`. Only Hyprland has specials; on niri the payload has no
-    /// `special` key, so a config that checked it never calls this, and one that did not is told.
+    /// `workspaces:toggle_special(name)`. Only Hyprland has specials; niri lacks the `special` key
+    /// so configs can feature-test it.
     pub fn toggle_special(&self, name: &str) {
         match self.compositor {
             Some(CompositorKind::Hyprland) => hyprland::toggle_special(name),
@@ -345,7 +325,7 @@ mod tests {
 
     #[test]
     fn derive_state_groups_by_output_and_orders_outputs_and_workspaces_deterministically() {
-        // Passed out of order on purpose: an adaptor folds a map, and map iteration is not an order.
+        // Deliberately out of order: adaptors fold maps, whose iteration is unordered.
         let workspaces = [
             workspace(9, 3, "eDP-1", false, false),
             workspace(2, 1, "DP-2", true, false),
@@ -381,8 +361,7 @@ mod tests {
 
     #[test]
     fn derive_state_reports_the_active_workspace_by_id_not_by_index() {
-        // `id` and `idx` deliberately disagree: a reorder moves `idx` and leaves `id` alone, so
-        // a mapping that reached for the wrong one would still pass if they happened to agree.
+        // `id` and `idx` disagree: reorder moves `idx` but not `id`, catching swapped fields.
         let state = derive_state(&[workspace(42, 1, "eDP-1", true, true)], None);
 
         assert_eq!(state.outputs[0].active_workspace, 42);
@@ -391,7 +370,7 @@ mod tests {
 
     #[test]
     fn derive_state_ignores_a_workspace_that_has_no_output() {
-        // Real: a compositor reports no output for a workspace when none are connected at all.
+        // Real: a compositor reports no output when none are connected.
         let orphan = WorkspaceRow { output: None, ..workspace(1, 1, "eDP-1", true, true) };
 
         assert_eq!(derive_state(&[orphan], None).outputs, Vec::new());
@@ -448,14 +427,14 @@ mod tests {
 
     #[test]
     fn derive_state_has_no_active_client_when_no_window_holds_focus() {
-        // Real, not hypothetical: focusing a layer-shell surface leaves every toplevel unfocused.
+        // Real: focusing a layer-shell surface leaves every toplevel unfocused.
         assert_eq!(derive_state(&[workspace(1, 1, "eDP-1", true, true)], None).active_client, None);
     }
 
     #[test]
     fn active_client_carries_is_fullscreen_only_when_the_compositor_said() {
-        // ADR-0056 decision 5 kept the key out rather than fabricate `false`; ADR-0119 lets a
-        // compositor that knows say so. Absent, not `null`, when it does not.
+        // ADR-0056 decision 5 keeps the key absent rather than fabricating `false`; ADR-0119 lets
+        // a compositor that knows provide it. Absent, not `null`, otherwise.
         let json = serde_json::to_value(derive_state(&[], Some(&window("a title", "kitty", false)))).unwrap();
         let client = &json["active_client"];
         assert_eq!(client["title"], "a title");

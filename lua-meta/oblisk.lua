@@ -43,421 +43,382 @@
 --- Payload types ------------------------------------------------------------------------------
 
 ---@class AccessPointInfo
----One scanned access point, already resolved to what `network.available_networks` needs
----(docs/oblisk-idl-api-specs.md §2.5). `Serialize`: this is what ends up in a `StateSnapshot`'s
----`payload`, same convention as `audio::mixer::AppStream`.
+---One scanned AP, resolved to `network.available_networks` (docs/oblisk-idl-api-specs.md §2.5)
+---and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
----@field secure boolean A key is required: the AP advertises WEP privacy, or non-empty WPA1 or RSN key management.
----@field ssid string The network name; entries dedupe on this, keeping only the stronger of two radios.
+---@field secure boolean A key is required: WEP privacy or non-empty WPA1/RSN key management.
+---@field ssid string Network name. Entries dedupe on it, keeping the stronger sighting.
 ---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
----§ 2.9's `active_client`. `is_fullscreen` is present only from a compositor that reports it
----(ADR-0056 decision 5 refused to fabricate `false`, ADR-0119 lets Hyprland say); `class` is
----Wayland's `app_id`, since X11's `WM_CLASS` has no Wayland equivalent.
----@field class string The Wayland `app_id`, e.g. `"firefox"`. Named `class` for the X11 habit, but a Wayland toplevel has no `WM_CLASS`. The key `applications.by_app_id` is built to be looked up by.
----@field is_floating boolean The compositor has this window floating rather than tiled.
----@field is_fullscreen? boolean The window covers its whole output. Absent when the compositor does not say (niri-ipc has no such field, ADR-0056 decision 5); Hyprland reports it (ADR-0119).
----@field title string The window title, e.g. `"src/main.rs - Neovim"`. Empty string for a window that sets none.
+---§ 2.9's `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
+---rejects fabricated `false`; ADR-0119 lets Hyprland provide it). `class` is Wayland `app_id`;
+---Wayland has no X11 `WM_CLASS` equivalent.
+---@field class string Wayland `app_id`, e.g. `"firefox"`. Named `class` for X11 familiarity; use it with `applications.by_app_id`.
+---@field is_floating boolean Whether the compositor floats this window rather than tiles it.
+---@field is_fullscreen? boolean Whether the window covers its whole output. Absent when unreported (niri-ipc has no field, ADR-0056 decision 5); Hyprland reports it (ADR-0119).
+---@field title string Window title, e.g. `"src/main.rs - Neovim"`; empty when unset.
 
 ---@class AppStream
----One playback stream node PipeWire has advertised, filtered to
----`media.class == "Stream/Output/Audio"` and resolved to its owning process. `main.rs` puts
----this as-is in a `StateSnapshot`'s `payload`. Field names match § 2.4's spelling (`id`, `name`,
----ADR-0053 decision 3); `pid`/`process_name` are kept beyond § 2.4 because ADR-0016's
----owning-process lookup was hard-won and worth keeping.
----@field id integer PipeWire registry id of the stream node: the key [`AudioApps`] tracks entries by.
----@field muted boolean § 2.4's per-app mute, from the same `Props` param as `volume`.
+---A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
+---§ 2.4 names `id`/`name` (ADR-0053 decision 3), while ADR-0016's `pid`/`process_name` remain.
+---@field id integer PipeWire registry id, the [`AudioApps`] key.
+---@field muted boolean § 2.4 per-app mute, from the same `Props` as `volume`.
 ---@field name? string `application.name`, if the client set one.
----@field pid integer `application.process.id`: the pid PipeWire recorded for the stream's owning process.
----@field process_name? string `/proc/{pid}/comm` for `pid`, if the process still existed when this stream was seen.
----@field volume number § 2.4's per-app volume, range `[0.0, 1.0]`, read from `SPA_PARAM_Props` through the same cube-root conversion the master sink uses (see [`master`]): `pw-cli enum-params <id> Props` confirms a stream cubes `channelVolumes` like a sink. `1.0` until that param arrives.
+---@field pid integer `application.process.id` recorded for the owning process.
+---@field process_name? string `/proc/{pid}/comm`, if the process still existed when observed.
+---@field volume number § 2.4 per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
 
 ---@class AppSummary
----One application as the config sees it (ADR-0061). Deliberately the display half only:
----the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
----config that could rewrite a command line before it ran would be a config that could be made
----to run something else.
----@field comment? string The unlocalized `Comment=`: the one-line description a launcher draws under the name and matches a search against, `"Web Browser"` under `Firefox` (ADR-0112). `None` for an entry with none, which is common, so a config hides the line rather than drawing an empty one. Localized the way `name` is not, and for the same reason.
----@field icon? string The `Icon=` key as written: a theme name, or an absolute path. `icon { name = ... }` takes either, which is exactly what ADR-0054 decision 2 built it for. `None` for an entry with no `Icon=` at all, so a config can tell "no icon" from an icon that failed to resolve.
----@field id string The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
----@field name string The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English on a localized system.
+---One application as config sees it (ADR-0061). Display data only: argv stays private because
+---`applications:launch(id)` runs it, and exposing it would let config rewrite the command.
+---@field comment? string Unlocalized `Comment=`, the one-line description/search text under the name, e.g. `"Web Browser"` under `Firefox` (ADR-0112). `None` means no key, so config can hide it; unlike `name`, this field is localized.
+---@field icon? string `Icon=` as written, either a theme name or absolute path; `icon { name = ... }` accepts both (ADR-0054 decision 2). `None` means no `Icon=` key, distinct from failed resolution.
+---@field id string Desktop file id (`org.telegram.desktop`), and `launch`'s argument.
+---@field name string Unlocalized `Name=`. `Name[xx]` is not read (ADR-0061), so this is English on a localized system.
 
 ---@class AudioDevice
----One § 2.4 `sinks`/`sources` entry. Both arrays share this one type: an output and an input
----differ only in which `media.class` produced them, never in what a config reads. `name` is
----§ 2.4's "user-friendly description": `node.description` (`"Built-in Audio Analog Stereo"`),
----not the routing `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`). Both exist on
----every device this machine advertises; only one is meant for a person.
----@field active boolean Whether this is the device the `default.audio.sink`/`default.audio.source` metadata key currently routes to.
----@field icon? string The node's `device.icon-name`, as PipeWire spells it: `"audio-card-analog"`, `"audio-headset-bluetooth"`, `"audio-headphones"`. A hint for choosing a glyph, not an icon-theme lookup this side performs; `None` when the node carries none, which a virtual sink does.
----@field id integer PipeWire registry id, which is what `audio:set_default_sink(id)` takes.
----@field name string The device description, e.g. `"Built-in Audio Analog Stereo"`. Not stable across a reboot; [`AudioDevice::id`] is not either.
+---One § 2.4 `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
+---`node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
+---@field active boolean Whether `default.audio.sink`/`default.audio.source` currently routes here.
+---@field icon? string PipeWire's `device.icon-name` hint, such as `"audio-card-analog"`; not resolved here. `None` means the node carried no hint, as with a virtual sink.
+---@field id integer PipeWire registry id used by `audio:set_default_sink(id)`.
+---@field name string Device description, e.g. `"Built-in Audio Analog Stereo"`; neither is reboot-stable.
 
 ---@alias BatteryStatus
----| "Unknown" # UPower has no answer, which includes every host where the display device is not a battery.
+---| "Unknown" # UPower has no answer, including hosts whose display device is not a battery.
 ---| "Charging" # Taking current from the mains adapter.
 ---| "Discharging" # Running off the battery, with no mains adapter supplying it.
----| "Empty" # Flat, which UPower reports in place of `Discharging` only at the very end.
----| "FullyCharged" # At the top of the battery, on mains, holding. A charge limit gives `PendingCharge` instead.
----| "PendingCharge" # On mains, at the charge limit, not taking current. "Charge limit reached".
----| "PendingDischarge" # On mains, above the charge limit, draining down to it. The cable is in and the level falls.
+---| "Empty" # Flat; UPower reports this instead of `Discharging` only at the very end.
+---| "FullyCharged" # Full on mains and holding; a charge limit gives `PendingCharge` instead.
+---| "PendingCharge" # On mains at the charge limit, not taking current.
+---| "PendingDischarge" # On mains above the charge limit, draining down to it.
 ---§ 2.2's `battery.state`, one of UPower's seven `Device.State` values.
 ---
----A boolean cannot carry this, and that is why it is not one. The four states a laptop with a
----charge threshold moves between are `Charging`, `PendingCharge` (the limit is reached and the
----mains adapter is holding the battery there), `PendingDischarge` (the battery is above the
----limit and draining down to it, still on mains) and `Discharging` (on battery). Under the
----`charging: bool` this replaced, the middle two both read `false`, so a config could not tell
----"the limit is reached" from "you are on battery" -- which on this dev machine, whose
----`charge_control_end_threshold` is 70, is most of every day.
+---A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making the charge
+---limit indistinguishable from running on battery. This machine's `charge_control_end_threshold`
+---is 70, so that distinction covers most of every day. The four laptop states are `Charging`,
+---`PendingCharge` (limit reached, mains holding), `PendingDischarge` (above the limit, draining
+---on mains), and `Discharging` (on battery).
 ---
----Serialized by name, so Lua compares `b.state == "PendingCharge"`. The same shape
----`mpris`'s `play_state` already uses at this boundary.
+---Serialized by name, so Lua compares `b.state == "PendingCharge"`; `mpris.play_state` uses the
+---same boundary shape.
 
 ---@class ConnectedDevice
----@field battery integer `-1` if unsupported/unknown (no `Battery1` interface on this device, or its `Percentage` property failed to read) -- per the IDL comment, not a sentinel invented here.
----@field category string A drawing hint from the device's class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"` for anything the class bits do not place. Pick an icon from it; do not treat it as a capability.
----@field codec? string Always `None` this round -- codec query/control is deferred (ADR-0030): it needs a live PipeWire `Device` proxy, an `audio`-capability concern, not `bluetooth`'s.
----@field mac string The canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`. What every `bluetooth:` command takes to name a device.
+---@field battery integer Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed), per the IDL.
+---@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a capability.
+---@field codec? string Always `None` for now; codec query/control is deferred (ADR-0030) to an `audio` capability with a live PipeWire `Device` proxy.
+---@field mac string Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
 ---@field name string The device's advertised name.
 
 ---@class DiscoveredDevice
----@field mac string The canonical MAC address. What `bluetooth:pair(mac)` takes.
----@field name string The advertised name. Often empty for a device that broadcasts only an address.
----@field paired boolean Always `false` -- per the IDL comment, every entry in this pool is by definition unpaired.
+---@field mac string Canonical MAC address accepted by `bluetooth:pair(mac)`.
+---@field name string Advertised name, often empty when the device broadcasts only an address.
+---@field paired boolean Always `false`; every entry in this pool is unpaired (IDL contract).
 
 ---@class FileEntry
----One file in a watched folder.
----@field modified integer Unix epoch seconds of the last modification, for a "newest first" sort. `0` when the filesystem does not say.
----@field name string The file name alone, `sunrise.jpg`, for drawing and for matching a search against.
----@field path string The absolute path, what `image { source = ... }` takes and what a config stores.
+---@field modified integer Last-modification Unix seconds for newest-first sorting; `0` when unavailable.
+---@field name string File name alone, such as `sunrise.jpg`, for drawing and search.
+---@field path string Absolute path for `image { source = ... }` and config storage.
 
 ---@class Folder
----One watched folder as the config sees it.
----@field entries FileEntry[] The plain files directly inside the folder, hidden ones (a leading dot) skipped, filtered to the extensions `watch` named, sorted by name case-insensitively. Not recursive: a subfolder is not listed and nothing inside it is. Replaced wholesale on every change inotify reports, debounced, so a copy in progress lands as one update.
----@field error? string Why the last listing produced nothing, in words fit to draw (`"No such file or directory"`), or absent when it succeeded. Set alongside `ready = true`, so a picker tells a missing folder from an empty one.
----@field ready boolean `false` between `watch` and the first listing landing, which is the "loading" a picker draws a spinner for. `true` afterwards, even when `entries` is empty or `error` is set.
+---@field entries FileEntry[] Plain files directly inside the folder, skipping dotfiles, filtered to `watch`'s extensions and sorted case-insensitively. Not recursive. Replaced wholesale after each debounced inotify burst, so a copy in progress lands as one update.
+---@field error? string A drawable listing error such as `"No such file or directory"`, or absent on success. Set with `ready = true`, distinguishing a missing folder from an empty one.
+---@field ready boolean `false` until the first listing lands, for a picker's loading spinner. `true` thereafter, even when `entries` is empty or `error` is set.
 
 ---@class IdleInhibitor
----One logind inhibitor blocking idle, as a config would draw it.
----@field who string The `who` the holder passed to `Inhibit`, e.g. `"mpv"`. Free text chosen by that program, so it is a label to draw and never something to match on.
----@field why string The `why` the holder passed, e.g. `"Playing video"`. Also free text, and often empty.
+---One logind inhibitor blocking idle.
+---@field who string Free-text `who` passed to `Inhibit`, e.g. `"mpv"`; draw it as a label, never match it.
+---@field why string Free-text `why`, e.g. `"Playing video"`, often empty.
 
 ---@class MenuItem
----One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
----(docs/oblisk-idl-api-specs.md §2.14).
----@field children MenuItem[] Nested entries, recursive. The whole tree arrives in one `GetLayout(0, -1)` reply rather than a submenu at a time, so this is populated without any `tray:menu_will_show` first. Empty for a leaf, and also empty for a node past [`MAX_MENU_DEPTH`], whose children are dropped with a line on stderr.
----@field enabled boolean `false` for an entry the application has greyed out. Activating one is a no-op, so draw it as unavailable rather than filtering it away: the gap is the application's own layout.
----@field icon_name? string A theme icon name for the entry, or `nil`. DBusMenu's pixmap form is not carried.
----@field id integer DBusMenu's own item id. What `tray:activate_menu_item` and `tray:menu_will_show` take.
----@field label? string The entry text, exactly as the application sent it. `nil` when it sent none, which is the normal case on a separator. DBusMenu's `_` mnemonic markers are *not* stripped, so a label can arrive as `"_Quit"`; strip it in the config if you do not want the underscore drawn.
+---One DBusMenu layout node, resolved to `tray.items[].menu` (docs/oblisk-idl-api-specs.md §2.14).
+---@field children MenuItem[] Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose children are dropped with an stderr line.
+---@field enabled boolean `false` for a greyed-out entry. Activation is a no-op; keep it to preserve the application's layout instead of filtering it.
+---@field icon_name? string Theme icon name, or `nil`; DBusMenu pixmaps are not carried.
+---@field id integer DBusMenu item id used by `tray:activate_menu_item` and `tray:menu_will_show`.
+---@field label? string Entry text exactly as sent, or `nil`. Separators normally have none. `_` mnemonic markers remain, so `"_Quit"` is sent as-is; strip it in config if you do not want the underscore drawn.
 ---@field menu_type string `"standard"` or `"separator"`. A separator carries no label and is not clickable.
----@field toggle_state? integer DBusMenu's own `0` off, `1` on, `-1` indeterminate. `nil` exactly when [`MenuItem::toggle_type`] is, and `-1` for an item that declared a toggle type and then sent no state, which is the same thing DBusMenu means by indeterminate.
+---@field toggle_state? integer DBusMenu state: `0` off, `1` on, `-1` indeterminate. `nil` exactly when [`MenuItem::toggle_type`] is `nil`; a missing state with a toggle type becomes `-1`.
 ---@field toggle_type? string `"checkmark"`, `"radio"`, or `nil` for an entry that is not a toggle.
 
 ---@class Notification
----One queued notification -- `notifications.feed[]`'s object shape (docs/oblisk-idl-api-specs.md
----§2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
----are new fields; ADR-0090 adds `actions` and `has_default_action`). Trimmed to what the feed
----shape and the write commands need: `expire_timeout` and `replaces_id` are acted on and not
----carried, since neither is a thing a config draws or decides.
----@field actions NotificationAction[] The buttons the sender offered, in the order it listed them, minus the two keys that mean something other than a button. Empty for the great majority of notifications.
----@field app_icon? string The sending application's own icon: a theme name like `"firefox"`, or an absolute path when it sent one that passed the trusted-root check. `nil` when it identified itself with neither. Feeds `icon { name = ... }`, which takes either form (ADR-0054 decision 2). A theme name is the overwhelmingly common case and used to be dropped on the floor: this value ran through the same absolute-path validator the attached picture does, and `"firefox"` is not an absolute path, so nearly every real notification arrived with no icon at all (ADR-0091).
----@field app_name string The sending application's name, truncated to 64 bytes on a character boundary.
----@field body NotificationSpan[] The message as a run of spans rather than one string, because the freedesktop body is markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own bold/italic/underline/href, or an image whose path passed the trusted-root check, so a config draws the list in order and never has to parse markup itself.
----@field desktop_entry? string `hints["desktop-entry"]`: the sender's `.desktop` file id, e.g. `"org.telegram.desktop"`, which is the key `oblisk.applications`'s `by_app_id` is built to be looked up by (§ 2.13) and the grouping key `app_name` is only a stand-in for -- two applications can share a display name and one can change its own. `nil` for a sender that set none, which is most command-line senders and few desktop applications. Carried as sent, minus anything holding a path separator, since a desktop id never does (ADR-0101).
----@field expired boolean The sender's timeout ran out. The notification is still here -- expiry *retires* an entry from the popup and leaves it in the feed for the history to show (ADR-0100) -- so this is what a popup filters on and a history ignores. `NotificationClosed(id, reason=1)` has already gone to the sender by the time this reads `true`. A `replaces_id` replacement is fresh content and reads `false` again. Never `true` on a critical notification or on one sent with `expire_timeout = 0`, which never expire.
----@field has_default_action boolean The sender offered a `"default"` action: the whole card is activatable, and clicking it should call `notifications:invoke_action(id, "default")`. Its own field rather than an entry in `actions`, because it is not a button and drawing it as one is wrong.
----@field has_reply boolean The sender offered an inline reply action, so `notifications:reply(id, text)` will be accepted. Calling it on a notification without one is refused, which is why this is carried rather than guessed.
----@field id integer The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and `:invoke_action` take. Reused when an application replaces its own notification in place.
----@field image_path? string The picture the sender attached -- album art, an avatar, a screenshot thumbnail -- as an absolute path to a file that exists: either a decoded, bounds-checked image spooled to the runtime directory, or a path it sent that passed the trusted-root check. `nil` when it attached none. Never a theme name (ADR-0091). Was called `icon_path` and held this *and* the sending application's icon, whichever arrived first. They are two different pictures with two different jobs, so they are now two fields; see [`Notification::app_icon`].
----@field reply_placeholder? string `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say -- "Reply to Alice" rather than a generic "Reply". `nil` for a sender that set none, and meaningless without [`Notification::has_reply`]. Truncated to 64 bytes like a button label, which is roughly what it is (ADR-0101).
----@field summary string The title, truncated to 128 bytes on a character boundary. Plain text: any markup the application sent is parsed out, not rendered.
----@field timestamp integer When this content arrived, as Unix epoch seconds -- the same clock and the same unit as `oblisk.system`'s `time` (§2.11), so a config's relative age is `system.time - timestamp` and needs nothing else to line the two up. Set from the content, not from the id: a `replaces_id` replacement is a fresh `Notify` with a fresh timestamp, because "3 new messages" arriving now is not four minutes old just because "1 new message" was. Carried because a config cannot recover it. Nothing else in the feed says when anything happened, and the obvious workaround -- noting the clock the first time an id is seen -- has to run inside a `computed`, which ADR-0021 requires to be side-effect-free.
----@field transient boolean `hints["transient"]`: the sender says this is worth a popup and nothing more (§1's base spec). An expired transient is removed outright rather than retired, so a history never has to filter it after the fact; while it is live, this is how a history knows to leave it to the popup (ADR-0100).
----@field urgency Urgency `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint. Critical is the one that outlives do-not-disturb and never expires on its own.
+---Queued `notifications.feed[]` object (idl §2.7; ADR-0033, ADR-0090). `expire_timeout` and
+---`replaces_id` affect processing but are not feed data.
+---@field actions NotificationAction[] Offered buttons in sender order, excluding `default` and `inline-reply`; often empty.
+---@field app_icon? string Application icon: theme name (for example `"firefox"`) or trusted absolute path; `nil` if neither was supplied. Feeds `icon { name = ... }` (ADR-0054 decision 2). ADR-0091 fixed the former bug that sent theme names through absolute-path validation, leaving nearly every notification with the generic fallback.
+---@field app_name string Sending application, truncated to 64 bytes at a character boundary.
+---@field body NotificationSpan[] Body spans, truncated to 512 bytes before parsing. Text carries bold/italic/underline/href; images carry trusted paths, so config draws without parsing markup.
+---@field desktop_entry? string `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by `oblisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`. `nil` when absent; slashed values are dropped (ADR-0101).
+---@field expired boolean Whether the timeout expired. Ordinary expiry retires the entry from popups but leaves it in feed history (ADR-0100), after `NotificationClosed(id, reason=1)`; replacements reset it. Never true for critical or `expire_timeout = 0` notifications.
+---@field has_default_action boolean Whether the card is activatable via `notifications:invoke_action(id, "default")`; separate from `actions` because `default` is not a button.
+---@field has_reply boolean Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.
+---@field id integer Server id, starting at `1`; used by dismiss/reply/action and reused by replacement.
+---@field image_path? string Attached picture (album art/avatar/thumbnail) as an existing absolute path: decoded image spooled to runtime storage or a trusted sender path. `nil` when absent; never a theme name (ADR-0091). Formerly shared `icon_path` with the application icon; now separate.
+---@field reply_placeholder? string `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say, "Reply to Alice" rather than a generic "Reply"; capped at 64 bytes, `nil` if absent, and meaningless without [`Notification::has_reply`] (ADR-0101).
+---@field summary string Plain-text title, truncated to 128 bytes at a character boundary; markup is parsed out.
+---@field timestamp integer Arrival time in Unix epoch seconds, matching `oblisk.system.time` (§2.11); age is `system.time - timestamp`. Replacements get fresh timestamps; carried because configs cannot recover history inside ADR-0021 side-effect-free `computed`s.
+---@field transient boolean `hints["transient"]`: popup-only (§1). Expired transient entries are removed, not retired, so history never sees them (ADR-0100).
+---@field urgency Urgency `"low"`, `"normal"`, or `"critical"`; missing hint means `"normal"`. Critical bypasses DND and never expires.
 
 ---@class NotificationAction
----One action button a sender offered (ADR-0090). `Notify` carries these as a flat
----`[key1, label1, key2, label2, ...]` array, which was read for one bool and thrown away until
----now -- so `GetCapabilities` advertised `actions` and `action-icons` and neither was true.
----
----The two keys with meanings of their own are not in here: `"default"` is the whole
----notification's activation and becomes [`Notification::has_default_action`], and
----`"inline-reply"` becomes [`Notification::has_reply`]. Both would otherwise draw as buttons
----beside the ones a sender actually meant as buttons.
----@field icon_name? string A *theme icon name*, present only when the sender set the `action-icons` hint, in which case the base spec says the key is that name. Not a path and never resolved here: `icon` takes a theme name directly (ADR-0054 decision 2), so there is nothing to spool. A key holding a path separator is refused as an icon rather than carried, because `icon` also accepts an absolute path -- without that check, a sender could name any file on this machine and have the shell draw it.
----@field key string What `notifications:invoke_action(id, key)` takes, and what travels back to the sender as `ActionInvoked`'s `action_key`. Opaque: it means something to the application and nothing here.
----@field label string What to draw on the button. The sender's own label, or the key when it sent an empty one and the action is not icon-only.
+---One offered action button (ADR-0090), excluding `default` activation and `inline-reply`, which
+---become [`Notification::has_default_action`] and [`Notification::has_reply`]. The flat array
+---was once read for one bool and discarded, so `GetCapabilities` advertised `actions` and
+---`action-icons` while neither was true; parsed buttons are retained now.
+---@field icon_name? string Theme icon name when `action-icons` is set; never a path or resolved here. Keys containing `/` are refused to prevent a sender naming arbitrary files (ADR-0054 decision 2).
+---@field key string Opaque key accepted by `notifications:invoke_action(id, key)` and returned as `ActionInvoked.action_key`.
+---@field label string Button label, falling back to the key when empty unless the action is icon-only.
 
 ---@class NotificationSpan
----One allowlisted body-markup run (CONTEXT.md's "Notification body span"; ADR-0033). A text run
----carries its own styling and, for a `<a href>`, the link target; an image run carries only a
----spooled/validated path -- `alt` text is parsed for grammar completeness but not carried
----forward, since nothing in this round's scope reads it.
----@field bold? boolean The run sat inside `<b>`.
----@field href? string The `<a href>` target this run links to, or `nil` for a run that is not a link. Carried as text, not opened: launching it is a config's decision.
----@field image_path? string An absolute path to an image that exists under a trusted root. A path outside one is dropped during parsing rather than carried and refused later.
----@field italic? boolean The run sat inside `<i>`.
+---One allowlisted body-markup run (CONTEXT.md, ADR-0033). Text carries styling and link target;
+---images carry only a spooled/validated path. `alt` is parsed but not carried.
+---@field bold? boolean Whether the run was inside `<b>`.
+---@field href? string `<a href>` target, or `nil` when not a link. Config decides whether to open it.
+---@field image_path? string Existing absolute path under a trusted root; outside paths are dropped during parsing.
+---@field italic? boolean Whether the run was inside `<i>`.
 ---@field kind "text"|"image"
----@field text? string The run's text, already unescaped. Empty runs are not emitted.
----@field underline? boolean The run sat inside `<u>`.
+---@field text? string Unescaped text; empty runs are omitted.
+---@field underline? boolean Whether the run was inside `<u>`.
 
 ---@class OutputWorkspaces
 ---One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
----@field active_workspace integer The [`WorkspaceEntry::id`] of the workspace visible on this output; every output has one.
----@field focused_workspace? integer ADR-0056 decision 4: present only on the output that actually holds focus, so `out.focused_workspace ~= nil` is the "is this the focused monitor" test.
----@field name string The connector name, e.g. `"eDP-1"`. Matches an `oblisk.screens` entry's `name` and a surface's `monitor`.
----@field workspaces WorkspaceEntry[] The workspaces on this output, ordered by [`WorkspaceEntry::idx`]. What a strip draws: the two ids above are opaque on their own and name nothing a user would recognise.
+---@field active_workspace integer [`WorkspaceEntry::id`] visible on this output; every output has one.
+---@field focused_workspace? integer Present only on the focused output (ADR-0056 decision 4); `out.focused_workspace ~= nil` tests whether this is the focused monitor.
+---@field name string Connector name, e.g. `"eDP-1"`; matches `oblisk.screens.name` and a surface's `monitor`.
+---@field workspaces WorkspaceEntry[] Workspaces on this output, ordered by [`WorkspaceEntry::idx`]; the strip draws these because the two ids above are opaque.
 
 ---@class PlayerState
----@field album_art_path string An absolute path to the artwork, or empty. `mpris:artUrl` counts only as a `file://` URL that canonicalizes to an existing file, so a remote or stale URL both arrive empty rather than a path that fails to load; held across a same-track update so the cover doesn't blink.
----@field artist string `xesam:artist`, joined with `", "` when there is more than one. Empty when absent.
----@field desktop_entry string `MediaPlayer2.DesktopEntry`, the basename of the player's `.desktop` file, e.g. `"mpv"` or `"firefox"`. Empty when the player does not publish one, which several do not. The stable name for a player. `identity` is a display string a player may localise or decorate; this is what an app-matching rule should be written against.
----@field id string Bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`; what `mpris:` commands use to name a player.
----@field identity string `MediaPlayer2.Identity`, the player's display name, e.g. `"Spotify"`; empty if unanswered.
----@field length integer `-1` when `mpris:length` is absent or malformed: a live stream, or a player that simply doesn't report it. A genuine unavailable, not a fabricated zero (ADR-0036).
----@field play_state string `"Playing"`, `"Paused"` or `"Stopped"`; keeps its previous value rather than fabricating `"Stopped"` if the player fails to answer.
----@field position integer Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and not after; nothing polls it while playing, so a progress bar must add elapsed time itself.
----@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read. Monotonic, not wall clock, so it survives a clock adjustment; subtract from a monotonic `now` for elapsed.
----@field title string `xesam:title`; empty when the player publishes no metadata, the normal state between tracks.
----@field url string `xesam:url`, the track's own location: a `file://` path for a local file, an `https://` page for a browser. Empty when the player publishes none, which is normal for a stream. Carried for ADR-0137: telling a video from a song is a list of video sites, a list of music sites and a list of file extensions, and every one of those is taste. This is the fact underneath, which a config cannot reach any other way.
+---@field album_art_path string Absolute artwork path, or empty. `mpris:artUrl` must be a `file://` URL canonicalizing to an existing file; remote/stale URLs become empty. Held across same-track updates so covers do not blink.
+---@field artist string `xesam:artist`, joined with `", "`; empty when absent.
+---@field desktop_entry string `MediaPlayer2.DesktopEntry`, the `.desktop` basename, e.g. `"mpv"` or `"firefox"`; empty when unpublished. Stable player name for app matching. `identity` is a display string that may localize or decorate.
+---@field id string Bus-name suffix after `org.mpris.MediaPlayer2.`, e.g. `"spotify"`; used by `mpris:` commands.
+---@field identity string `MediaPlayer2.Identity`, e.g. `"Spotify"`; empty if unanswered.
+---@field length integer `-1` when `mpris:length` is absent or malformed, as for a live stream; unavailable is not fabricated as zero (ADR-0036).
+---@field play_state string `"Playing"`, `"Paused"`, or `"Stopped"`; retains the previous value if the player fails.
+---@field position integer Playback offset in microseconds, valid at [`PlayerState::position_updated_at`]. Nothing polls it while playing; progress bars add elapsed time.
+---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read; subtract from a monotonic `now` for elapsed time and survive wall-clock adjustments.
+---@field title string `xesam:title`; empty when metadata is absent, normal between tracks.
+---@field url string `xesam:url`, such as a local `file://` path or browser `https://` page; empty when absent, normal for a stream. Carried for ADR-0137: configs cannot reliably classify video versus song from site lists or extensions, which are taste-dependent.
 
 ---@class PrivacyUser
----One app using one of the three things this capability watches (ADR-0034's
----`privacy.camera_users: table`, array of `{app_name}`; extended to microphone and screencast by
----ADR-0137). One type for all three because all three answer the same question, "who", and a
----second identical struct would only make the three lists look like they differ.
----@field app_name string The using process's name, from its PipeWire node when it has one, then `/proc/<pid>/comm`, falling back to `"pid 1234"`. Always something drawable, never empty.
+---An app using one watched resource. The `{app_name}` row shape from ADR-0034's
+---`privacy.camera_users` extends to microphone and screencast under ADR-0137; one type keeps the
+---three "who" lists identical.
+---@field app_name string Process name from its PipeWire node, then `/proc/<pid>/comm`, then `"pid 1234"`; never empty.
 
 ---@class SpecialWorkspace
----One special workspace (ADR-0119). Identified by `name`, which is what
----`workspaces:toggle_special(name)` takes, since Hyprland addresses them by name and their ids
----are negative.
----@field app_id? string The `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
----@field name string The compositor's full name, `"special:scratch"` or the unnamed `"special"`.
----@field populated boolean At least one window sits on it.
----@field shown_on? string The connector of the output currently showing it, absent while it is hidden. A special shows on one output at a time.
+---One special workspace (ADR-0119), identified by `name`, the argument to
+---`workspaces:toggle_special(name)`; Hyprland uses names and negative ids.
+---@field app_id? string `app_id` of its standing window, chosen as [`WorkspaceEntry::app_id`] is.
+---@field name string Full compositor name, `"special:scratch"` or unnamed `"special"`.
+---@field populated boolean Whether at least one window sits on it.
+---@field shown_on? string Connector currently showing it, absent while hidden; a special shows on one output at a time.
 
 ---@class TrayItem
----@field attention_icon_name? string The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item that declares no attention icon, which is most of them.
----@field attention_icon_path? string The file half of the attention artwork, on the same terms as `attention_icon_name`.
----@field icon_name? string A theme icon name, for `icon { name = ... }`. Exactly one of this and [`TrayItem::icon_path`] is ever set, so a config draws whichever is present.
----@field icon_path? string A decoded, bounds-checked PNG spooled to the runtime directory, for `image { source = ... }`. Set when the item sent pixels rather than a theme name.
----@field id string § 2.14's stable id: the registering process's D-Bus unique name, sanitized (e.g. `"1.234"`). What every `tray:` command takes to name the item it acts on.
----@field item_is_menu boolean The item saying a left click must open its menu instead of activating it. Honour it, or a click does nothing on the items that set it.
----@field menu? MenuItem[] The top-level menu entries, or `nil` for an item with no `com.canonical.dbusmenu` menu. Fetched once when the item registers, then again on the item's own layout updates.
----@field name string The display name. `Title`, falling back to `Id` when the item leaves `Title` empty.
----@field overlay_icon_name? string A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried rather than composited: a `stack` node is what puts one image on another, and the Supervisor has no canvas. Both stay `nil` when the item declares no badge.
----@field overlay_icon_path? string The file half of the badge, on the same terms as `overlay_icon_name`.
----@field status string SNI's own `Status`: `"Active"`, `"Passive"` or `"NeedsAttention"`. `"Passive"` is the item asking to be hidden, which is a config's decision to honour or ignore.
----@field tooltip? string The item's tooltip title and text, flattened to one string. `nil` when it has none.
+---@field attention_icon_name? string `NeedsAttention` artwork, resolved like `icon_name`/`icon_path`; draw it instead of the base pair when `status == "NeedsAttention"`. Both are `nil` when undeclared.
+---@field attention_icon_path? string File half of the attention artwork, matching `attention_icon_name`.
+---@field icon_name? string Theme icon name for `icon { name = ... }`; exclusive with [`TrayItem::icon_path`].
+---@field icon_path? string Decoded, bounds-checked PNG in the runtime directory for `image { source = ... }`; set when the item sent pixels instead of a theme name.
+---@field id string docs/oblisk-idl-api-specs.md §2.14 id: sanitized registering-process D-Bus unique name, e.g. `"1.234"`. Used by every `tray:` command.
+---@field item_is_menu boolean `true` means left click opens the menu instead of activating the item.
+---@field menu? MenuItem[] Top-level menu entries, or `nil` without `com.canonical.dbusmenu`. Fetched at registration and on layout updates.
+---@field name string Display name: `Title`, falling back to `Id` when `Title` is empty.
+---@field overlay_icon_name? string Badge to draw over the base icon's corner. Carried, not composited, because a `stack` node overlays images and the Supervisor has no canvas. Both are `nil` when undeclared.
+---@field overlay_icon_path? string File half of the badge, matching `overlay_icon_name`.
+---@field status string SNI status: `"Active"`, `"Passive"`, or `"NeedsAttention"`. `"Passive"` asks config to hide the item.
+---@field tooltip? string Tooltip title and text flattened to one string, or `nil` when absent.
 
 ---@class UpdateCandidate
----One installed package with a newer version available. The shape every backend answers in,
----which is also the shape Lua reads out of `updates.packages`.
----@field download_size integer Bytes to fetch. `0` for a package already sitting in the manager's cache.
----@field installed_size integer Bytes the new version occupies once unpacked. Not a delta: subtracting the old version's size is the config's job if it wants one.
+---One installed package with a newer version, also the `updates.packages` Lua shape.
+---@field download_size integer Bytes to fetch; `0` when already cached.
+---@field installed_size integer Bytes occupied unpacked, not a delta. Config subtracts the old size if needed.
 ---@field name string The package name, as the package manager spells it.
----@field new_version string The version the synced repos offer.
----@field old_version string The installed version, in the manager's own version spelling.
+---@field new_version string Version offered by synced repositories.
+---@field old_version string Installed version in the manager's spelling.
 
 ---@alias Urgency "low"|"normal"|"critical"
----The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
----key the sound registry directly.
+---`low`/`normal`/`critical` urgency tier, also used as the sound-registry key.
 
 ---@class WorkspaceEntry
----`id` is the compositor's stable, monitor-independent identity: what `active_workspace`/
----`focused_workspace` refer to and what `workspaces:focus(id)` takes. `idx` is the 1-based
----position on that output (what a keybind/button label means), not stable across a reorder.
----@field app_id? string The Wayland `app_id` of the window that stands for this workspace: the focused one when focus is here, else the compositor's first. Absent when the workspace is empty or its windows report no id, so `nil` and "draw the number" are the same test.
----@field id integer Stable identity, independent of which output the workspace sits on. What the two ids on [`OutputWorkspaces`] refer to and what `workspaces:focus(id)` takes.
----@field idx integer 1-based position on this output. Not stable: a reorder renumbers it, which is why it is the thing to draw and [`WorkspaceEntry::id`] is the thing to send.
----@field name? string The compositor's own name for the workspace, or `nil` when it has none. Most do not.
----@field populated boolean At least one window sits on this workspace (ADR-0117). What a strip dims an empty workspace by.
+---`id` is the stable, monitor-independent identity used by `active_workspace`,
+---`focused_workspace`, and `workspaces:focus(id)`. `idx` is the output-local 1-based position,
+---useful for labels but unstable across reorders.
+---@field app_id? string Wayland `app_id` of its representative window: focused when focused, otherwise the compositor's first. Absent for empty workspaces or windows without an id; `nil` means draw the number.
+---@field id integer Stable identity independent of output; the ids on [`OutputWorkspaces`] and `workspaces:focus(id)` use it.
+---@field idx integer 1-based position on this output. Reorders renumber it, so draw `idx` but send `id`.
+---@field name? string Compositor name, or `nil` when it has none; most do not.
+---@field populated boolean Whether a window sits here (ADR-0117); strips dim empty workspaces.
 
 ---@class ApplicationsState
 ---`oblisk.applications`'s payload (ADR-0061 decision 2).
 ---
----`by_app_id` repeats the summaries in `entries` rather than indexing into it. A Lua array
----index counts from one while the JSON array this serializes to counts from zero, so an index
----would carry an off-by-one nobody can see in the payload; repeating three small fields for a
----few hundred entries costs less than that trap.
----@field by_app_id table<string, AppSummary> The same entries, keyed by the `app_id` a window reports, for a caller holding `workspaces.active_client.class` rather than a desktop file id. Keyed on exact `StartupWMClass` and exact desktop id first, then case-folded and last-dot-segment spellings, and an exact key is never displaced by a folded one. Miss on it before concluding an app is not installed: the mapping is a set of heuristics, not a registry.
----@field entries AppSummary[] Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on `applications:refresh()`; nothing watches the directories, so an app installed mid-session does not appear until something asks.
+---`by_app_id` repeats summaries instead of indexing `entries`: Lua arrays start at one while the
+---serialized JSON array starts at zero. Repeating three small fields for a few hundred entries
+---avoids an invisible off-by-one.
+---@field by_app_id table<string, AppSummary> The same entries keyed by a window's `app_id`, for callers holding `workspaces.active_client.class` rather than a desktop id. Exact `StartupWMClass` and desktop id win over case-folded and last-dot-segment spellings; exact keys are never displaced. A miss is only a heuristic miss, not proof that the app is uninstalled.
+---@field entries AppSummary[] Visible, launchable installed entries, sorted by name. Rebuilt by `applications:refresh()`; directories are not watched, so mid-session installs wait for it.
 
 ---@class AudioState
----The full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3): master output
----volume/mute plus the per-app stream list.
----@field apps AppStream[] One entry per app playing audio right now; empty is normal, not an error.
+---Full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3).
+---@field apps AppStream[] One entry per app playing audio; empty is normal.
 ---@field muted boolean Master output mute.
----@field sinks AudioDevice[] Every output device. `audio:set_default_sink(id)` takes one's [`AudioDevice::id`].
----@field source_muted boolean The default input device's mute. The microphone-mute every privacy indicator wants as its click target, which § 3.2 had left as a hole beside `muted`.
----@field source_volume number The default input device's volume, range `[0.0, 1.0]`, derived exactly as [`AudioState::volume`] is: a source cubes its `channelVolumes` the way a sink does (`pw-cli enum-params <source> Props` shows the same shape). `0.0` before the default source's first `Props` param arrives, or on a machine with no input at all.
+---@field sinks AudioDevice[] Every output device; `audio:set_default_sink(id)` takes [`AudioDevice::id`].
+---@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators (§ 3.2).
+---@field source_volume number Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or with no input device.
 ---@field sources AudioDevice[] Every input device, on the same terms as [`AudioState::sinks`].
----@field volume number Master output volume, range `[0.0, 1.0]`; see [`master`]'s module doc comment for how this is derived from the default sink's `channelVolumes`.
+---@field volume number Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
 
 ---@class BatteryState
----`oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys
----verbatim -- may not be renamed. `Default` is itself the correct "no battery hardware" answer
----for a desktop, not a placeholder needing a sentinel.
----@field percent integer Charge, `0` to `100`, rounded. Against the battery's own full capacity, not against a charge limit, so a machine capped at 70 reads `70` and stays there rather than reading `100`.
----@field present boolean UPower's display device is a battery and reports itself present. `false` on a desktop, which is an answer rather than a missing one: check it before drawing anything else here.
----@field state BatteryStatus What the battery is doing, by UPower's own name. The field that separates holding a charge limit on mains (`PendingCharge`) from actually running down (`Discharging`), which a boolean could not.
----@field time_to_empty? integer Seconds until flat, or `nil`. UPower reports `0` both while charging and while it has not yet estimated, and neither is a duration, so both are the absent case here.
----@field time_to_full? integer Seconds until full, or `nil`, on the same terms as `time_to_empty`.
+---`oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys verbatim
+---and may not be renamed. `Default` is the correct desktop answer when no battery exists.
+---@field percent integer Charge, `0` to `100`, rounded against the battery's full capacity, not its charge limit. A machine capped at 70 therefore reads `70`, not `100`.
+---@field present boolean Whether UPower's display device is a battery and present. `false` on a desktop is an answer, not missing data; check it before drawing the other fields.
+---@field state BatteryStatus UPower's state, including `PendingCharge` on mains versus `Discharging` on battery.
+---@field time_to_empty? integer Seconds until flat, or `nil`. UPower reports `0` while charging and before it has estimated; neither is a duration.
+---@field time_to_full? integer Seconds until full, or `nil` on the same terms as `time_to_empty`.
 
 ---@class IdleState
----`oblisk.idle`'s payload (ADR-0141).
----@field inhibited boolean Anything at all is holding an idle inhibitor, this shell included. While true no threshold event reaches the config, so a config's own countdown has to stop here rather than keep running against events that will never arrive.
----@field inhibitors IdleInhibitor[] The holders that are not this shell.
+---`oblisk.idle` payload (ADR-0141).
+---@field inhibited boolean Any idle inhibitor is held, including this shell. While true, no threshold event reaches config, so its countdown must stop.
+---@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell.
 
 ---@class BluetoothState
----@field connected_devices ConnectedDevice[] Paired devices currently connected. In BlueZ's own object order, which is not sorted.
----@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan. Empties when discovery stops.
----@field discovering boolean A discovery scan is running, which is what fills [`BluetoothState::discovered_devices`].
----@field enabled boolean The adapter is powered. `false` also when there is no adapter at all, so this is not proof the machine has Bluetooth hardware.
+---@field connected_devices ConnectedDevice[] Paired, connected devices in BlueZ object order, which is not sorted.
+---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
+---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
+---@field enabled boolean Whether the adapter is powered. `false` also means no adapter, so it does not prove Bluetooth hardware exists.
 
 ---@class BrightnessState
----`oblisk.brightness`'s full payload (§ 2.3). `percent` is the JSON key verbatim -- the
----Renderer routes it into the Lua `oblisk.brightness` signal table by name, unchanged.
----`Default` (`0`) is a placeholder before the first real read; never observed if no device
----was found, since no signal is sent in that case (see `brightness/mod.rs`).
----@field percent integer Screen backlight, `0` to `100`. Read from sysfs `brightness`, the last requested value, rather than `actual_brightness`, so it matches what was asked for instead of lagging through a hardware fade.
+---`oblisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
+---key. `Default` (`0`) precedes the first read, but no-device construction emits no signal, so
+---Lua never observes the placeholder (see `brightness/mod.rs`).
+---@field percent integer Screen backlight, `0` to `100`, from sysfs `brightness` (the requested value), not `actual_brightness`, which can lag during a hardware fade.
 
 ---@class FilesState
----`oblisk.files`'s payload (ADR-0120): every watched folder, keyed by the path `watch` was
----given, so a config reads back `oblisk.files.folders[folder]` with the string it wrote.
----@field folders table<string, Folder> One entry per `files:watch(path)` still in force, keyed by that path with trailing slashes stripped. Absent until the first `watch`, so a config draws nothing rather than an empty list for a folder it never asked about.
+---`oblisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
+---`oblisk.files.folders[folder]` reads back with the string the config wrote.
+---@field folders table<string, Folder> One entry per active `files:watch(path)`, keyed by `path` with trailing slashes stripped. Absent until watched, so an unrequested folder is not an empty list.
 
 ---@class KeyboardState
----`oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` when this machine has no
----keyboard-backlight hardware. `caps_lock`/`num_lock`/`scroll_lock` have no sentinel (bare
----`bool`) -- they default `false` and stay there, logged once, if neither evdev nor sysfs
----resolves. `active_layout` defaults to an empty string (IDL declares it non-nullable,
----ADR-0034), `active_layout_index`/`layout_count` default `0`.
----@field active_layout string The layout's display name, e.g. `"English (US)"`. Empty string before the compositor has answered once.
----@field active_layout_index integer The active layout's 0-based position in the configured list. What `keyboard:invoke("switch_layout", index)` takes.
----@field backlight_pct integer Keyboard backlight, `0` to `100`, or `-1` on a machine with no backlight device. `-1` is an answer, not a failure: check for it before drawing a slider.
+---`oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` without keyboard-backlight
+---hardware. Lock booleans have no sentinel: they default and remain `false` if neither evdev nor
+---sysfs resolves. `active_layout` is the non-nullable empty-string sentinel; index and count are
+---`0` by default (ADR-0034).
+---@field active_layout string Layout display name, e.g. `"English (US)"`; empty before the compositor answers.
+---@field active_layout_index integer Active layout's 0-based configured-list position, passed to `keyboard:invoke("switch_layout", index)`.
+---@field backlight_pct integer Keyboard backlight, `0` to `100`, or `-1` without a backlight device. Check `-1` before drawing a slider.
 ---@field caps_lock boolean Caps Lock is on.
----@field layout_count integer How many layouts are configured. `switch_layout` has nothing to switch to below `2`, so this is the check for whether to draw a layout indicator at all.
+---@field layout_count integer Configured layout count. Below `2`, `switch_layout` has nothing to change and a layout indicator need not be drawn.
 ---@field num_lock boolean Num Lock is on.
 ---@field scroll_lock boolean Scroll Lock is on.
 
 ---@class LockState
 ---`oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
----acquisition; Lua can't rebuild it because state is sampled at layout time (ADR-0044), not
----evented, so two identical consecutive failures are one unchanged `error` string. `error`'s
----"nothing went wrong" value is the empty string, like `keyboard`'s `active_layout`.
----@field active boolean The session is locked and the Renderer has confirmed it: never optimistic, so a lock asked for but not yet confirmed still reads `false`, and a config can't draw the wrong screen.
----@field attempts integer Authentication attempts against the lock currently held: counts every PAM answer including success, resetting to `0` only on a *new* confirmed lock, so it's per-acquisition, not per-failure. A lockout rule reads it with [`LockState::error`].
----@field authenticating boolean A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this is what a spinner reads. `lock:authenticate` is refused while it is true.
----@field error string Why the last attempt failed, in words fit to draw, e.g. `"too many attempts"`. Empty when the last attempt succeeded or none has been made, rewritten on every PAM answer and cleared on a new lock, so it always describes the lock now on screen.
+---acquisition. Lua cannot rebuild it from layout-time state (ADR-0044), so identical failures
+---leave one `error` string; empty `error` means no failure, like `keyboard.active_layout`.
+---@field active boolean The Renderer confirmed the session locked. A requested but unconfirmed lock remains `false`; [`apply`] changes this only from the Renderer report.
+---@field attempts integer PAM answers against the held lock, including success. Resets to `0` only on a new confirmed lock, so it is per-acquisition, not per-failure; lockout rules read it with `error`.
+---@field authenticating boolean A password is with PAM and unanswered. `pam_unix` takes about a second, so this drives a spinner; `lock:authenticate` is refused while true.
+---@field error string Drawable reason for the last failure, e.g. `"too many attempts"`. Empty before attempts or after success; rewritten on every PAM answer and cleared on a new lock.
 
 ---@class MprisState
----@field players PlayerState[] Every MPRIS player on the bus, longest-running first. A player that appears appends, and one pushing position updates does not move, so `players[1]` keeps meaning the same player. Empty when nothing is running, which is not an error.
+---@field players PlayerState[] Every MPRIS player, longest-running first. New players append and position updates do not move entries, so `players[1]` keeps its meaning. Empty when no player is running, which is valid, not an error.
 
 ---@class NetworkState
----`oblisk.network`'s live push state: the whole §2.5 read schema, not just §4.2's scan results.
----Every field is re-derived from NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce,
----no incremental state).
+---`oblisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
+---NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ---
----The link fields exist because the AP list cannot answer "am I online". It says nothing about a
----wired link, and it cannot tell a powered-down radio from a powered one with nothing joined --
----both are simply an absence of [`AccessPointInfo::active`].
----@field available_networks AccessPointInfo[] Access points from the last completed scan: deduplicated by SSID, the connected one first and the rest strongest first, cut to 20, and kept as-is while [`NetworkState::scanning`] is true so a panel doesn't blank. The connected network leads by construction, so a list can be drawn in payload order without sorting it again.
----@field connect_error? string Why the last `network:connect` failed, in words fit to draw, or `nil` when the last one worked or none has been tried. `AddAndActivateConnection2` returns before the radio has tried anything, so this is filled in later, from the activation's own `StateChanged(state, reason)`: a wrong password is only knowable there. Sticky until the next attempt, like `UpdatesState::check_error`: an error that cleared itself on the next scan would be gone before it was read.
----@field connected boolean Something is carrying the default route, from NetworkManager's `PrimaryConnection`. That property names the active connection the default route belongs to, which is §2.5's "default gateway interface is active" exactly; `/` means none, and means offline.
----@field connecting_ssid? string The SSID a `network:connect` is currently trying to join, or `nil` when none is in flight. What a spinner on one row reads, the same job `LockState::authenticating` does for the lock -- and it names the row rather than being a bare flag, because a list needs to know which one. Cleared when the attempt reaches a verdict, either way.
----@field ethernet_enabled boolean A wired device is activated. §2.5 words this as the link carrier, but the carrier is up whenever a cable is seated, which would leave `network:set_ethernet_enabled(false)` looking like it did nothing; this is the read-back that the setter's own toggle needs.
----@field networking_enabled boolean NetworkManager is managing networking at all, from `NetworkingEnabled`. `false` means every other field here is a report about a stack that has been switched off.
----@field password_ssid? string The SSID whose `network:connect` is waiting on a password, or `nil` when nothing is. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) for the one case that cannot proceed without one, and cleared by the attempt that consumes it or by `network:cancel_connect`. Here rather than derived in the config, because the fact it reports -- this machine has no profile for that SSID -- lives in NetworkManager's settings, and a config could only guess at it (ADR-0037). It is also what the shell binds `keyboard_interactivity` to: a bar that takes the keyboard whenever it feels like it is a bar that steals it, so the surface claims focus exactly while this names a network and gives it back the moment it stops.
----@field scanning boolean A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather than when NetworkManager confirms, so a spinner starts on the click, not a round trip later.
----@field ssid? string The Wi-Fi SSID in use, or `"Ethernet"` when the default route is wired, or `nil` when nothing is joined. Wired wins when both are up, matching which one `connected` is about. It names an association, not a working route: a network still negotiating DHCP has an `ssid` and a `connected` of `false`, which is what makes those two fields worth having separately.
----@field strength integer The associated AP's signal strength, `0` to `100`, or `0` with no Wi-Fi association. Read off the same merged entry the panel draws, so the bar and the list never disagree by a point.
----@field wifi_enabled boolean The Wi-Fi radio is powered, from `WirelessEnabled`. What separates "radio off" from "radio on, joined to nothing", which the AP list alone cannot.
+---The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
+---down radio from a powered radio with no association.
+---@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected first, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready to draw.
+---@field connect_error? string Display text for the last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the activation's `StateChanged(state, reason)`, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`.
+---@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
+---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and clears when the attempt reaches either verdict.
+---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
+---@field networking_enabled boolean Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the other fields describe a switched-off stack.
+---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) only when needed; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
+---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.
+---@field ssid? string Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins when both are up. An association negotiating DHCP has an `ssid` but `connected == false`.
+---@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged entry the panel draws, so the bar and list agree.
+---@field wifi_enabled boolean Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no association.
 
 ---@class NotificationsState
----`notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
----@field dnd boolean Do-not-disturb, flipped by `notifications:set_dnd`. It gates exactly one thing in the Supervisor: a non-critical notification's sound does not play. Notifications are still accepted, still queued, and still appear in [`NotificationsState::feed`], so not drawing the popup is the config's decision, and `"critical"` is the urgency worth letting through.
----@field feed Notification[] The newest 20 notifications, most recent first: the ones still popped up *and* the ones that expired unread, which stay until dismissed (ADR-0100) -- `expired` tells them apart. A truncated view of a 100-deep queue (ADR-0033), so a notification can leave this list while still being present and still dismissable by id.
+---`notifications.feed`/`notifications.dnd` `StateSnapshot` payload (ADR-0033).
+---@field dnd boolean DND from `notifications:set_dnd`; gates only non-critical sounds. Notifications remain accepted, queued, and in `feed`; popup suppression is config policy.
+---@field feed Notification[] Newest 20 first, including unread retired entries until dismissed (ADR-0100); `expired` distinguishes them. This is a view of the 100-entry queue, so older entries remain dismissable by id after leaving the list (ADR-0033).
 
 ---@class PowerState
----`oblisk.power`'s full payload (§ 2.13). Every field is `Option`, omitted from the JSON
----rather than serialized as `null`, so a config reads `nil` for anything this host cannot
----answer. See `power/mod.rs` for why this is four optional fields, not one on/off capability.
----@field active_profile? string The active platform profile, e.g. `"balanced"`. What `power:set_profile` sets. `nil` on a host with no power-profiles-daemon, which is why every field here is optional.
----@field energy_rate? number UPower's `EnergyRate` in watts, passed through unchanged. Positive in both directions, so it is the magnitude and [`PowerState::on_battery`] is the sign. `nil` when UPower is absent.
----@field on_battery? boolean Running on battery rather than mains, from UPower. `nil` when UPower is absent. This is the mains question; whether the battery is filling is `oblisk.battery`'s `state`.
----@field profiles? string[] Every profile this hardware offers, in the daemon's own order, e.g. `{"performance", "balanced", "power-saver"}`. `nil` when the daemon is absent. Drive a selector off this rather than off a hardcoded list: not every machine has all three.
+---`oblisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
+---host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
+---@field active_profile? string Active platform profile, e.g. `"balanced"`, set by `power:set_profile`; `nil` without power-profiles-daemon.
+---@field energy_rate? number UPower's `EnergyRate` in watts, unchanged. It is positive in both directions, so [`PowerState::on_battery`] supplies the sign; `nil` without UPower.
+---@field on_battery? boolean Running on battery rather than mains, from UPower; `nil` without UPower. This is the mains question; charge direction is `oblisk.battery.state`.
+---@field profiles? string[] Profiles in daemon order, e.g. `{"performance", "balanced", "power-saver"}`; `nil` when power-profiles-daemon is absent. Drive selectors from this list because machines differ.
 
 ---@class PrivacyState
----@field camera_users PrivacyUser[] Every process holding a camera open. Empty means no camera is in use, which is the whole signal: a config draws an indicator when this is non-empty.
----@field microphone_users PrivacyUser[] Every app PipeWire reports as reading a microphone right now (ADR-0137). A stream that is open but idle is not here, so this is "something is listening", not "something could". Not the same question as `oblisk.audio`'s `source_muted`, which is a device setting: a muted microphone with a running capture stream appears in both.
----@field screencast_users PrivacyUser[] Every app producing a screen-capture stream into PipeWire (ADR-0137). The name is best-effort and may be the portal rather than the app that asked it, since a portal-created node carries the portal's identity. Screen recorders on wlr-screencopy (`wf-recorder`, `grim`) never reach PipeWire and never appear here.
+---@field camera_users PrivacyUser[] Processes holding a camera open. Empty means no camera is in use; a config draws its indicator only when this is non-empty.
+---@field microphone_users PrivacyUser[] Apps PipeWire reports reading a microphone now (ADR-0137). Open-but-idle streams are absent: this means "something is listening", not "something could". Distinct from `oblisk.audio.source_muted`, a device setting; a muted active capture appears in both.
+---@field screencast_users PrivacyUser[] Apps producing PipeWire screen-capture streams (ADR-0137). Names may be the portal's identity for portal-created nodes. wlr-screencopy recorders (`wf-recorder`, `grim`) bypass PipeWire and never appear.
 
 ---@class SysinfoState
----`oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12). Field
----names are the `StateSnapshot` payload's JSON keys verbatim -- the Renderer routes them
----straight into the Lua signal table by name, unchanged.
----@field cpu_percent integer Total CPU utilization, `0` to `100`, across all cores. `0` before the first sample, which needs two reads a tick apart to produce a delta.
+---`oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12), with field
+---names unchanged from the `StateSnapshot` JSON keys.
+---@field cpu_percent integer Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.
 ---@field ram_percent integer Physical memory in use, `0` to `100`.
----@field swap_percent integer Swap in use, `0` to `100`. `0` on a machine with no swap, which is indistinguishable from swap that is simply empty.
----@field temp_cores integer[] Per-core temperatures in Celsius, from one hwmon pass. Empty on a machine that exposes none. Length is the sensor count, not the core count, and the order is hwmon's.
----@field temp_gpu integer GPU temperature in Celsius, or `-1` when no GPU sensor was found. Read from the same hwmon pass as [`SysinfoState::temp_cores`], so it is never newer or older than they are.
+---@field swap_percent integer Swap in use, `0` to `100`; `0` means either no swap or empty swap.
+---@field temp_cores integer[] Per-core Celsius temperatures from one hwmon pass. Empty when none are exposed. Length is sensor count, not core count, in hwmon order.
+---@field temp_gpu integer GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as [`SysinfoState::temp_cores`], so neither is newer than the other.
 
 ---@class SystemState
----`oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11). The field name
----is the `StateSnapshot` payload's JSON key verbatim.
----@field time integer Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
+---`oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11), with its
+---`StateSnapshot` JSON key unchanged.
+---@field time integer Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds; milliseconds would be wrong by 1000x.
 
 ---@class StorageState
 ---`oblisk.storage`'s payload (ADR-0136).
----@field files table<string, any> One entry per `persistent_table` a config declared, keyed by the absolute path it joined from `path` and `name`. Absent until that declaration is seen, so a config reads `nil` rather than an empty table for a file nobody opened.
+---@field files table<string, any> One entry per declared `persistent_table`, keyed by the absolute `path` joined from `path` and `name`. Absent until declared, so unopened files read as `nil`, not an empty table.
 
 ---@class PolkitState
----`oblisk.polkit`'s payload. Everything but `active` is empty while it is false.
----@field action_id string The action being authorised, e.g. `org.freedesktop.systemd1.manage-units`.
----@field active boolean polkitd is waiting on the user for the request the fields below describe.
----@field authenticating boolean A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this is what a "checking" line reads. A second submit is refused while it is true.
----@field error string Why the last attempt failed, in words fit to draw, e.g. `"authentication failed"`. Empty until an attempt fails; the prompt stays open for another try, and this clears with it.
----@field icon_name string A themed icon name for the action, or empty when the caller set none.
----@field message string What polkitd wants shown, already translated: "Authentication is required to ...".
+---`oblisk.polkit`'s payload. All fields except `active` are empty while it is false.
+---@field action_id string Action being authorized, e.g. `org.freedesktop.systemd1.manage-units`.
+---@field active boolean polkitd is waiting for the user; the remaining fields describe its request.
+---@field authenticating boolean A password is with PAM and unanswered. `pam_unix` takes about a second, so this drives a checking line; a second submit is refused while true.
+---@field error string Drawable reason for the last failure, e.g. `"authentication failed"`. Empty until failure; the prompt stays open for another try and clears with it.
+---@field icon_name string Themed icon name, or empty when the caller set none.
+---@field message string Translated text polkitd wants shown, such as "Authentication is required to ...".
 
 ---@class TrayState
----@field items TrayItem[] Every registered `StatusNotifierItem`, oldest registration first. A new item appends and an item updating a property does not move, so a strip can be drawn straight from this without sorting. Registration order rather than id order because [`TrayItem::id`] is a D-Bus unique name like `"1.234"`: sorting it lexicographically puts `1.100` before `1.20` and drops a newly started application into the middle of the strip.
+---@field items TrayItem[] Registered items, oldest first. New items append; property updates do not move them, so no sorting is needed. Registration order avoids lexicographic D-Bus id order, where `1.100` precedes `1.20` and a new app lands mid-strip.
 
 ---@class UpdatesState
----`oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
----nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
----`installing` is true means the transaction size isn't known yet (the package manager hasn't
----printed it).
----@field check_error? string Why the last check failed, or `nil` when the last one worked. A check never modifies the system (`Backend::check` promises that much), so this is a network or parse failure, never a half-applied change to the system.
----@field checking boolean A check is running right now. Rises before the sync starts and falls when the result is written, with a push at both edges, so a config can draw a spinner and disable its own refresh control. `updates:check` refuses a second one while this is true.
----@field consecutive_check_failures integer How many checks in a row have failed, reset to `0` by the first success. The count only: "warn after five" is a threshold somebody has an opinion about, so it lives in the config.
----@field count integer How many packages have a newer version in the synced repos. Always equal to `#packages`, and carried separately so a badge does not have to walk the list.
----@field install_current_package string The package name from the step line the package manager is on. Empty string before the first one, not `nil`, because a name is always a string once the transaction is under way.
----@field install_current_step integer Which package of the transaction the package manager is on, its own 1-based `(2/5)` counter. `0` before the first line is parsed.
----@field install_error? string Why the Supervisor never got an answer from the package manager at all -- it could not spawn the install command, or could not wait on it. Distinct from [`UpdatesState::install_exit_code`], which is the answer: this one means the question was never asked, and it is the Supervisor's own failure rather than the package manager's.
----@field install_exit_code? integer What the package manager itself answered on the last install: `0` for success, its own code for a failure, `nil` if none has finished this session. The code and [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a network error, a disk-space error, a signature error -- is wording, and wording belongs in the config (ADR-0113 amendment).
----@field install_finished_at? integer Unix seconds when the last install stopped, however it stopped. With an install's start held by whatever asked for it, this is what a duration is measured against.
----@field install_log string[] The tail of the last install's output, newest last, both streams interleaved in arrival order (they are read by two tasks, so the interleaving between them is not exact). Capped at the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a socket, not a file. Cleared when an install starts.
----@field install_total_steps integer How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means the package manager has not printed a step line yet, so a progress bar has no denominator: show it as indeterminate rather than dividing.
----@field installing boolean An install is running. The `install_*` fields above only describe a run that has started; `updates:install` refuses a second one while this is true.
----@field last_successful_check? integer Unix seconds at the end of the last check that completed without error, or `nil` if none has since this session started. A failed check leaves it on the older, still-true value.
----@field package_manager? string Which package manager answered, or `nil` when this machine has none this Supervisor speaks -- the one field a config can read before anything has been checked, and the one that tells an indicator whether it has any business being on the bar at all (ADR-0134). The name of the command: `"pacman"`.
----@field packages UpdateCandidate[] What would be upgraded, one entry each. A failed check leaves this and [`UpdatesState::count`] on the last good answer rather than clearing them, so a config keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
----@field reboot_required boolean A kernel package was installed at some point this session, per `Backend::needs_reboot`. Sticky on purpose: once set it stays set through later installs that do not touch the kernel, because the running kernel is still the old one until the machine restarts.
+---`oblisk.updates` payload. `check_error`/`install_error` are `None` when clear. While
+---`installing`, `install_total_steps == 0` means the manager has not printed the transaction size.
+---@field check_error? string Last check error, or `nil` after success. Checks never modify the system (`Backend::check`), so this is a network/parse failure, not a half-applied change.
+---@field checking boolean A check is running. Set before sync and cleared when its result is written, with a push at both edges for spinners/refresh controls. `updates:check` refuses a second check while true.
+---@field consecutive_check_failures integer Consecutive check failures, reset to `0` by the first success. Thresholds belong in config.
+---@field count integer Number of packages with newer synced-repo versions. Always `#packages`, duplicated so a badge need not walk the list.
+---@field install_current_package string Current package name from the step line. Empty before the first line, never `nil`.
+---@field install_current_step integer Current package number, using the manager's 1-based `(2/5)` counter. `0` before progress.
+---@field install_error? string Why Supervisor never got a manager answer: spawn or wait failed. Unlike [`UpdatesState::install_exit_code`], this means the install was never answered and the failure is Supervisor's.
+---@field install_exit_code? integer Manager exit code from the last install: `0` success, its code on failure, `nil` before one finishes. Together with [`UpdatesState::install_log`], it is the failure fact; wording such as network, disk, or signature error belongs in config (ADR-0113 amendment).
+---@field install_finished_at? integer Unix seconds when the last install stopped, regardless of outcome. Use it with the caller's install start to measure duration.
+---@field install_log string[] Last install output, newest last, stdout/stderr interleaved by arrival (two readers make the cross-stream order inexact). Keeps the last 200 lines; cleared when an install starts.
+---@field install_total_steps integer Transaction package count. `0` while [`UpdatesState::installing`] means no step line yet; show progress as indeterminate rather than divide.
+---@field installing boolean An install is running. `install_*` describe a started run; `updates:install` refuses a second one while true.
+---@field last_successful_check? integer Unix seconds when the last check completed successfully, or `nil` this session. Failed checks preserve the older value.
+---@field package_manager? string Package manager name, or `nil` when unsupported. Available before any check and used by an indicator to decide whether it belongs on the bar (ADR-0134), e.g. `"pacman"`.
+---@field packages UpdateCandidate[] Packages that would upgrade, one per entry. A failed check preserves the last good list and [`UpdatesState::count`] while [`UpdatesState::check_error`] reports the gap.
+---@field reboot_required boolean A kernel package was installed this session per `Backend::needs_reboot`. Sticky: later installs cannot clear it because the running kernel remains old until restart.
 
 ---@class WorkspacesState
----`oblisk.workspaces`'s full payload (§ 2.9); field names are the JSON keys verbatim, and
----`active_client` (`Option`, § 2.9's "or `nil` if none focused") is omitted, not `null`.
----@field active_client? ActiveClient The focused toplevel, or `nil` if none. One window per session, not per output: there is no way to ask what is focused on an unfocused monitor (ADR-0056 decision 4).
----@field compositor string Which compositor these came from, `"niri"` or `"hyprland"` (ADR-0119). Display policy differs by compositor where the state does not: Hyprland creates a numbered workspace on focus, so a strip pads empty slots there and not on niri, which keeps its own trailing empty workspace.
----@field outputs OutputWorkspaces[] One entry per output, keyed by connector name; empty until the compositor first answers.
----@field special? SpecialWorkspace[] The compositor's special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119). Absent on a compositor that has none, so `special == nil` hides the control and an empty list means none exist right now. Hyprland lists a special only while it holds a window or is shown.
+---`oblisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
+---omitted, not `null` (§ 2.9 says `nil` when unfocused).
+---@field active_client? ActiveClient Focused toplevel, or `nil` if none. One window per session, not per output; an unfocused monitor cannot be queried (ADR-0056 decision 4).
+---@field compositor string Source compositor, `"niri"` or `"hyprland"` (ADR-0119). Hyprland creates a numbered workspace on focus, so strips pad empty slots there; niri keeps its trailing empty one.
+---@field outputs OutputWorkspaces[] One entry per output, keyed by connector name; empty until the first compositor answer.
+---@field special? SpecialWorkspace[] Compositor special workspaces, Hyprland's scratchpads, ordered by name (ADR-0119). Absent when unsupported (`special == nil`); an empty list means supported but none exist. Hyprland lists a special only while it holds a window or is shown.
 
 --- Capabilities -------------------------------------------------------------------------------
 
@@ -465,7 +426,7 @@
 ---@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch"|"open_url", ...: any)
 
 ---@class AudioCapability: Capability<AudioState>
----@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_source_volume"|"set_source_muted"|"toggle_source_mute"|"set_app_volume"|"set_app_muted", ...: any)
+local AudioCapability = {}
 
 ---@class BatteryCapability: Capability<BatteryState>
 local BatteryCapability = {}
@@ -498,7 +459,7 @@ local BatteryCapability = {}
 ---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget", ...: any)
 
 ---@class NotificationsCapability: Capability<NotificationsState>
----@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd"|"hold_expiry", ...: any)
+local NotificationsCapability = {}
 
 ---@class PowerCapability: Capability<PowerState>
 ---@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)

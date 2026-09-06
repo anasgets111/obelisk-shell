@@ -1,55 +1,39 @@
--- Development bar. Two jobs, and they pull in opposite directions often enough to be worth naming:
--- it is the fixture that exercises the engine against a real session (`cargo build --workspace &&
--- XDG_CONFIG_HOME=dev-config target/debug/supervisor`), and it is the worked example of what a
--- config for this shell looks like. Where those conflict the fixture wins, and the comment says so.
+-- Development bar, real-session fixture, and worked example. Where fixture and example conflict,
+-- the fixture wins.
+-- `cargo build --workspace && XDG_CONFIG_HOME=dev-config target/debug/supervisor`.
+-- Build both binaries first. Supervisor finds Renderer beside its binary via
+-- `supervisor/src/generation.rs`'s `renderer_binary_path`, not through Cargo; `cargo run -p
+-- supervisor` can rebuild one half and launch stale `target/debug/renderer`. A Renderer older than
+-- `fonts` then reports `attempt to call a nil value (global 'fonts')` at this file.
 --
--- `cargo build --workspace` first, and it is not optional. The Supervisor finds the Renderer as a
--- filesystem sibling of its own binary (`supervisor/src/generation.rs`'s `renderer_binary_path`),
--- not as a Cargo dependency, so `cargo run -p supervisor` rebuilds one half of the stack and
--- launches whatever `target/debug/renderer` happens to be. That fails as a *config* error: a
--- Renderer older than the `fonts` global reports `attempt to call a nil value (global 'fonts')` at
--- the declaration below and points at this file, which is the last place the fault actually is.
+-- Zones and module order copy `~/.config/quickshell`, including the rightmost clock. ADR-0053
+-- exposed the need for clock, battery and volume data sources; none had a source until that ADR.
 --
--- Laid out like a bar people actually run, because it is copied from one: the zones and the order
--- of the modules in them are `~/.config/quickshell`'s, down to the clock sitting last on the right
--- rather than centred. That shape is not decoration. It is what found ADR-0053: writing it required
--- a clock, a battery and a volume readout, and none of the three had a data source until that ADR.
---
--- Editing this file while the stack runs drives a reload. Changing `id`/`layer`/`anchor`/`monitor`/
--- `namespace` on a surface is a topology change and drives a full PBA generation swap (dbus spec §
--- 14); anything else reloads in place on the same Lua VM.
+-- Editing reloads the stack. Changing surface `id`/`layer`/`anchor`/`monitor`/`namespace` changes
+-- topology and triggers a full PBA generation swap (dbus spec § 14); other edits reload in place on
+-- the same Lua VM.
 
--- What this file imports, and where each thing lives. The tree mirrors the Quickshell config this
--- shell is written to replace, directory for directory: `config/` holds design tokens,
--- `components/` holds dumb reusable widgets, `lib/` holds functions with no node in them, and
--- `modules/` holds feature assemblies -- `bar/` with its `indicators/` and `panels/`, `global/`
--- for the surfaces that are not the bar, `notification/`, `osd/`, and `shell/` for the one host
--- that puts a panel on screen.
+-- Imports mirror the Quickshell tree. `config/` holds tokens; `components/` holds dumb reusable
+-- widgets, not feature logic; `lib/` holds node-free functions; `modules/` assembles
+-- `bar/indicators/`, `bar/panels/`, `global/` for surfaces outside the bar, `notification/`,
+-- `osd/`, and `shell/`'s panel host. There is no `services/`: Quickshell's 25
+-- singleton `*Service.qml` files each own their D-Bus connection, poll loop or socket.
+-- Supervisor-owned capabilities push signals on `oblisk`; the config reads `oblisk.audio`, and the
+-- data layer is not this config's job.
 --
--- There is no `services/` directory, and that is the one place the mirror deliberately breaks.
--- Quickshell needs 25 singleton `*Service.qml` files because each one has to own its own D-Bus
--- connection, poll loop or socket. Here every one of those is a capability the Supervisor owns and
--- pushes as a signal on `oblisk`, so the config reads `oblisk.audio` instead of constructing an
--- `AudioService`. The data layer is not missing from this tree; it is not the config's job.
---
--- `require` resolves inside this directory only and the module cache is cleared before every
--- re-evaluation (ADR-0047), so editing any file below reloads the bar in place.
+-- `require` resolves only inside this directory and its cache clears before each re-evaluation
+-- (ADR-0047), so any file below can reload the bar in place.
 
--- Bound to locals first, and that is load-bearing rather than style. Lua 5.4's `require` returns
--- *two* values, the module and the loader data (the file path), where 5.3 returned one. A call in
--- the last position of a table constructor expands to all of its values, so the obvious `return {
--- require(...), require(...) }` puts one more element in this list than it has surfaces, a string
--- like "/path/to/lock.lua", and the engine then reports `error converting Lua string to table` with
--- no clue which entry is wrong. `local x = require(...)` takes the first value and nothing else.
--- The font chain, in fallback order, and it has to be declared before anything measures text.
--- `femtovg` and `cosmic-text` both fall back across it per glyph, so one chain covers body text and
--- the Nerd Font private-use glyphs the Quickshell config draws its whole chrome with: the codepoint
--- picks the face, not the node. Without this the engine resolves `sans-serif` and those glyphs
--- render as tofu, which is what they did until the `fonts` declaration existed (ADR-0043 decision
--- 2).
+-- Bind modules before the return. Lua 5.4 `require` returns the module and loader data, unlike 5.3;
+-- a final `require` in a table expands both, adds a path such as "/path/to/lock.lua", and produces
+-- `error converting Lua string to table`, with no clue which entry is wrong. Bind it as
+-- `local x = require(...)` to keep only the module.
+-- Declare the font chain before text measurement. `femtovg` and `cosmic-text` fall back per glyph,
+-- so body text and Nerd Font private-use glyphs choose their faces independently; without it, the
+-- engine resolves `sans-serif` and the glyphs become tofu (ADR-0043 decision 2).
 --
--- Read once, at startup. Editing this list re-evaluates and changes nothing until the shell is
--- restarted; `renderer/src/lua/fonts.rs` says why.
+-- Read once at startup. Editing the list changes nothing until restart; see
+-- `renderer/src/lua/fonts.rs`.
 fonts {
     "CaskaydiaCove Nerd Font Propo",
     "Noto Sans",
@@ -65,30 +49,27 @@ local settings = require("modules.bar.panels.settings")
 local panel_host = require("modules.shell.panel_host")
 local launcher = require("modules.global.launcher")
 local wallpaper_picker = require("modules.global.wallpaper_picker")
--- A tooltip is a surface of its own, so each is listed here rather than nested in the bar: a
--- `popup` is an `xdg_popup` rooted under the bar, not a node inside it (§ 6, ADR-0062).
--- They cost nothing until hovered -- a popup with `visible = false` creates no Wayland object.
+-- Each tooltip is its own surface, not a bar child: `popup` is an `xdg_popup` rooted under the bar
+-- (§ 6, ADR-0062). `visible = false` creates no Wayland object until hover.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
 local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip
 local wallpaper_tooltip = require("modules.bar.indicators.wallpaper_button").tooltip
--- New with the icon-only bar, and not decoration. A circle with a wifi glyph in it says how strong
--- the signal is and nothing about which network, which is fine on the bar and useless without
--- somewhere to read the rest -- so the two indicators that lost their labels grew a tooltip each.
+-- Icon-only wifi/Bluetooth indicators show strength, not network/device names; tooltips restore
+-- the labels they lost.
 local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
--- The idle circle's own, and the one tooltip here that is not just a name: it counts down to
--- whatever the next stage is, which the bar itself has no room to say.
+-- The idle tooltip counts down to the next stage, which the bar has no room to show.
 local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
 local idle_settings = require("modules.global.idle_settings")
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
--- Not a surface: the battery's side effects (OSD lines, low-battery notifications, suspend), which
--- only need to be registered once. Required for that, and returns nothing to list below.
+-- Not a surface. Registers the battery's OSD, low-battery notification and suspend effects once;
+-- it returns nothing to the surface list.
 require("modules.global.power_events")
--- Also not a surface: the idle clock. One `register_threshold`, one handler on `oblisk.system`, and
--- the three actions a seat left alone eventually gets. `lib/idle.lua` holds everything it acts on,
--- so the bar reads the same facts without requiring this.
+-- Not a surface. Registers the idle clock: one `register_threshold`, one `oblisk.system` handler,
+-- and the three actions for an unattended seat. `lib/idle.lua` owns the actions; the bar reads the
+-- same facts without requiring this module.
 require("modules.global.idle")
 
 return {

@@ -1,7 +1,6 @@
-//! Subprocess process-group lifecycle primitives: spawn a child as leader of its own new
-//! process group, then reap the whole group (`SIGTERM`, grace period, escalate to `SIGKILL`).
-//! See ADR-0018, ADR-0026 (`process.run`, on top in [`registry`]), ADR-0025
-//! (`reload::run_pba` is the reap primitive's caller).
+//! Process-group lifecycle: spawn a new group leader, then reap the group with `SIGTERM`, grace,
+//! and `SIGKILL`. See ADR-0018, ADR-0026 (`process.run`, [`registry`]), and ADR-0025
+//! (`reload::run_pba` calls the reap primitive).
 //!
 //! Uses `tokio::process::Command::process_group(0)` rather than hand-rolling `setpgid`.
 
@@ -16,17 +15,17 @@ use tokio::process::{Child, Command};
 
 pub mod registry;
 
-/// What a `wait()` `timeout()`'s elapsed deadline means once a following `try_wait()` is consulted.
+/// Meaning of an elapsed `wait()` timeout after a following `try_wait()`.
 #[derive(Debug, PartialEq, Eq)]
 enum TimeoutRace {
-    /// The group had, in fact, already exited in the same instant the deadline fired.
+    /// The group exited as the deadline fired.
     ActuallyExited(ExitStatus),
-    /// Genuinely still running -- the timeout wasn't racing a real exit.
+    /// Still running; the timeout did not race an exit.
     StillRunning,
 }
 
-/// Classifies a `wait()` `timeout()`'s elapsed deadline: a real exit can land in the same
-/// instant the timer fires. `late_status` must come from a non-blocking `try_wait()` right after.
+/// Classifies an elapsed `wait()` timeout. A real exit can land at the deadline; `late_status` must
+/// be the immediate non-blocking `try_wait()` result.
 fn classify_timeout(late_status: io::Result<Option<ExitStatus>>) -> io::Result<TimeoutRace> {
     Ok(match late_status? {
         Some(status) => TimeoutRace::ActuallyExited(status),
@@ -34,8 +33,8 @@ fn classify_timeout(late_status: io::Result<Option<ExitStatus>>) -> io::Result<T
     })
 }
 
-/// Waits up to `grace` for `child` to exit, applying [`classify_timeout`] if the deadline
-/// fires first. Shared by both post-SIGTERM and post-SIGKILL phases in [`reap_process_group`].
+/// Waits up to `grace`, classifying a deadline with [`classify_timeout`]. Used after both SIGTERM
+/// and SIGKILL in [`reap_process_group`].
 async fn wait_or_classify(child: &mut Child, grace: Duration) -> io::Result<TimeoutRace> {
     match tokio::time::timeout(grace, child.wait()).await {
         Ok(status) => Ok(TimeoutRace::ActuallyExited(status?)),
@@ -43,8 +42,7 @@ async fn wait_or_classify(child: &mut Child, grace: Duration) -> io::Result<Time
     }
 }
 
-/// Sends `signal` to `pgid`, treating "already gone" (`ESRCH`) as success -- a group dying
-/// between deciding to signal and `kill(2)` landing is a race to reap around, not a failure.
+/// Sends `signal` to `pgid`; `ESRCH` is success because the group may die before `kill(2)` lands.
 fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
     match killpg(pgid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -52,20 +50,18 @@ fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
     }
 }
 
-/// The 100ms grace window `docs/oblisk-supervisor-services-dbus.md` § 10 specifies between
-/// `SIGTERM` and `SIGKILL`. A parameter, not baked in, so tests can use a faster reap.
+/// The 100ms § 10 grace window from `docs/oblisk-supervisor-services-dbus.md`. Parameterized so
+/// tests can reap faster.
 pub const DEFAULT_REAP_GRACE: Duration = Duration::from_millis(100);
 
-/// Spawns `cmd` as the leader of a new, independent Unix process group. Any process this
-/// child forks without calling `setsid`/`setpgid` itself inherits that same group, which is
-/// what lets [`reap_process_group`] clean up a whole subtree via a single `killpg`.
+/// Spawns `cmd` as a new group leader. Descendants without `setsid`/`setpgid` inherit the group,
+/// letting [`reap_process_group`] clean a subtree with one `killpg`.
 pub fn spawn_group_leader(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
     Command::new(cmd).args(args).envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str()))).process_group(0).spawn()
 }
 
-/// Identical to [`spawn_group_leader`] except stdout/stderr are piped instead of inherited --
-/// `process.run` (ADR-0026) needs to forward the child's output as
-/// `SupervisorFrame::ProcessOutput`. Stdin stays inherited.
+/// [`spawn_group_leader`] with piped stdout/stderr for `process.run` (ADR-0026) to forward as
+/// `SupervisorFrame::ProcessOutput`; stdin stays inherited.
 pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
     Command::new(cmd)
         .args(args)
@@ -76,9 +72,8 @@ pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, Str
         .spawn()
 }
 
-/// Identical to [`spawn_group_leader`] except stdin and stdout are piped instead of
-/// inherited. `dbus::polkit`'s PAM worker (ADR-0028) writes the password to stdin once, then
-/// reads one `shared::PamOutcome` frame back over stdout. Stderr stays inherited.
+/// [`spawn_group_leader`] with piped stdin/stdout for PAM (ADR-0028): write one password,
+/// read one `shared::PamOutcome`; stderr stays inherited.
 pub fn spawn_group_leader_stdio_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
     Command::new(cmd)
         .args(args)
@@ -92,22 +87,19 @@ pub fn spawn_group_leader_stdio_piped(cmd: &str, args: &[String], envs: &[(Strin
 /// How [`reap_process_group`] recovered `child`'s process group.
 #[derive(Debug)]
 pub enum ReapOutcome {
-    /// The group exited on its own within the grace period; `SIGKILL` was never sent.
+    /// The group exited within grace; `SIGKILL` was not sent.
     ExitedCleanly(ExitStatus),
-    /// The group ignored (or was too slow to react to) `SIGTERM`; `SIGKILL` was sent to
-    /// force it down.
+    /// The group ignored or was too slow for `SIGTERM`; `SIGKILL` forced it down.
     Escalated(ExitStatus),
 }
 
-/// Safely reaps `child`'s process group: `SIGTERM` to the whole group, wait up to `grace`,
-/// escalate to `SIGKILL` if it hasn't exited. Signals the *group*, not just `child`'s pid, so
-/// it also reaches any descendant the child forked into the same group.
+/// Reaps `child`'s group: SIGTERM, wait `grace`, then SIGKILL. Signaling the group reaches
+/// descendants in it, not just `child`.
 ///
-/// `child` must have been spawned via [`spawn_group_leader`] -- this reads `child.id()` as
-/// the pgid, which only holds for a group leader.
+/// `child` must come from [`spawn_group_leader`]: `child.id()` is the pgid only for a group leader.
 ///
-/// Never blocks longer than roughly `2 * grace`: a process wedged in uninterruptible I/O (D
-/// state) can defer even `SIGKILL` indefinitely, so the post-`SIGKILL` wait is bounded too.
+/// Waits roughly `2 * grace` at most. D-state I/O can defer even SIGKILL indefinitely, so the
+/// post-SIGKILL wait is bounded too.
 pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Result<ReapOutcome> {
     let pid = child.id().ok_or_else(|| io::Error::other("child has no pid; already reaped"))?;
     let pgid = Pid::from_raw(pid as i32);
@@ -138,9 +130,8 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    // Reproducing the actual OS-level race (a real SIGKILL landing exactly on a timeout
-    // deadline) isn't reliable to trigger -- 320 stress runs never hit it. These two tests
-    // instead cover the classification decision directly with a fabricated `ExitStatus`.
+    // The OS race is unreliable: 320 stress runs never hit it. Test classification directly with
+    // fabricated `ExitStatus` values instead.
 
     #[test]
     fn classify_timeout_reports_the_race_when_late_status_shows_an_exit() {
@@ -174,8 +165,8 @@ mod tests {
         child.kill().await.expect("cleanup kill failed");
     }
 
-    /// Polls `condition` until it's true or `timeout` elapses, sleeping briefly between checks --
-    /// used below to wait out a grandchild's `/proc` teardown after its parent is reaped.
+    /// Polls until `condition` or `timeout`, waiting for a grandchild's `/proc` teardown after its
+    /// parent is reaped.
     async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -218,8 +209,7 @@ mod tests {
     #[tokio::test]
     async fn reap_process_group_escalates_a_sigterm_ignoring_child_to_sigkill() {
         let mut child = spawn_group_leader("sh", &sh_args("trap '' TERM; sleep 5"), &[]).expect("failed to spawn");
-        // Give the shell a moment to install `trap '' TERM` -- a SIGTERM racing the shell's
-        // own startup can otherwise land before the trap installs, flaking this test.
+        // Let the shell install `trap '' TERM`; a racing SIGTERM can otherwise flake this test.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let outcome = reap_process_group(&mut child, Duration::from_millis(50)).await.expect("reap failed");
@@ -236,9 +226,8 @@ mod tests {
         let mut child = spawn_group_leader("true", &[], &[]).expect("failed to spawn");
         let pid = child.id().expect("freshly spawned child has a pid");
         let pgid = Pid::from_raw(pid as i32);
-        // Reap it directly (bypassing reap_process_group) so the group has zero members left --
-        // killpg against a pgid nothing belongs to anymore returns ESRCH, the exact race this
-        // helper exists to swallow.
+        // Reap directly so the empty group makes `killpg` return ESRCH, the race this helper
+        // swallows.
         child.wait().await.expect("wait should reap the already-exited child");
 
         signal_group_best_effort(pgid, Signal::SIGTERM)
@@ -247,9 +236,8 @@ mod tests {
 
     #[tokio::test]
     async fn reap_process_group_kills_the_whole_group_not_just_the_direct_child() {
-        // The direct child backgrounds a grandchild without calling setsid/setpgid, so it
-        // inherits the child's group. It prints the grandchild's pid via `$!` then blocks in a
-        // bare `wait`, keeping the shell alive as a real second process sharing that group.
+        // The child backgrounds a grandchild without `setsid`/`setpgid`, prints `$!`, then blocks
+        // in `wait`; both remain real members of the same group.
         let mut child = Command::new("sh")
             .args(sh_args("sleep 30 & echo $!; wait"))
             .process_group(0)
@@ -278,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_group_leader_piped_also_puts_the_child_in_its_own_process_group() {
-        // Guards against the piped variant silently dropping the process-group behavior.
+        // Guard the piped variant's process-group behavior.
         let mut child = spawn_group_leader_piped("sh", &sh_args("sleep 5"), &[]).expect("failed to spawn");
         let child_pid = child.id().expect("freshly spawned child has a pid");
 
@@ -308,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_group_leader_stdio_piped_also_puts_the_child_in_its_own_process_group() {
-        // Guards against the stdin/stdout-piped variant silently dropping process-group behavior.
+        // Guard the stdin/stdout-piped variant's process-group behavior.
         let mut child = spawn_group_leader_stdio_piped("sh", &sh_args("cat"), &[]).expect("failed to spawn");
         let child_pid = child.id().expect("freshly spawned child has a pid");
 

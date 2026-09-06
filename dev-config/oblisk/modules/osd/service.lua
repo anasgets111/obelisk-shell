@@ -1,36 +1,32 @@
--- The OSD as OSDService.qml has it: a change somewhere on the system puts a card on screen for two
--- seconds saying what changed. Driven by pushes (ADR-0115), not by bar clicks, so a volume key, a
--- `wpctl` in a terminal and the bar button all show the same card. Before `on_change` only the bar
--- button could, and the OSD was mostly a way to watch yourself click.
+-- As `OSDService.qml`: system changes show a card for two seconds. Push-driven (ADR-0115), so a
+-- volume key, terminal `wpctl`, and bar button use the same card; before `on_change`, only the bar
+-- button could trigger it.
 --
--- Two shapes, decided by `level`: a level (volume, brightness, keyboard backlight) draws a glyph,
--- a track and a percentage; a fact (a toggle, a device, a layout, a charger) draws the glyph in a
--- tile and a line of text. `modules/osd/popup.lua` draws them and knows nothing else.
+-- `level` selects the shape: volume/brightness/keyboard backlight use glyph, track, percentage;
+-- toggles/devices/layout/charger use a glyph tile and text. `modules/osd/popup.lua` only draws.
 --
--- Not the mirror's queue. It holds a pending entry to show after the current one, and a suppress
--- list per kind; here a card that arrives while a more important one is up is dropped, and one
--- that is as important or more replaces it. That is enough for the case the list existed for: the
--- brightness step the charger edge triggers arrives while "charger connected" is up, and is not
--- what you want to read.
+-- No mirror queue. A less important card arriving during a higher-priority one is dropped; an equal
+-- or higher one replaces it. This covers the charger edge's brightness step while "charger
+-- connected" is visible, which is not useful to read.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 
 local osd = {}
 
--- The mirror's `prio`, lower first. Kinds not listed are the least important.
+-- Mirror `prio`, lower first. Unlisted kinds are least important.
 local PRIORITY = { battery = 0, audio_device = 1, networking = 2, bluetooth = 2, volume = 3, brightness = 3 }
 
 osd.entry = state("osd_entry", { kind = "", glyph = "", text = "" })
 osd.visible = state("osd_visible", false)
 
--- `process.run("sleep", ...)` is this engine's only timer. `ProcessHandle:kill()` does not cancel the
--- queued `exit_cb`, so a newer card while the older sleep is still running is told apart by a
--- request counter rather than a kill, or the older timer would hide the newer card.
+-- `process.run("sleep", ...)` is the only timer. `ProcessHandle:kill()` does not cancel queued
+-- `exit_cb`, so a request counter distinguishes a newer card from the older sleep; killing alone
+-- would let the old callback hide the new card.
 local SECONDS = "2"
 local request = 0
 
--- `entry`: `{ glyph, text, level?, color? }`. `level` in 0..100 selects the track layout.
+-- `entry` is `{ glyph, text, level?, color? }`; `level` in 0..100 selects the track layout.
 function osd.show(kind, entry)
     local current = osd.entry:get()
     if osd.visible:get() and current.kind ~= kind and (PRIORITY[kind] or 9) > (PRIORITY[current.kind] or 9) then
@@ -48,7 +44,7 @@ function osd.show(kind, entry)
     end)
 end
 
--- `showToggle`: "<what> on" / "<what> off".
+-- `showToggle`: "<what> on" or "<what> off".
 local function toggle(kind, on, glyph_on, glyph_off, what)
     osd.show(kind, { glyph = on and glyph_on or glyph_off, text = what .. (on and " on" or " off") })
 end
@@ -61,8 +57,8 @@ local function active_name(devices)
     end
 end
 
--- Every handler below skips `previous == nil`, the first push after start: the mirror's
--- `initialized` timer, for the same reason -- nothing changed, the shell just learned the state.
+-- Every handler skips the first push (`previous == nil`): like the mirror's `initialized` timer, it
+-- reports learned state, not a change.
 
 oblisk.audio:on_change(function(a, previous)
     if previous == nil then

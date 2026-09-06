@@ -1,23 +1,15 @@
--- A module's visual grouping, the thing every bar calls a pill. Worth having as a component rather
--- than repeated inline: it is eleven modules, and the padding and radius being identical across
--- them is the entire visual effect.
---
--- Glass, not solid. The ground is surface2 at 0.42 alpha with a hairline of near-white at 0.18
--- around it, which is what `Components/IconButton.qml` and the mirror's own pills paint. An opaque
--- ground here is the difference between a control that floats over the wallpaper and a filled
--- rectangle sitting on a strip, and it was opaque `SURFACE` until now.
---
--- `item_radius` is half `item_height`, so a pill's ends are semicircles and it agrees with the
--- circular icon buttons beside it without either naming the other's number.
---
--- Cross-axis alignment is filled in here because `align_v` defaults to `"Start"` and a pill is
--- taller than everything in it. A child that forgets the property sits on the top edge while its
--- neighbours that remembered sit centred, which is a per-child bug that reads as an engine one: the
--- volume pill drew its `icon` a few pixels above the readout for exactly this reason, since the
--- `button` and the `meter` beside it both set the property and the bare `icon` did not. Setting the
--- row's own `align_v` does not help, because that places the pill inside the bar rather than placing
--- the pill's children inside the pill. A child wanting `"Start"` or `"Stretch"` still says so and
--- keeps it.
+-- A module's visual grouping, shared by eleven bar modules. Identical padding and radius are the
+-- visual effect.
+-- Glass, not solid: `surface2` at 0.42 alpha with a near-white 0.18 hairline, matching
+-- `Components/IconButton.qml` and the mirror's pills. Opaque `SURFACE` made a filled rectangle on
+-- the strip instead of a control floating over wallpaper.
+-- `item_radius` is half `item_height`, giving semicircular ends that match adjacent icon buttons
+-- without duplicating their number.
+-- Fill missing child `align_v` because it defaults to `"Start"` and the pill is taller. Otherwise a
+-- child sits at the top while neighbours centre; the volume pill's bare `icon` was a few pixels
+-- above its readout while its `button` and `meter` were correct. The row's own alignment only
+-- places
+-- the pill in the bar, not its children. Explicit `"Start"` or `"Stretch"` still wins.
 local theme = require("config.theme")
 
 return function(children, background, opts)

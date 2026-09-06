@@ -1,6 +1,5 @@
-//! Keyboard backlight proxy for `oblisk.keyboard` (ADR-0034).
-//!
-//! Raw-to-percentage scaling is handled in `crate::capabilities::scale` (ADR-0053).
+//! Keyboard backlight proxy for `oblisk.keyboard` (ADR-0034); raw-to-percent scaling is in
+//! `crate::capabilities::scale` (ADR-0053).
 
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.KbdBacklight",
@@ -21,8 +20,6 @@ pub(crate) trait KbdBacklight {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- KbdBacklightProxy (real D-Bus call, p2p pattern) ----
 
     use tokio::net::UnixStream;
 

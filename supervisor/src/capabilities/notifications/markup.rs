@@ -1,6 +1,5 @@
-//! Markup allowlist parser: five allowlisted body-markup constructs (`<b>`, `<i>`, `<u>`,
-//! `<a href>`, `<img src>`). Split from `dbus::notifications` -- see `dbus/notifications/mod.rs`
-//! for the module-level doc.
+//! Allowlist parser for `<b>`, `<i>`, `<u>`, `<a href>`, and `<img src>` body markup. Split from
+//! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::sync::LazyLock;
 
@@ -8,26 +7,20 @@ use regex::Regex;
 
 use super::NotificationSpan;
 
-// -------------------------------------------------------------------------------------------
-// Markup allowlist parser (TDD seam 2): five constructs, everything else stripped.
-// -------------------------------------------------------------------------------------------
-
-/// Matches one HTML-ish tag (`<name ...>`, `</name>`, or a self-closing `<name .../>`),
-/// double-quoted attribute values only, matching ADR-0033's grammar. `regex`'s guaranteed
-/// linear-time matching keeps this non-backtracking, the same property §1.1's superseded
-/// flat-text sanitizer named explicitly.
+/// Matches HTML-ish opening, closing, or self-closing tags with double-quoted attributes.
+/// ADR-0033's grammar stays linear-time and non-backtracking, as §1.1 required.
 static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"</?[a-zA-Z][a-zA-Z0-9]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_:-]*\s*=\s*"[^"]*")*\s*/?>"#)
         .expect("TAG_PATTERN is a valid, hand-checked regex literal")
 });
 
-/// Extracts `key="value"` attribute pairs from a tag's own inner text (double-quoted only).
+/// Extracts double-quoted `key="value"` attributes.
 static ATTR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"([a-zA-Z_:][a-zA-Z0-9_:-]*)\s*=\s*"([^"]*)""#)
         .expect("ATTR_PATTERN is a valid, hand-checked regex literal")
 });
 
-/// One recognized (or explicitly rejected) tag construct -- [`classify_tag`]'s output.
+/// [`classify_tag`]'s recognized or rejected tag forms.
 #[derive(Debug, Clone, PartialEq)]
 enum ClassifiedTag {
     OpenBold,
@@ -36,19 +29,15 @@ enum ClassifiedTag {
     CloseItalic,
     OpenUnderline,
     CloseUnderline,
-    /// `<a href="URL">` -- an anchor with no `href` attribute is [`ClassifiedTag::Ignored`]
-    /// instead, since it isn't a usable anchor construct.
+    /// `<a href="URL">`; no `href` is [`ClassifiedTag::Ignored`].
     OpenAnchor(String),
     CloseAnchor,
-    /// `<img src="PATH">` (self-closing or not; `alt`, if present, is parsed but discarded). No
-    /// `src` is [`ClassifiedTag::Ignored`].
+    /// `<img src="PATH">`, self-closing or not; `alt` is discarded. No `src` is ignored.
     Image(String),
-    /// `<script>`/`<style>` -- the opening half of an opaque block whose entire content is
-    /// discarded up to its matching close tag.
+    /// `<script>`/`<style>` opening an opaque block discarded through its matching close tag.
     OpaqueOpen(String),
-    /// Anything else: an unrecognized element, a malformed construct, or an allowed tag missing a
-    /// required attribute. The tag itself is stripped; unlike `OpaqueOpen`, surrounding text is
-    /// not touched -- only script/style content is dropped outright (§1.1).
+    /// Unrecognized/malformed tags or missing required attributes. Strip only the tag; unlike
+    /// `OpaqueOpen`, preserve surrounding text. Script/style content is dropped (§1.1).
     Ignored,
 }
 
@@ -58,9 +47,7 @@ fn extract_attr(attrs: &str, key: &str) -> Option<String> {
         .find_map(|caps| if caps[1].eq_ignore_ascii_case(key) { Some(caps[2].to_string()) } else { None })
 }
 
-/// Classifies one `TAG_PATTERN` match (including its surrounding `<`/`>`) into a
-/// [`ClassifiedTag`]. Never panics on malformed input -- everything not recognized falls to
-/// [`ClassifiedTag::Ignored`].
+/// Classifies a `TAG_PATTERN` match; malformed input falls to [`ClassifiedTag::Ignored`].
 fn classify_tag(raw: &str) -> ClassifiedTag {
     let inner = &raw[1..raw.len() - 1];
     let is_closing = inner.starts_with('/');
@@ -92,15 +79,13 @@ fn classify_tag(raw: &str) -> ClassifiedTag {
     }
 }
 
-/// Whether `raw` (a `TAG_PATTERN` match) is the closing tag matching `opaque_name`.
+/// Whether `raw` closes `opaque_name`.
 fn is_closing_tag_named(raw: &str, opaque_name: &str) -> bool {
     let inner = raw.trim_start_matches('<').trim_end_matches('>');
     inner.strip_prefix('/').is_some_and(|name| name.trim().eq_ignore_ascii_case(opaque_name))
 }
 
-/// Flushes `current` into a new [`NotificationSpan::Text`] carrying the currently-active style,
-/// if non-empty. A no-op otherwise -- callers flush unconditionally on every style change and at
-/// end-of-input, so most calls see an already-empty `current`.
+/// Flushes non-empty `current` into a styled [`NotificationSpan::Text`].
 fn flush_text(
     spans: &mut Vec<NotificationSpan>,
     current: &mut String,
@@ -121,17 +106,11 @@ fn flush_text(
     });
 }
 
-/// Parses `input` into [`NotificationSpan`]s, accepting exactly `<b>`, `<i>`, `<u>`,
-/// `<a href="URL">`, `<img src="PATH" alt="ALT">` and rejecting/stripping everything else
-/// (ADR-0033). Pure grammar only -- an `<img>`'s `src` is carried through unvalidated; the real
-/// filesystem/path-trust check is a separate step ([`validate_trusted_path`], via
-/// [`sanitize_body`]) so this function stays testable with no filesystem I/O.
+/// Parses exactly the five allowlisted constructs (ADR-0033). `<img>` paths stay unvalidated;
+/// [`sanitize_body`] applies [`validate_trusted_path`] separately so this remains filesystem-free.
 ///
-/// Style depth counters, not a generic stack: nesting composes naturally (`<b><i>x</i></b>` is
-/// both bold and italic) and an unclosed allowed tag simply applies its style through to
-/// end-of-input instead of erroring, the same lenient convention real notification daemons
-/// (mako) use. `href` uses a real stack since nested anchors with different targets are
-/// meaningful; the innermost one wins.
+/// Style depth counters compose nesting (`<b><i>x</i></b>` is both styles), and unclosed tags
+/// style through end-of-input, matching mako. `href` uses a stack; the innermost target wins.
 pub(super) fn parse_markup(input: &str) -> Vec<NotificationSpan> {
     let mut spans = Vec::new();
     let mut current = String::new();
@@ -215,8 +194,6 @@ pub(super) fn parse_markup(input: &str) -> Vec<NotificationSpan> {
 mod tests {
     use super::super::test_support::text;
     use super::*;
-
-    // ---- parse_markup (TDD seam 2) ----
 
     #[test]
     fn parse_markup_plain_text_is_a_single_unstyled_span() {

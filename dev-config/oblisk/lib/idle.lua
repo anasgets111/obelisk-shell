@@ -1,72 +1,53 @@
--- What the shell does about an idle seat, minus the doing: the settings, the three stages, and the
--- one question everything else asks -- is something holding this session awake, and what.
---
--- `modules/global/idle.lua` is the other half and runs the clock. Split so the bar can read this
--- without pulling in a file whose whole purpose is side effects, the same one-way shape
--- `lib/media.lua` has: `lib/` is required by `modules/`, never the reverse.
---
+-- Idle-seat policy, not execution: settings, three stages, and reasons holding the session awake.
+-- `modules/global/idle.lua` runs the clock. Keep this side-effect-free for bar readers, with the
+-- same
+-- one-way dependency as `lib/media.lua`: `modules/` requires `lib/`, never the reverse.
 -- ## One threshold, not three
---
--- `IdleService.qml` is three `IdleMonitor`s, one per stage, each with its own `timeout` and a chain
--- of `enabled` bindings that keep them in order. This registers exactly one threshold, at one
--- second, and then counts on `oblisk.system.time`.
---
--- Not a stylistic preference. `oblisk.idle:register_threshold` has no counterpart that removes one
--- (§ 3.2), so a panel that changes the lock timeout from five minutes to ten would leave both
--- registered and lock at five anyway. With one registration the timeouts are plain Lua numbers a
--- panel can edit, and the stages are a list this file walks rather than a lattice of `enabled`
--- conditions each waiting on the others.
---
+-- `IdleService.qml` uses three `IdleMonitor`s with per-stage `timeout` and chained `enabled`. This
+-- registers one one-second threshold and counts on `oblisk.system.time`.
+-- `oblisk.idle:register_threshold` has no removal counterpart (§ 3.2): changing lock from five to
+-- ten minutes would leave both thresholds registered and still lock at five. One registration keeps
+-- editable Lua-number timeouts and a walked stage list instead of mutually waiting `enabled` gates.
 -- ## A stage is armed by the one before it finishing, not by a running total
---
--- `IdleService.qml` is three `IdleMonitor`s whose `enabled` is a gate on the stage before them --
--- `_lockDone` is `!lockActionEnabled || LockService.locked`, and the DPMS stage names it. A
--- monitor's timer starts when `enabled` flips true, so the chain is a sequence of relative delays
--- and, more importantly, it *unwinds*: unlocking makes `_lockDone` false again, the pending DPMS
--- monitor is torn down, and the whole sequence starts over. That is the behaviour, and it falls out
--- of the gates rather than being handled anywhere.
---
--- So a stage here carries a `done` predicate, and `idle.eligible` is the same condition
--- generalised to any `order`: a stage is armed once every enabled stage before it reports done.
--- `modules/global/idle.lua` stamps the moment a stage arms and fires it that stage's own delay
--- later, which is what makes the delays relative, and clears the stamp the moment it stops being
--- armed, which is what makes an unlock undo the rest of the sequence.
---
--- Counting from one zero was the first two attempts and was wrong twice over: the two timeouts
--- interfered (lowering the blank silently shortened the gap before the lock), and nothing could
--- undo a stage that had already fired, so unlocking left the screen due to blank a minute later
--- whatever you did next.
---
--- What it costs: stages fire on a one-second clock that the bar's own readouts already run on, so
--- the resolution is a second and the cost is nothing new. `oblisk.system` pushing is load-bearing;
--- if that timer ever stops, the stages stop with it.
---
--- ponytail: the seat is "idle" from the moment the one-second threshold reports it, which is a
--- second after the last input. `idle_since` subtracts that second back out, so the elapsed count is
--- right; nothing here can do better, because `ext-idle-notifier-v1` has no "how long has this seat
--- been idle" call.
---
+-- In `IdleService.qml`, each `enabled` gates on the preceding stage: `_lockDone` is
+-- `!lockActionEnabled || LockService.locked`, and DPMS names it. A monitor starts timing when its
+-- gate turns true; unlocking makes `_lockDone` false, tears down pending DPMS, and restarts the
+-- chain.
+-- The gates provide this unwind without a separate handler.
+-- Here each stage carries `done`; `idle.eligible` generalizes the same rule to any `order`: arm a
+-- stage once every enabled predecessor is done. `modules/global/idle.lua` stamps arming, fires
+-- after
+-- that stage's delay, and clears the stamp when it is no longer armed, making delays relative and
+-- unlock undo the rest of the sequence.
+-- Counting from one zero failed twice: the two timeouts interfered, so lowering blank shortened the
+-- lock gap, and fired stages could not be undone, so unlocking left the screen due to blank a
+-- minute
+-- later regardless of what followed.
+-- Stages use the bar's existing one-second readout clock, so resolution is one second with no new
+-- cadence. `oblisk.system` pushes are load-bearing; if that timer stops, stages stop too.
+-- ponytail: the one-second threshold reports idle one second after last input. `idle_since`
+-- subtracts
+-- it back out, but `ext-idle-notifier-v1` has no "how long idle" call to do better.
 -- ## Holding it awake is an inhibitor, not a flag
---
--- The mirror's `armed` is `idleEnabled && !inhibited`, checked in every stage's `enabled` binding,
--- because a Quickshell `IdleInhibitor` is a Wayland surface inhibitor its own `IdleMonitor`s ignore.
--- Here `oblisk.idle:inhibit(reason)` takes a logind hold and the Supervisor holds every threshold
--- event for as long as *anything* is holding one, ours included (ADR-0139). So a manual hold, a
--- video playing, and `systemd-inhibit --what=idle` from a terminal all stop the stages by the same
--- route, `idle_since` goes back to zero on the way in, and no stage below needs a guard.
+-- The mirror checks `idleEnabled && !inhibited` on every stage because its Wayland-surface
+-- `IdleInhibitor` is ignored by its own `IdleMonitor`s. Here `oblisk.idle:inhibit(reason)` takes a
+-- logind hold, and the Supervisor holds every threshold event while anything holds one, ours
+-- included
+-- (ADR-0139). Manual hold, video, and `systemd-inhibit --what=idle` therefore stop stages alike;
+-- `idle_since` resets on entry and stages need no individual guard.
 local store = require("lib.store")
 local media = require("lib.media")
 local icons = require("config.icons")
 
 local idle = {}
 
--- The one registration. A second is `IdleMonitor { timeout: 1 }` in the mirror, which exists there
--- to wake the displays on any input; it does that here too, and the counting as well.
+-- One registration. The mirror's second `IdleMonitor { timeout: 1 }` wakes displays on input; this
+-- threshold does that and the counting too.
 idle.TICK = 1
 
--- The three stages, in the order the panel lists them, which is not the order they run in -- that
--- is whatever the timeouts say. `options` is `IdleSettingsPanel.qml`'s `timeoutOptionsMin` in
--- seconds; the value stored need not be one of them, so a `state.json` edited by hand still reads.
+-- Stages are listed in panel order, not run order, which follows timeouts. `options` mirrors
+-- `IdleSettingsPanel.qml`'s `timeoutOptionsMin` in seconds; stored values need not be listed, so
+-- hand-edited `state.json` values still read.
 idle.STAGES = {
     {
         key = "dpms",
@@ -85,8 +66,7 @@ idle.STAGES = {
         detail = "needs your password to come back",
         icon = icons.lock,
         options = { 30, 60, 120, 300, 600, 900, 1800 },
-        -- `_lockDone`, and the reason this whole mechanism is predicates rather than a running
-        -- total: unlocking makes this false again, which disarms every stage waiting behind it.
+        -- `_lockDone`; unlocking makes it false and disarms every following stage.
         done = function()
             local l = oblisk.lock:get()
             return l ~= nil and l.active
@@ -98,12 +78,12 @@ idle.STAGES = {
         detail = "sleeps the machine",
         icon = icons.sleep,
         options = { 300, 600, 900, 1800, 3600, 7200 },
-        -- Terminal: nothing waits behind it, and a suspended machine is not idle. A stage with no
-        -- `done` never satisfies a successor, which is the safe answer for any stage added later.
+        -- Terminal: nothing waits behind it, and a suspended machine is not idle. A stage without
+        -- `done` never satisfies a successor, the safe default for future stages.
     },
 }
 
---- One stage by key, or `nil`. What validates an `order` entry read back off disk.
+--- Stage by key, or `nil`; used to validate an `order` entry read from disk.
 --- @param key string
 --- @return table?
 function idle.stage(key)
@@ -117,8 +97,8 @@ end
 
 local ORDER = { "dpms", "lock", "suspend" }
 
--- Annotated because the table mixes booleans with profile tables, and without it inference calls
--- every value a `boolean|table` and then refuses both halves of the fold in `idle.read`.
+-- Annotated because booleans and profile tables otherwise infer as `boolean|table`, blocking both
+-- halves of `idle.read`'s fold.
 ---@type table<string, any>
 local DEFAULTS = {
     enabled = false,
@@ -127,9 +107,9 @@ local DEFAULTS = {
     battery = { dpms_on = true, dpms_sec = 120, lock_on = true, lock_sec = 180, suspend_on = true, suspend_sec = 600 },
 }
 
--- Every stage exactly once, in the stored sequence: unknown names dropped, missing ones appended in
--- declaration order. A hand-edited `state.json` that names a stage twice, or one written before a
--- stage existed, would otherwise leave a stage that can never run and no way to find out why.
+-- Normalize to each stage exactly once: drop unknown/duplicate names, then append missing stages in
+-- declaration order. This repairs hand-edited `state.json` and files predating a new stage. Without
+-- it, a missing stage can never run and gives no clue why.
 local function resolve_order(stored)
     local seen, out = {}, {}
     for _, key in ipairs(type(stored) == "table" and stored or {}) do
@@ -146,9 +126,8 @@ local function resolve_order(stored)
     return out
 end
 
---- Every key filled in, whatever the stored table is missing. `persistent_table`'s own `defaults`
---- seed the top-level `idle` key once and never look inside it again, so a `state.json` written
---- before a stage existed would otherwise read `nil` for its timeout and divide by it.
+--- Fill every missing key. `persistent_table` seeds only top-level `idle` once, so an older
+--- `state.json` would otherwise yield a missing stage timeout and divide by `nil`.
 --- @param stored table? `store.idle`'s payload
 --- @return table
 function idle.read(stored)
@@ -176,9 +155,9 @@ function idle.read(stored)
     return out
 end
 
--- Copy-on-write, `lib/ui_state.lua`'s `toggle_key`: `set` compares a table by identity, so a fresh
--- one is both what makes the write land and what keeps the value under an unfinished resolve from
--- being mutated.
+-- Copy-on-write like `lib/ui_state.lua`'s `toggle_key`: table identity makes a fresh table
+-- necessary
+-- for the write and prevents mutating a value under an unfinished resolve.
 local function with(source, key, value)
     local next_table = {}
     for k, v in pairs(source or {}) do
@@ -188,8 +167,8 @@ local function with(source, key, value)
     return next_table
 end
 
---- Writes one setting back to `lib/store.lua`. `profile` is `"ac"`, `"battery"`, or `nil` for the
---- two that are not per-profile.
+--- Write one setting to `lib/store.lua`; `profile` is `"ac"`, `"battery"`, or `nil` for shared
+--- keys.
 --- @param profile string?
 --- @param key string
 --- @param value any
@@ -202,17 +181,18 @@ function idle.write(profile, key, value)
     store:set("idle", with(current, profile, with(current[profile], key, value)))
 end
 
---- The next value up `stage.options` from `sec`, wrapping. `step` of `-1` goes back down. Wrapping
---- rather than clamping is `modules/bar/panels/power_menu.lua`'s brightness rule: a control that
---- stops dead at one end reads as broken, and there is no harm at either end of this list.
+--- Next `stage.options` value from `sec`, wrapping; `step = -1` goes down. This follows
+--- `modules/bar/panels/power_menu.lua`'s brightness rule: stopping at an end reads as broken, and
+--- either end is safe.
 --- @param stage table one entry of `idle.STAGES`
 --- @param sec integer
 --- @param step integer
 --- @return integer
 function idle.cycle(stage, sec, step)
     local options = stage.options
-    -- The nearest option at or above the stored value, so a hand-edited 45s steps to 60s rather
-    -- than back to the start of the list.
+    -- Choose the nearest option at or above the stored value, so hand-edited 45s steps to 60s
+    -- rather
+    -- than the list's start.
     local index = #options
     for position, value in ipairs(options) do
         if value >= sec then
@@ -221,13 +201,13 @@ function idle.cycle(stage, sec, step)
         end
     end
     if options[index] ~= sec then
-        -- Land on that neighbour first; a stored value off the list is one press from a listed one.
+        -- Land on that neighbour first; an off-list value is one press from a listed value.
         return step > 0 and options[index] or options[math.max(1, index - 1)]
     end
     return options[(index - 1 + step) % #options + 1]
 end
 
---- A timeout as words: `"off"`, `"45s"`, `"5m"`, `"1m 30s"`.
+--- Timeout words: `"off"`, `"45s"`, `"5m"`, `"1m 30s"`.
 --- @param sec integer?
 --- @return string
 function idle.format(sec)
@@ -243,7 +223,7 @@ function idle.format(sec)
     return string.format("%dm %ds", sec // 60, sec % 60)
 end
 
---- A duration as a clock, for the two counters that tick: `"0:42"`, `"14:03"`.
+--- Clock duration for the two counters: `"0:42"`, `"14:03"`.
 --- @param sec integer
 --- @return string
 function idle.clock(sec)
@@ -251,17 +231,16 @@ function idle.clock(sec)
 end
 
 -- ## State
---
--- `state()` rather than locals, and the names matter: a signal registry entry keeps its value
--- across a config reload (ADR-0044 decision 5), which is what stops an edit to this file from
--- forgetting a manual hold or leaking the logind inhibitor behind it.
+-- Use named `state()` signals because registry entries survive config reloads
+-- (ADR-0044 decision 5),
+-- preventing an edit from forgetting a manual hold or leaking its logind inhibitor.
 
 --- The `oblisk.system.time` the seat went idle, or `0` while it is awake.
 idle.since = state("idle_since", 0)
 
---- When each stage armed, in `oblisk.system.time`, keyed by `stage.key`. A stage absent from this
---- is not armed, which is `IdleMonitor { enabled: false }`: no timer is running for it. The stamp
---- is what makes a delay relative, and clearing it is what makes an unlock undo the sequence.
+--- Arming time in `oblisk.system.time`, keyed by `stage.key`. Missing means
+--- `IdleMonitor { enabled: false }`;
+--- the stamp makes delay relative, and clearing it makes unlock undo the sequence.
 idle.armed_at = state("idle_armed_at", {})
 
 --- Whether the displays are off because `modules/global/idle.lua` turned them off.
@@ -284,31 +263,30 @@ end
 --- the AC answer: a machine that cannot tell you it is on battery is plugged in.
 idle.active_profile = oblisk.power:map(idle.profile_of)
 
---- Why the session is being held awake, in words fit to draw, or an empty list when it is not.
---- Pure, and it takes the four payloads rather than reading them, so `modules/global/idle.lua` can
---- call it with what an `on_change` handed it instead of trusting a `computed` to be current
---- inside a callback.
+--- Human-readable hold reasons, or an empty list. Pure and payload-based so
+--- `modules/global/idle.lua`
+--- can use `on_change`'s value instead of a possibly stale `computed` in its callback.
 --- @param privacy table? `oblisk.privacy`'s payload
 --- @param mpris table? `oblisk.mpris`'s payload
 --- @param settings table the result of [`idle.read`]
 --- @param manual boolean
---- @param foreign table? `oblisk.idle`'s payload, whose `inhibitors` are the holders that are not us
+--- @param foreign table? `oblisk.idle` payload of holders not taken by this config
 --- @return string[]
 function idle.reasons_from(privacy, mpris, settings, manual, foreign)
     local reasons = {}
     if manual then
         reasons[#reasons + 1] = "manual"
     end
-    -- Everything else here is a hold this config took and can explain. These are the ones it did
-    -- not: `systemd-inhibit --what=idle`, or a browser during a call. The framework has honoured
-    -- them since ADR-0139 and only started saying so with ADR-0141, which is why this shell used to
-    -- draw "nothing is holding this awake" while holding every threshold event.
+    -- These reasons include holds this config did not take, such as `systemd-inhibit --what=idle`
+    -- or a browser call. The framework honored them since ADR-0139 but exposed them only with
+    -- ADR-0141; before that, the shell said "nothing is holding this awake" while holding every
+    -- threshold event.
     for _, inhibitor in ipairs((foreign or {}).inhibitors or {}) do
         reasons[#reasons + 1] = inhibitor.who ~= "" and inhibitor.who or "another application"
     end
-    -- `automaticInhibitorActive`: a video playing, or anything reading a camera, a microphone or
-    -- the screen. Named one by one rather than as "media", because "why is my laptop not sleeping"
-    -- deserves the actual answer.
+    -- `automaticInhibitorActive`: video, camera, microphone, and screen capture, named separately
+    -- so
+    -- "why is my laptop not sleeping" gets the actual reason rather than "media".
     if settings.video_auto_inhibit then
         if media.is_playing_video(mpris) then
             reasons[#reasons + 1] = "video"
@@ -324,8 +302,8 @@ function idle.reasons_from(privacy, mpris, settings, manual, foreign)
             reasons[#reasons + 1] = "screen capture"
         end
     end
-    -- TODO: `fullscreenInhibitorActive`. `oblisk.workspaces.active_client` carries no fullscreen
-    -- flag on niri yet, so a film in a fullscreen player is caught by `video` above or not at all.
+    -- TODO: `fullscreenInhibitorActive`; niri's `oblisk.workspaces.active_client` has no fullscreen
+    -- flag, so a fullscreen film is caught by `video` or not at all.
     return reasons
 end
 
@@ -337,24 +315,22 @@ idle.reasons = computed(
     end
 )
 
---- Whether anything is holding the session awake, including a holder this config cannot name.
---- `oblisk.idle`'s own `inhibited` is the authority -- it is the same `BlockInhibited` the gate
---- acts on -- so a hold with an unreadable `who` still stops the countdown rather than leaving the
---- modal drawing a bar that can never fill.
+--- Whether anything holds the session awake, including unnamed holders. `oblisk.idle`'s `inhibited`
+--- is the authoritative `BlockInhibited` gate, so an unreadable `who` still stops the countdown
+--- instead of leaving a modal bar that can never fill.
 idle.inhibited = computed({ idle.reasons, oblisk.idle }, function(reasons, foreign)
     return #reasons > 0 or (foreign ~= nil and foreign.inhibited == true)
 end)
 
---- Takes or drops the logind hold so it matches [`idle.reasons`], and does nothing when it already
---- does. Every caller that can change the answer calls this; it is the one writer.
+--- Make the logind hold match [`idle.reasons`], with no-op convergence. Every caller that can
+--- change the answer calls this one writer.
 ---
---- A capability call in `lib/` rather than in a module, which `lib/ui_state.lua`'s `close_panel`
---- already does and for the same reason: the alternative is three callers each remembering to
---- take, drop and count, and one of them eventually not.
+--- Keep the capability call in `lib/`, like `lib/ui_state.lua`'s `close_panel`; three module
+--- callers
+--- each remembering take/drop/count would eventually disagree.
 function idle.sync_inhibit()
-    -- Our own hold is not counted here: `oblisk.idle`'s `inhibitors` exclude it by construction
-    -- (`foreign_idle_inhibitors`), so reading it back cannot make this function think it already
-    -- holds one and refuse to take it.
+    -- Our hold is excluded from `oblisk.idle.inhibitors` by `foreign_idle_inhibitors`, so readback
+    -- cannot make this function think it already holds one and skip acquiring it.
     local reasons = idle.reasons_from(
         oblisk.privacy:get(),
         oblisk.mpris:get(),
@@ -374,16 +350,15 @@ function idle.sync_inhibit()
     end
 end
 
---- Flips the bar button's hold and settles the inhibitor behind it.
+--- Flip the bar button's hold and settle its inhibitor.
 --- @param on boolean
 function idle.set_manual(on)
     idle.manual:set(on)
     idle.sync_inhibit()
 end
 
---- The stages that will run, in order, with the delay each one waits once it is armed. `from` and
---- `at` are the running total the delays add up to, for anything that wants to say "and then, and
---- then"; nothing fires on them, because a stage's clock starts when it arms and not before.
+--- Runnable stages in order and their post-arming delays. `from`/`at` are display totals only; no
+--- stage fires from them because its clock starts when it arms.
 --- @param settings table the result of [`idle.read`]
 --- @param profile string `"ac"` or `"battery"`
 --- @return { list: table[], total: integer }
@@ -409,16 +384,15 @@ function idle.plan(settings, profile)
     return { list = list, total = from }
 end
 
---- Which stage of `plan` is armed right now, or `nil` when none is.
+--- Currently armed stage from `plan`, or `nil`.
 ---
---- `IdleStage`'s `enabled` generalised to any order: the first stage whose predecessors have all
---- reported [`done`](idle.STAGES), skipping any that has already reported done itself. A stage with
---- no `done` never satisfies a successor, so a terminal stage ends the chain rather than letting
---- whatever follows it fire immediately.
+--- Generalizes `IdleStage.enabled`: choose the first stage whose predecessors report
+--- [`done`](idle.STAGES), skipping stages already done. A stage without `done` satisfies no
+--- successor, so it terminates the chain.
 ---
---- Called every tick rather than latched, which is the point: `oblisk.lock`'s `active` going false
---- makes the lock stage undone, and the stage behind it stops being the armed one on the very next
---- tick. Nothing has to notice the unlock.
+--- Recomputed every tick, not latched: when `oblisk.lock.active` goes false, lock becomes undone
+--- and
+--- the next stage stops being armed on the next tick without an unlock listener.
 --- @param plan table the result of [`idle.plan`]
 --- @return table? one entry of `plan.list`
 function idle.armed(plan)
@@ -432,8 +406,8 @@ function idle.armed(plan)
     return nil
 end
 
---- Moves one stage `step` places through the order and stores the result. Out of range is a no-op,
---- which is what lets the modal wire the two chevrons unconditionally and hide rather than guard.
+--- Move one stage `step` places and store it. Out-of-range is a no-op, so the modal can wire both
+--- chevrons unconditionally and hide them rather than guard.
 --- @param key string
 --- @param step integer `-1` earlier, `1` later
 function idle.move(key, step)
@@ -452,13 +426,14 @@ function idle.move(key, step)
     idle.write(nil, "order", order)
 end
 
---- The plan in force right now.
+--- Current plan.
 idle.schedule = computed({ store.idle, idle.active_profile }, function(stored, profile)
     return idle.plan(idle.read(stored), profile)
 end)
 
---- Which stage is armed and how long it has been, straight off the stamp
---- `modules/global/idle.lua` writes. `key` is `""` and `elapsed` `0` when none is.
+--- Armed stage and elapsed time from the stamp `modules/global/idle.lua` writes. None is
+--- `key = ""`,
+--- `elapsed = 0`.
 idle.arming = computed({ oblisk.system, idle.armed_at }, function(s, stamps)
     for key, at in pairs(stamps or {}) do
         return { key = key, elapsed = math.max(0, ((s and s.time) or 0) - at) }
@@ -466,7 +441,7 @@ idle.arming = computed({ oblisk.system, idle.armed_at }, function(s, stamps)
     return { key = "", elapsed = 0 }
 end)
 
---- How long the seat has been idle, in seconds, or `0` while it is not.
+--- Seat idle duration in seconds, or `0` while awake.
 idle.elapsed = computed({ oblisk.system, idle.since }, function(s, since)
     if since == 0 then
         return 0

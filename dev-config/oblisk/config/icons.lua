@@ -1,21 +1,13 @@
--- The glyphs the bar draws itself with, by name.
+-- Glyphs the bar draws by name. An `icon` is a themed raster looked up by name (ADR-0054).
+-- It paints in its theme artwork's colours. These private-use codepoints use `text`,
+-- because `PaintStyle::Icon` has no tint and `layout::paint` applies none.
+-- `text` accepts `foreground`, `font_size` and `opacity`, so a state can turn one glyph accent or
+-- red. `shell.lua` puts "CaskaydiaCove Nerd Font Propo" first; fallback is per glyph (ADR-0043
+-- decision 2), so codepoints choose Nerd Font and Latin text chooses Noto Sans. Without it, these
+-- render as tofu.
 --
--- These are Nerd Font codepoints in the private use area, rendered as `text` rather than as `icon`
--- nodes, and that is the whole reason the bar can be one colour per state. An `icon` is a themed
--- raster looked up by name (ADR-0054) and paints in whatever colours the theme's artwork has;
--- `PaintStyle::Icon` carries no tint and `layout::paint` never applies one. A glyph is a `text`
--- node, so it takes `foreground`, `font_size` and `opacity` like any other string and a caller can
--- turn it accent-coloured on connect or red on error with one property.
---
--- They resolve because `shell.lua` declares "CaskaydiaCove Nerd Font Propo" first in the font chain
--- and the chain falls back per glyph (ADR-0043 decision 2): a codepoint in this file picks the
--- Nerd Font, and the Latin text beside it picks Noto Sans, with no node saying which face it wants.
--- Without that declaration every one of these is tofu.
---
--- Written as `\u{...}` escapes rather than pasted literals so the source stays ASCII and the
--- codepoint is the thing a reader can look up (nerdfonts.com/cheat-sheet). The name on the left is
--- this config's, the codepoint on the right is the mirror's: every value here is the one
--- `~/.config/quickshell` already uses for the same state, so the two bars read the same.
+-- `\u{...}` keeps the source ASCII; the codepoint is lookupable at nerdfonts.com/cheat-sheet.
+-- Names are this config's; values match `~/.config/quickshell` for the same state.
 local icons = {}
 
 -- Left zone.
@@ -26,24 +18,24 @@ icons.lock        = "\u{F033E}"
 icons.sleep       = "\u{F04B2}"  -- nf-md-power_sleep
 icons.settings    = "\u{F0493}"
 icons.launcher    = "\u{F035C}"
-icons.web         = "\u{F059F}"  -- nf-md-web, the launcher's "open this as a link / search the web" row
+icons.web         = "\u{F059F}"  -- nf-md-web, the launcher's open-link/search row
 icons.wallpaper   = "\u{F02E9}"
 
--- Updates, in the order `ArchChecker.qml` tests them.
+-- Updates, in `ArchChecker.qml` test order.
 icons.updating    = "\u{F0996}"
 icons.update_err  = "\u{F0159}"
 icons.checking    = "\u{F085}"
 icons.updates     = "\u{F019}"
 icons.up_to_date  = "\u{F00AA}"
 
--- Battery. `levels` is indexed 1..5 from empty to full, which is `BatteryIndicator.qml`'s own
--- `icons[min(floor(fraction * 5), 4)]` with Lua's 1-based indexing folded in.
+-- Battery: `levels` is 1..5, empty to full, matching `BatteryIndicator.qml`'s
+-- `icons[min(floor(fraction * 5), 4)]` after Lua's 1-based indexing.
 icons.battery_ac      = "\u{F1E6}"
 icons.battery_pending = "\u{F0084}"
 icons.battery_levels  = { "\u{F244}", "\u{F243}", "\u{F242}", "\u{F241}", "\u{F240}" }
 
--- The OSD's glyphs, where the bar uses themed icons: the OSD draws its icon in the accent colour,
--- and a themed icon cannot be tinted.
+-- OSD glyphs used by themed icons. The OSD tints its icon with the accent; themed icons cannot be
+-- tinted.
 icons.brightness  = "\u{F00DE}"
 icons.keyboard    = "\u{F030C}"
 icons.caps_lock   = "\u{F0A9B}"
@@ -58,45 +50,42 @@ icons.headphones  = "\u{F02CB}"
 icons.headset     = "\u{F02CE}"
 icons.phone       = "\u{F03F2}"
 
--- Audio, by loudness, plus the muted glyph the mute toggle swaps in.
+-- Audio levels, plus the muted toggle glyph.
 icons.vol_muted   = "\u{F075F}"
 icons.vol_zero    = "\u{F0581}"
 icons.vol_low     = "\u{F057F}"
 icons.vol_mid     = "\u{F0580}"
 icons.vol_high    = "\u{F057E}"
 
--- Network. `wifi` is indexed 1..4 weakest to strongest, matching `NetworkService.getWifiIcon`.
+-- Network: `wifi` is indexed 1..4, weakest to strongest, matching `NetworkService.getWifiIcon`.
 icons.wifi        = { "\u{F091F}", "\u{F0922}", "\u{F0925}", "\u{F0928}" }
 icons.wifi_off    = "\u{F092E}"
 icons.wifi_none   = "\u{F092D}"
 icons.ethernet    = "\u{F0200}"
 
--- Bluetooth: off, on, connected.
 icons.bt_off      = "\u{F00B2}"
 icons.bt_on       = "\u{F00AF}"
 icons.bt_conn     = "\u{F00B1}"
 
--- Notifications, and the clock's own glyph when there are none.
+-- Notifications, plus `bell_off` for the clock glyph when there are none.
 icons.bell        = "\u{F0A2}"
 icons.bell_active = "\u{F116B}"
 icons.bell_off    = "\u{F009B}"
 
--- Privacy. Font Awesome rather than Material here, which is the mirror's own choice: these three
--- are the glyphs `PrivacyIndicator.qml` names as ``, `` and ``.
+-- Privacy uses Font Awesome, matching `PrivacyIndicator.qml`'s ``, `` and ``.
 icons.mic_on      = "\u{F130}"
 icons.mic_off     = "\u{F131}"
 icons.camera      = "\u{F030}"
 icons.screenshare = "\u{F108}"
 
--- Media transport, and the readouts in the system-info widget.
 icons.play        = "\u{F040A}"
 icons.pause       = "\u{F03E4}"
 icons.cpu         = "\u{F061A}"
 icons.ram         = "\u{F035B}"
 icons.disk        = "\u{F02CA}"
 
--- Bluetooth device categories, one per § 2.6 `category`, so a mouse and a headset do not both draw
--- the generic bluetooth glyph.
+-- Bluetooth device categories, one per § 2.6 `category`, avoid using the generic glyph for a mouse
+-- or headset.
 icons.device = {
     keyboard    = "\u{F030C}",
     mouse       = "\u{F037D}",
@@ -107,10 +96,9 @@ icons.device = {
     generic     = "\u{F00AF}",
 }
 
--- Idle. `idle` is the mirror's "nothing is holding this awake" glyph and `awake` its coffee cup,
--- swapped on the bar the moment a manual hold is taken. `display` is the monitor the DPMS stage
--- powers down; the suspend stage reuses `sleep` above rather than adding the mirror's second,
--- near-identical power-sleep glyph.
+-- Idle: `idle` means nothing holds the system awake, `awake` is the coffee cup, and the bar swaps
+-- them when a manual hold starts. `display` is the monitor DPMS powers down; suspend reuses `sleep`
+-- instead of adding the mirror's near-identical second power-sleep glyph.
 icons.idle        = "\u{F0FAA}"
 icons.awake       = "\u{F0176}"
 icons.display     = "\u{F0379}"
@@ -119,18 +107,16 @@ icons.refresh     = "\u{F0450}"
 icons.clear_all   = "\u{F0234}"
 icons.info        = "\u{F02FD}"
 
--- A list row's own actions, `PanelActionIcon`'s two glyphs in the mirror: drop a saved network or a
--- paired device, and cut a live connection.
+-- List-row actions, matching `PanelActionIcon`: delete a saved network or paired device, or cut a
+-- live connection.
 icons.trash       = "\u{F0A7A}"
 icons.disconnect  = "\u{F1616}"
 
--- Alerts.
 icons.warning     = "\u{F0026}"
 icons.close       = "\u{F0156}"
 
--- A notification card's own controls: the two chevrons expand and collapse a group or a message,
--- and `reply`/`send` are the two halves of an inline reply (the button that opens the field, and
--- the one that sends what was typed into it).
+-- Notification card controls: chevrons expand/collapse a group or message; `reply` opens the inline
+-- field and `send` submits its text.
 icons.chevron_up   = "\u{F0143}"
 icons.chevron_down = "\u{F0140}"
 icons.reply        = "\u{F0468}"

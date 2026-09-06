@@ -1,8 +1,5 @@
-//! Keyboard layout integration for `oblisk.keyboard` (ADR-0034).
-//!
-//! Provides the [`CompositorLink`] trait. Implementors are selected at startup
-//! via `crate::compositor` detection. If no supported compositor is running,
-//! `active_layout` degrades to unavailable (empty string, count 0, ADR-0034).
+//! Keyboard layout integration for `oblisk.keyboard` (ADR-0034). `crate::compositor` selects a
+//! [`CompositorLink`] at startup; without a supported compositor, layout is empty with count `0`.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
@@ -15,9 +12,8 @@ use crate::compositor::{CompositorKind, hyprland_socket_path};
 
 use super::controller::{KeyboardSignal, KeyboardState};
 
-/// Methods are synchronous and fire-and-forget for `switch_layout`. State updates
-/// flow back through the implementor's event stream rather than a return value. Not
-/// `async fn` to preserve object safety for `Box<dyn CompositorLink>`.
+/// `switch_layout` is synchronous fire-and-forget; state returns through the implementor's event
+/// stream. It is not `async fn` to preserve `Box<dyn CompositorLink>` object safety.
 pub trait CompositorLink: Send + Sync {
     fn kind(&self) -> CompositorKind;
     fn switch_layout(&self, index: usize);
@@ -33,10 +29,9 @@ fn apply_niri_layout(state: &Arc<Mutex<KeyboardState>>, names: &[String], idx: u
 pub struct NiriLink;
 
 impl NiriLink {
-    /// Connects to `$NIRI_SOCKET` and spawns the event-stream reader on its own thread.
-    /// `Socket` is a blocking Unix stream wrapper. The first event carries the full
-    /// initial state; no separate startup query is required. Degrades to `None` if connecting
-    /// fails.
+    /// Connects to `$NIRI_SOCKET` and reads its blocking `Socket` stream on a dedicated thread.
+    /// The first event carries full initial state, so no startup query is needed. Failed connects
+    /// yield `None`.
     pub fn new(state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Option<Self> {
         let mut socket = match niri_ipc::socket::Socket::connect() {
             Ok(socket) => socket,
@@ -103,11 +98,11 @@ impl CompositorLink for NiriLink {
         CompositorKind::Niri
     }
 
-    /// A fresh connection per call: `read_events` consumes and shuts down the write half of
-    /// the event-stream socket, so that connection genuinely cannot also send this write.
+    /// Opens a fresh connection because `read_events` consumes and shuts down the event socket's
+    /// write half; that connection cannot also send this command.
     fn switch_layout(&self, index: usize) {
-        // `index` arrives from untrusted JSON-RPC as an unbounded u64; niri's wire protocol
-        // takes a u8, so out-of-range is rejected here rather than silently truncated (e.g. 256 -> 0).
+        // JSON-RPC supplies an unbounded u64, while niri's wire protocol takes u8. Reject overflow
+        // instead of truncating 256 to 0.
         let Ok(index) = u8::try_from(index) else {
             eprintln!("keyboard: switch_layout index {index} is out of range for niri (must fit in a u8); ignored");
             return;
@@ -130,25 +125,21 @@ impl CompositorLink for NiriLink {
     }
 }
 
-/// Hyprland's real IPC protocol: two Unix sockets per instance under
-/// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/` -- `.socket2.sock` pushes
-/// newline-terminated `event>>payload` lines (`activelayout>>...` is a "something changed"
-/// trigger only), `.socket.sock` accepts plain-text commands for the read (`devices -j`) and
-/// write (`switchxkblayout <device> <index>`).
+/// Hyprland IPC uses two sockets under
+/// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`: `.socket2.sock` pushes newline-terminated
+/// `event>>payload` lines, where `activelayout>>...` only triggers a resync; `.socket.sock` accepts
+/// `devices -j` reads and `switchxkblayout <device> <index>` writes.
 pub struct HyprlandLink {
     signature: String,
-    /// The primary keyboard's real device name (Hyprland's `keyboards[].name`), cached from
-    /// the most recent resync -- `switchxkblayout` needs a genuine device name, no wildcard
-    /// documented. `None` until the first successful resync; `switch_layout` is a no-op until then.
+    /// Primary keyboard device name (`keyboards[].name`) from the latest resync. Hyprland requires
+    /// a real name, not a documented wildcard. `None` until success; `switch_layout` then no-ops.
     device_name: Arc<Mutex<Option<String>>>,
 }
 
-/// One entry of `hyprctl -j devices`'s `"keyboards"` array, only the fields this needs.
-/// `active_keymap` is the human-readable active layout name; `layout` is the XKB-code comma
-/// list, used only for a count -- matching `active_keymap` back to a position in it needs a
-/// code->name table Hyprland's JSON doesn't provide, so `active_layout_index` stays `0`. `main`
-/// marks the primary keyboard (ADR-0034), preferred over the array's first entry since ordering
-/// isn't guaranteed with more than one attached keyboard.
+/// Needed fields from `hyprctl -j devices`'s `keyboards` entries. `active_keymap` is the display
+/// name; comma-separated `layout` only supplies the count. Hyprland provides no code-to-name
+/// table, so `active_layout_index` stays `0`. Prefer `main` (ADR-0034) because array order is not
+/// guaranteed with multiple keyboards.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct HyprlandKeyboard {
     name: String,
@@ -174,16 +165,14 @@ fn apply_hyprland_layout(
     let mut guard = state.lock().unwrap();
     guard.active_layout = keyboard.active_keymap.clone();
     guard.layout_count = keyboard.layout.split(',').filter(|s| !s.is_empty()).count() as u32;
-    // active_layout_index left at its previous value; see HyprlandKeyboard's doc comment.
+    // Hyprland has no code-to-name mapping; keep the previous index (see above).
     drop(guard);
     *device_name.lock().unwrap() = Some(keyboard.name.clone());
 }
 
-/// Orders concurrent [`resync_hyprland_layout`] calls (one at construction, one per
-/// `activelayout>>` event) so a slower-to-finish but older `hyprctl` call can't overwrite a
-/// faster, more recent result -- without this, a burst of rapid layout switches could leave
-/// `KeyboardState` stuck on a stale layout. `ticket()` hands out a strictly increasing number
-/// before the subprocess starts; `claim()` only applies a result if its ticket is still newest.
+/// Orders concurrent [`resync_hyprland_layout`] calls so an older, slower `hyprctl` result cannot
+/// overwrite a newer one. Without it, rapid switches leave `KeyboardState` stale. `ticket()`
+/// increments before spawning; `claim()` applies only the newest ticket.
 struct ResyncSequence {
     next: AtomicU64,
     last_applied: AtomicU64,
@@ -250,9 +239,9 @@ async fn resync_hyprland_layout(
 }
 
 impl HyprlandLink {
-    /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed present by
-    /// `compositor::detect_compositor`. Spawns the event-listener thread and runs one initial resync so
-    /// `active_layout` isn't empty until the first `activelayout` event arrives.
+    /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed by
+    /// `compositor::detect_compositor`. Starts the listener and an initial resync so
+    /// `active_layout` is populated before the first `activelayout` event.
     pub fn new(signature: String, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Self {
         let device_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let sequence = Arc::new(ResyncSequence::new());
@@ -266,10 +255,8 @@ impl HyprlandLink {
 
         let loop_device_name = Arc::clone(&device_name);
         let loop_sequence = Arc::clone(&sequence);
-        // Captured on the constructor's tokio-context thread: the OS thread below has no tokio
-        // runtime bound to it, so the free `tokio::spawn` would panic -- and, under this
-        // workspace's `panic = "abort"` release profile, take down the process -- the first
-        // time it needs the runtime. `Handle::spawn` carries its own runtime reference instead.
+        // The OS listener thread has no Tokio runtime. Free `tokio::spawn` would panic and, under
+        // this workspace's `panic = "abort"` release profile, abort the process; use this handle.
         let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
             let stream = match UnixStream::connect(&socket_path) {
@@ -380,7 +367,7 @@ mod tests {
 
     #[test]
     fn niri_switch_layout_index_validation_rejects_values_that_would_truncate() {
-        // Regression: 256 used to truncate to 0 via `as u8` instead of being rejected.
+        // Regression: 256 used to truncate to 0 via `as u8`.
         assert!(u8::try_from(256usize).is_err());
         assert!(u8::try_from(usize::MAX).is_err());
     }
@@ -396,7 +383,7 @@ mod tests {
 
     #[test]
     fn resync_sequence_claim_drops_a_ticket_older_than_one_already_applied() {
-        // Regression: an older resync finishing after a newer one must not overwrite it with stale data.
+        // Regression: an older resync must not overwrite a newer result.
         let sequence = ResyncSequence::new();
         let stale = sequence.ticket();
         let fresh = sequence.ticket();

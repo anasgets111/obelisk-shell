@@ -1,26 +1,18 @@
-//! `pacman`'s half of `updates:install()` (ADR-0034): the two things about `pkexec pacman -Syu
-//! --noconfirm` that belong to `pacman` and not to the scheduler -- how its output spells progress,
-//! and which package names owe a reboot. The command itself is named in
-//! `PacmanBackend::install_command` and run by `controller.rs` through
-//! `process::spawn_group_leader_piped`, which is where privilege elevation routes through Oblisk's
-//! own already-registered polkit agent (`dbus::polkit`): `pkexec` talks to polkit and triggers our
-//! agent's interactive prompt, rather than a manual `CheckAuthorization` call. That run is against
-//! the real `/etc/pacman.conf`/`/var/lib/pacman` as root, no throwaway copy (unlike `check.rs`'s
-//! read-only sync).
+//! `pacman` half of `updates:install()` (ADR-0034): progress syntax and reboot heuristic. The
+//! command is `pkexec pacman -Syu --noconfirm`, run by `controller.rs` through
+//! `process::spawn_group_leader_piped`; `pkexec` talks to polkit and triggers the Oblisk polkit
+//! agent's interactive prompt rather than a manual `CheckAuthorization` call. It modifies the real
+//! `/etc/pacman.conf`/`/var/lib/pacman` as root, unlike `check.rs`.
 //!
-//! Progress parsing (`parse_install_step`) is best-effort against pacman's well-known real
-//! stdout format (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`), not independently verified
-//! end-to-end against a real privileged run: an actual system upgrade needs the user's own
-//! hands on the keyboard for the polkit password prompt. A wrong progress-line match only
-//! misses a cosmetic UI update -- install success is read from the real process exit status,
-//! not the parsed lines.
+//! Progress parsing is best-effort against pacman's real format
+//! (`"(2/5) installing nss (3.127-1 -> 3.128-1)"`), not end-to-end verified because a privileged
+//! run needs the user's polkit prompt. A missed line affects only UI progress; success comes from
+//! process exit status.
 
 use super::super::backend::InstallStep;
 
-/// One `(current/total) installing|upgrading|reinstalling <package> ...` line from `pacman`'s real
-/// install-phase output, read as an [`InstallStep`]. `None` for every other line (database-sync
-/// messages, download progress bars, blank lines) -- the reader just leaves the previous progress
-/// in place.
+/// Parses `(current/total) installing|upgrading|reinstalling <package> ...` install lines. `None`
+/// for sync messages, download bars, and blanks; the previous progress remains.
 pub fn parse_install_step(line: &str) -> Option<InstallStep> {
     let rest = line.trim().strip_prefix('(')?;
     let (counts, rest) = rest.split_once(')')?;
@@ -36,11 +28,9 @@ pub fn parse_install_step(line: &str) -> Option<InstallStep> {
     Some(InstallStep { current, total, package })
 }
 
-/// Whether `package_names` includes a Linux kernel package (`linux`, or `linux-<variant>`
-/// such as `linux-lts`/`linux-zen`/`linux-hardened`) -- the common desktop-tooling heuristic
-/// for "this update needs a reboot to take effect" (ADR-0034's `rebootRequired`). A heuristic,
-/// not authoritative: a firmware or glibc update can also warrant a reboot without a kernel
-/// package being involved.
+/// Whether `package_names` includes `linux` or `linux-<variant>` such as `linux-lts`, `linux-zen`,
+/// or `linux-hardened` (ADR-0034 `rebootRequired`). Heuristic only; firmware or glibc can also
+/// require reboot without a kernel package.
 pub fn needs_reboot(package_names: &[String]) -> bool {
     package_names.iter().any(|name| name == "linux" || name.starts_with("linux-"))
 }
@@ -108,7 +98,7 @@ mod tests {
 
     #[test]
     fn needs_reboot_does_not_false_positive_on_a_name_merely_starting_with_linux() {
-        // No hyphen after "linux" -- not the kernel-variant naming convention, must not match.
+        // No hyphen after `linux`, so this is not a kernel-variant name.
         assert!(!needs_reboot(&["linuxfoo".to_string()]));
     }
 }

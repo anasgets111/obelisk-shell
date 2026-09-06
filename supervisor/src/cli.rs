@@ -1,12 +1,10 @@
 //! Argument parsing for the `oblisk` binary.
 //!
-//! Hand-rolled rather than derived. There are four flags and two subcommands, `clap` would be the
-//! largest dependency in the workspace, and the one non-obvious rule here (`-c` may name a file,
-//! and says so rather than silently taking the parent) is a line of code either way.
+//! Hand-rolled: four flags, two subcommands, and one non-obvious rule (`-c` may name a file).
+//! `clap` would be the workspace's largest dependency; the rule needs custom code either way.
 
 use std::path::{Path, PathBuf};
 
-/// What the command line asked for.
 #[derive(Debug, PartialEq)]
 pub enum Command {
     /// Start the shell. The default with no arguments.
@@ -17,8 +15,8 @@ pub enum Command {
     },
     /// Evaluate the config and report what it says, without taking a Wayland surface.
     Check,
-    /// `set <name> <value>` or `toggle <name>`: write one of the running config's `state`
-    /// signals from outside, for a compositor keybind (ADR-0112).
+    /// `set <name> <value>` or `toggle <name>` writes a running config's `state` signal
+    /// from outside for a compositor keybind (ADR-0112).
     SetState(shared::SetState),
     Version,
     Help,
@@ -27,8 +25,7 @@ pub enum Command {
 #[derive(Debug, PartialEq)]
 pub struct Args {
     pub command: Command,
-    /// The `-c` directory, already absolute. `None` leaves `shared::config_dir()`'s own order in
-    /// charge.
+    /// Absolute `-c` directory. `None` leaves `shared::config_dir()`'s own order in charge.
     pub config_dir: Option<PathBuf>,
 }
 
@@ -58,10 +55,8 @@ false)` flips. VALUE is read as JSON (true, 3, \"text\", [1,2]); anything
 that is not JSON is taken as a string, so quoting `notifications` is optional.
 ";
 
-/// `-c` names a directory. A path to `shell.lua` is accepted, because that is the file someone was
-/// editing when they reached for the flag, and the intent is unambiguous. It reports the
-/// substitution rather than making it silently, since a config author who thinks the unit is a file
-/// will be surprised by `require` and by the watcher later.
+/// `-c` names a directory, but accepts a path to `shell.lua` because that is what someone reaches
+/// for after editing it. Report the substitution: `require` and the watcher use the directory.
 fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
     let given = Path::new(raw);
     let dir = if given.is_file() {
@@ -74,8 +69,8 @@ fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
     } else {
         given.to_path_buf()
     };
-    // Absolute before it goes anywhere. Every Renderer inherits this through the environment, and
-    // a spawned process is not promised the working directory this one had.
+    // Resolve before handing it to Renderer through the environment; spawned processes need not
+    // share this process's working directory.
     std::path::absolute(&dir).map_err(|err| format!("--config {}: {err}", dir.display()))
 }
 
@@ -96,8 +91,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                     _ => "toggle",
                 });
             }
-            // The words after `set`/`toggle`: a state name, and for `set` a value, which may
-            // itself begin with a dash (`-1`) and so is taken before the flag arms below.
+            // Take the state name and `set` value before flags; a value may begin with a dash
+            // (`-1`).
             _ if matches!(command, Some("set" | "toggle"))
                 && (positional.is_empty() || command == Some("set") && positional.len() == 1) =>
             {
@@ -130,9 +125,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         Some("set") => {
             let [name, value] = <[String; 2]>::try_from(positional)
                 .map_err(|_| "set takes a state name and a value: `oblisk set launcher_open true`".to_string())?;
-            // JSON when it parses, a string otherwise: `oblisk set panel_kind notifications` is
-            // what someone types, and making them type `'"notifications"'` for it would be
-            // pedantry in a keybind.
+            // Parse JSON when possible; bare words stay strings, so keybinds need no extra quotes.
             let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
             Command::SetState(shared::SetState { name, write: shared::StateWrite::Set(value) })
         }
@@ -179,11 +172,9 @@ mod tests {
 
     #[test]
     fn a_path_to_shell_lua_resolves_to_its_directory() {
-        // The mistake worth accommodating: `-c ~/.config/oblisk/shell.lua` is what someone types
-        // straight after editing that file.
+        // Accommodate the common `-c ~/.config/oblisk/shell.lua` after editing that file.
         //
-        // An absolute path, because the substitution turns on `is_file()` and a test's working
-        // directory is its crate root rather than the workspace root.
+        // Use an absolute path: `is_file()` then sees it, while tests run from the crate root.
         let shell_lua = format!("{}/../dev-config/oblisk/shell.lua", env!("CARGO_MANIFEST_DIR"));
         let args = parse_args(&["-c", &shell_lua]).unwrap();
         assert!(args.config_dir.unwrap().ends_with("dev-config/oblisk"));
@@ -196,8 +187,7 @@ mod tests {
         assert_eq!(parse_args(&["check"]).unwrap().command, Command::Check);
     }
 
-    /// ADR-0112: the two verbs a keybind speaks. A value is JSON when it parses and a string when
-    /// it does not, so a bare word needs no shell quoting.
+    /// ADR-0112: keybind verbs. Values parse as JSON when possible; bare words need no quotes.
     #[test]
     fn set_and_toggle_name_a_state_and_read_the_value_as_json_or_a_bare_string() {
         use shared::{SetState, StateWrite};

@@ -1,24 +1,16 @@
 //! System tray host (`oblisk.tray`, docs/oblisk-supervisor-services-dbus.md §2;
 //! docs/oblisk-idl-api-specs.md §2.14; ADR-0031).
 //!
-//! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and client-handles every
-//! registered `org.kde.StatusNotifierItem` (plus its optional `com.canonical.dbusmenu` menu).
-//! Hand-written `#[zbus::proxy]` traits (ADR-0031: no crate reuse -- `system-tray` has a
-//! source-verified pixmap-squaring bug), a `*Controller` struct holding the write-action
-//! proxies, a `HashMap<Key, Entry>` dynamic per-object registry kept live via per-item
-//! forwarder tasks (one `JoinHandle` per tracked object, aborted on removal), and pure
-//! pretty-printable/parsing helpers unit-testable without a live D-Bus connection.
+//! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and handles registered
+//! `org.kde.StatusNotifierItem`s and optional `com.canonical.dbusmenu` menus. Hand-written proxies
+//! avoid `system-tray`'s source-verified pixmap-squaring bug (ADR-0031); a keyed registry and one
+//! abortable forwarder per item keep snapshots live.
 //!
-//! The base SNI spec has no signal telling a host when a client unregisters -- liveness is
-//! tracked via `org.freedesktop.DBus.NameOwnerChanged`: one global forwarder task removes
-//! every registry entry for a unique name the instant that name drops off the bus (see
-//! [`registry::spawn_name_owner_changed_forwarder`]).
+//! SNI has no unregister signal. `NameOwnerChanged` supplies liveness; one global forwarder removes
+//! every entry for a unique name when it drops off the bus.
 //!
-//! ponytail: `TrayController::new` never fails outright, same reasoning as
-//! `BluetoothController::new` (ADR-0030) -- a session with no other tray host running (the
-//! overwhelmingly common case for niri/sway) is not an error, and `RequestName` losing the race to
-//! an already-running DE tray (Plasma/GNOME) is an expected, handled outcome (ADR-0031's "dual-role
-//! dance"), not a startup failure either.
+//! ponytail: `TrayController::new` never fails outright (ADR-0030). No other tray host, common on
+//! niri/sway, is not an error; losing `RequestName` to Plasma/GNOME is expected (ADR-0031).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,15 +18,12 @@ use serde::Serialize;
 
 use item::TrayItem;
 
-/// Well-known bus name and object path this controller hosts `org.kde.StatusNotifierWatcher` at
-/// (docs/oblisk-supervisor-services-dbus.md §2's literal path).
+/// Well-known bus name and object path for `org.kde.StatusNotifierWatcher` (§2).
 const WATCHER_BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_OBJECT_PATH: &str = "/StatusNotifierWatcher";
-/// `RegisterStatusNotifierItem`'s `service` argument, when it names a bus name rather than an
-/// object path, always means this fixed item object path (ADR-0031).
+/// Fixed item path when `RegisterStatusNotifierItem`'s `service` is a bus name (ADR-0031).
 const DEFAULT_ITEM_OBJECT_PATH: &str = "/StatusNotifierItem";
-/// ARGB pixmaps are rejected above this size (docs/oblisk-supervisor-services-dbus.md §2.1,
-/// ADR-0031: "largest available pixmap capped at the spec's 128px limit").
+/// Maximum accepted ARGB pixmap dimension (§2.1, ADR-0031).
 const MAX_PIXMAP_DIMENSION: i32 = 128;
 
 /// `IconPixmap`'s D-Bus wire shape (`a(iiay)`): width, height, raw ARGB32 bytes.
@@ -55,13 +44,9 @@ pub use controller::TrayController;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayState {
-    /// Every registered `StatusNotifierItem`, oldest registration first. A new item appends and an
-    /// item updating a property does not move, so a strip can be drawn straight from this without
-    /// sorting.
-    ///
-    /// Registration order rather than id order because [`TrayItem::id`] is a D-Bus unique name like
-    /// `"1.234"`: sorting it lexicographically puts `1.100` before `1.20` and drops a newly started
-    /// application into the middle of the strip.
+    /// Registered items, oldest first. New items append; property updates do not move them, so no
+    /// sorting is needed. Registration order avoids lexicographic D-Bus id order, where `1.100`
+    /// precedes `1.20` and a new app lands mid-strip.
     pub items: Vec<TrayItem>,
 }
 
@@ -87,9 +72,8 @@ impl std::fmt::Display for TrayActionError {
 
 impl std::error::Error for TrayActionError {}
 
-/// `tray:activate(id, x, y)`'s click-vs-menu gate (ADR-0031): an item with `ItemIsMenu == true`
-/// must show its menu instead of activating -- enforced here, once, centrally, rather than
-/// trusted to every `shell.lua` author.
+/// `tray:activate` gate (ADR-0031): `ItemIsMenu == true` means show the menu, not `Activate`,
+/// enforced here once and centrally rather than trusted to every `shell.lua` author.
 fn should_call_activate(item_is_menu: bool) -> bool {
     !item_is_menu
 }
@@ -106,11 +90,8 @@ pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i
     Some((id, x, y))
 }
 
-/// `tray:scroll(id, delta, orientation)`'s `arguments: [id, delta, orientation]` (ADR-0074).
-///
-/// Its own parser rather than a reuse of [`parse_activate_args`]: the shapes look alike, but the
-/// third argument is a string here and reusing the coordinate parser would silently drop every
-/// scroll whose orientation was spelled correctly.
+/// `tray:scroll(id, delta, orientation)`'s `[id, delta, orientation]` (ADR-0074). Separate from
+/// [`parse_activate_args`] because the third argument is a string, not a coordinate.
 pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32, String)> {
     let id = arguments.first()?.as_str()?.to_string();
     let delta = arguments.get(1)?.as_i64()? as i32;
@@ -125,15 +106,13 @@ pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<
     Some((id, menu_item_id))
 }
 
-/// `tray:menu_will_show(id, submenu_id)`'s `arguments: [id, submenu_id]` -- same shape as
-/// [`parse_activate_menu_item_args`], kept as a distinct function so each write action's
-/// parser matches its own command name at the call site.
+/// `tray:menu_will_show(id, submenu_id)`'s `[id, submenu_id]`, kept separate from
+/// [`parse_activate_menu_item_args`] so each action names its own parser.
 pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
     parse_activate_menu_item_args(arguments)
 }
 
-/// Every action `oblisk.tray:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.tray:invoke(...)`; `dispatch` keeps the table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
@@ -144,9 +123,8 @@ pub enum TrayAction {
     MenuWillShow,
 }
 
-/// `oblisk.tray`'s action dispatch (ADR-0037): owns the action match, argument parse, and
-/// write-action spawn for every `tray` `CommandEnvelope`. Write actions are `tokio::spawn`ed
-/// rather than awaited inline (ADR-0031).
+/// `oblisk.tray` dispatch (ADR-0037): matches, parses, and spawns every write action
+/// (ADR-0031).
 pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<TrayAction>(params) else { return };
@@ -160,7 +138,7 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        // Same `[id, x, y]` shape as `Activate`, so the same parser (ADR-0074).
+        // Same `[id, x, y]` shape as `Activate` (ADR-0074).
         TrayAction::SecondaryActivate => match parse_activate_args(&params.arguments) {
             Some((id, x, y)) => {
                 let controller = controller.clone();
@@ -226,16 +204,14 @@ mod tests {
 
     #[test]
     fn parse_scroll_args_refuses_a_numeric_orientation() {
-        // The reason this is not `parse_activate_args`: the shapes look alike, and reusing that one
-        // would read the orientation as a coordinate and drop every correctly spelled scroll.
+        // The orientation is a string; the coordinate parser would drop valid scrolls.
         let args = vec![serde_json::json!("1.42"), serde_json::json!(-120), serde_json::json!(3)];
         assert_eq!(parse_scroll_args(&args), None);
     }
 
     #[test]
     fn every_tray_action_the_idl_names_parses() {
-        // `secondary_activate` and `scroll` are new (ADR-0074); serde owns the mapping, so a
-        // rename that misses the stub fails here rather than at a config author's keyboard.
+        // `secondary_activate` and `scroll` are new (ADR-0074); this checks their serde spellings.
         for name in ["activate", "secondary_activate", "scroll", "activate_menu_item", "menu_will_show"] {
             let action: Result<TrayAction, _> = serde_json::from_value(serde_json::json!(name));
             assert!(action.is_ok(), "{name} must deserialize into a TrayAction");

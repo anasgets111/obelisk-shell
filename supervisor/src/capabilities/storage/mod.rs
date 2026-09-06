@@ -1,18 +1,14 @@
-//! `oblisk.storage` capability: the JSON files a config declared with `persistent_table`
-//! (ADR-0136). Top-level, sibling to `files`/`system`: plain filesystem reads and writes, no D-Bus
-//! proxy and no hardware thread.
+//! `oblisk.storage` owns JSON files declared with `persistent_table` (ADR-0136). Plain filesystem
+//! reads/writes, sibling to `files`/`system`, with no D-Bus proxy or hardware thread.
 //!
-//! Nothing here knows what a store is *for*. The path, the file name and the defaults are all the
-//! config's, so "settings", "state" and "cache" are three files a config chose to declare and not
-//! three things this Supervisor has an opinion about. What replaced `system:write_state` and the
-//! one hardcoded `state.json` it wrote.
+//! The config chooses each path, name, and defaults; "settings", "state", and "cache" are not
+//! Supervisor concepts. This replaced `system:write_state` and its hardcoded `state.json`.
 
 pub mod controller;
 
 pub use controller::{StorageController, StorageSignal};
 
-/// Every action `oblisk.storage:invoke(...)` accepts. `dispatch` matches this rather than a
-/// string, so a variant with no arm (or an arm with no variant) fails the build.
+/// Every action `oblisk.storage:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageAction {
@@ -20,8 +16,8 @@ pub enum StorageAction {
     Set,
 }
 
-/// `storage:open(path, defaults)`'s `arguments: [path, defaults]`. The Renderer joined `path` and
-/// `name` before sending, so one absolute path arrives and one key is what the config reads back.
+/// `storage:open(path, defaults)`'s `arguments: [path, defaults]`. The Renderer joins `path` and
+/// `name` first, so one absolute path arrives and becomes the config's key.
 pub fn parse_open_args(arguments: &[serde_json::Value]) -> Option<(String, serde_json::Value)> {
     let path = arguments.first()?.as_str()?.to_string();
     let defaults = match arguments.get(1) {
@@ -32,8 +28,8 @@ pub fn parse_open_args(arguments: &[serde_json::Value]) -> Option<(String, serde
     Some((path, defaults))
 }
 
-/// `storage:set(path, key, value)`'s three arguments. A missing third is `null`, which deletes,
-/// because that is what a Lua `nil` marshals to and deleting is what it should mean.
+/// `storage:set(path, key, value)`'s three arguments. A missing third is `null`, deleting the key
+/// because Lua `nil` marshals as `null`.
 pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<(String, String, serde_json::Value)> {
     let path = arguments.first()?.as_str()?.to_string();
     let key = arguments.get(1)?.as_str()?.to_string();
@@ -41,8 +37,8 @@ pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<(String, String
     Some((path, key, value))
 }
 
-/// `oblisk.storage`'s action dispatch (ADR-0037). Synchronous: both actions touch memory and
-/// schedule a save, and the save itself is the task.
+/// `oblisk.storage` action dispatch (ADR-0037). Synchronous: actions touch memory and schedule the
+/// save task.
 pub fn dispatch(controller: &StorageController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<StorageAction>(params) else { return };

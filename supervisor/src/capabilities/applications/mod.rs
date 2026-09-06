@@ -1,14 +1,11 @@
-//! `oblisk.applications` capability: the installed `.desktop` entries, enumerated
-//! (ADR-0061). Top-level, sibling to `system`/`updates`/`privacy` -- plain filesystem
-//! reads, no D-Bus proxy and no hardware thread.
+//! `oblisk.applications`: installed `.desktop` entries (ADR-0061). A top-level capability using
+//! plain filesystem reads, with no D-Bus proxy or hardware thread.
 //!
-//! This is the capability ADR-0054 decision 5 said would arrive "the day something needs an icon
-//! for a window that is not already telling us its icon". Three callers arrived at once: an
-//! application launcher needs every entry's name, icon and command; a focused-window readout has
-//! an `app_id` and no icon; and a tray item can report neither an `IconName` nor an
-//! `IconPixmap`. Enumeration rather than § 3.2's `system:find_icon(app_id, ...)`, because that
-//! row is a synchronous call the control socket has no reply shape for, and because a launcher
-//! wants the whole list rather than one lookup at a time.
+//! ADR-0054 decision 5 called for this when a window needed an icon it did not report. The
+//! launcher needs every name/icon/command, a focused window has `app_id` but no icon, and a tray
+//! item may have neither `IconName` nor `IconPixmap`. Enumerate instead of § 3.2's synchronous
+//! `system:find_icon(app_id, ...)`: the control socket has no reply shape for it, and launchers
+//! need the whole list.
 
 pub mod controller;
 pub mod entry;
@@ -17,8 +14,8 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
-/// Every action `oblisk.applications:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.applications:invoke(...)`; exhaustive dispatch keeps variants and
+/// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationsAction {
@@ -27,9 +24,8 @@ pub enum ApplicationsAction {
     OpenUrl,
 }
 
-/// `oblisk.applications`'s action dispatch (ADR-0037). All three actions are synchronous here:
-/// `refresh` hands the actual scan to `spawn_blocking` itself, and `launch` and `open_url` spawn a
-/// detached child without waiting for it.
+/// `oblisk.applications` action dispatch (ADR-0037). `refresh` calls `spawn_blocking`; `launch`
+/// and `open_url` spawn detached children without waiting.
 pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<ApplicationsAction>(params) else { return };

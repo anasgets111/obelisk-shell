@@ -10,74 +10,56 @@ use tokio::sync::watch;
 use super::backend::{Backend, UpdateCandidate};
 use crate::process;
 
-/// `oblisk.updates`'s combined payload. `check_error`/`install_error` are `None` when
-/// nothing's gone wrong, not a fabricated empty string. `install_total_steps == 0` while
-/// `installing` is true means the transaction size isn't known yet (the package manager hasn't
-/// printed it).
+/// `oblisk.updates` payload. `check_error`/`install_error` are `None` when clear. While
+/// `installing`, `install_total_steps == 0` means the manager has not printed the transaction size.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdatesState {
-    /// Which package manager answered, or `nil` when this machine has none this Supervisor
-    /// speaks -- the one field a config can read before anything has been checked, and the one
-    /// that tells an indicator whether it has any business being on the bar at all (ADR-0134).
-    /// The name of the command: `"pacman"`.
+    /// Package manager name, or `nil` when unsupported. Available before any check and used by an
+    /// indicator to decide whether it belongs on the bar (ADR-0134), e.g. `"pacman"`.
     pub package_manager: Option<String>,
-    /// How many packages have a newer version in the synced repos. Always equal to
-    /// `#packages`, and carried separately so a badge does not have to walk the list.
+    /// Number of packages with newer synced-repo versions. Always `#packages`, duplicated so a
+    /// badge need not walk the list.
     pub count: u32,
-    /// What would be upgraded, one entry each. A failed check leaves this and
-    /// [`UpdatesState::count`] on the last good answer rather than clearing them, so a config
-    /// keeps showing the count it knows while [`UpdatesState::check_error`] explains the gap.
+    /// Packages that would upgrade, one per entry. A failed check preserves the last good list and
+    /// [`UpdatesState::count`] while [`UpdatesState::check_error`] reports the gap.
     pub packages: Vec<UpdateCandidate>,
-    /// Unix seconds at the end of the last check that completed without error, or `nil` if none has
-    /// since this session started. A failed check leaves it on the older, still-true value.
+    /// Unix seconds when the last check completed successfully, or `nil` this session. Failed
+    /// checks preserve the older value.
     pub last_successful_check: Option<i64>,
-    /// Why the last check failed, or `nil` when the last one worked. A check never modifies the
-    /// system (`Backend::check` promises that much), so this is a network or parse failure, never a
-    /// half-applied change to the system.
+    /// Last check error, or `nil` after success. Checks never modify the system
+    /// (`Backend::check`), so this is a network/parse failure, not a half-applied change.
     pub check_error: Option<String>,
-    /// A check is running right now. Rises before the sync starts and falls when the result is
-    /// written, with a push at both edges, so a config can draw a spinner and disable its own
-    /// refresh control. `updates:check` refuses a second one while this is true.
+    /// A check is running. Set before sync and cleared when its result is written, with a push at
+    /// both edges for spinners/refresh controls. `updates:check` refuses a second check while true.
     pub checking: bool,
-    /// How many checks in a row have failed, reset to `0` by the first success. The count only:
-    /// "warn after five" is a threshold somebody has an opinion about, so it lives in the config.
+    /// Consecutive check failures, reset to `0` by the first success. Thresholds belong in config.
     pub consecutive_check_failures: u32,
-    /// An install is running. The `install_*` fields above only describe a run that has started;
-    /// `updates:install` refuses a second one while this is true.
+    /// An install is running. `install_*` describe a started run; `updates:install` refuses a
+    /// second one while true.
     pub installing: bool,
-    /// Which package of the transaction the package manager is on, its own 1-based `(2/5)`
-    /// counter. `0` before the first line is parsed.
+    /// Current package number, using the manager's 1-based `(2/5)` counter. `0` before progress.
     pub install_current_step: u32,
-    /// How many packages the transaction has. `0` while [`UpdatesState::installing`] is true means
-    /// the package manager has not printed a step line yet, so a progress bar has no denominator:
-    /// show it as indeterminate rather than dividing.
+    /// Transaction package count. `0` while [`UpdatesState::installing`] means no step line yet;
+    /// show progress as indeterminate rather than divide.
     pub install_total_steps: u32,
-    /// The package name from the step line the package manager is on. Empty string before the
-    /// first one, not `nil`, because a name is always a string once the transaction is under way.
+    /// Current package name from the step line. Empty before the first line, never `nil`.
     pub install_current_package: String,
-    /// What the package manager itself answered on the last install: `0` for success, its own code
-    /// for a failure, `nil` if none has finished this session. The code and
-    /// [`UpdatesState::install_log`] are the two facts about a failure; what to *call* it -- a
-    /// network error, a disk-space error, a signature error -- is wording, and wording belongs in
-    /// the config (ADR-0113 amendment).
+    /// Manager exit code from the last install: `0` success, its code on failure, `nil` before one
+    /// finishes. Together with [`UpdatesState::install_log`], it is the failure fact; wording such
+    /// as network, disk, or signature error belongs in config (ADR-0113 amendment).
     pub install_exit_code: Option<i32>,
-    /// Unix seconds when the last install stopped, however it stopped. With an install's start held
-    /// by whatever asked for it, this is what a duration is measured against.
+    /// Unix seconds when the last install stopped, regardless of outcome. Use it with the caller's
+    /// install start to measure duration.
     pub install_finished_at: Option<i64>,
-    /// The tail of the last install's output, newest last, both streams interleaved in arrival
-    /// order (they are read by two tasks, so the interleaving between them is not exact). Capped at
-    /// the last 200: a long upgrade writes thousands of lines and this is a payload pushed over a
-    /// socket, not a file. Cleared when an install starts.
+    /// Last install output, newest last, stdout/stderr interleaved by arrival (two readers make the
+    /// cross-stream order inexact). Keeps the last 200 lines; cleared when an install starts.
     pub install_log: Vec<String>,
-    /// Why the Supervisor never got an answer from the package manager at all -- it could not spawn
-    /// the install command, or could not wait on it. Distinct from
-    /// [`UpdatesState::install_exit_code`], which is the answer: this one means the question was
-    /// never asked, and it is the Supervisor's own failure rather than the package manager's.
+    /// Why Supervisor never got a manager answer: spawn or wait failed. Unlike
+    /// [`UpdatesState::install_exit_code`], this means the install was never answered and the
+    /// failure is Supervisor's.
     pub install_error: Option<String>,
-    /// A kernel package was installed at some point this session, per `Backend::needs_reboot`.
-    /// Sticky on purpose:
-    /// once set it stays set through later installs that do not touch the kernel, because the
-    /// running kernel is still the old one until the machine restarts.
+    /// A kernel package was installed this session per `Backend::needs_reboot`. Sticky: later
+    /// installs cannot clear it because the running kernel remains old until restart.
     pub reboot_required: bool,
 }
 
@@ -91,15 +73,15 @@ pub enum UpdatesSignal {
 pub struct UpdatesConfigure {
     /// Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
     pub interval_secs: u64,
-    /// When the config remembers the last successful check happening, from wherever it keeps
-    /// that -- `system.state`, most likely. Optional, and a seed rather than an override: it is
-    /// taken only while this process has no check of its own, which is exactly the boot where the
-    /// question "has an hour passed?" would otherwise have no answer but "start over".
+    /// Remembered Unix time of the last successful check, likely from `system.state`. Optional
+    /// seed,
+    /// not override: used only before this process has checked, so restarts can answer "has an hour
+    /// passed?" without starting over.
     pub checked_at: Option<i64>,
 }
 
-/// `updates:configure({interval})`'s `arguments: [{...}]` -- a table argument (ADR-0034). A present
-/// key with the wrong type drops the whole call rather than half-applying it.
+/// `updates:configure({interval})` takes one table argument (ADR-0034). A wrong-typed present key
+/// drops the whole call.
 pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesConfigure> {
     let table = arguments.first()?.as_object()?;
     let interval_secs = table.get("interval")?.as_u64()?;
@@ -110,9 +92,8 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesCo
     Some(UpdatesConfigure { interval_secs, checked_at })
 }
 
-/// How many lines of [`UpdatesState::install_log`] survive. Enough to hold a failure and the lines
-/// around it -- a config wanting the whole run of a 2,000-package upgrade wants a file, not a state
-/// payload that is re-serialized and pushed on every progress line.
+/// Tail length for [`UpdatesState::install_log`]. Enough to hold a failure and nearby lines; a
+/// 2,000-package run belongs in a file, not a state payload reserialized on every progress line.
 const LOG_TAIL_LINES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,37 +106,28 @@ fn poll_mode(interval: Duration) -> PollMode {
     if interval.is_zero() { PollMode::Dormant } else { PollMode::Ticking(interval) }
 }
 
-/// `Clone` so `main.rs` can hand a cheap `Arc`-backed copy to the `tokio::spawn`ed task
-/// `updates:install()`'s dispatch arm needs.
+/// Cloneable so `main.rs` can hand an `Arc`-backed copy to the spawned install task.
 #[derive(Clone)]
 pub struct UpdatesController {
-    /// The package manager this machine has. `None` is a real, supported state: every action
-    /// below then does nothing but say so, rather than failing a check to report it.
+    /// Package manager backend, or `None`; actions then no-op instead of failing a check.
     backend: Option<Arc<dyn Backend>>,
     state: Arc<Mutex<UpdatesState>>,
     interval_tx: watch::Sender<Duration>,
-    /// `updates:check`'s nudge to the scheduler. Capacity one and `try_send`, so a burst of
-    /// requests collapses into the single check they were all asking for.
+    /// `updates:check` nudge. Capacity one plus `try_send` collapses a burst into one check.
     check_now_tx: tokio::sync::mpsc::Sender<()>,
     events: UnboundedSender<UpdatesSignal>,
 }
 
 impl UpdatesController {
-    /// Detects this machine's package manager (`backend::detect`) and starts the scheduler
-    /// around it. Starts dormant (`Duration::ZERO`) -- nothing checks for updates until Lua calls
-    /// `updates:configure` at least once.
-    ///
-    /// Pushes once, immediately, which no other capability's constructor does: `package_manager`
-    /// is the answer to "should this indicator exist", and on a machine with no manager at all
-    /// there is no later event to carry it -- the scheduler would sit dormant forever and a config
-    /// would never learn why. On this machine it is also the first hour's difference between an
-    /// indicator that appears at login and one that appears whenever the first check lands.
+    /// Detects the package manager and starts a dormant scheduler (`Duration::ZERO`) until
+    /// `updates:configure`. Pushes immediately so `package_manager` can decide indicator presence,
+    /// including on machines with no backend and no later scheduler event. This makes the indicator
+    /// appear at login rather than after the first check.
     pub fn new(events: UnboundedSender<UpdatesSignal>) -> Self {
         Self::with_backend(super::backend::detect().map(Arc::from), events)
     }
 
-    /// [`UpdatesController::new`] against a backend chosen by the caller rather than detected,
-    /// which is how the tests drive the scheduler without a real package manager underneath it.
+    /// [`UpdatesController::new`] with a caller-supplied backend for scheduler tests.
     fn with_backend(backend: Option<Arc<dyn Backend>>, events: UnboundedSender<UpdatesSignal>) -> Self {
         let state = Arc::new(Mutex::new(UpdatesState {
             package_manager: backend.as_ref().map(|backend| backend.name().to_string()),
@@ -170,14 +142,9 @@ impl UpdatesController {
         Self { backend, state, interval_tx, check_now_tx, events }
     }
 
-    /// Sets the schedule, and optionally seeds the last-check time the config remembered across a
-    /// restart (ADR-0113 amendment). The seed is taken only while this process has none of its own:
-    /// a check this session actually ran is fresher than anything a config can tell it, and this
-    /// must never move `last_successful_check` backwards.
-    ///
-    /// Seeding pushes, because the field is Lua-visible: a config that persisted the time and then
-    /// read `last_successful_check` back as `nil` for the next hour would be told its own answer is
-    /// unknown.
+    /// Sets the schedule and optionally seeds a remembered check time (ADR-0113 amendment). Uses
+    /// the seed only before this process checks, never moving `last_successful_check` backwards.
+    /// Seeding pushes because the field is Lua-visible.
     pub fn configure(&self, configure: UpdatesConfigure) {
         if self.backend.is_none() {
             return;
@@ -195,12 +162,8 @@ impl UpdatesController {
         }
     }
 
-    /// `updates:check()`. Runs one check now, whatever the schedule says -- including when there is
-    /// no schedule at all, since a config may want the button and never the timer.
-    ///
-    /// Refused while a check is already running, the way [`UpdatesController::install`] refuses a
-    /// second transaction: the answer in flight is the answer being asked for, and a click during a
-    /// sync should not queue a second sync behind it.
+    /// `updates:check()`: runs one check regardless of schedule, including dormant mode. Refuses a
+    /// second request while checking; the in-flight answer is the requested answer.
     pub fn check_now(&self) {
         if self.backend.is_none() {
             eprintln!("updates: check() called on a machine with no package manager this Supervisor speaks; ignored");
@@ -217,12 +180,9 @@ impl UpdatesController {
         }
     }
 
-    /// `updates:install()`. A no-op (logged) if an install is already running, or if this machine
-    /// has no package manager at all -- no manager worth the name supports two concurrent
-    /// transactions against the same database lock. The check-and-set is one atomic critical section
-    /// under a single lock acquisition: two `install()` calls dispatched close together could
-    /// otherwise both observe `installing == false` and both launch a real upgrade against the same
-    /// database.
+    /// `updates:install()`. Logged no-op without a backend or during another install; package
+    /// managers share one database lock. The check-and-set is one critical section, so concurrent
+    /// calls cannot both observe `installing == false` and launch upgrades.
     pub async fn install(&self) {
         let Some(backend) = self.backend.clone() else {
             eprintln!("updates: install() called on a machine with no package manager this Supervisor speaks; ignored");
@@ -253,10 +213,10 @@ impl UpdatesController {
     }
 }
 
-/// Runs until every `UpdatesController` (and its `Clone`s) drops. Spawned only when a backend was
-/// detected -- on a machine with no package manager there is no schedule to keep. Every check runs
-/// inside `tokio::task::spawn_blocking`, never awaited inline: `Backend::check` is blocking network
-/// I/O by contract, and `pacman`'s `alpm` types are not even `Send`.
+/// Runs until every `UpdatesController` (and its `Clone`s) drops. Spawned only with a backend. Each
+/// check uses
+/// `tokio::task::spawn_blocking`: `Backend::check` performs blocking network I/O and pacman's
+/// `alpm` types are not `Send`.
 async fn run_check_task(
     backend: Arc<dyn Backend>,
     mut interval_rx: watch::Receiver<Duration>,
@@ -268,8 +228,8 @@ async fn run_check_task(
         let interval = *interval_rx.borrow_and_update();
         match poll_mode(interval) {
             PollMode::Dormant => {
-                // `check_now` is answered here too, not only under a schedule: a config that never
-                // names an interval and only ever checks on a click is a shape this should allow.
+                // Dormant mode still answers `check_now`; a config may use a button without a
+                // timer.
                 tokio::select! {
                     changed = interval_rx.changed() => {
                         if changed.is_err() {
@@ -286,17 +246,13 @@ async fn run_check_task(
             }
             PollMode::Ticking(duration) => {
                 let mut ticker = tokio::time::interval(duration);
-                // A check can genuinely run longer than a short configured interval (real
-                // network I/O); the default `Burst` behavior would then fire every missed tick
-                // back-to-back, hammering the mirrors -- `Delay` resumes ticking after the check finishes.
+                // Checks can exceed a short interval. `Burst` would hammer mirrors with missed
+                // ticks; `Delay` resumes after the check.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // `tokio::time::interval`'s first tick fires immediately, and here that is the
-                // point: a config that says "every hour" wants to know what is pending now, not in
-                // an hour (ADR-0113 amendment). It is consumed only when a check inside this
-                // process is still fresh, which is what makes a config reload cheap -- the
-                // controller outlives the generation that configured it, so every save would
-                // otherwise be another mirror sync, and under the old unconditional consume every
-                // save reset the hour and a day of editing never checked at all.
+                // `interval` ticks immediately, so an hourly schedule checks now, not in an hour
+                // (ADR-0113 amendment). Skip only when this process has a fresh check; the
+                // controller outlives config generations; under the old unconditional consume,
+                // every save reset the hour and a day of editing never checked at all.
                 if !first_check_is_due(state.lock().unwrap().last_successful_check, now_unix(), duration) {
                     ticker.tick().await;
                 }
@@ -315,7 +271,7 @@ async fn run_check_task(
                             if changed.is_err() {
                                 return;
                             }
-                            break; // interval reconfigured -- rebuild dormant/ticking in the outer loop
+                            break; // interval reconfigured; rebuild dormant/ticking outer loop
                         }
                     }
                 }
@@ -324,13 +280,9 @@ async fn run_check_task(
     }
 }
 
-/// One check, from wherever it was asked for: the schedule's tick, or `updates:check`. Raises
-/// `checking` with a push before the sync so a config can say so, and lowers it with another once
-/// the answer is written -- two pushes, because "checking" that is only visible after the fact is
-/// not visible at all.
-///
-/// A failed check leaves `count`/`packages` on the last good answer (§ 2.14) and only writes
-/// `check_error`, so a mirror hiccup does not blank a list the user is reading.
+/// Runs one scheduled or manual check. Pushes when `checking` rises and when the result is written,
+/// so the state is visible during the sync. Failures preserve `count`/`packages` (§2.14) and write
+/// only `check_error`.
 async fn run_one_check(
     backend: &Arc<dyn Backend>,
     state: &Arc<Mutex<UpdatesState>>,
@@ -365,10 +317,8 @@ async fn run_one_check(
     let _ = events.send(UpdatesSignal::Changed);
 }
 
-/// Whether the tick `tokio::time::interval` fires the instant it is built should be spent on a
-/// real check, or consumed. Due when nothing has checked yet in this process, or when the last
-/// success is at least `interval` old -- the same question the ticker would ask a moment later,
-/// asked once up front so a fresh process answers "now" and a reconfigured one does not.
+/// Whether the interval's immediate first tick should check or be consumed. Due with no process
+/// check, or when the last success is at least `interval` old.
 fn first_check_is_due(last_successful_check: Option<i64>, now: i64, interval: Duration) -> bool {
     let Some(last) = last_successful_check else { return true };
     now.saturating_sub(last) >= interval.as_secs() as i64
@@ -378,11 +328,10 @@ fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// The real, system-modifying install: whatever `Backend::install_command` names, run for real
-/// against the live system as root. Streams stdout line by line, reading progress through
-/// `Backend::parse_install_step` and writing it into `state` as it goes -- Lua never sees raw
-/// subprocess output (ADR-0034). Assumes `state.installing` and its progress fields are already
-/// set by [`UpdatesController::install`]'s atomic check-and-set.
+/// Assumes `state.installing` and its progress fields were set by `UpdatesController::install`'s
+/// atomic check-and-set. Runs `Backend::install_command` against the live system as root, reads
+/// stdout line by line, parses progress into `state`, and never exposes raw output to Lua
+/// (ADR-0034).
 async fn run_install(
     backend: Arc<dyn Backend>,
     state: Arc<Mutex<UpdatesState>>,
@@ -403,23 +352,17 @@ async fn run_install(
     run_install_with_child(backend, state, events, child).await;
 }
 
-/// Split from [`run_install`] so the stdout-driven progress loop can be tested against a stub
-/// child process, without a real privileged upgrade. Sends `UpdatesSignal::Changed` on every
-/// parsed progress line (ADR-0034), not just at the end.
+/// Testable stdout loop for [`run_install`]. Sends `UpdatesSignal::Changed` on every parsed line
+/// (ADR-0034), not only at completion.
 async fn run_install_with_child(
     backend: Arc<dyn Backend>,
     state: Arc<Mutex<UpdatesState>>,
     events: UnboundedSender<UpdatesSignal>,
     mut child: tokio::process::Child,
 ) {
-    // Drained concurrently on its own task, not left unread: a real upgrade can write enough stderr
-    // warnings to fill the pipe's ~64KiB kernel buffer, which blocks the package manager's
-    // single-threaded process and wedges `installing` at `true` forever. Logged, not discarded.
-    //
-    // The handle is kept and awaited below rather than detached. Detached, the task races the exit:
-    // `child.wait()` returns as soon as the process is gone, while the last stderr lines can still
-    // be sitting in the pipe unread, so `installing` could fall with the log missing exactly the
-    // lines that say why the install failed.
+    // Drain stderr concurrently: ~64KiB of warnings can fill the kernel pipe, block the
+    // single-threaded manager, and leave `installing` stuck at `true`. Await the drain after exit;
+    // detached reading can lose the final failure lines.
     let stderr_drain = child.stderr.take().map(|stderr| {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -431,8 +374,7 @@ async fn run_install_with_child(
         })
     });
 
-    // Plain local `Vec`, not `Arc<Mutex<_>>`: every read/write happens sequentially within
-    // this loop, never shared with another task -- unlike `state`.
+    // Local `Vec`: only this loop accesses it, unlike shared `state`.
     let mut installed_packages: Vec<String> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
@@ -440,10 +382,8 @@ async fn run_install_with_child(
             let step = backend.parse_install_step(&line);
             let mut guard = state.lock().unwrap();
             push_log_line(&mut guard.install_log, line);
-            // The push rides the progress lines rather than every line. One `Changed` re-resolves
-            // every surface in the generation (ADR-0044 decision 2), and a package manager writes a
-            // download meter; the lines are in `install_log` either way, they just arrive on
-            // screen with the next step rather than on their own frame.
+            // Push on progress lines, not every download-meter line. `Changed` re-resolves every
+            // surface (ADR-0044 decision 2); all lines still enter `install_log`.
             let Some(step) = step else { continue };
             guard.install_current_step = step.current;
             guard.install_total_steps = step.total;
@@ -455,8 +395,7 @@ async fn run_install_with_child(
     }
 
     let status = child.wait().await;
-    // After the wait, never before: the pipe closes when the process ends, which is what lets the
-    // drain finish rather than blocking here on a stream nothing is going to close.
+    // Await after process exit; only then does the pipe close and the drain finish.
     if let Some(drain) = stderr_drain {
         let _ = drain.await;
     }
@@ -465,11 +404,10 @@ async fn run_install_with_child(
     guard.install_finished_at = Some(now_unix());
     match status {
         Ok(status) => {
-            // `None` only for a process killed by a signal, which has no exit code to report.
+            // `None` means the process was killed by a signal.
             guard.install_exit_code = status.code();
             if status.success() {
-                // Accumulates (OR), never overwrites: a reboot owed from an earlier install must
-                // not be cleared just because this install didn't touch the kernel.
+                // Accumulate: a prior kernel install must not be cleared by an unrelated install.
                 guard.reboot_required |= backend.needs_reboot(&installed_packages);
             }
         }
@@ -479,10 +417,9 @@ async fn run_install_with_child(
     let _ = events.send(UpdatesSignal::Changed);
 }
 
-/// Appends one line to an install log, dropping the oldest once the tail is full. A `Vec` and a
-/// `remove(0)` rather than a `VecDeque`: this is serialized as a JSON array on every push, so it
-/// has to be one anyway, and [`LOG_TAIL_LINES`] shifts of a pointer-sized element are not the cost
-/// in a function that just parsed a line of subprocess output.
+/// Appends to the install-log tail, dropping its oldest line at capacity. Keep a `Vec`, not a
+/// `VecDeque`: the state serializes as a JSON array, and shifting 200 pointers is not the cost
+/// here.
 fn push_log_line(log: &mut Vec<String>, line: String) {
     if log.len() >= LOG_TAIL_LINES {
         log.remove(0);
@@ -593,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_manual_check_runs_with_no_schedule_configured_at_all() {
-        // The dormant arm answers `check_now` too: a config may want the button and never the timer.
+        // Dormant mode answers `check_now`; a config may use a button without a timer.
         let (controller, mut events_rx) = failing_controller().await;
 
         controller.check_now();
@@ -717,7 +654,7 @@ mod tests {
         assert_eq!(snapshot.install_current_package, "gnome-autoar");
         assert_eq!(snapshot.install_error, None);
 
-        // Correctness: progress must ride the updates signal per-line, not just at the end (ADR-0034).
+        // Progress must ride the updates signal per line, not just at the end (ADR-0034).
         let mut signal_count = 0;
         while events_rx.try_recv().is_ok() {
             signal_count += 1;

@@ -1,44 +1,34 @@
-//! The `fonts { ... }` declaration: which font families this shell measures and paints with
-//! (ADR-0043 decision 2).
+//! `fonts { ... }` declares the font families used for measurement and paint (ADR-0043 decision 2).
 //!
-//! A global that records rather than a value the config returns, because `shell.lua` returns an
-//! array of surfaces and there is no slot in it for something that is not one. That puts this in
-//! the same shape as `state`, `hover` and `scroll`: a registry in `Lua::app_data`, written while
-//! the config evaluates and read afterwards.
+//! It records in `Lua::app_data` rather than returning a value: `shell.lua` returns surfaces, so
+//! there is no slot for a font chain. Like `state`, `hover`, and `scroll`, it is written during
+//! config evaluation and read afterwards.
 //!
-//! Its own module rather than a fourth registry inside `lua::signal`, where those three live. They
-//! are there because they are signals and share `SignalKind`, its write gating and the dirty flag.
-//! This is a plain list read once with no reactivity at all, so putting it beside them would file it
-//! under the one thing it is not.
+//! This stays out of `lua::signal`: those registries share `SignalKind`, write gating, and the
+//! dirty flag; this is a plain, non-reactive list read once.
 //!
-//! **Process-wide, not per node.** One chain, ordered, and `femtovg` and `cosmic-text` both fall
-//! back across it per glyph. That is what makes a Nerd Font's private-use glyphs work beside a sans
-//! face for body text without any node saying which it wants: the codepoint decides. A per-node
-//! `font_family` is the separate and harder half, because measurement and paint select faces
-//! through different mechanisms and `text::shaping`'s module doc already records what it cost when
-//! those two disagreed.
+//! **Process-wide, not per node.** `femtovg` and `cosmic-text` fall back through one ordered chain
+//! per glyph, so Nerd Font private-use glyphs can sit beside a sans body face; the codepoint picks.
+//! Per-node `font_family` is separate and harder because measurement and paint select faces through
+//! different mechanisms; `text::shaping` records the cost when they disagree.
 
 use mlua::Lua;
 
-/// The declared chain, in the order the config wrote it. Absent until a config calls `fonts`.
+/// The declared chain in config order, absent until `fonts` is called.
 #[derive(Default)]
 struct FontRegistry(Vec<String>);
 
-/// Registers the `fonts(chain)` global, taking an array of family names.
+/// Registers `fonts(chain)`, taking an array of family names.
 ///
-/// Last call wins rather than accumulating. Two `fonts` declarations in one config are a mistake,
-/// and appending them would silently produce a chain neither file asked for; taking the last at
-/// least matches what a reader of the second one expects.
+/// Last call wins. Multiple declarations are a mistake; appending would silently create a chain
+/// neither declaration asked for, while replacement matches the second declaration's reading.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "fonts",
         lua.create_function(|lua, chain: mlua::Table| {
-            // Every key is collected and then checked to be exactly `1..=n`, rather than trusting
-            // either `sequence_values` or `raw_len`. Both are wrong here in the same direction:
-            // `sequence_values` stops at the first `nil` and returns what it had, and Lua's `#` is
-            // undefined on a sparse table and answers 1 for `{ [1] = "A", [3] = "C" }`. Either way a
-            // chain with a hole loses its tail silently, and the shell runs on a shorter fallback
-            // than the config wrote with nothing said about it.
+            // Collect every key, then require exactly `1..=n`: `sequence_values` stops at the first
+            // `nil`, while Lua's `#` is undefined for sparse tables and returns 1 for
+            // `{ [1] = "A", [3] = "C" }`. Either would silently drop the tail and shorten fallback.
             let mut indexed: Vec<(i64, String)> = Vec::new();
             for pair in chain.pairs::<mlua::Value, mlua::Value>() {
                 let (key, value) = pair?;
@@ -47,10 +37,9 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
                         "fonts() takes an array of family-name strings, not a table with named keys",
                     ));
                 };
-                // Checked rather than left to mlua's `FromLua`, which coerces a number to a string
-                // the way Lua itself does. `fonts { 12 }` would otherwise record a family named
-                // "12", and the only symptom would be `resolve_chain` logging that it could not
-                // find it, which reads like a missing font rather than a wrong config.
+                // Check before mlua's `FromLua`, which coerces numbers like Lua. Without this,
+                // `fonts { 12 }` records family `"12"`; only `resolve_chain` then reports a
+                // missing font, hiding the config error.
                 let mlua::Value::String(family) = value else {
                     return Err(mlua::Error::runtime(format!(
                         "fonts() takes an array of family-name strings; entry {index} is not a string"
@@ -76,18 +65,14 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
 
 /// What the config declared, or empty if it declared nothing.
 ///
-/// Empty means keep `text::fonts::DEFAULT_CHAIN`: a config that never mentions fonts is the normal
-/// case, not one that wants no text.
-/// ponytail: read once, at startup, by `wayland::run`. Editing `fonts { ... }` in a live config
-/// re-evaluates and records the new chain here, and nothing acts on it until the process restarts.
+/// Empty keeps `text::fonts::DEFAULT_CHAIN`; omitting `fonts` is normal, not "no text".
+/// ponytail: a config writes this once and normally never touches it; `wayland::run` reads it once
+/// at startup. A live edit re-evaluates and records a new chain, but nothing uses it until restart.
 ///
-/// Deliberate rather than missed. Acting on it needs the change to reach the Wayland thread, which
-/// owns the `TextPainter` that would have to be dropped and rebuilt, so it needs a new
-/// `FrameOutcome` threaded through the reload path that PBA also runs on. That is a lot of delicate
-/// machinery for a declaration a config writes once and then does not touch, and a font chain
-/// change invalidates every measurement in the shell, which is closer to a topology change than to
-/// the in-place restyle a reload is for. The upgrade path is that outcome variant, when something
-/// wants it.
+/// Deliberate: applying a change requires reaching the Wayland thread that owns the `TextPainter`,
+/// dropping and rebuilding it, and threading a new `FrameOutcome` through the PBA reload path. A
+/// chain change invalidates every measurement, unlike reload's in-place restyle. Upgrade with that
+/// outcome variant when live font changes are needed.
 pub fn declared_chain(lua: &Lua) -> Vec<String> {
     lua.app_data_ref::<FontRegistry>().map(|registry| registry.0.clone()).unwrap_or_default()
 }
@@ -118,9 +103,8 @@ mod tests {
         );
     }
 
-    /// Found by review. `sequence_values` stops at the first `nil` and returns what it had, so a
-    /// sparse table lost its tail with no error at all: `{ [1] = "A", [3] = "C" }` recorded `["A"]`
-    /// and the shell quietly ran on a shorter fallback chain than the config wrote.
+    /// Review found that `sequence_values` stops at the first `nil`: `{ [1] = "A", [3] = "C" }`
+    /// recorded `["A"]` and silently shortened the fallback chain.
     #[test]
     fn a_hole_in_the_chain_is_refused_rather_than_truncating_it() {
         let lua = lua_with_fonts();
@@ -129,8 +113,8 @@ mod tests {
         assert!(declared_chain(&lua).is_empty(), "a refused call records nothing");
     }
 
-    /// The typo the key walk also catches: a named key is not an array entry, and taking it
-    /// silently would drop the family the config thought it had declared.
+    /// The key walk catches named keys, which are not array entries and would silently drop a
+    /// declared family.
     #[test]
     fn a_table_with_named_keys_is_not_a_chain() {
         let lua = lua_with_fonts();
@@ -145,9 +129,8 @@ mod tests {
         assert_eq!(declared_chain(&lua), vec!["B"]);
     }
 
-    /// A number is where this bites: mlua's own `FromLua` for `String` coerces one the way Lua
-    /// does, so without the check the chain records a family named "12" and the only symptom is
-    /// `resolve_chain` reporting it could not find it.
+    /// mlua's `FromLua<String>` coerces numbers like Lua, so without the check `12` becomes family
+    /// `"12"` and only `resolve_chain` reports it missing.
     #[test]
     fn a_chain_entry_that_is_not_a_string_is_refused_by_name() {
         let lua = lua_with_fonts();

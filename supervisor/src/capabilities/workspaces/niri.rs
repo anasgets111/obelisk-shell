@@ -1,25 +1,22 @@
-//! `workspaces`' one implementor: niri's IPC event stream, reached over `$NIRI_SOCKET`.
+//! `workspaces`' niri implementor, reached over `$NIRI_SOCKET`.
 //!
-//! This is the only file in the capability that names `niri_ipc`. `controller.rs` owns the
-//! payload, the reduction and the publish contract in terms of `WorkspaceRow`/`FocusedWindow`;
-//! this maps niri's own types onto those and drives the loop.
+//! The only file naming `niri_ipc`. `controller.rs` owns payload, reduction, and publish in terms
+//! of `WorkspaceRow`/`FocusedWindow`; this maps niri types and drives the loop.
 //!
-//! ADR-0056 decision 1 stands: there is still no trait, because there is still one implementor.
-//! What changed is where the seam sits. A second compositor is a sibling module plus two arms in
-//! `WorkspacesController`, and it inherits `derive_state`, `StatePublisher` and their tests
-//! instead of re-deriving § 2.9's shape -- which is the part ADR-0056 said should be taken from
-//! two real implementors rather than predicted from one.
+//! ADR-0056 decision 1 still applies: one implementor needs no trait. A second compositor is a
+//! sibling plus two `WorkspacesController` arms, inheriting `derive_state`, `StatePublisher`, and
+//! their tests instead of predicting § 2.9 from one implementation.
 
 use std::collections::HashMap;
 
 use super::controller::{FocusedWindow, StatePublisher, WorkspaceRow};
 
-/// niri's workspaces reduced to the reduction's input. `name` and `output` are cloned per event;
-/// a session has a handful of workspaces, so this is not the place to avoid an allocation.
+/// niri workspaces reduced to the common input. Clone `name` and `output` per event; a session has
+/// only a handful of workspaces.
 ///
-/// `populated`/`app_id` (ADR-0117) come from `Window.workspace_id`: the focused window's id when
-/// focus is on that workspace, else the window with the lowest id, since the map has no order and
-/// the tile the compositor calls first is not on the wire. An empty `app_id` is `None`.
+/// `populated`/`app_id` (ADR-0117) use `Window.workspace_id`: focused window id when focused
+/// there, otherwise the lowest id because the map has no order and the compositor's first tile is
+/// not on the wire. Empty `app_id` is `None`.
 fn workspace_rows(
     workspaces: &HashMap<u64, niri_ipc::Workspace>,
     windows: &HashMap<u64, niri_ipc::Window>,
@@ -44,13 +41,11 @@ fn workspace_rows(
         .collect()
 }
 
-/// niri answers "which window has focus" with a flag on each window, so the search is here
-/// rather than in `derive_state` -- and only the winner is cloned, so a session with fifty
-/// windows still builds one `FocusedWindow` per event.
+/// niri flags focus on each window, so search here rather than in `derive_state`. Clone only the
+/// winner; even a fifty-window session builds one `FocusedWindow` per event.
 ///
-/// `title`/`app_id` are `Option` on the wire and default to empty: § 2.9 declares both
-/// non-nullable, and a window that reports neither is a real (if odd) toplevel, not an absence
-/// of one.
+/// Wire `title`/`app_id` are `Option` but § 2.9 makes them non-nullable, so default to empty. A
+/// window reporting neither is still a real toplevel.
 fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWindow> {
     windows.values().find(|window| window.is_focused).map(|window| FocusedWindow {
         title: window.title.clone().unwrap_or_default(),
@@ -61,22 +56,19 @@ fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWin
     })
 }
 
-/// Connects, asks for the event stream, and folds every event into niri's own two state parts
-/// on its own OS thread (blocking `std::net::UnixStream`). `EventStreamStatePart::apply` returns
-/// the event back when its part ignored it, so one `if let` chains both parts.
+/// Connects, requests the event stream, and folds events into niri's two state parts on an OS
+/// thread (`std::net::UnixStream`). `EventStreamStatePart::apply` returns ignored events, so one
+/// `if let` chains both parts.
 ///
-/// A second event-stream connection to the same compositor: `keyboard` already holds one for
-/// `KeyboardLayoutsChanged` (ADR-0056 decision 2 weighs that against sharing it).
+/// Uses a second event-stream connection; `keyboard` already owns one for `KeyboardLayoutsChanged`
+/// (ADR-0056 decision 2 weighs this against sharing).
 ///
-/// ponytail: that reducer panics rather than degrading on two events, `WindowClosed` and
-/// `WindowLayoutsChanged` naming a window it has never seen (both are a bare `.expect` in
-/// `niri_ipc::state`). Those are niri's own invariants and this reader cannot violate them from
-/// the outside: it feeds one stream, in order, starting from the full replay. If one ever does
-/// fire, the panic kills this thread alone and workspaces silently stop updating for the rest of
-/// the run, with a backtrace on stderr as the only clue. The upgrade path is a `catch_unwind`
-/// around `apply` that resets both parts and re-requests the stream, and it is not built because
-/// it would be error handling for a case with no observed instance and no way to reach it from
-/// here.
+/// ponytail: `niri_ipc::state` panics on `WindowClosed` or `WindowLayoutsChanged` for an unknown
+/// window (`.expect`). The reader feeds one ordered stream from the full replay, so it cannot
+/// violate those invariants externally. If one fires, only this thread dies; workspaces stop for
+/// the run and stderr gets the backtrace. Upgrade with `catch_unwind` around `apply`, resetting
+/// both parts and re-requesting the stream; no instance has been observed and this code cannot
+/// trigger the case.
 pub fn spawn_reader(mut publisher: StatePublisher) {
     let mut socket = match niri_ipc::socket::Socket::connect() {
         Ok(socket) => socket,
@@ -132,10 +124,9 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
     });
 }
 
-/// `workspaces:focus(id)`. A fresh connection per call: `read_events` consumes and shuts down
-/// the write half of the event-stream socket, so the reader's connection can't also send this
-/// write. `WorkspaceReferenceArg::Id`, not `Index`: `idx` shifts under a reorder, so addressing
-/// by index could focus the wrong workspace.
+/// `workspaces:focus(id)`. Use a fresh connection: `read_events` consumes and shuts down the
+/// event-stream socket's write half. Use `WorkspaceReferenceArg::Id`, not `Index`; `idx` shifts
+/// on reorder and could focus the wrong workspace.
 pub fn focus(id: u64) {
     std::thread::spawn(move || {
         let mut socket = match niri_ipc::socket::Socket::connect() {
@@ -158,10 +149,9 @@ pub fn focus(id: u64) {
 mod tests {
     use super::*;
 
-    /// Both fixtures deserialize niri's own wire JSON rather than a struct literal, copied from
-    /// a live `niri msg -j workspaces`/`-j windows` -- this would break if niri renamed a field.
-    /// That guarantee is why these tests live with the adaptor: the wire contract is the only
-    /// thing in this capability that a niri upgrade can break.
+    /// Fixtures deserialize niri wire JSON, copied from live `niri msg -j workspaces`/`-j windows`
+    /// rather than struct literals. A renamed field breaks them; the wire contract is the niri
+    /// upgrade boundary, so tests stay with the adaptor.
     fn workspace(id: u64, idx: u8, output: &str, is_active: bool, is_focused: bool) -> niri_ipc::Workspace {
         serde_json::from_value(serde_json::json!({
             "id": id, "idx": idx, "name": null, "output": output,
@@ -253,8 +243,8 @@ mod tests {
 
     #[test]
     fn workspace_rows_keep_a_workspace_niri_reports_no_output_for() {
-        // Dropping it is `derive_state`'s call, not the adaptor's: the adaptor reports what niri
-        // said. niri sets `output: null` when no outputs are connected at all.
+        // `derive_state` drops it; the adaptor reports niri's value. niri sets `output: null` with
+        // no connected outputs.
         let mut orphan = workspace(1, 1, "eDP-1", true, true);
         orphan.output = None;
 
@@ -277,7 +267,7 @@ mod tests {
 
     #[test]
     fn focused_window_is_none_when_niri_flags_nothing() {
-        // Real, not hypothetical: focusing a layer-shell surface leaves every toplevel unfocused.
+        // Real: focusing a layer-shell surface leaves every toplevel unfocused.
         let windows = map(vec![(14, window(14, "Sign in | Slack", "slack", false, false))]);
 
         assert_eq!(focused_window(&windows), None);
@@ -285,7 +275,7 @@ mod tests {
 
     #[test]
     fn focused_window_defaults_a_null_title_or_app_id_to_empty_rather_than_dropping_the_window() {
-        // § 2.9 declares both non-nullable, and both are `Option` on niri's wire.
+        // § 2.9 declares both non-nullable, while niri's wire uses `Option` for both.
         let mut bare = window(2, "", "", true, false);
         bare.title = None;
         bare.app_id = None;

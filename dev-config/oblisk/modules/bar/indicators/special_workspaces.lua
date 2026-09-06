@@ -1,15 +1,15 @@
--- Mirrors `SpecialWorkspaces.qml`: one circle per special workspace, Hyprland's scratchpads,
--- accent while it is shown on some output and glass while hidden, a click toggling it. Reads
--- `oblisk.workspaces.special` (ADR-0119), which is `nil` on a compositor without specials, so the
--- whole row is absent there; `LeftSide.qml` gates its loader on `supportsSpecialWorkspaces` the
--- same way. Also absent while the list is empty, so the row costs the bar no spacing gap then.
+-- Mirrors `SpecialWorkspaces.qml`: one circle per Hyprland scratchpad, accented while `shown_on` is
+-- set and glass while hidden; a click invokes `toggle_special`. `oblisk.workspaces.special` is
+-- `nil` without specials (ADR-0119), so the row
+-- is absent there, as `LeftSide.qml` gates on `supportsSpecialWorkspaces`; it also hides when empty
+-- to avoid a bar spacing gap.
 --
--- The glyph is the standing window's icon when `oblisk.applications` knows its `app_id`, else the
--- first two letters of the name after `special:`, which is the mirror's fallback; its keyword-to-
--- glyph table (`term`, `slack`...) is not carried, since the real icon covers what it guessed at.
+-- Use the standing window's icon when `oblisk.applications` knows its `app_id`; otherwise use the
+-- first two letters after `special:`. The mirror's keyword table (`term`, `slack`...) is omitted
+-- because the standing icon covers what that guess would provide.
 --
--- No tooltip: one would be a `popup` per special mounted in `shell.lua`, for a list that changes
--- as scratchpads come and go. The two letters carry the name well enough.
+-- No tooltip: it would require one `popup` per special mounted in `shell.lua`, one per changing
+-- scratchpad. Two letters carry the name.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")

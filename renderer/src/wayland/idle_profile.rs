@@ -1,71 +1,56 @@
-//! What the Renderer's poll loop actually did, printed on an interval, behind `OBLISK_PROFILE_IDLE`.
+//! Reports what wakes the Renderer's poll loop, what work it does, and its CPU cost when
+//! `OBLISK_PROFILE_IDLE` is set. It replaces ad-hoc probes: each question used to mean a temporary
+//! `eprintln!`, one reading, then deletion. ADR-0124 made polling timeout-free, so a wake with no
+//! work means an unnecessary re-arm and a spin. All figures here are release-build measurements.
+//! Idle costs 0.34% of a core; `dev` resolves roughly four times slower, so compare like builds.
 //!
-//! Every performance question asked of this loop so far has been answered by adding a temporary
-//! `eprintln!`, taking a reading, and deleting it again: how often it wakes, what wakes it, how
-//! much of a core it costs, and whether a turn that woke did any work at all. That last one is the
-//! bug shape this exists to catch. Since ADR-0124 the loop polls with no timeout, so a turn that
-//! wakes and finds nothing to do means something re-armed a wakeup for no reason -- a spin, and
-//! the difference between the 0.34% of a core this process costs idle and a hot laptop. That
-//! figure, and every other number here, is a release build: a `dev` build resolves roughly four
-//! times slower, so a debug reading compared against a release one invents a regression that is
-//! not there. Compare like with like, or the profile lies to you.
-//!
-//! Off unless `OBLISK_PROFILE_IDLE` is set, and off is genuinely free: the whole struct is behind
-//! an `Option` the loop checks with `if let`, so a build with it unset does two branch-predicted
-//! tests per turn and touches no clock. Set it to a report interval in seconds
-//! (`OBLISK_PROFILE_IDLE=10`); anything unparseable falls back to [`DEFAULT_INTERVAL_SECS`] rather
-//! than refusing to start, since the point is a diagnostic that turns on when asked.
+//! Unset means two predicted branches per turn and no clock reads: the profiler is behind an
+//! `Option`. Set a positive interval in seconds (`OBLISK_PROFILE_IDLE=10`); invalid input uses
+//! [`DEFAULT_INTERVAL_SECS`] instead of preventing startup.
 
 use std::time::{Duration, Instant};
 
 use nix::sys::resource::{UsageWho, getrusage};
 
-/// The report interval used when `OBLISK_PROFILE_IDLE` is set to something that isn't a positive
-/// number of seconds. Ten seconds is long enough that the idle case reports single-digit turns,
-/// which is what makes an unexpected hundred obvious at a glance.
+/// Fallback for a non-positive or invalid `OBLISK_PROFILE_IDLE`; ten seconds usually yields
+/// single-digit idle turns, making an unexpected hundred obvious.
 const DEFAULT_INTERVAL_SECS: u64 = 10;
 
-/// A turn's worth of work, filled in by the loop body once it knows what happened. Every field is
-/// something the loop already computed to decide what to do; nothing here is measured for the
-/// profile's sake.
+/// Work the loop already computed for one turn; the profiler measures none of these fields.
 #[derive(Clone, Copy, Default)]
 pub struct Turn {
-    /// `dispatch_pending` handed the handlers at least one Wayland event.
+    /// `dispatch_pending` handed handlers a Wayland event.
     pub dispatched: bool,
     /// `re_resolve_if_dirty` rebuilt the tree.
     pub re_resolved: bool,
     /// A keystroke changed a text field.
     pub typed: bool,
-    /// At least one background image decode landed.
+    /// A background image decode landed.
     pub decoded: bool,
-    /// How many `ActivateDraw` nonces this turn serviced.
+    /// `ActivateDraw` nonces serviced this turn.
     pub draws: usize,
     /// The turn reached `repaint_mapped_surfaces`.
     pub painted: bool,
-    /// How many surfaces that repaint actually drew and swapped. The gap between this and
-    /// `painted` is the point: `App::paint_surface` builds a display list for every mapped
-    /// surface and then declines the ones whose list is unchanged, so a window reporting
-    /// `resolve=18 drawn=0` is eighteen whole-scene re-resolves that moved not one pixel --
-    /// ADR-0044 decision 2's single global dirty flag, costing exactly what it was always going
-    /// to cost. Still a count the paint path decides for its own reasons, not for this one's.
+    /// Surfaces that repaint actually drew and swapped. `painted` can exceed this because
+    /// `App::paint_surface` builds every mapped surface's list, then skips unchanged lists:
+    /// `resolve=18 drawn=0` means eighteen whole-scene re-resolves moved no pixels, the cost of
+    /// ADR-0044 decision 2's single global dirty flag.
     pub drawn: usize,
 }
 
 impl Turn {
-    /// Whether this turn did anything. A woken turn that answers `false` is the spin signature.
+    /// A woken turn with `false` is the spin signature.
     fn did_work(self) -> bool {
         self.dispatched || self.re_resolved || self.typed || self.decoded || self.draws > 0
     }
 }
 
-/// Where a turn's time went. Unlike [`Turn`], these *are* measured for the profile's sake -- three
-/// `clock_gettime` calls a turn -- which is why [`Phases::start`] takes the switch: with the
-/// profile off every `mark` below is a branch on a `None` and nothing else, and the loop touches
-/// no clock. The split is the answer to what a `drawn=0` window provokes, so it is deliberately
-/// not a second environment variable: nobody has ever wanted one of these two without the other.
+/// Measured phase times. Each turn costs three `clock_gettime` calls when enabled; with the profile
+/// off, `mark` branches on `None` and the loop touches no clock. The split explains `drawn=0`, so
+/// it shares the main switch rather than adding another environment variable.
 #[derive(Clone, Copy, Default)]
 pub struct Phases {
-    /// Start of the phase currently being timed, or `None` when the profile is off.
+    /// Current phase start, or `None` when profiling is off.
     at: Option<Instant>,
     resolve: Duration,
     surface_state: Duration,
@@ -73,14 +58,13 @@ pub struct Phases {
 }
 
 impl Phases {
-    /// Begins a turn's timing, or doesn't. Pass `profile.is_some()`.
+    /// Starts timing when `profile.is_some()`.
     pub fn start(on: bool) -> Self {
         Self { at: on.then(Instant::now), ..Self::default() }
     }
 
-    /// Closes the current phase and opens the next. Called unconditionally after each phase's
-    /// block, including a block that didn't run: a skipped phase reporting zero is the truth, and
-    /// it keeps the next phase from being credited with time it didn't spend.
+    /// Closes the current phase and opens the next. Called after every phase, including skipped
+    /// ones, so a skipped phase reports zero instead of charging its neighbor.
     fn split(&mut self) -> Duration {
         let Some(at) = self.at else { return Duration::ZERO };
         let now = Instant::now();
@@ -101,17 +85,16 @@ impl Phases {
     }
 }
 
-/// Which of the two polled fds was ready. Both can be, and neither can: `poll` returning zero or
-/// an error leaves the loop to try again, which is itself worth counting.
+/// Readiness of the two polled fds. Both or neither can be ready; zero or an error is retried and
+/// counted as neither.
 #[derive(Clone, Copy)]
 pub struct Wake {
     pub wayland: bool,
     pub waker: bool,
 }
 
-/// Counts for one report window. Separated from the [`IdleProfile`] that owns the clock so
-/// [`render`] is a pure function of a window's worth of facts, testable without waiting ten
-/// seconds for one.
+/// One report window, separate from [`IdleProfile`] so [`render`] stays pure and testable without
+/// waiting ten seconds.
 #[derive(Default, Clone, Copy)]
 pub struct Counters {
     turns: u64,
@@ -132,9 +115,8 @@ pub struct Counters {
     repaint: Duration,
 }
 
-/// CPU consumed over a window, in seconds: the whole process against this one thread. The gap
-/// between them is the shaping worker, the socket thread and tokio, so a report where `process`
-/// is much larger than `main` says to go and look at a thread this loop doesn't own.
+/// CPU seconds for the whole process and this thread. Their gap is shaping, the socket thread, or
+/// tokio; a much larger `process` value points outside this loop.
 #[derive(Clone, Copy, Default)]
 struct Cpu {
     process: f64,
@@ -142,8 +124,7 @@ struct Cpu {
 }
 
 impl Cpu {
-    /// `getrusage` for both scopes, or zeros if the kernel refuses. A refused reading costs the
-    /// CPU columns, not the report.
+    /// `getrusage` for both scopes, or zeros if the kernel refuses; only CPU columns are lost.
     fn now() -> Self {
         let seconds = |who| {
             getrusage(who).map_or(0.0, |usage| {
@@ -161,7 +142,7 @@ impl Cpu {
     }
 }
 
-/// The loop's own accumulator: counts turns and wakes, and prints a line every `interval`.
+/// Accumulates turns and wakes, printing every `interval`.
 pub struct IdleProfile {
     interval: Duration,
     window_started: Instant,
@@ -170,9 +151,7 @@ pub struct IdleProfile {
 }
 
 impl IdleProfile {
-    /// `Some` only when `OBLISK_PROFILE_IDLE` is set. The one call site is the loop's setup, so
-    /// reading the environment here rather than at the call site keeps the whole feature in one
-    /// file.
+    /// `Some` only when `OBLISK_PROFILE_IDLE` is set.
     pub fn from_env() -> Option<Self> {
         let raw = std::env::var("OBLISK_PROFILE_IDLE").ok()?;
         let secs = raw.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
@@ -185,9 +164,7 @@ impl IdleProfile {
         })
     }
 
-    /// Records which fds woke the loop. Called at the poll site, so it attributes the wake that
-    /// ends this turn to the turn that runs next -- the same turn that will report the work the
-    /// wake caused.
+    /// Records the poll wake for the turn that runs next, which reports the work it caused.
     pub fn wake(&mut self, wake: Wake) {
         match (wake.wayland, wake.waker) {
             (true, true) => self.counters.wake_both += 1,
@@ -227,10 +204,8 @@ impl IdleProfile {
     }
 }
 
-/// One report line. Pure, so the shape below is a test rather than something to squint at in a
-/// log. `SPIN` is appended when most turns did nothing and there were enough of them to mean it:
-/// a handful of idle turns is ordinary (a Wayland event this client ignores), a hundred a second
-/// is the bug.
+/// Pure report formatting. `SPIN` needs at least 100 turns and more idle than busy turns: a few
+/// ignored Wayland events are ordinary; a hundred idle turns per second is the bug.
 fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
     let secs = window.as_secs_f64().max(f64::MIN_POSITIVE);
     let percent = |seconds: f64| seconds / secs * 100.0;
@@ -272,8 +247,6 @@ mod tests {
 
     #[test]
     fn a_turn_that_only_painted_still_counts_as_idle() {
-        // `painted` is a consequence of the other flags, never a cause, so a turn carrying it
-        // alone did not happen; counting it as work would hide exactly the spin this looks for.
         assert!(!Turn { painted: true, ..Turn::default() }.did_work());
         assert!(Turn { re_resolved: true, ..Turn::default() }.did_work());
         assert!(Turn { draws: 1, ..Turn::default() }.did_work());
@@ -287,16 +260,12 @@ mod tests {
 
     #[test]
     fn a_mostly_idle_window_is_marked_only_once_it_is_busy_enough_to_mean_something() {
-        // Nine turns out of ten idle, but only ten turns: an ordinary quiet window.
         assert!(!render(Duration::from_secs(10), &counters(10, 9), Cpu::default()).contains("SPIN"));
-        // The same ratio at a hundred times the rate is the loop eating a core for nothing.
         assert!(render(Duration::from_secs(10), &counters(1000, 900), Cpu::default()).contains("SPIN"));
     }
 
     #[test]
     fn a_window_that_resolved_without_drawing_says_so_in_both_columns() {
-        // The shape the whole phase split exists to make visible: every turn re-resolved the
-        // scene, the resolve was nearly all of the time, and not one surface reached the GPU.
         let c = Counters {
             turns: 18,
             re_resolved: 18,
@@ -324,8 +293,6 @@ mod tests {
 
     #[test]
     fn each_phase_is_credited_only_with_its_own_span() {
-        // A skipped phase reports zero rather than handing its neighbour the time, which is what
-        // makes `surfstate=0.0` on a turn that took the `re_resolved` branch a real signal.
         let mut phases = Phases::start(true);
         std::thread::sleep(Duration::from_millis(5));
         phases.mark_resolve();

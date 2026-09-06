@@ -1,56 +1,55 @@
-//! `oblisk.polkit`: the challenge polkitd is asking the user to answer, and the one action a
-//! dialog has against it (ADR-0114).
+//! `oblisk.polkit`: polkitd's pending challenge and the dialog's one action (ADR-0114).
 //!
-//! The D-Bus half is `crate::polkit`; this owns what a config reads and the reply that half is
-//! holding open. Built in `main.rs` and pushed from its loop rather than from `Capabilities`, like
-//! `lock`: its inputs (a bus callback, a `secure_submit` frame, a PAM answer) all land in that loop.
+//! `crate::polkit` owns D-Bus; this owns the config state and held reply. Like `lock`, `main.rs`
+//! builds and pushes it because the bus callback, `secure_submit` frame, and PAM answer all land
+//! in that loop.
 
 use tokio::sync::oneshot;
 
 use crate::polkit::{AgentError, BeginAuthenticationCall, first_unix_user_uid};
 
-/// `oblisk.polkit`'s payload. Everything but `active` is empty while it is false.
+/// `oblisk.polkit`'s payload. All fields except `active` are empty while it is false.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct PolkitState {
-    /// polkitd is waiting on the user for the request the fields below describe.
+    /// polkitd is waiting for the user; the remaining fields describe its request.
     pub active: bool,
-    /// What polkitd wants shown, already translated: "Authentication is required to ...".
+    /// Translated text polkitd wants shown, such as "Authentication is required to ...".
     pub message: String,
-    /// The action being authorised, e.g. `org.freedesktop.systemd1.manage-units`.
+    /// Action being authorized, e.g. `org.freedesktop.systemd1.manage-units`.
     pub action_id: String,
-    /// A themed icon name for the action, or empty when the caller set none.
+    /// Themed icon name, or empty when the caller set none.
     pub icon_name: String,
-    /// A password is with PAM and no answer has come back. `pam_unix` takes about a second, so this
-    /// is what a "checking" line reads. A second submit is refused while it is true.
+    /// A password is with PAM and unanswered. `pam_unix` takes about a second, so this drives a
+    /// checking line; a second submit is refused while true.
     pub authenticating: bool,
-    /// Why the last attempt failed, in words fit to draw, e.g. `"authentication failed"`. Empty
-    /// until an attempt fails; the prompt stays open for another try, and this clears with it.
+    /// Drawable reason for the last failure, e.g. `"authentication failed"`. Empty until failure;
+    /// the prompt stays open for another try and clears with it.
     pub error: String,
 }
 
 /// Every action `oblisk.polkit:invoke(...)` accepts (ADR-0037). `cancel` dismisses the prompt and
-/// tells polkitd's caller `Cancelled`. No doc comment on the variant: schemars would render one as
-/// `oneOf` rather than the bare `enum` the stub generator reads action names from.
+/// tells polkitd's caller `Cancelled`. Variants stay undocumented: schemars would render a doc as
+/// `oneOf`, not the bare `enum` read by the stub generator.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolkitAction {
     Cancel,
 }
 
-/// The `BeginAuthentication` call polkitd is waiting on, with the reply that ends it.
+/// polkitd's pending `BeginAuthentication` call and its completing reply.
 struct Pending {
     call: BeginAuthenticationCall,
     uid: u32,
     reply: oneshot::Sender<Result<(), AgentError>>,
 }
 
-/// What a PAM answer did to the pending challenge.
+/// Effect of a PAM answer on the pending challenge.
 pub enum Answer {
-    /// The cookie is not the challenge on screen: cancelled or replaced while PAM was busy.
+    /// Cookie no longer names the on-screen challenge: it was canceled or replaced during PAM.
     Stale,
     /// Recorded in `error`; the prompt stays open.
     Failed,
-    /// The challenge is over and polkitd has been told by the helper; `reply` ends the held call.
+    /// The challenge is over; the helper told polkitd and `reply` ends the held call.
     Succeeded { reply: oneshot::Sender<Result<(), AgentError>> },
 }
 
@@ -65,12 +64,11 @@ impl PolkitController {
         self.state.clone()
     }
 
-    /// polkitd's `BeginAuthentication`. One at a time: a second request while one is open is
-    /// answered `Cancelled` on the spot rather than queued or shown, since one password field
-    /// cannot be typing for two callers, and the refused caller either retries or reports the
-    /// failure itself. So is a request naming no `unix-user` identity, which this agent cannot
-    /// authenticate (it takes the first such identity; ADR-0028 left a picker for later). Returns
-    /// whether the request became the state.
+    /// polkitd's `BeginAuthentication`, admitting one at a time. A second request is answered
+    /// `Cancelled`, not queued or shown, because one password field cannot serve two callers; the
+    /// refused caller retries or reports the failure. A request without `unix-user` is also
+    /// canceled; this agent takes the first identity
+    /// (ADR-0028 left a picker for later). Returns whether the request became state.
     pub fn begin(&mut self, call: BeginAuthenticationCall, reply: oneshot::Sender<Result<(), AgentError>>) -> bool {
         let Some(uid) = first_unix_user_uid(&call.identities) else {
             eprintln!("polkit: challenge {:?} carried no unix-user identity; cancelling it", call.cookie);
@@ -93,9 +91,8 @@ impl PolkitController {
         true
     }
 
-    /// Ends the pending challenge with `Cancelled`: the dialog's own cancel (`None`), or polkitd's
-    /// `CancelAuthentication` for `Some(cookie)`, which only applies to the challenge it names.
-    /// Returns whether anything was open to cancel.
+    /// Ends the challenge with `Cancelled`: dialog cancel (`None`) or polkitd's
+    /// `CancelAuthentication` for the matching `Some(cookie)`. Returns whether one was open.
     pub fn cancel(&mut self, cookie: Option<&str>) -> bool {
         let matches = self.pending.as_ref().is_some_and(|p| cookie.is_none_or(|c| c == p.call.cookie));
         if !matches {
@@ -108,16 +105,16 @@ impl PolkitController {
         true
     }
 
-    /// Admits one PAM conversation for the pending challenge and marks it started, or refuses:
-    /// nothing pending, or one already in flight (a held Enter must not spawn a worker per repeat).
+    /// Admits and marks one PAM conversation, refusing when none is pending or one is already in
+    /// flight; held Enter must not spawn a worker per repeat.
     pub fn try_begin_authentication(&mut self) -> Option<(u32, String)> {
         let pending = self.pending.as_ref().filter(|_| !self.state.authenticating)?;
         self.state.authenticating = true;
         Some((pending.uid, pending.call.cookie.clone()))
     }
 
-    /// Applies the PAM answer for `cookie`. Success hands back the reply to end the held call with;
-    /// the controller has already forgotten the challenge.
+    /// Applies the PAM answer for `cookie`. Success returns the reply that ends the held call; the
+    /// controller has already forgotten the challenge.
     pub fn record_outcome(&mut self, cookie: &str, outcome: shared::PamOutcome) -> Answer {
         if !self.pending.as_ref().is_some_and(|p| p.call.cookie == cookie) {
             return Answer::Stale;
@@ -133,7 +130,7 @@ impl PolkitController {
     }
 }
 
-/// `oblisk.polkit`'s action dispatch (ADR-0037). Returns whether the state changed.
+/// `oblisk.polkit` action dispatch (ADR-0037). Returns whether state changed.
 pub fn dispatch(controller: &mut PolkitController, envelope: &shared::CommandEnvelope) -> bool {
     let Some(action) = crate::parse_action::<PolkitAction>(&envelope.params) else { return false };
     match action {

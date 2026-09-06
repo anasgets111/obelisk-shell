@@ -1,29 +1,25 @@
--- Mirrors `Modules/Global/WallpaperPicker.qml`: a grid of the folder's files with a search box
--- over it and the settings beside it, a click or Enter applying one to the chosen screen or to
--- every screen at once.
+-- Mirrors `WallpaperPicker.qml`: searchable file grid, settings beside it, click/Enter applies to
+-- the chosen screen or all screens.
 --
--- ## The engine pieces this leans on
+-- ## Engine pieces
 --
--- The files are `oblisk.files` following the folder (ADR-0120), so the grid is a `list` over a
--- `computed` and nothing here scans anything. Every tile is an `image` with `async = true`
--- (ADR-0122): the pool decodes each 4K file down to a tile's worth of pixels while the card is
--- already up, and the tiles fill in as they land, where fifty inline decodes would hold the whole
--- shell for a second on open. The search box is the launcher's: `autofocus`, `on_navigate`,
--- `on_submit`, a two-stage Escape.
+-- `oblisk.files` follows the folder (ADR-0120), so the grid lists a `computed` and does no
+-- scanning.
+-- Each tile uses `image` with `async = true` (ADR-0122); the pool downsizes 4K files while the card
+-- is up, avoiding fifty inline decodes that held the shell for one second on open. Search reuses
+-- launcher's autofocus/navigation/submit and two-stage Escape.
 --
--- ## The grid is rows
+-- ## Grid rows
 --
--- There is no wrapping layout, so `rows` chunks the filtered list into rows of
--- `theme.wallpaper_columns` and the `list` stacks them. Tab and Shift-Tab walk one tile, Up and
--- Down walk a row, since `on_navigate` has no left and right; the mirror's arrow keys do the same
--- across its `GridView`.
+-- No wrapping layout: `rows` chunks into `theme.wallpaper_columns`, then `list` stacks them. Tab /
+-- Shift-Tab move one tile; Up/Down move a row because `on_navigate` has no left/right, matching the
+-- mirror's `GridView`.
 --
--- ## What is not carried over
+-- ## Not carried over
 --
--- The Displays tab, which is `DisplaySettings.qml` and a feature of its own. The transition,
--- theme and dark-mode rows: there is no animation model (ADR-0055 decision 4) and this config has
--- one theme. The mirror's thumbnail cache under `~/.cache/thumbnails`: the pool's downscale is what
--- makes a tile cheap here, and a decode is once per generation.
+-- Displays tab (`DisplaySettings.qml`), transition/theme/dark-mode rows (no animation model,
+-- ADR-0055 decision 4, and this config has one theme), and `~/.cache/thumbnails`: pool downscale
+-- makes tiles cheap and each generation decodes once.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -35,20 +31,20 @@ local icon_button = require("components.icon_button")
 
 local SCROLL = scroll("wallpaper_grid")
 local COLUMNS = theme.wallpaper_columns
--- `"all"` is the mirror's "All displays" option; no connector is spelled that way.
+-- `"all"` is the mirror's "All displays" option; no connector has that name.
 local ALL = "all"
 
 local query = state("wallpaper_query", "")
 local selected_path = state("wallpaper_selected", "")
 local monitor = state("wallpaper_monitor", ALL)
--- Plain locals, not state: what the field held a keystroke ago, for Escape's two stages.
+-- Plain locals, not state: previous field text for Escape's two stages.
 local typed = ""
 local emptied_a_query = false
 
 -- ## Sizes
 --
--- The tile is what the grid card's inner width leaves each of the four columns, so the grid never
--- has a gutter down its right edge. Sixteen by nine, the mirror's `cellHeight`.
+-- Tile width is the grid card's inner width divided across four columns, so no right gutter. Height
+-- is 16:9, matching the mirror's `cellHeight`.
 local card_padding = theme.spacing.lg
 local grid_padding = theme.spacing.sm
 local tile_gap = theme.spacing.xs
@@ -60,7 +56,7 @@ local grid_inner = theme.wallpaper_picker_width
 local TILE_WIDTH = math.floor((grid_inner - (COLUMNS - 1) * tile_gap) / COLUMNS)
 local TILE_HEIGHT = math.floor(TILE_WIDTH * 9 / 16)
 
--- ## The list
+-- ## List
 
 local function entries_of(f)
     local folder = wallpaper.folder_in(f)
@@ -94,13 +90,12 @@ local rows = filtered:map(function(entries)
     return chunks
 end)
 
--- ## Which screens a click lands on, and what they show now
+-- ## Click target and current display state
 --
--- `targetMonitorNames` and `currentWallpaperPath`: every screen under "all", else the one; the
--- path they all agree on, or `""` when they differ, so the applied badge and the ring go nowhere
--- rather than to one of several answers. A screen unplugged while chosen reads as "all",
--- `onMonitorOptionsChanged`, decided where it is read rather than written back, since
--- `oblisk.screens` is a plain signal with no `on_change`.
+-- "all" targets every screen, otherwise one. The current path is the common path or `""` when
+-- screens differ, so the badge and ring do not choose among conflicting answers. An unplugged
+-- selection reads as "all" (`onMonitorOptionsChanged`), because `oblisk.screens` has no
+-- `on_change`.
 local function choice_among(chosen, screens)
     for _, screen in ipairs(screens or {}) do
         if screen.name == chosen then
@@ -153,8 +148,9 @@ local current_fit = computed({ wallpaper.all(), oblisk.screens, effective_monito
     return common(fits)
 end)
 
--- What the ring is on: `selected_path` where it is still showing, else the applied file where it
--- is, else the first tile. One `computed` for the grid; each tile asks one question of it.
+-- Ring `selected_path` if visible, else the applied file, else the first tile. One `computed`
+-- serves
+-- the grid; each tile asks it once.
 local effective_selected = computed({ selected_path, current_path, filtered }, function(chosen, applied, entries)
     local first = ""
     for _, entry in ipairs(entries or {}) do
@@ -262,7 +258,7 @@ local function tile(entry)
                 width = "Fill",
                 height = "Fill",
             },
-            -- The name strip, the mirror's `shadowColorStrong` band along the bottom.
+            -- Bottom name strip, the mirror's `shadowColorStrong` band.
             rect {
                 width = "Fill",
                 height = theme.control.md,
@@ -273,7 +269,7 @@ local function tile(entry)
                     cell(entry.name, theme.FG, theme.font.xs, { width = "Fill", align = "Center", align_v = "Center" }),
                 },
             },
-            -- The applied badge, top left.
+            -- Applied badge, top left.
             rect {
                 width = theme.control.xs,
                 height = theme.control.xs,
@@ -315,9 +311,7 @@ local grid = list {
 
 -- ## Empty states
 --
--- Four things the grid can have to say instead of tiles, one line each, in the order they are
--- checked: the folder cannot be read, the listing has not landed, the folder is empty, nothing
--- matched.
+-- In order: folder unreadable, listing pending, folder empty, no match.
 local folder_state = computed({ oblisk.files, trimmed }, function(f, needle)
     local folder = wallpaper.folder_in(f)
     if folder == nil or not folder.ready then
@@ -358,7 +352,7 @@ local empty_states = {
     panel_empty_state("No results found", state_is("no_match")),
 }
 
--- ## The search box, `OInput` at the top of the card
+-- ## Search box, `OInput` at the top of the card
 
 local search = rect {
     width = "Fill",
@@ -409,11 +403,10 @@ local search = rect {
     },
 }
 
--- ## The sidebar, `OComboBox` rows as segmented rows
+-- ## Sidebar, `OComboBox` rows as segments
 --
--- A combo box is a popup this config has not built, and each of these has at most a handful of
--- answers, so every answer is a button in a row and the chosen one is accent. `choice` builds one
--- such button; the monitor row is a `list` because the screens can change under it.
+-- This config has no combo popup. Each small option set is a segmented row of buttons; `choice`
+-- builds one. The monitor row is a `list` because screens can change.
 local function choice(value, label, current, on_pick, slot)
     local hovered = hover(slot)
     local chosen = current:map(function(now)
@@ -532,7 +525,7 @@ local body = row {
     },
 }
 
--- Centred in the space under the bar, on the launcher's terms.
+-- Centered below the bar, like the launcher.
 local card_margin = oblisk.screens:map(function(screens)
     local screen = screens and screens[1]
     if not (screen and screen.width and screen.height) then

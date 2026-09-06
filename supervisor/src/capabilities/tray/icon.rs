@@ -6,8 +6,8 @@ use crate::capabilities::shm_icons::{self, PngEncodeError};
 
 use super::MAX_PIXMAP_DIMENSION;
 
-/// The `/dev/shm/oblisk-$UID` subdirectory every tray pixmap is spooled into. Named once because
-/// three call sites now agree on it: the write, the per-item delete, and the startup sweep.
+/// `/dev/shm/oblisk-$UID` subdirectory for tray pixmaps, shared by writes, per-item deletion, and
+/// startup sweep.
 pub(super) const SPOOL_SUBDIR: &str = "tray";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,9 +17,9 @@ pub(super) struct IconPixmap {
     pub(super) bytes: Vec<u8>,
 }
 
-/// Bounds-checks one raw `IconPixmap` (docs/oblisk-supervisor-services-dbus.md §2.1): square,
-/// non-empty, capped at [`MAX_PIXMAP_DIMENSION`], and its byte length matches `width * height *
-/// 4` (ARGB32, 4 bytes/pixel) exactly.
+/// Validates one raw `IconPixmap` (docs/oblisk-supervisor-services-dbus.md §2.1): non-empty square,
+/// at most
+/// [`MAX_PIXMAP_DIMENSION`], with exactly `width * height * 4` ARGB32 bytes.
 fn pixmap_is_valid(width: i32, height: i32, byte_len: usize) -> bool {
     width > 0
         && width == height
@@ -27,8 +27,7 @@ fn pixmap_is_valid(width: i32, height: i32, byte_len: usize) -> bool {
         && (width as usize) * (height as usize) * 4 == byte_len
 }
 
-/// The single largest pixmap that passes [`pixmap_is_valid`] (ADR-0031: "no target-size guess,
-/// largest capped at 128" -- downscaling a large source always beats upscaling a small one).
+/// Largest valid pixmap (ADR-0031: no target-size guess, cap at 128; downscaling beats upscaling).
 pub(super) fn largest_valid_pixmap(pixmaps: &[IconPixmap]) -> Option<&IconPixmap> {
     pixmaps
         .iter()
@@ -38,30 +37,19 @@ pub(super) fn largest_valid_pixmap(pixmaps: &[IconPixmap]) -> Option<&IconPixmap
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum IconSource {
-    /// `IconName` named a file inside the item's own `IconThemePath` (ADR-0074). Wins over
-    /// [`Self::Name`], because a name that resolved to a concrete file has no business being looked
-    /// up again in a session theme that has never heard of it.
+    /// `IconName` resolved inside the item's `IconThemePath` (ADR-0074), ahead of [`Self::Name`].
     ThemePathFile(String),
-    /// `IconName` was non-empty -- preferred over a pixmap (ADR-0031), skips the whole
-    /// decode/PNG-spool pipeline.
+    /// Non-empty `IconName`, preferred over pixmaps (ADR-0031), so no decode or PNG spool occurs.
     Name(String),
-    /// `IconName` was empty but at least one pixmap passed bounds-checking.
+    /// Empty `IconName` with at least one valid pixmap.
     Pixmap,
     /// Neither source is usable.
     None,
 }
 
-/// The file `icon_name` names inside the item's own `IconThemePath`, or `None` when the item
-/// declares no such directory or holds no such file (ADR-0074).
-///
-/// Three spellings tried, because the spec says only "a directory of icons" and leaves the layout
-/// to the application: the bare name for a name that already carries its extension, then `.png` and
-/// `.svg`, which is what the ones that do this actually ship.
-///
-/// `IconThemePath` is an application-supplied path, so a name containing `/` or `..` would reach
-/// outside it. Rejected rather than sanitized: a real `IconName` is a themed icon name and never
-/// contains either, and the alternative is path canonicalization to decide what is inside a
-/// directory the shell does not own.
+/// Finds `icon_name` in the item's `IconThemePath`, trying the bare name, `.png`, then `.svg`.
+/// The spec says only "a directory of icons" and leaves layout to the application. Rejects `/`
+/// and `\`; a name containing `/` or `..` could reach outside it.
 pub(super) fn theme_path_file(theme_path: &str, icon_name: &str) -> Option<String> {
     if theme_path.is_empty() || icon_name.is_empty() || icon_name.contains('/') || icon_name.contains('\\') {
         return None;
@@ -74,10 +62,8 @@ pub(super) fn theme_path_file(theme_path: &str, icon_name: &str) -> Option<Strin
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Which icon source to use, and whether a pixmap decode is even necessary (ADR-0031's
-/// IconName-preference decision) -- kept separate from the pixmap *value* so this stays a
-/// cheap, pure decision; the caller re-derives the actual largest pixmap via
-/// [`largest_valid_pixmap`] only when this returns [`IconSource::Pixmap`].
+/// Chooses the source and whether decoding is needed (ADR-0031). This stays a cheap, pure decision;
+/// the caller re-derives the largest pixmap only for [`IconSource::Pixmap`].
 pub(super) fn resolve_icon_source(icon_name: &str, pixmaps: &[IconPixmap], theme_path: &str) -> IconSource {
     if let Some(path) = theme_path_file(theme_path, icon_name) {
         IconSource::ThemePathFile(path)
@@ -90,8 +76,8 @@ pub(super) fn resolve_icon_source(icon_name: &str, pixmaps: &[IconPixmap], theme
     }
 }
 
-/// Encodes a bounds-checked ARGB32 (network byte order: A, R, G, B per pixel) buffer to a PNG
-/// byte stream via the `png` crate (ADR-0031: pure Rust, encode-only, minimal dependency tree).
+/// Encodes bounds-checked ARGB32 bytes (network order A, R, G, B) to PNG via `png` (ADR-0031:
+/// pure Rust, encode-only, minimal dependency tree).
 fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>, PngEncodeError> {
     let mut rgba = Vec::with_capacity(argb.len());
     let (chunks, _remainder) = argb.as_chunks::<4>();
@@ -113,14 +99,9 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
     Ok(buffer)
 }
 
-/// Writes `pixmap` (already bounds-checked) as a PNG to
-/// `/dev/shm/oblisk-$UID/tray/{filename_stem}.png` ([`shm_icons::write_png`]), creating the
-/// directory tree if missing. Same path overwritten in place on every call -- no cache-busting
-/// (ADR-0031).
-///
-/// `filename_stem` is the item's sanitized unique name for its base icon and that plus a variant
-/// suffix for the other two, so an item's attention and overlay pixmaps do not overwrite each other
-/// or the icon they sit beside (ADR-0074).
+/// Writes a validated pixmap to `/dev/shm/oblisk-$UID/tray/{filename_stem}.png`
+/// ([`shm_icons::write_png`]), creating the tree and overwriting the same path (no cache-busting,
+/// ADR-0031). Base, attention, and overlay stems differ so their files do not collide (ADR-0074).
 pub(super) fn write_icon_png(filename_stem: &str, pixmap: &IconPixmap) -> std::io::Result<String> {
     let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes)
         .map_err(std::io::Error::other)?;
@@ -135,8 +116,7 @@ mod tests {
 
     #[test]
     fn an_items_own_theme_path_beats_the_session_theme() {
-        // The whole point: an application that ships artwork the session theme has never heard of
-        // gets that artwork, instead of a name the renderer will look up and miss.
+        // Prefer artwork the session theme does not know.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("my-app.png"), b"not really a png").unwrap();
         let found = theme_path_file(dir.path().to_str().unwrap(), "my-app").expect("the shipped file");
@@ -169,8 +149,7 @@ mod tests {
 
     #[test]
     fn an_icon_name_cannot_escape_the_directory_it_was_given() {
-        // `IconThemePath` and `IconName` both come from the application. A themed icon name never
-        // contains a separator, so a name that does is refused rather than cleaned up.
+        // A themed name has no separator; refuse one rather than clean it up.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("real.png"), b"x").unwrap();
         assert_eq!(theme_path_file(dir.path().to_str().unwrap(), "../../etc/passwd"), None);
@@ -179,8 +158,7 @@ mod tests {
 
     #[test]
     fn no_theme_path_and_no_name_still_reaches_the_pixmap() {
-        // The regression this signature change could have caused: an empty theme path must not
-        // shadow the pixmap branch every Chromium tray item depends on.
+        // Empty theme paths must not shadow Chromium's pixmap branch.
         let pixmaps = vec![IconPixmap { width: 2, height: 2, bytes: vec![0; 16] }];
         assert_eq!(resolve_icon_source("", &pixmaps, ""), IconSource::Pixmap);
     }
@@ -267,11 +245,11 @@ mod tests {
         assert_eq!(resolve_icon_source("", &invalid, ""), IconSource::None);
     }
 
-    // ---- encode_argb32_to_png (round trip through the real png crate, both encode and decode) ----
+    // ---- encode_argb32_to_png round trip through the real png crate ----
 
     #[test]
     fn encode_argb32_to_png_round_trips_a_known_pixel() {
-        // One 1x1 pixel: A=0x11, R=0x22, G=0x33, B=0x44 (network byte order per the SNI spec).
+        // One 1x1 SNI pixel: A=0x11, R=0x22, G=0x33, B=0x44.
         let argb = vec![0x11, 0x22, 0x33, 0x44];
         let png_bytes = encode_argb32_to_png(1, 1, &argb).expect("encoding must succeed");
 
@@ -281,7 +259,7 @@ mod tests {
         let info = reader.next_frame(&mut buf).expect("valid PNG frame");
         let rgba = &buf[..info.buffer_size()];
 
-        // R, G, B, A -- the encoder must reorder from the source's A, R, G, B.
+        // PNG stores R, G, B, A, so the encoder must reorder ARGB.
         assert_eq!(rgba, &[0x22, 0x33, 0x44, 0x11]);
     }
 }

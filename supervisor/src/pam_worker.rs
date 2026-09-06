@@ -1,17 +1,11 @@
-//! Real PAM conversation, closing ADR-0015. Both halves of ADR-0028's design live here, sharing
-//! the wire protocol (`shared::PamOutcome` over `shared::framing`) and the PAM service name
-//! ([`pam_service`]). PAM runs in a re-exec'd worker, not inline, because `nonstick`'s FFI blocks
-//! and this codebase forbids a blocking call inline in the async Supervisor (ADR-0028).
-//! [`run_worker`] is the worker side: runs when re-exec'd with `OBLISK_PAM_WORKER=1` (`main.rs`'s
-//! branch, ahead of D-Bus/tokio-runtime/audio-thread setup), drives one blocking `nonstick`
-//! transaction against its stdin password, and writes one [`shared::PamOutcome`] frame to stdout.
-//! [`run_authentication`] is the spawn side: re-execs this binary as a worker
-//! ([`crate::process::spawn_group_leader_stdio_piped`]), exchanges the password/outcome over piped
-//! stdin/stdout, and reports the outcome back over a channel to `main.rs`'s loop, the only place
-//! allowed to order an unlock (ADR-0052). [`run_polkit_helper`] is its polkit sibling and does not
-//! use the worker at all: polkitd only accepts `AuthenticationAgentResponse2` from uid 0, so the
-//! conversation runs in polkit's own setuid helper, which makes that call itself (ADR-0114).
-//! No reuse of `RendererFrame`/`SupervisorFrame`: a different boundary than Supervisor<->Renderer.
+//! Real PAM conversation, closing ADR-0015. ADR-0028's halves share `shared::PamOutcome` over
+//! `shared::framing` and [`pam_service`]. Blocking `nonstick` FFI runs in a re-exec'd worker, not
+//! the async Supervisor. [`run_worker`] handles `OBLISK_PAM_WORKER=1`, reads one stdin password,
+//! runs one transaction, and writes one outcome frame. [`run_authentication`] re-execs via
+//! [`crate::process::spawn_group_leader_stdio_piped`], exchanges piped stdin/stdout, and reports
+//! to `main.rs`, the only unlock authority (ADR-0052). [`run_polkit_helper`] uses polkit's setuid
+//! helper instead: polkitd accepts `AuthenticationAgentResponse2` only from uid 0 (ADR-0114).
+//! It does not reuse `RendererFrame`/`SupervisorFrame`, which cross a different boundary.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,25 +14,21 @@ use std::time::Duration;
 use nonstick::{ConversationAdapter, Transaction};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Where PAM keeps its per-service stacks. A constant so [`pam_service_in`] can be pointed at a
-/// temporary directory by its tests without a real `/etc` to install into.
+/// PAM service-stack directory. A constant lets [`pam_service_in`] tests use a temporary directory.
 const PAM_CONFIG_DIR: &str = "/etc/pam.d";
 
-/// The service Oblisk's own stack is installed as (`packaging/pam.d/oblisk`).
+/// Service name for Oblisk's installed stack (`packaging/pam.d/oblisk`).
 const OBLISK_SERVICE: &str = "oblisk";
 
-/// What [`run_conversation`] authenticates against when `packaging/pam.d/oblisk` isn't installed.
-/// This system has no `/etc/pam.d/polkit-1`, so `"login"` is the disclosed fallback (ADR-0028).
+/// [`run_conversation`] fallback when `packaging/pam.d/oblisk` is absent. This system lacks
+/// `/etc/pam.d/polkit-1`, so `"login"` is the disclosed fallback (ADR-0028).
 const FALLBACK_SERVICE: &str = "login";
 
-/// The PAM service this worker authenticates against: Oblisk's own stack when the admin has
-/// installed one, the console-login stack otherwise. Chosen by probing, not hardcoding: a missing
-/// service file makes PAM fall through to `/etc/pam.d/other`, which is `pam_deny` on a stock Arch
-/// install, so naming `oblisk` unconditionally would turn "the packager forgot one file" into "the
-/// lock screen refuses every correct password", and failing closed locks the user out of their own
-/// machine. The probe is a `stat` per authentication (once per typed password), deliberately
-/// uncached: an admin installing the file shouldn't have to restart the shell, least convenient
-/// exactly when the session is locked.
+/// Uses Oblisk's stack when installed, otherwise the console-login stack. Probing avoids PAM's
+/// `/etc/pam.d/other` fallback, `pam_deny` on stock Arch: hardcoding `oblisk` would turn a missing
+/// package file into a lock screen rejecting every correct password, while failing closed locks
+/// out the user. `stat` runs once per authentication, deliberately uncached so installing the file
+/// takes effect without restarting the locked shell.
 fn pam_service_in(pam_config_dir: &std::path::Path) -> &'static str {
     if pam_config_dir.join(OBLISK_SERVICE).exists() { OBLISK_SERVICE } else { FALLBACK_SERVICE }
 }
@@ -47,24 +37,17 @@ fn pam_service() -> &'static str {
     pam_service_in(std::path::Path::new(PAM_CONFIG_DIR))
 }
 
-/// Ceiling on the whole write-password/read-outcome exchange with the worker (`exchange_over`),
-/// not any single PAM call inside it. Generous relative to `reload::PbaTimings`'s 2-3 second
-/// deadlines, since PAM is human-paced (a network-backed module, a fingerprint retry loop) but
-/// still bounded: without it a wedged worker never returns from `read_json_frame`, and
-/// [`run_authentication`]'s spawned task would sit forever holding a plaintext password while the
-/// prompt that started it stays `authenticating`.
+/// Ceiling on the whole worker exchange (`exchange_over`), not one PAM call. It exceeds
+/// `reload::PbaTimings`'s 2-3 seconds because PAM may be human-paced (network module, fingerprint
+/// retry), but bounds a wedged `read_json_frame` and prevents a spawned task holding plaintext
+/// forever while the prompt remains `authenticating`.
 const PAM_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Oblisk's flow has only one pre-supplied password known before the conversation starts
-/// (ADR-0028), so [`ConversationAdapter::masked_prompt`] always answers with it regardless of
-/// prompt text; `prompt`/`radio_prompt`/`binary_prompt` are never expected, so `ConversationError`
-/// is correct if PAM asks one anyway. Its `OsString` is a plain, non-zeroizable copy of the
-/// password, forced by PAM's C API boundary (`char*`). Everything else is zeroized: the source
-/// `Vec<u8>` in [`run_worker`] after the conversation completes, and this struct's own `password`,
-/// explicitly by `run_conversation` via the shared `Rc<RefCell<_>>` handle right after the PAM
-/// calls finish. Since `masked_prompt` only takes `&self`, it could only be zeroized from `Drop`
-/// (a backup per ADR-0005): the `Drop` impl below covers the path where `run_conversation` never
-/// reaches its own call (an FFI panic).
+/// ADR-0028 supplies one password before the conversation, so `masked_prompt` returns it for any
+/// text. `prompt`/`radio_prompt`/`binary_prompt` are unexpected and return `ConversationError`.
+/// PAM's `char*` boundary forces a plain, non-zeroizable `OsString` copy. The worker's source
+/// `Vec<u8>` and this struct's `Rc<RefCell<_>>` bytes are zeroized after PAM calls; `Drop` is the
+/// ADR-0005 backstop if an FFI panic skips that explicit call.
 struct PasswordConversation {
     password: Rc<RefCell<Vec<u8>>>,
 }
@@ -94,8 +77,8 @@ impl ConversationAdapter for PasswordConversation {
     }
 }
 
-/// Maps a `nonstick` transaction failure to the [`shared::PamOutcome`] variant the spawn side
-/// should react to. Pure, so it's directly unit-testable without any real PAM call.
+/// Maps a `nonstick` failure to the [`shared::PamOutcome`] the spawn side handles. Pure and
+/// directly testable without PAM.
 fn outcome_for_error(err: nonstick::ErrorCode) -> shared::PamOutcome {
     use nonstick::ErrorCode::*;
     match err {
@@ -107,8 +90,8 @@ fn outcome_for_error(err: nonstick::ErrorCode) -> shared::PamOutcome {
     }
 }
 
-/// Drives one whole PAM transaction (`pam_start` via `TransactionBuilder`, then `authenticate` and
-/// `account_management`) against `username`, answering every prompt with `password`.
+/// Runs `pam_start` via `TransactionBuilder`, then `authenticate` and `account_management`, using
+/// `password` for every prompt.
 fn run_conversation(username: &str, password: &[u8]) -> shared::PamOutcome {
     let password = Rc::new(RefCell::new(password.to_vec()));
     let conversation = PasswordConversation { password: Rc::clone(&password) };
@@ -127,16 +110,14 @@ fn run_conversation(username: &str, password: &[u8]) -> shared::PamOutcome {
         }
         Err(err) => shared::PamOutcome::StartFailed(format!("{err:?}")),
     };
-    // Explicit call, not left to PasswordConversation's own Drop alone (ADR-0005): the Rc clone
-    // reaches the same backing bytes regardless of whether txn has already dropped, and a zeroize
-    // on an already-zeroized buffer is a harmless no-op.
+    // Explicit ADR-0005 call, not only `PasswordConversation::Drop`: the Rc reaches the same bytes
+    // whether `txn` already dropped, and zeroizing twice is harmless.
     shared::Zeroize::zeroize(&mut *password.borrow_mut());
     outcome
 }
 
-/// Reads `reader` (stdin, locked) to exhaustion. `read_to_end` can leave real password bytes in
-/// the buffer on a mid-read I/O error, so `?`-ing straight out would drop them unscrubbed into
-/// freed heap memory: zeroize whatever was read before propagating the error.
+/// Reads `reader` to EOF. On a mid-read error, zeroize bytes already in the buffer before
+/// propagating; otherwise `?` would drop password bytes unscrubbed.
 fn read_password(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     let mut password = Vec::new();
     if let Err(err) = reader.read_to_end(&mut password) {
@@ -146,13 +127,10 @@ fn read_password(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     Ok(password)
 }
 
-/// The worker side of ADR-0028: runs when this binary is re-exec'd with `OBLISK_PAM_WORKER=1` set
-/// (`main.rs`'s branch, ahead of D-Bus/tokio-runtime/audio-thread setup, must never touch any of
-/// that). Reads the password off stdin (the spawn side closes the write half so this hits EOF),
-/// drives the PAM conversation, zeroizes the password, and writes one [`shared::PamOutcome`] frame
-/// to stdout. [`run_conversation`] is entirely synchronous/blocking, since `nonstick`'s FFI calls
-/// block anyway; only the final `write_json_frame` needs an async executor (`shared::framing` is
-/// built on `tokio::io::AsyncWrite`), so `new_current_thread()` is the minimal correct runtime.
+/// ADR-0028 worker path for `OBLISK_PAM_WORKER=1`. `main.rs` enters it before D-Bus/runtime/audio
+/// setup. Read stdin until the spawn side closes it, run PAM, zeroize, and write one outcome frame.
+/// `run_conversation` is blocking; only `write_json_frame` needs an executor because
+/// `shared::framing` uses `tokio::io::AsyncWrite`, so `new_current_thread()` is sufficient.
 pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
     let username = std::env::var("OBLISK_PAM_USERNAME")?;
 
@@ -169,14 +147,12 @@ pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resolve `uid` to a username and run the whole worker round trip. `Err` carries why the
-/// conversation never happened. Borrows `secret` and never zeroizes it: [`run_authentication`]
-/// scrubs it on every path, and scrubbing here too would make ownership harder to audit.
+/// Resolves `uid` and runs the worker round trip. Borrows, but never zeroizes, `secret`;
+/// [`run_authentication`] owns scrubbing on every path.
 ///
-/// ponytail: `User::from_uid` is a blocking libc call (`getpwuid_r`), inline here rather than via
-/// `spawn_blocking`, since the lookup is local-passwd-file-fast (no NSS/LDAP) and rare (one
-/// challenge or lock submission at a time; ADR-0025's precedent for PBA swaps). Upgrade:
-/// `spawn_blocking` if a networked NSS backend appears.
+/// ponytail: `User::from_uid` blocks in libc (`getpwuid_r`), but stays inline because local passwd
+/// lookup is fast, has no NSS/LDAP, and is rare (one challenge/lock submission; ADR-0025's PBA
+/// precedent). Upgrade: `spawn_blocking` if a networked NSS backend appears.
 async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome, String> {
     let username = username_for(uid)?;
     spawn_worker_and_exchange(&username, secret).await.map_err(|err| format!("pam worker failed: {err}"))
@@ -190,15 +166,14 @@ fn username_for(uid: u32) -> Result<String, String> {
     }
 }
 
-/// polkit's own setuid helper: runs PAM as root and, on success, invokes
-/// `AuthenticationAgentResponse2` itself -- the one method polkitd accepts only from uid 0, which is
-/// why an agent running as the session user cannot answer a challenge through [`run_worker`]. The
-/// path libpolkit-agent uses; Quickshell's agent reaches it through that library.
+/// polkit's setuid helper runs PAM as root and invokes `AuthenticationAgentResponse2`, which
+/// polkitd accepts only from uid 0. A session-user agent cannot answer through [`run_worker`]. This
+/// is libpolkit-agent's path; Quickshell's agent reaches it through that library.
 const POLKIT_HELPER: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
 
-/// [`run_authentication`]'s polkit sibling (ADR-0114): same spawn-and-report shape, same `Drop`
-/// backstop, but the conversation is [`POLKIT_HELPER`]'s. `Success` here means polkitd has already
-/// been told; the caller only has to answer the held `BeginAuthentication`.
+/// [`run_authentication`]'s polkit sibling (ADR-0114): same spawn/report and `Drop` backstop, but
+/// the conversation is [`POLKIT_HELPER`]'s. `Success` means polkitd was told; the caller answers
+/// the held `BeginAuthentication`.
 pub async fn run_polkit_helper(
     uid: u32,
     cookie: String,
@@ -233,10 +208,9 @@ async fn authenticate_via_helper(uid: u32, cookie: &str, secret: &[u8]) -> Resul
     }
 }
 
-/// The helper's line protocol, as libpolkit-agent's `polkitagentsession.c` speaks it: the cookie
-/// goes in first; every `PAM_PROMPT_ECHO_OFF`/`PAM_PROMPT_ECHO_ON` line is answered with the one
-/// password (ADR-0028's one-shot conversation); `PAM_ERROR_MSG`/`PAM_TEXT_INFO` are logged; and
-/// `SUCCESS`/`FAILURE` end it. Verified against polkit 127's helper by hand.
+/// libpolkit-agent's `polkitagentsession.c` protocol: cookie first; answer every
+/// `PAM_PROMPT_ECHO_OFF`/`PAM_PROMPT_ECHO_ON` with the one password (ADR-0028); log
+/// `PAM_ERROR_MSG`/`PAM_TEXT_INFO`; `SUCCESS`/`FAILURE` end it. Verified against polkit 127.
 async fn drive_helper(
     child: &mut tokio::process::Child,
     cookie: &str,
@@ -263,25 +237,19 @@ async fn drive_helper(
     Err(std::io::Error::other("the helper closed its stdout without a verdict"))
 }
 
-/// The spawn side of every PAM conversation: one worker round trip for `uid`, with the outcome sent
-/// back over `outcome_tx` tagged with `tag` -- the lock's acquisition number or a polkit cookie, so
-/// the receiver can tell an answer from the question it was asked for (`lock::accepts_outcome`, and
-/// the polkit controller's pending cookie). Spawned rather than awaited inline by both callers: an
-/// Enter key at a password prompt is neither bounded nor rare, and `pam_unix`'s failure delay
-/// would stall every other frame behind it.
+/// One worker round trip for `uid`; send the outcome on `outcome_tx` tagged by the lock acquisition
+/// number or polkit cookie, so the receiver matches answer to request (`lock::accepts_outcome` and
+/// the polkit pending cookie). Both callers spawn it: Enter is unbounded and common, and
+/// `pam_unix`'s failure delay would stall every frame if awaited inline.
 ///
-/// `secret` is zeroized on every path, including the ones that never return: the future can be
-/// dropped mid-`.await` by a runtime shutdown or unwound by a panic, neither of which reaches the
-/// explicit `zeroize` below, so `Zeroizing`'s `Drop` backs it (ADR-0005). The wrapper is a
-/// parameter rather than applied inside, since a spawned future's arguments are captured when built
-/// but the body only runs once polled. A failure to even reach PAM becomes `StartFailed`, the same
-/// variant a `pam_start` failure uses, so the prompt has one `error` string either way.
+/// `secret` is zeroized even when the future is dropped during shutdown or unwinds on panic, via
+/// `Zeroizing::Drop` (ADR-0005). The wrapper is an argument because spawned arguments are captured
+/// before the body is polled. Failure before PAM is `StartFailed`, matching `pam_start` failure.
 ///
-/// `outcome_tx` always receives something regardless of how the task ends, via [`ReportOnDrop`]:
-/// the caller marked itself `authenticating` when it spawned this, and only the outcome clears
-/// that, so a task that never reaches its own `.send()` would leave a one-way latch -- a lock
-/// screen nobody can get past short of a VT switch. `UnboundedSender::send` is synchronous, so it
-/// still runs from `Drop::drop` during an unwind.
+/// [`ReportOnDrop`] sends something on every task exit. The caller sets `authenticating` and only
+/// an outcome clears it; missing a send would create a one-way latch, leaving the lock screen
+/// stuck until a VT switch. `UnboundedSender::send` is synchronous, so `Drop::drop` can send while
+/// unwinding.
 pub async fn run_authentication<T: Send + 'static>(
     uid: u32,
     mut secret: shared::Zeroizing<Vec<u8>>,
@@ -295,15 +263,14 @@ pub async fn run_authentication<T: Send + 'static>(
     };
     shared::Zeroize::zeroize(&mut *secret);
     if let Some((tag, tx)) = guard.pending.take() {
-        // A closed channel means main.rs's loop is gone, the posture LockController::send takes.
+        // A closed channel means `main.rs`'s loop is gone, which `LockController::send` permits.
         if tx.send((tag, outcome)).is_err() {
             eprintln!("pam: the outcome channel is closed; dropping an authentication result");
         }
     }
 }
 
-/// [`run_authentication`]'s `Drop` backstop: reports a fallback outcome the one time it's dropped
-/// still holding its sender (every exit but the ordinary one, which `.take()`s it first).
+/// [`run_authentication`]'s `Drop` backstop: reports once if dropped before ordinary `.take()`.
 struct ReportOnDrop<T> {
     pending: Option<(T, UnboundedSender<(T, shared::PamOutcome)>)>,
 }
@@ -311,9 +278,8 @@ struct ReportOnDrop<T> {
 impl<T> Drop for ReportOnDrop<T> {
     fn drop(&mut self) {
         if let Some((tag, tx)) = self.pending.take() {
-            // The receiver only needs a PamOutcome to clear `authenticating`; the variant doesn't
-            // matter since there's no real PAM answer, and PamError gives the prompt's error
-            // string something to say.
+            // Any `PamOutcome` clears `authenticating`; `PamError` supplies the prompt's error
+            // text when no real PAM answer exists.
             let outcome =
                 shared::PamOutcome::PamError("pam authentication task ended without reporting an outcome".to_string());
             let _ = tx.send((tag, outcome));
@@ -321,8 +287,8 @@ impl<T> Drop for ReportOnDrop<T> {
     }
 }
 
-/// Re-execs this binary (the same `current_exe()` resolution `renderer_binary_path()` uses for the
-/// renderer) as a PAM worker for `username`, then delegates the wire exchange to [`exchange_over`].
+/// Re-execs this binary, using the `current_exe()` resolution shared with
+/// `renderer_binary_path()`, as a PAM worker for `username`, then calls [`exchange_over`].
 async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Result<shared::PamOutcome> {
     let exe = std::env::current_exe()?;
     let child = crate::process::spawn_group_leader_stdio_piped(
@@ -336,16 +302,12 @@ async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Re
     exchange_over(child, secret, PAM_EXCHANGE_TIMEOUT).await
 }
 
-/// Writes `secret` to `child`'s stdin (closing the write half so the worker's read hits EOF),
-/// reads one [`shared::PamOutcome`] frame back over its stdout, then reaps the process group.
-/// Split out from [`spawn_worker_and_exchange`] so the wire protocol can be tested against a fake
-/// child without a real re-exec'd PAM worker; the reap always runs, even on a failed or timed-out
-/// write or read, so a hung worker is never left running untracked. `timeout` bounds only the
-/// write+read exchange, not the reap that follows (`reap_process_group` has its own grace period):
-/// without it, a worker that never writes or exits hangs `read_json_frame` forever, and on the
-/// polkit path, awaited inline in `main.rs`'s top-level `select!`, that stalls the entire
-/// Supervisor. Taken as a parameter, matching `reap_process_group`'s `grace`, so tests can use a
-/// short one instead of [`PAM_EXCHANGE_TIMEOUT`]'s real 30 seconds.
+/// Writes `secret` to stdin, closes it so the worker sees EOF, reads one outcome frame from stdout,
+/// then reaps the process group. The split enables fake-worker protocol tests. Reap always runs,
+/// including after failed/timed-out I/O, so a hung worker is not untracked. `timeout` covers only
+/// write/read; `reap_process_group` has its own grace. Without it, `read_json_frame` could hang
+/// forever and the inline polkit path would stall `main.rs`'s `select!`. Parameterize it so tests
+/// avoid the real 30-second [`PAM_EXCHANGE_TIMEOUT`].
 async fn exchange_over(
     mut child: tokio::process::Child,
     secret: &[u8],
@@ -365,11 +327,9 @@ async fn exchange_over(
     outcome_result
 }
 
-/// The actual write-then-read half of the exchange, wrapped by [`exchange_over`] in a
-/// `tokio::time::timeout`. Split out so the timeout wraps a plain future borrowing `child`, which
-/// `exchange_over` can still reach afterward to reap it whether this future completed or was
-/// cancelled: a cancelled future drops everything it owns (child.stdin's taken handle), closing
-/// that pipe end cleanly even mid-write.
+/// Write/read half wrapped by [`exchange_over`] in `tokio::time::timeout`. It borrows `child`, so
+/// `exchange_over` can reap after completion or cancellation. Cancellation drops the taken stdin
+/// handle and closes that pipe even mid-write.
 async fn write_secret_then_read_outcome(
     child: &mut tokio::process::Child,
     secret: &[u8],
@@ -388,10 +348,8 @@ mod tests {
 
     // ---- pam_service_in ----
 
-    /// The safe direction, and the one that matters: with no stack installed the worker keeps
-    /// using the console-login service that has been authenticating all along. Naming `oblisk`
-    /// here instead would send PAM to `/etc/pam.d/other`, which is `pam_deny` on a stock Arch
-    /// install -- a lock screen that refuses the correct password.
+    /// Without a stack, keep the console-login service. Naming `oblisk` would select
+    /// `/etc/pam.d/other`, `pam_deny` on stock Arch, and reject the correct password.
     #[test]
     fn without_an_installed_stack_the_service_falls_back_to_login() {
         let dir = tempfile::tempdir().unwrap();
@@ -405,16 +363,15 @@ mod tests {
         assert_eq!(pam_service_in(dir.path()), "oblisk");
     }
 
-    /// A directory PAM could not read at all is the same case as "not installed", not a panic:
-    /// this runs inside the worker on the path to an unlock.
+    /// An unreadable PAM directory is "not installed", not a panic; this runs in the unlock worker.
     #[test]
     fn a_missing_pam_config_directory_falls_back_rather_than_failing() {
         assert_eq!(pam_service_in(std::path::Path::new("/no/such/pam.d")), "login");
     }
 
-    /// The file this repo ships is what the probe looks for, and it has to carry both chains --
-    /// `run_conversation` calls `authenticate` and then `account_management`, and a stack with no
-    /// `account` line fails the second one after the password was already accepted.
+    /// The shipped file is what the probe finds and must carry both chains: `run_conversation`
+    /// calls `authenticate`, then `account_management`; without `account`, the second fails after
+    /// password acceptance.
     #[test]
     fn the_shipped_pam_stack_declares_both_chains_the_worker_drives() {
         let shipped =
@@ -429,9 +386,8 @@ mod tests {
         );
     }
 
-    /// A generous timeout for tests exercising the ordinary (non-timeout) paths -- short enough
-    /// to keep a hung test from stalling the suite, long enough it never fires against these
-    /// fast, local `sh -c` fake workers. Distinct from [`PAM_EXCHANGE_TIMEOUT`] on purpose.
+    /// Test timeout for ordinary paths: short enough to bound a hung test, long enough for local
+    /// `sh -c` fakes. Deliberately distinct from [`PAM_EXCHANGE_TIMEOUT`].
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
     #[test]
@@ -452,15 +408,13 @@ mod tests {
         );
     }
 
-    // run_authentication / spawn_worker_and_exchange call real libpam via a real subprocess
-    // re-exec, which can't be meaningfully unit-tested without a real PAM stack. What can and
-    // must be tested is the wire protocol itself, exercised against a fake "worker" (a shell
-    // one-liner) rather than a real re-exec'd PAM worker.
+    // Real libpam re-exec needs a real PAM stack; unit-test the wire protocol with a fake shell
+    // worker instead.
 
     #[tokio::test]
     async fn exchange_over_reads_back_the_worker_s_one_shot_outcome_frame() {
-        // Frame wire format (shared::framing): a 4-byte big-endian length prefix, then the JSON
-        // payload. PamOutcome::Success serializes as the 9-byte JSON string "Success".
+        // `shared::framing`: 4-byte big-endian length, then JSON. `Success` is the 9-byte JSON
+        // string `"Success"`.
         let script = r#"cat > /dev/null; printf '\000\000\000\011"Success"'"#;
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
@@ -472,8 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_over_still_reaps_the_worker_when_the_frame_read_fails() {
-        // A "worker" that writes a malformed (undecodable) frame and then hangs instead of
-        // exiting. The read must fail, but the process must still be reaped, not left running.
+        // Malformed frame, then a hang. Read must fail and the process must still be reaped.
         let script = r#"printf '\000\000\000\004evil'; sleep 5"#;
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
@@ -497,8 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_over_actually_delivers_the_secret_to_the_child_s_stdin() {
-        // A fake worker that reports back the byte count it read on stdin, proving the write
-        // half actually reaches the child (and closes, so the child's read hits EOF).
+        // Fake worker reports stdin byte count, proving delivery and EOF closure.
         let script = r#"n=$(wc -c < /dev/stdin); printf '\000\000\000\025{"PamError":"got %s"}' "$n""#;
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
@@ -514,9 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_over_times_out_and_still_reaps_a_worker_that_never_responds() {
-        // A "worker" that writes nothing and just sleeps -- a PAM module blocked on an
-        // unreachable network auth backend. Must return an error within `timeout`, and the
-        // worker must still end up reaped.
+        // A sleeping worker models a PAM module blocked on unreachable network auth. Return an
+        // error within `timeout` and still reap it.
         let script = "sleep 30";
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
@@ -543,8 +494,7 @@ mod tests {
 
     #[test]
     fn read_password_zeroizes_whatever_it_already_read_before_a_mid_stream_error() {
-        // A reader that hands back real bytes on its first read() call, then fails on its
-        // second, reproducing a pipe error partway through a read_to_end loop.
+        // Supplies real bytes once, then fails, reproducing a mid-`read_to_end` pipe error.
         struct FailsAfterFirstChunk {
             chunk: &'static [u8],
             handed_out: bool,
@@ -566,19 +516,15 @@ mod tests {
             .expect_err("a reader that errors mid-stream must surface that error, not silently truncate");
 
         assert_eq!(err.to_string(), "simulated mid-read pipe failure");
-        // By the time this test can observe anything, the partially-filled Vec has already been
-        // dropped inside read_password -- proving a live buffer was zeroized needs inspecting it
-        // before it drops, not after.
+        // The partial Vec is already dropped here; proving live zeroization requires observing it
+        // before drop, not afterward.
     }
 
-    // The next three tests pin this module's own code: authenticating must be releasable even
-    // when the spawned task that would otherwise release it panics or is dropped before
-    // reporting.
+    // Pin release when the spawned authentication task panics or drops before reporting.
 
     #[test]
     fn report_on_drop_sends_a_fallback_outcome_when_dropped_before_reporting() {
-        // Simulates a panic unwinding out of run_authentication, or its future being dropped
-        // mid-.await: either way, the guard is dropped without its own take-then-send ever running.
+        // Simulates panic from `run_authentication` or future drop mid-`.await`, before its send.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         drop(ReportOnDrop { pending: Some((7u64, tx)) });
 
@@ -611,8 +557,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicking_task_still_reports_a_fallback_outcome_via_the_drop_guard() {
-        // An FFI panic unwinding out of run_authentication before it reaches its own send. tokio::spawn catches the unwind, but the task's own locals -- including the
-        // ReportOnDrop guard -- still drop normally during it, the property this test pins.
+        // `tokio::spawn` catches an FFI panic, but locals, including `ReportOnDrop`, still drop;
+        // this pins that fallback send.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
             let _guard = ReportOnDrop { pending: Some((7u64, tx)) };

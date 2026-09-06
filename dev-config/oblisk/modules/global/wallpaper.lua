@@ -1,21 +1,17 @@
--- The wallpaper, which is not a capability and never was (ADR-0055): a `Background` panel holding
--- one `image`, and `lib/wallpaper.lua` saying which file. One declaration for every output, and
--- `child` is a function of the output's name (ADR-0121), so each screen draws its own file at its
--- own fit and a monitor plugged in later gets its instance without a reload.
+-- Wallpaper is not a capability (ADR-0055): a `Background` panel with one image per output, using
+-- `lib/wallpaper.lua`. `child` is keyed by output name (ADR-0121), so each screen gets its own file
+-- and fit, including monitors plugged in later without a reload.
 --
--- `async` is left off, deliberately: the file decodes inside the first frame, so the frame the
--- candidate presents is whole (ADR-0122). A wallpaper change is a decode in the frame too, a
--- stall of the frame it lands in rather than a flash of the ground under it; ADR-0002's crossfade
--- is what would make it neither, and that waits on an animation model.
+-- Keep `async` off: decode inside the first frame makes the presented frame whole (ADR-0122). A
+-- change stalls its landing frame instead of flashing the ground; ADR-0002's crossfade awaits an
+-- animation model.
 local wallpaper = require("lib.wallpaper")
 
--- All four edges anchored, so the compositor sizes both axes and this covers the output.
+-- Anchor all four edges so the compositor sizes both axes over the output.
 --
--- `"Ignore"` rather than `false`, and the difference is the whole point. Both reserve nothing, but
--- `false` still leaves the surface inside the area *other* surfaces reserved, so the moment the bar
--- claimed its 39px this shrank to 1161 and sat below it. `"Ignore"` is layer-shell's `-1`: reserve
--- nothing, ignore everyone else, cover the output. `true` would not have helped either -- a surface
--- anchored to all four edges has no single edge to reserve against, so it reads as 0 (ADR-0078).
+-- Use `"Ignore"`, not `false`. Both reserve nothing, but `false` respects other reservations, so a
+-- 39px bar shrank this to 1161px and placed it below. Layer-shell `-1` ignores them and covers the
+-- output. `true` also reads as 0 for an all-edge surface with no single edge (ADR-0078).
 return panel {
     id = "wallpaper",
     layer = "Background",
@@ -23,9 +19,8 @@ return panel {
     exclusive = "Ignore",
     width = "Fill",
     height = "Fill",
-    -- Painted under the image, so a source that does not decode leaves the desktop dark rather
-    -- than transparent, and the failure is visible instead of looking like a surface that never
-    -- mapped.
+    -- Under the image: a failed decode leaves the desktop dark, not transparent, so the failure is
+    -- visible instead of looking like an unmapped surface.
     background = "#11111bff",
     child = function(output)
         return image {

@@ -1,15 +1,14 @@
--- Mirrors BatteryIndicator.qml: a pill whose ground fills left to right with the charge, a glyph
--- that steps through five levels, and the percentage. The one module on this bar that is a pill
--- rather than a circle, because it is the one carrying a number.
+-- Mirrors BatteryIndicator.qml: a pill filled left to right, a five-level glyph, and a percentage.
+-- It is the only pill on this bar because it carries a number.
 --
--- The fill is a `rect` sized as a percentage string inside a stacking parent, which is
--- `components/meter.lua`'s trick spent on a whole control instead of a 6px bar: a `rect` has no main
--- axis, so its children stack at its origin and `Fill` means its whole box. That puts the fill under
--- the text with no z-order property and no overlay node.
+-- The fill is a percentage-sized `rect` in a stacking parent, using `components/meter.lua`'s trick
+-- spent on a whole control instead of a 6px bar. A `rect` has no main axis, so children stack at
+-- its origin and `Fill` puts
+-- the fill under the text without z-order or an overlay node.
 --
--- The pill carries `clip = "Rounded"`, so the fill is a plain square-cornered rect and the pill's
--- own arc cuts it. It used to carry the pill's radius instead and draw as a lozenge inside the left
--- end at low charge, because the engine only clipped to rectangles.
+-- `clip = "Rounded"` on the pill cuts the square-cornered fill to its arc. Putting the radius on
+-- the fill drew a lozenge inside the pill's left end at low charge because the engine clipped only
+-- to rectangles.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -25,9 +24,8 @@ local function battery_color(b)
     if b == nil or not b.present then
         return theme.DIM
     end
-    -- Only a battery that is actually running down gets a warning colour. Red at 14% while the
-    -- charger is in says the wrong thing, and it is the reference service's own rule:
-    -- `isLowAndNotCharging` gates its threshold on `isOnBattery` for exactly this.
+    -- Warn only while running down. Red at 14% on the charger is wrong; the reference service's
+    -- `isLowAndNotCharging` gates its threshold on `isOnBattery` too.
     if util.battery_at_most(b, util.battery_thresholds.critical) then
         return theme.RED
     end
@@ -41,26 +39,22 @@ local function battery_glyph(b)
     if b == nil or not b.present then
         return icons.battery_ac
     end
-    -- Taking current gets the bolt. Sitting on mains at a charge limit, or full, gets the plug:
-    -- the cable is in and the level is not moving, which is a different thing to show and used to
-    -- be indistinguishable from running on battery.
+-- `Charging` gets the bolt. Mains at a charge limit and full get the plug: the cable is in and the
+-- level is not moving, a state once indistinguishable from running on battery.
     if b.state == "Charging" then
         return icons.battery_pending
     end
     if b.state == "PendingCharge" or b.state == "FullyCharged" then
         return icons.battery_ac
     end
-    -- Five buckets over 0..100, which is `icons[min(floor(fraction * 5), 4)]` with Lua's 1-based
-    -- indexing folded in: 100% lands in bucket 5 rather than falling off the end.
+    -- Five buckets over 0..100. Lua's 1-based indexing makes 100% bucket 5, not an out-of-range 6.
     local bucket = math.floor((b.percent or 0) / 20) + 1
     return icons.battery_levels[math.max(1, math.min(5, bucket))]
 end
 
--- One colour for the readout, because the fill is now translucent and never gets light enough to
--- need black text over it. This was two, switched at the 60% mark, and the switch was the whole
--- reason the fill had to be opaque: a solid #a6e3a1 bar at 89% charge was the brightest object on
--- the bar and it existed to make a contrast threshold meaningful. Tint the ground instead and the
--- threshold, and the second colour, both go away.
+-- One readout colour works with the translucent fill. The old two-colour switch at 60% existed for
+-- an opaque fill: solid `#a6e3a1` at 89% was the bar's brightest object. Tinting the ground removes
+-- that contrast threshold and the second colour.
 local READOUT = theme.text_contrast(theme.GLASS_CONTROL)
 
 local fill = rect {

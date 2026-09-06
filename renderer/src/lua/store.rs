@@ -1,15 +1,13 @@
-//! The `persistent_table { path, name, defaults }` global (ADR-0136): a JSON file the config
-//! names, read as signals and written a key at a time.
+//! `persistent_table { path, name, defaults }` (ADR-0136): named JSON file, read as signals and
+//! written one key at a time.
 //!
-//! Nothing here decides where anything goes. `path` and `name` are the config's, and
-//! `oblisk.config_dir` plus `os.getenv` (one of the four `os` calls ADR-0048 kept) are what a
-//! config builds them from, so `$XDG_STATE_HOME`, `$XDG_CACHE_HOME`, a file beside `shell.lua` and
-//! three files at once are all the same call made differently.
+//! Config supplies `path` and `name`, usually from `oblisk.config_dir` and `os.getenv` (one of
+//! ADR-0048's four calls), so `$XDG_STATE_HOME`, `$XDG_CACHE_HOME`, a file beside `shell.lua`, and
+//! three simultaneous files are all the same call with different inputs.
 //!
-//! The store is a plain Lua table, not userdata: `store.theme` misses the table, falls through to
-//! `__index`, and gets a signal over that key which is then `rawset` so the second read is a plain
-//! table lookup. `store:set` is a real field, which is why it is also the one key name a config
-//! cannot store.
+//! Plain Lua table, not userdata: a missing `store.theme` falls through `__index`, gets a signal,
+//! and is `rawset` so later reads are ordinary. `set` is a real field, so configs cannot store that
+//! key.
 
 use std::collections::HashMap;
 
@@ -17,16 +15,13 @@ use mlua::{Lua, ObjectLike, Table, Value};
 
 use crate::lua::signal::{Signal, from_userdata};
 
-/// Every store this generation has built, keyed by the joined absolute path, so two
-/// `persistent_table` calls naming one file are one table with one set of signals. Survives
-/// re-evaluation with the VM (ADR-0044 decision 4), which is what keeps a reload from handing the
-/// config a second table over the same file.
+/// Stores keyed by joined absolute path: two calls naming one file share one table/signals. It
+/// survives VM re-evaluation (ADR-0044 decision 4), so reload does not hand back a second table.
 #[derive(Default)]
 struct StoreRegistry(HashMap<String, Table>);
 
-/// Registers the `persistent_table` global. Reads `oblisk.storage` at call time rather than at
-/// registration: this runs in `Loader::new`, and `lua::namespace::build` has not put the `oblisk`
-/// table in place yet.
+/// Registers `persistent_table`. Resolve `oblisk.storage` at call time; registration runs in
+/// `Loader::new`, before `lua::namespace::build` creates `oblisk`.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "persistent_table",
@@ -37,9 +32,9 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
             let file = join(&path, &name)?;
 
             let storage = storage_capability(lua)?;
-            // Re-sent by every evaluation rather than only the first: the Supervisor merges
-            // defaults into what it already holds (ADR-0136 decision 4), so an edit to `defaults`
-            // lands on a reload while a value the user changed does not revert.
+            // Send every evaluation: the Supervisor merges defaults (ADR-0136 decision 4), so
+            // edited
+            // defaults land on reload without reverting user values.
             let defaults = match defaults {
                 Value::Nil => Value::Table(lua.create_table()?),
                 defaults => defaults,
@@ -65,12 +60,10 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
     )
 }
 
-/// The file a config named, as one absolute path.
+/// Config file as one absolute path.
 ///
-/// `path` and `name` stay two arguments because the directory is the part a config computes and
-/// the file name is the part it writes as a literal. Joined here rather than in the Supervisor so
-/// the key a config reads back and the key the Supervisor stores are the same string by
-/// construction rather than by two implementations agreeing.
+/// Keep `path` and `name` separate because config computes the directory and writes the filename.
+/// Join here so config and Supervisor use the same key by construction.
 fn join(path: &str, name: &str) -> mlua::Result<String> {
     if !path.starts_with('/') {
         return Err(mlua::Error::runtime(format!(
@@ -83,8 +76,8 @@ fn join(path: &str, name: &str) -> mlua::Result<String> {
     Ok(format!("{}/{name}", path.trim_end_matches('/')))
 }
 
-/// `oblisk.storage`, read through the namespace's `__index` so the read itself is what asks the
-/// Supervisor to start the capability (ADR-0070 decision 1).
+/// `oblisk.storage` through namespace `__index`, so the read starts the capability
+/// (ADR-0070 decision 1).
 fn storage_capability(lua: &Lua) -> mlua::Result<mlua::AnyUserData> {
     let oblisk: Table = lua.globals().get("oblisk").map_err(|_| {
         mlua::Error::runtime("persistent_table: the `oblisk` namespace is not built yet on this Lua state")
@@ -92,8 +85,7 @@ fn storage_capability(lua: &Lua) -> mlua::Result<mlua::AnyUserData> {
     oblisk.get("storage")
 }
 
-/// The table a config holds: `set` as a real field, every other key answered by `__index` with a
-/// signal over that key of that file.
+/// Config table: real `set` field; `__index` answers other keys with per-file signals.
 fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Result<Table> {
     let store = lua.create_table()?;
     let path = file.to_string();
@@ -113,8 +105,7 @@ fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Resul
         "__index",
         lua.create_function(move |lua, (store, key): (Table, String)| {
             let key_signal = key_signal(lua, &signal, &path, &key)?;
-            // Cached onto the table itself, so the second read of `store.theme` is a plain lookup
-            // and the config holds one signal per key rather than one per resolve.
+            // Cache on the table: later reads are plain and each key has one signal.
             store.raw_set(key.as_str(), key_signal.clone())?;
             Ok(key_signal)
         })?,
@@ -123,9 +114,8 @@ fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Resul
     Ok(store)
 }
 
-/// One key of one file, as a signal over the whole `oblisk.storage` payload. `nil` until the first
-/// push, and `nil` for a key the file does not have, which is § 3.1's rule: an absent signal value
-/// leaves the property's documented default in place.
+/// One file key mapped over `oblisk.storage`. `nil` before first push and for absent keys, so § 3.1
+/// leaves the property's documented default.
 fn key_signal(lua: &Lua, storage: &Signal, file: &str, key: &str) -> mlua::Result<Signal> {
     let file = file.to_string();
     let key = key.to_string();

@@ -1,16 +1,15 @@
--- Mirrors PrivacyIndicator.qml: three red circles, each present only while the thing it names is
--- actually in use, and the whole group absent when nothing is.
+-- Mirrors PrivacyIndicator.qml: red circles appear only while their device is in use, and the group
+-- disappears when none is.
 --
--- All three exist now. `PrivacyState` was one field, `camera_users`, until ADR-0137 added
--- `microphone_users` and `screencast_users` off the same PipeWire connection, which is what this
--- file was waiting for -- drawing two alerts that could never fire was worse than drawing one.
+-- `PrivacyState` began with `camera_users`; drawing two alerts that could never fire was worse than
+-- drawing one. ADR-0137 added `microphone_users` and `screencast_users` from the same PipeWire
+-- connection.
 --
--- "In use" is PipeWire's own `Running`, not the existence of a stream: a browser tab holds a
--- capture node open between calls, and a microphone circle lit by that would never go out.
+-- "In use" is PipeWire `Running`, not stream existence. A browser tab keeps a capture node open
+-- between calls, so stream existence would leave the microphone circle lit.
 --
--- Red ground rather than a red word. `text_contrast` picks the glyph colour against it, so the
--- alert reads at a glance and does not need "cam:" spelled out beside it -- which is what this
--- module used to do, in a 96px box, permanently reserved whether anything was recording or not.
+-- Red ground with `text_contrast` picking the glyph colour against it, not a red label. The old
+-- "cam:" readout reserved a 96px box even when nothing was recording.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -36,8 +35,8 @@ end
 return row {
     align_v = "Center",
     spacing = theme.spacing.sm,
-    -- On the group as well as on each circle: an invisible child leaves the layout entirely, but
-    -- this row itself would still earn a spacing gap from `left_side.lua` while holding nothing.
+    -- Invisible children leave the layout entirely, but this row would still earn a spacing gap.
+    -- Hide the group too, or `left_side.lua` still gives the empty row that gap.
     visible = util.shown_when(oblisk.privacy, function(p)
         return users_of("camera_users")(p) or users_of("microphone_users")(p) or users_of("screencast_users")(p)
     end),

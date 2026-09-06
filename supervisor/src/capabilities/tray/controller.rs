@@ -27,24 +27,20 @@ pub struct TrayController {
 }
 
 impl TrayController {
-    /// Requests `org.kde.StatusNotifierWatcher` with no `ReplaceExisting`/`DoNotQueue` flags
-    /// (ADR-0031's "dual-role dance"): with `DoNotQueue` unset, zbus never returns
-    /// `Err(NameTaken)` for this case -- it queues instead, returning `Ok(InQueue)`. So every
-    /// `Ok` reply here is a real success path; only a hard `Err` is logged as a genuine
-    /// failure, and even that doesn't stop construction.
+    /// Requests `org.kde.StatusNotifierWatcher` without `ReplaceExisting`/`DoNotQueue` flags
+    /// (ADR-0031). With `DoNotQueue` unset, zbus queues and returns `Ok(InQueue)`, so only a hard
+    /// `Err` is failure, and it does not stop construction.
     ///
-    /// The `StatusNotifierWatcher` object is attached at [`WATCHER_OBJECT_PATH`] regardless
-    /// of who owns the name, then `RegisterStatusNotifierHost` is called against the
-    /// well-known name (not a resolved unique name) -- D-Bus routing delivers that call to
-    /// whichever process actually owns it.
+    /// Exports [`WATCHER_OBJECT_PATH`] regardless of name ownership, then calls
+    /// `RegisterStatusNotifierHost` at the well-known name so D-Bus routes to the actual owner.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<TraySignal>) -> Self {
         match connection.request_name_with_flags(WATCHER_BUS_NAME, BitFlags::<RequestNameFlags>::empty()).await {
             Ok(reply) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) -> {reply}"),
             Err(err) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) failed: {err}"),
         }
 
-        // Before anything can spool: a fresh Supervisor owns nothing in there, so whatever is left
-        // is a previous run's and nothing will ever delete it otherwise (ADR-0074).
+        // Sweep before spooling; leftovers belong to a previous run and otherwise survive
+        // (ADR-0074).
         crate::capabilities::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -55,8 +51,7 @@ impl TrayController {
             host_registered,
             events: events.clone(),
         };
-        // Logged-and-continue, not `?`-propagated: an export failure here must not abort the
-        // whole Supervisor -- this controller still constructs either way.
+        // Continue after export failure; tray setup must not abort the Supervisor.
         if let Err(err) = connection.object_server().at(WATCHER_OBJECT_PATH, watcher).await {
             eprintln!("tray: failed to export StatusNotifierWatcher at {WATCHER_OBJECT_PATH}: {err}");
         }
@@ -84,17 +79,14 @@ impl TrayController {
         Self { registry, events }
     }
 
-    /// Fully inert controller: empty registry, no forwarder tasks, nothing exported. Used
-    /// when a dedicated session-bus connection for the tray host couldn't be established.
-    /// Every read/write action behaves as it would against a live controller with no items
-    /// registered yet.
+    /// Empty registry, no forwarders, and nothing exported. Used when the tray session-bus
+    /// connection cannot be established; actions behave like a live controller with no items.
     pub fn inert(events: UnboundedSender<TraySignal>) -> Self {
         Self { registry: Arc::new(Mutex::new(HashMap::new())), events }
     }
 
-    /// Full, live re-derivation of `tray.items` from the entire tracked registry.
-    /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
-    /// tasks recompute it before ever sending a [`TraySignal`]).
+    /// Re-derives `tray.items` from the registry. Synchronous because forwarders update
+    /// `last_known` before sending [`TraySignal`].
     pub fn build_state(&self) -> TrayState {
         TrayState { items: ordered_items(&self.registry) }
     }
@@ -115,8 +107,7 @@ impl TrayController {
         self.registry.lock().unwrap().get(key).and_then(|entry| entry.menu.clone())
     }
 
-    /// `tray:activate(id, x, y)`. No-ops (does not call the real `Activate`) when the item's
-    /// `ItemIsMenu` is `true` -- SNI's own documented semantics, enforced centrally
+    /// `tray:activate(id, x, y)`. Skips `Activate` when `ItemIsMenu` is true, per SNI semantics
     /// (ADR-0031, [`should_call_activate`]).
     pub async fn activate(&self, id: &str, x: i32, y: i32) {
         let Some((key, tray_item)) = self.find_item_id(id) else {
@@ -135,11 +126,8 @@ impl TrayController {
         }
     }
 
-    /// `tray:secondary_activate(id, x, y)`: § 2.5's middle-click (ADR-0074).
-    ///
-    /// No `should_call_activate` gate, unlike [`Self::activate`]: `ItemIsMenu` says a *primary*
-    /// click must open the menu instead of activating, and says nothing about the secondary one.
-    /// An application that wants nothing to happen exports a method that does nothing.
+    /// `tray:secondary_activate(id, x, y)`: §2.5 middle-click (ADR-0074). No
+    /// `should_call_activate` gate: `ItemIsMenu` constrains primary clicks only.
     pub async fn secondary_activate(&self, id: &str, x: i32, y: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: secondary_activate({id:?}) failed: {}", TrayActionError::UnknownItem);
@@ -154,11 +142,8 @@ impl TrayController {
         }
     }
 
-    /// `tray:scroll(id, delta, orientation)`: § 2.5's scroll over the icon (ADR-0074).
-    ///
-    /// `orientation` reaches the application verbatim. The spec names `"vertical"` and
-    /// `"horizontal"` and this does not police it, because the string is the application's to
-    /// interpret and refusing a third value here would only turn a shrug into a dropped command.
+    /// `tray:scroll(id, delta, orientation)`: §2.5 icon scroll (ADR-0074). Passes `orientation`
+    /// verbatim; the application interprets it, including values beyond the two named orientations.
     pub async fn scroll(&self, id: &str, delta: i32, orientation: &str) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: scroll({id:?}) failed: {}", TrayActionError::UnknownItem);
@@ -173,8 +158,8 @@ impl TrayController {
         }
     }
 
-    /// `tray:activate_menu_item(id, menu_item_id)`: `DBusMenu.Event(menu_item_id, "clicked",
-    /// &Value::I32(0), timestamp)` (ADR-0031).
+    /// `tray:activate_menu_item(id, menu_item_id)` sends `DBusMenu.Event(id, "clicked", 0,
+    /// timestamp)` (ADR-0031).
     pub async fn activate_menu_item(&self, id: &str, menu_item_id: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: activate_menu_item({id:?}, {menu_item_id}) failed: {}", TrayActionError::UnknownItem);
@@ -190,10 +175,10 @@ impl TrayController {
         }
     }
 
-    /// `tray:menu_will_show(id, submenu_id)`: calls `AboutToShow(submenu_id)` (DBusMenu's
-    /// lazy-population signal, ADR-0031), then re-fetches and re-pushes the item's entire
-    /// menu tree. A full re-fetch, not an in-place splice: menu trees are human-scale
-    /// (ADR-0031), so the extra round trip costs nothing a user would notice.
+    /// `tray:menu_will_show(id, submenu_id)` calls DBusMenu `AboutToShow(submenu_id)`, its
+    /// lazy-population signal, then re-fetches and pushes the entire menu tree (ADR-0031). Full
+    /// refetch is adequate for
+    /// human-scale trees.
     pub async fn menu_will_show(&self, id: &str, submenu_id: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: menu_will_show({id:?}, {submenu_id}) failed: {}", TrayActionError::UnknownItem);
@@ -220,36 +205,27 @@ impl TrayController {
     }
 }
 
-/// Whether `name` is an item's own well-known bus name, the
-/// `org.{kde,freedesktop}.StatusNotifierItem-PID-N` an application claims before it calls
-/// `RegisterStatusNotifierItem` (ADR-0073).
+/// Whether `name` is an item's well-known `org.{kde,freedesktop}.StatusNotifierItem-PID-N` name
+/// claimed before `RegisterStatusNotifierItem` (ADR-0073).
 ///
-/// Both spellings, because both are in the wild: KDE's is the de-facto one and Chromium claims the
-/// `org.freedesktop` one. The trailing `-` is what keeps this off `org.kde.StatusNotifierWatcher`
-/// and off any name that merely starts the same way.
+/// Accepts both KDE and Chromium spellings. The trailing `-` excludes the watcher and names that
+/// merely share the prefix.
 fn is_item_bus_name(name: &str) -> bool {
     ["org.kde.StatusNotifierItem-", "org.freedesktop.StatusNotifierItem-"].iter().any(|prefix| name.starts_with(prefix))
 }
 
-/// Registers every tray item already on the bus when this host starts (ADR-0073).
+/// Registers tray items already on the bus when this host starts (ADR-0073). The spec expects
+/// clients to re-register after `StatusNotifierHostRegistered`, but Slack does not; without this
+/// bus scan, restarting the shell lost Slack until Slack restarted.
 ///
-/// The spec's answer to a host starting late is `StatusNotifierHostRegistered`, which this watcher
-/// emits and which an application is meant to re-register on. Slack does not, so restarting the
-/// shell lost its icon until Slack itself was restarted. This asks the bus rather than waiting to be
-/// told.
+/// Serial because each `register_item` reads properties and optional `GetLayout`, while a session
+/// has only a handful of items. Duplicates are harmless: `(unique_name, object_path)` is the key,
+/// so re-registration overwrites the entry.
 ///
-/// Serial rather than joined: each `register_item` reads a handful of properties and an optional
-/// `GetLayout`, and a session has a handful of tray items, so the whole scan is a few round trips
-/// against a Supervisor that has already made several. A duplicate is harmless, since the registry
-/// is keyed by `(unique_name, object_path)` and an application that does re-register overwrites its
-/// own entry rather than adding a second.
-///
-/// ponytail: this finds only items that claimed a well-known name. One that called
-/// `RegisterStatusNotifierItem("/some/object/path")` and owns no `StatusNotifierItem-*` name is
-/// invisible to it, because nothing on the bus says which connections export the interface without
-/// asking each one. Vesktop is that shape and does not need this, since it re-registers on the
-/// signal. The upgrade path is introspecting every connection on the session bus, which is dozens of
-/// round trips at startup to look for something usually not there.
+/// ponytail: finds only items that claimed a well-known name. An item registering only
+/// `RegisterStatusNotifierItem("/some/object/path")` is invisible without introspecting every
+/// session-bus connection. Vesktop has that shape but re-registers on the signal. Upgrade path:
+/// introspection, costing dozens of startup round trips for a rare case.
 async fn adopt_existing_items(
     connection: &zbus::Connection,
     dbus_proxy: &zbus::fdo::DBusProxy<'_>,
@@ -264,8 +240,7 @@ async fn adopt_existing_items(
         }
     };
     for name in names.iter().filter(|name| is_item_bus_name(name.as_str())) {
-        // No sender: `resolve_registration`'s well-known branch never reads one, and there is no
-        // calling message here to take it from.
+        // No sender: this well-known branch does not need one, and no call supplies it.
         let resolved = match resolve_registration(connection, name.as_str(), None).await {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -292,15 +267,14 @@ mod tests {
 
     #[test]
     fn the_watcher_is_not_an_item() {
-        // The name this Supervisor owns itself. Adopting it would have the host register its own
-        // watcher as a tray icon.
+        // This Supervisor's own name; adopting it would register the watcher as an icon.
         assert!(!is_item_bus_name("org.kde.StatusNotifierWatcher"));
         assert!(!is_item_bus_name("org.kde.StatusNotifierHost-1234"));
     }
 
     #[test]
     fn a_name_that_only_starts_the_same_way_is_not_an_item() {
-        // The trailing `-` is the whole guard: without it every one of these matches.
+        // The trailing `-` excludes these prefix-only names.
         assert!(!is_item_bus_name("org.kde.StatusNotifierItemRegistry"));
         assert!(!is_item_bus_name("org.kde.StatusNotifierItem"));
         assert!(!is_item_bus_name("com.example.org.kde.StatusNotifierItem-1-1"));

@@ -1,7 +1,8 @@
-//! `ram_percent`/`swap_percent` sourcing: `/proc/meminfo` (ADR-0035).
+//! `ram_percent`/`swap_percent` come from `/proc/meminfo` (ADR-0035).
 
-/// The four `/proc/meminfo` fields `ram_percent`/`swap_percent` need. `mem_available` is used
-/// as-is (ADR-0035: the kernel's own considered-free estimate, not reinvented from `Buffers`/`Cached`).
+/// The four `/proc/meminfo` fields needed for RAM/swap percentages. Use `mem_available` as-is,
+/// the kernel's considered-free estimate, rather than rebuilding it from `Buffers`/`Cached`
+/// (ADR-0035).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemInfo {
     pub mem_total: u64,
@@ -10,14 +11,12 @@ pub struct MemInfo {
     pub swap_free: u64,
 }
 
-/// Parses `/proc/meminfo`'s `key:   value kB` lines into a [`MemInfo`]. `None` if
-/// `MemTotal`/`MemAvailable` are missing -- those two are load-bearing; `SwapTotal`/`SwapFree`
-/// default to `0` if absent, since tolerating their absence costs nothing.
+/// Parses `/proc/meminfo`'s `key:   value kB` lines. `None` if `MemTotal` or `MemAvailable` is
+/// missing; absent `SwapTotal`/`SwapFree` default to `0`.
 pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     let mut values = std::collections::HashMap::new();
     for line in text.lines() {
-        // A blank or colon-less line is skipped, not fatal -- `str::lines()` yields "" for a
-        // blank line, which has no ':' to split on.
+        // Skip blank or colon-less lines; `str::lines()` yields an empty line for blanks.
         let Some((key, rest)) = line.split_once(':') else { continue };
         if let Some(value) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
             values.insert(key, value);
@@ -31,8 +30,7 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     })
 }
 
-/// `ram_percent`/`swap_percent`: `100 * used / total`, `0` for swap when `swap_total == 0`
-/// (no swap configured) rather than dividing by zero.
+/// RAM/swap percentage is `100 * used / total`; swap is `0` when `swap_total == 0`.
 pub fn compute_percentages(info: &MemInfo) -> (u8, u8) {
     let ram_used = info.mem_total.saturating_sub(info.mem_available);
     let ram_percent = (100 * ram_used).checked_div(info.mem_total).unwrap_or(0) as u8;
@@ -43,8 +41,7 @@ pub fn compute_percentages(info: &MemInfo) -> (u8, u8) {
     (ram_percent, swap_percent)
 }
 
-/// Reads and parses `{proc_root}/meminfo`. `proc_root` is a parameter, never a hardcoded
-/// `/proc`, so a test can point it at a tempdir.
+/// Reads `{proc_root}/meminfo`; injected `proc_root` lets tests use a tempdir.
 pub fn read_meminfo(proc_root: &std::path::Path) -> std::io::Result<MemInfo> {
     let content = std::fs::read_to_string(proc_root.join("meminfo"))?;
     parse_meminfo(&content)
@@ -53,8 +50,8 @@ pub fn read_meminfo(proc_root: &std::path::Path) -> std::io::Result<MemInfo> {
 
 #[cfg(test)]
 mod tests {
-    /// A real `/proc/meminfo` capture from this machine (not invented), trimmed to the
-    /// fields this module reads plus a few unrelated ones to prove those are ignored.
+    /// Real `/proc/meminfo` capture from this machine, trimmed to used fields plus unrelated ones
+    /// to prove they are ignored.
     fn real_meminfo() -> &'static str {
         "MemTotal:       32479404 kB\n\
          MemFree:         1114104 kB\n\
@@ -84,7 +81,7 @@ mod tests {
 
     #[test]
     fn parse_meminfo_skips_a_blank_or_colon_less_line_instead_of_aborting_the_whole_parse() {
-        // A blank line partway through must not discard the fields already seen around it.
+        // A blank line must not discard fields seen around it.
         let info = super::parse_meminfo("MemTotal: 1000 kB\n\nMemAvailable: 400 kB\n")
             .expect("a stray blank line must not abort the whole parse");
         assert_eq!(info.mem_total, 1000);
@@ -103,9 +100,9 @@ mod tests {
     fn compute_percentages_derives_ram_and_swap_usage_from_the_real_capture() {
         let info = super::parse_meminfo(real_meminfo()).unwrap();
         let (ram_percent, swap_percent) = super::compute_percentages(&info);
-        // used = 32479404 - 10607160 = 21872244 -> 21872244*100/32479404 = 67.34...% -> 67
+        // used = 21872244; 100*used/32479404 = 67.34...% -> 67
         assert_eq!(ram_percent, 67);
-        // used = 16239612 - 284180 = 15955432 -> 15955432*100/16239612 = 98.24...% -> 98
+        // used = 15955432; 100*used/16239612 = 98.24...% -> 98
         assert_eq!(swap_percent, 98);
     }
 

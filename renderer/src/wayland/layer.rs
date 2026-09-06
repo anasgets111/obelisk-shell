@@ -1,13 +1,13 @@
-//! The `panel` role: `zwlr_layer_surface_v1` (§ 6). Covers protocol-value mappings, the
-//! per-field diff `apply_spec_change` sends, and exclusive-zone computation. Creation, spec
-//! updates and configure/closed callbacks live here; bind/paint/(un)map logic lives in `surface`.
+//! The `panel` role: `zwlr_layer_surface_v1` (§ 6), including protocol mappings, per-field diffs,
+//! exclusive zones, creation, updates, and callbacks. Shared bind/paint/(un)map logic is in
+//! `surface`.
 
 use super::*;
 use crate::wayland::surface::MapState;
 use crate::wayland::surface::TrackedRole;
 
-/// `layout`'s `LayerKind` to the protocol's own stacking level. Pure and unit-testable without a
-/// live compositor, unlike most of `wayland/mod.rs`, which is why the mapping lives here.
+/// `layout`'s `LayerKind` to the protocol stacking level. Pure and unit-testable without a live
+/// compositor, unlike most of `wayland/mod.rs`, which is why the mapping lives here.
 fn layer_for(kind: LayerKind) -> Layer {
     match kind {
         LayerKind::Background => Layer::Background,
@@ -16,7 +16,7 @@ fn layer_for(kind: LayerKind) -> Layer {
         LayerKind::Overlay => Layer::Overlay,
     }
 }
-/// § 6's four `anchor` edge booleans to the protocol's bitflags.
+/// § 6's `anchor` edge booleans to protocol bitflags.
 pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     let mut flags = Anchor::empty();
     flags.set(Anchor::TOP, anchor.top);
@@ -25,8 +25,8 @@ pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     flags.set(Anchor::RIGHT, anchor.right);
     flags
 }
-/// § 6's `keyboard_interactivity` to the protocol's own field. Before ADR-0038 every surface
-/// had a hardcoded mode per role, so `Exclusive` and `None` surfaces could not coexist.
+/// § 6's `keyboard_interactivity`. Before ADR-0038 each role hardcoded a mode, preventing
+/// `Exclusive` and `None` surfaces from coexisting.
 pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
     match mode {
         node::KeyboardInteractivity::None => KeyboardInteractivity::None,
@@ -34,11 +34,9 @@ pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> K
         node::KeyboardInteractivity::Exclusive => KeyboardInteractivity::Exclusive,
     }
 }
-/// One axis of `zwlr_layer_surface_v1::set_size`, resolved against that axis of the output.
-/// `0` is the protocol's "anchors decide this axis" convention, covering both `SizeMode::Fill`
-/// and `SizeMode::Content` (the ordinary case: `parse_size_mode`'s answer for an omitted
-/// `width`/`height`, since a surface has no content size at creation time). A percent is the one
-/// form needing the output.
+/// One `set_size` axis resolved against the output. `0` means anchors decide it, covering `Fill`
+/// and `Content` because omitted dimensions have no content size at creation; only `Percent` uses
+/// the output extent.
 pub(super) fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
     match mode {
         SizeMode::Fill | SizeMode::Content => 0,
@@ -46,11 +44,9 @@ pub(super) fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
         SizeMode::Percent(fraction) => (output_extent * fraction).max(0.0) as u32,
     }
 }
-/// The axis, if any, on which this surface's `set_size` would be a protocol error.
-/// `zwlr_layer_surface_v1::set_size`: "If you pass 0 for either value... You must set your
-/// anchor to opposite edges in the dimensions you omit; not doing so is a protocol error," which
-/// kills the whole connection. Refuse with a log naming the axis rather than guess a size, since
-/// guessing would silently give a config author a full-screen bar for an auto-sized request.
+/// The axis on which `set_size(0, ...)` would be a protocol error. Layer-shell requires both
+/// opposite edges for an omitted axis; the error kills the connection, so name and refuse it
+/// instead of silently turning an auto-sized request into a full-screen bar.
 fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'static str> {
     if size.0 == 0 && !(anchor.left && anchor.right) {
         return Some("width");
@@ -60,26 +56,21 @@ fn ambiguous_zero_axis(size: (u32, u32), anchor: node::Anchor) -> Option<&'stati
     }
     None
 }
-/// Where a panel that still holds its `zwlr_layer_surface_v1` goes when `visible` turns true,
-/// from whether the configure answering its create has been acked. `configured_size` is that
-/// record: [`App::bind_and_clear`] is its only real writer and runs on the ack, `App::unbind`
-/// puts it back to `(0, 0)`, and no configure carries a zero on both axes.
+/// State for a kept panel when `visible` turns true, based on whether its create configure was
+/// acked. [`App::bind_and_clear`] records the size; `App::unbind` resets it to `(0, 0)`. No
+/// configure carries zero on both axes.
 ///
-/// A hidden panel is created and committed at startup, so by the time anything shows it the
-/// configure has almost always been read and [`MapState::Mapped`] is right. Almost: a panel shown
-/// in the same dispatch turn that created it -- an `osd` popping up mid-boot -- reaches here with
-/// nothing acked, and attaching a buffer then is the protocol error niri names by hand ("must ack
-/// the initial configure before attaching buffer"), which takes the connection down with it.
-/// Measured on this machine as a boot crash in roughly one run in four, each costing a generation
-/// restart. Waiting instead costs nothing: the configure is already on its way, and
-/// [`App::bind_and_clear`] finishes the show when it lands.
+/// Startup-created hidden panels are usually already configured. An `osd` shown in the same
+/// dispatch turn can still have no ack; attaching then triggers niri's "must ack the initial
+/// configure before attaching buffer" error. Measured boot crash rate: roughly one run in four,
+/// each costing a generation restart. Waiting costs nothing because [`App::bind_and_clear`] will
+/// finish the show when the configure arrives.
 fn map_state_for_kept_layer(configured_size: (u32, u32)) -> MapState {
     if configured_size == (0, 0) { MapState::AwaitingConfigure } else { MapState::Mapped }
 }
-/// The exclusive zone for a surface marked `exclusive`, derived from the size the compositor
-/// actually configured, not guessed at creation (a `"Fill"`-sized bar has no height yet). Anchored
-/// top or bottom but not both reserves that height; left or right but not both reserves that
-/// width. Everything else is `0`, since the protocol only defines the strip cases.
+/// An `exclusive` zone from the compositor-configured size, not creation-time guesses (`Fill` has
+/// no size yet). One top/bottom edge reserves height; one left/right edge reserves width; all
+/// other anchor shapes reserve `0` because the protocol defines only those strips.
 fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 {
     let (width, height) = configured_size;
     let one_vertical_edge = anchor.top != anchor.bottom;
@@ -90,30 +81,22 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
         _ => 0,
     }
 }
-/// The layer-shell requests one live surface needs after a re-resolve changed its `panel`
-/// properties: `margin`, `keyboard_interactivity`, size, and `exclusive` (ADR-0038 decision 2,
-/// § 6). `None` per field means "unchanged, send nothing", since these are double-buffered.
-/// [`SurfaceTopology`](node::SurfaceTopology)'s five fields (`id`, `layer`, `anchor`, `monitor`,
-/// `namespace`) are absent: the protocol can't change namespace or output at all
-/// (`get_layer_surface` consumes both), and an edit to any is a topology change
-/// `crate::socket::handle_reevaluate` routes to a generation swap instead, so each is
-/// `is_structural_property`, refused a `Signal`
-/// (`layout::node::reject_signal_in_structural_field`).
-/// `output` is the surface's *output's* logical size, not its configured size: see
-/// [`TrackedSurface::output_size`].
+/// Double-buffered layer-shell changes: `margin`, `keyboard_interactivity`, size, and `exclusive`
+/// (ADR-0038 decision 2, § 6). `None` means unchanged. Topology (`id`, `layer`, `anchor`,
+/// `monitor`, `namespace`) is absent because `get_layer_surface` consumes namespace/output and
+/// edits route to a generation swap instead; `crate::socket::handle_reevaluate` owns that handoff.
+/// `is_structural_property` rejects signals there. `output` is the logical output size, not the
+/// configured surface size.
 #[derive(Debug, Default, PartialEq)]
 struct SpecUpdate {
     margin: Option<node::EdgeInsets>,
     keyboard_interactivity: Option<node::KeyboardInteractivity>,
     size: Option<(u32, u32)>,
-    /// § 6's `exclusive` mode. Not the zone itself: `Reserve` derives it (see
-    /// [`exclusive_zone_for`]); this only reports whether the choice changed.
+    /// § 6's mode, not the zone: `Reserve` derives that from [`exclusive_zone_for`].
     exclusive: Option<node::Exclusive>,
 }
 impl SpecUpdate {
-    /// Whether this pass sent any layer-shell request at all, which is what decides whether
-    /// [`App::apply_spec_change`] has to commit. Every field here is double-buffered `wl_surface`
-    /// state, so "nothing moved" and "nothing needs a commit" are the same question.
+    /// Whether any double-buffered layer-shell request changed and needs a commit.
     fn moved_anything(&self) -> bool {
         self.margin.is_some()
             || self.keyboard_interactivity.is_some()
@@ -122,9 +105,7 @@ impl SpecUpdate {
     }
 }
 fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSize) -> SpecUpdate {
-    // Compared as the pixel pair that goes on the wire, not the two `SizeMode`s: a percent and an
-    // equivalent pixel count are the same request, and `Fill`/`Content` are both the protocol's
-    // `0`.
+    // Compare the wire pixel pair: equivalent percent/pixel sizes and `Fill`/`Content` (`0`) match.
     let extent =
         |spec: &PanelSpec| (layer_extent_for(spec.width, output.width), layer_extent_for(spec.height, output.height));
     SpecUpdate {
@@ -135,13 +116,12 @@ fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSi
         exclusive: (fresh.exclusive != applied.exclusive).then_some(fresh.exclusive),
     }
 }
-/// Parameters for [`App::spawn_layer`], bundled to stay under clippy's argument-count limit.
+/// Parameters for [`App::spawn_layer`], bundled for clippy's argument-count limit.
 pub(super) struct LayerSpec<'a> {
     layer_type: Layer,
-    /// The compositor-visible namespace (§ 6, default `"oblisk-{id}"`), matched by `layerrule`.
+    /// Compositor-visible namespace (§ 6, default `"oblisk-{id}"`), matched by `layerrule`.
     namespace: &'a str,
-    /// Always `Some` (ADR-0038 decision 3): one surface per `(surface, output)` pair, so the
-    /// output is never the compositor's to pick.
+    /// Always `Some` (ADR-0038 decision 3): one surface per `(surface, output)` pair.
     output: &'a wl_output::WlOutput,
     anchor: Anchor,
     size: (u32, u32),
@@ -169,12 +149,11 @@ impl App {
             spec.margin.bottom as i32,
             spec.margin.left as i32,
         );
-        // No `set_exclusive_zone` here: it is derived from the size the compositor picks, at
-        // configure time; see `exclusive_zone_for`.
+        // The exclusive zone uses the configure-time size.
         layer
     }
 
-    /// [`App::create_surfaces`]'s `panel` arm: one `zwlr_layer_surface_v1`, committed and tracked.
+    /// [`App::create_surfaces`]'s `panel` arm: create, commit, and track one layer surface.
     pub(super) fn create_panel(
         &mut self,
         qh: &QueueHandle<App>,
@@ -216,14 +195,9 @@ impl App {
         );
         layer.commit();
 
-        // § 6's `visible`. A panel declared `visible = false` is still created here and gets the
-        // initial commit, required by `get_layer_surface` before any configure. No buffer is ever
-        // attached and `MapState::Unmapped` keeps `paint_surface` from doing so, so the object
-        // exists and nothing is on screen. That is not the state a *hidden* panel reaches under
-        // ADR-0088 -- [`App::unmap`] destroys the object outright -- and the difference is
-        // deliberate: this one has never been mapped, so there is nothing for a compositor to fail
-        // to bring back, and keeping it means PBA staging still sees every declared surface
-        // ([`App::maybe_send_ready_signal`]).
+        // A declared `visible = false` panel still needs `get_layer_surface`'s initial commit, but
+        // no buffer is attached. Unlike an already-shown hidden panel (ADR-0088), the object has
+        // never mapped and can safely remain for PBA staging to see every declared surface.
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Panel {
                 layer: Some(layer),
@@ -240,23 +214,17 @@ impl App {
         });
     }
 
-    /// `visible = true` for a `panel` (ADR-0088). Two starting states, told apart by whether the
-    /// role still holds a `LayerSurface`.
+    /// Shows a `panel` (ADR-0088). The role holding a `LayerSurface` distinguishes two states.
     ///
-    /// **Never shown.** [`App::create_panel`] builds every declared panel, so one that started
-    /// `visible = false` already has a bufferless surface. Nothing needs building or
-    /// re-committing, and the next `paint_surface` attaches the first buffer, which is what maps
-    /// it -- but only once the configure answering that create has been acked, which is what
-    /// [`map_state_for_kept_layer`] reads.
+    /// **Never shown.** [`App::create_panel`] already built a bufferless surface. Painting attaches
+    /// the first buffer and maps it only after its configure is acked.
     ///
-    /// **Hidden after being shown.** [`App::unmap`] destroyed the object, so this builds a fresh
-    /// one from the last applied spec and waits in [`MapState::AwaitingConfigure`] for
-    /// `bind_and_clear`; attaching a buffer before acking the initial configure is what the
-    /// protocol forbids, and niri says so by name.
+    /// **Hidden after being shown.** [`App::unmap`] destroyed the object, so rebuild from the last
+    /// spec and wait in [`MapState::AwaitingConfigure`]; attaching before the initial ack is the
+    /// protocol error niri reports.
     ///
-    /// The size guard is [`App::create_panel`]'s, run again because `width`/`height` are
-    /// `Signal`-bindable: a spec that resolved to a `Fill` on a singly anchored axis since the
-    /// last create would be a protocol error that kills the connection.
+    /// Repeat [`App::create_panel`]'s guard because signal-bound `width`/`height` can turn a fixed
+    /// axis into `Fill` after creation; `set_size(_, 0)` would kill the connection.
     pub(super) fn show_panel(&mut self, qh: &QueueHandle<App>, index: usize) {
         let TrackedRole::Panel { layer, spec, output, output_size } = &self.surfaces[index].role else {
             return;
@@ -305,16 +273,10 @@ impl App {
         eprintln!("[oblisk-renderer] {} created: visible = true", self.surfaces[index].surface_id);
     }
 
-    /// `set_exclusive_zone`, one value per [`node::Exclusive`]: `Reserve` derives it from the
-    /// compositor-configured size (see [`exclusive_zone_for`]), `Respect` sends explicit `0`, and
-    /// `Ignore` sends `-1`.
-    /// The explicit `0` matters because `exclusive` is `Signal`-bindable (ADR-0038 decision 2): a
-    /// dock turning it off must take back its reserved zone, and the protocol's default of 0 is no
-    /// help once a real value has been sent. `-1` needs the same explicit push.
-    /// Stages only, since the caller commits; committing here would split one update across
-    /// several commits, and on an unmapped surface a bufferless commit is the protocol's re-map
-    /// procedure (see [`App::unmap`]). Also a no-op on a `window` (§ 6): reserving space
-    /// is what makes a surface a shell component, not a window.
+    /// Stages `Reserve`'s configured-size zone, explicit `0` for `Respect`, or `-1` for `Ignore`.
+    /// Explicit values matter because signal-bound `exclusive` must withdraw a prior reservation.
+    /// The caller commits: committing here would split updates, and a bufferless commit on an
+    /// unmapped surface is the re-map procedure. Windows have no zone (§ 6).
     pub(super) fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
         let TrackedRole::Panel { layer: Some(layer), spec, .. } = &tracked.role else {
@@ -323,33 +285,24 @@ impl App {
         let zone = match spec.exclusive {
             node::Exclusive::Reserve => exclusive_zone_for(spec.topology.anchor, tracked.configured_size),
             node::Exclusive::Respect => 0,
-            // `-1` is the protocol's "ignore every zone" sentinel, not derived from anything.
+            // `-1` is the protocol's "ignore every zone" sentinel.
             node::Exclusive::Ignore => -1,
         };
         layer.set_exclusive_zone(zone);
     }
 
-    /// Diffs one surface's freshly resolved `panel` spec against the one its layer-shell state was
-    /// last set from, and sends only what moved (see [`spec_update`] for which fields).
+    /// Diffs the fresh `panel` spec against layer-shell's baseline and sends only changed fields.
     ///
-    /// Ends in its own commit when anything moved, which the surrounding comments say it should not
-    /// have to. `apply_resolved_state` stages and lets `paint_surface`'s `swap_buffers` carry the
-    /// whole pass in one commit -- except that `paint_surface` returns early when the display list
-    /// is byte-identical to the last one, which is most passes for most surfaces and the entire
-    /// point of that check. Every field here is double-buffered `wl_surface` state, so on those
-    /// passes the request was sent and then sat pending until some unrelated repaint happened to
-    /// flush it.
+    /// Commits its own changes because `paint_surface` skips byte-identical display lists. Without
+    /// this, double-buffered requests could sit pending until an unrelated repaint.
     ///
-    /// Measured, not deduced. `panel_host` raised its `keyboard_interactivity` to `Exclusive` while
-    /// its card was already drawn and unchanged; niri never gave it the keyboard. Editing an
-    /// unrelated border width -- which changes the display list and so reaches `swap_buffers` --
-    /// delivered the focus change immediately. The bar never showed the bug because its clock
-    /// redraws it once a second, so it is never more than a second away from a commit.
+    /// Measured incident: `panel_host` raised `keyboard_interactivity` to `Exclusive` after its
+    /// unchanged card was drawn, but niri never gave it the keyboard. An unrelated border-width
+    /// edit changed the display list and `swap_buffers` delivered focus immediately. The bar hid
+    /// the bug by redrawing its clock once a second.
     ///
-    /// Guarded on `Mapped`, because a bufferless commit on an unmapped surface is the protocol's
-    /// re-map procedure (see [`App::unmap`]), and skipped for a PBA Candidate on the same terms as
-    /// [`App::apply_visibility`]: Supervisor services § 14.2 keeps a Candidate's surfaces invisible
-    /// until `ActivateDraw`.
+    /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
+    /// procedure, and Supervisor services § 14.2 keeps Candidates invisible until `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
         let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, .. } = &self.surfaces[index].role
         else {
@@ -361,26 +314,22 @@ impl App {
             layer.set_margin(margin.top as i32, margin.right as i32, margin.bottom as i32, margin.left as i32);
         }
         if let Some(mode) = update.keyboard_interactivity {
-            // Worth a line every time it moves. This surface taking the keyboard is the shell
-            // taking it away from whatever the user was typing in, so it should never be something
-            // that has to be inferred from behaviour; and a password prompt that never becomes
-            // typable is either this request not being sent or the compositor not acting on it,
-            // which nothing else here can tell apart.
+            // Log every change: it takes the keyboard from whatever the user was typing in, and a
+            // dead password prompt otherwise cannot distinguish a missing request from compositor
+            // inaction.
             eprintln!("[oblisk-renderer] {}: keyboard_interactivity -> {mode:?}", self.surfaces[index].surface_id);
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
         if let Some(size) = update.size {
-            // The same guard `create_panel` runs, needed again since `width`/`height` are
-            // resolvable: a `Signal` can turn a fixed height into `"Fill"` at runtime, and
-            // `set_size(_, 0)` on a singly anchored axis kills the connection (see
-            // [`ambiguous_zero_axis`]).
+            // Signals can turn a fixed height into `Fill`; `set_size(_, 0)` on a singly anchored
+            // axis kills the connection, so repeat [`ambiguous_zero_axis`].
             if let Some(axis) = ambiguous_zero_axis(size, fresh.topology.anchor) {
                 eprintln!(
                     "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
                      which layer-shell rejects as a protocol error; keeping its previous size. Give it an explicit {axis}, or anchor both edges.",
                     self.surfaces[index].surface_id
                 );
-                // Must not enter the baseline, or the next re-resolve never retries this size.
+                // Keep the old baseline so the next re-resolve retries this size.
                 fresh.width = applied.width;
                 fresh.height = applied.height;
             } else {
@@ -388,15 +337,14 @@ impl App {
             }
         }
 
-        // Before `apply_exclusive_zone`, which reads `exclusive` and the anchor off it: the borrow
-        // of `self.surfaces[index].role` taken above ends here.
+        // End the role borrow before `apply_exclusive_zone` reads the updated spec.
         if let TrackedRole::Panel { spec, .. } = &mut self.surfaces[index].role {
             *spec = fresh;
         }
         if update.exclusive.is_some() || update.size.is_some() {
             self.apply_exclusive_zone(index);
         }
-        // After `apply_exclusive_zone`, so one pass is still one commit rather than two.
+        // After the zone request, keeping the pass to one commit.
         if update.moved_anything()
             && self.surfaces[index].map_state == MapState::Mapped
             && !self.is_pba_candidate
@@ -408,16 +356,13 @@ impl App {
 }
 
 impl LayerShellHandler for App {
-    /// `zwlr_layer_surface_v1::closed` means this surface is gone and must be destroyed: the
-    /// compositor sends it when the output was destroyed, ADR-0038 decision 3's removal half
-    /// arriving via the layer-shell route instead of `wl_output`. Not a shutdown signal.
-    /// This used to set `self.exit`, defensible with one hardcoded bar but not once a config
-    /// declares N of them across M monitors: unplugging one external display would kill a shell
-    /// still painting on the laptop panel.
+    /// `closed` means this surface is gone, usually because its output was destroyed
+    /// (ADR-0038 decision 3), the removal half arriving through layer-shell rather than
+    /// `wl_output`. It does not mean the process should shut down. Exiting here would kill a shell
+    /// still painting on another monitor.
     ///
-    /// ponytail: closing every surface leaves this process alive with nothing on screen, right
-    /// for hotplug but wrong for a real shutdown. Upgrade path: exit on a `closed` no output
-    /// change explains.
+    /// ponytail: closing every surface leaves the process alive with nothing on screen. Upgrade:
+    /// exit on `closed` only when no output change explains it.
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
         let Some(surface_id) = self.surface_id_for(layer.wl_surface()).map(str::to_string) else {
             return;

@@ -1,9 +1,8 @@
-//! Discovery: which session-bus names `oblisk.mpris` tracks, and how it finds them. Split
-//! from `dbus::mpris` -- see `dbus/mpris/mod.rs` for the module-level doc.
+//! Discovery: which session-bus names `oblisk.mpris` tracks. Split from `dbus::mpris`; see
+//! `dbus/mpris/mod.rs`.
 //!
-//! MPRIS players never register with anything -- discovery is active: `ListNames` scanned
-//! once at startup, then `NameOwnerChanged` watched for the same prefix going forward for
-//! both arrival and departure (ADR-0036, independently validated by Quickshell's own
+//! Players never register; scan `ListNames` once, then watch `NameOwnerChanged` for arrivals and
+//! departures under the same prefix (ADR-0036, independently validated by Quickshell's
 //! `MprisWatcher`).
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,30 +14,27 @@ use super::player::{PlayerRegistry, register_player, unregister_player};
 pub(super) const MPRIS_SERVICE_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const EXCLUDED_SUFFIX: &str = "playerctld";
 
-/// True for any real MPRIS player bus name this capability should track -- the discovery
-/// prefix, minus `playerctld` (the `playerctl` project's own aggregator: it transparently
-/// mirrors whichever real player is active, including its own `Identity`/`DesktopEntry` --
-/// confirmed via live introspection to be the only reliable exclusion signal; ADR-0036).
-/// Excluding it here only affects `oblisk.mpris`'s own discovered-player list.
+/// True for a trackable MPRIS bus name: the discovery prefix, except `playerctld`, `playerctl`'s
+/// aggregator. It mirrors the active player, including `Identity`/`DesktopEntry`; live
+/// introspection found that exclusion signal reliable (ADR-0036). This only affects this list.
 pub(super) fn is_trackable_player(bus_name: &str) -> bool {
     bus_name.strip_prefix(MPRIS_SERVICE_PREFIX).is_some_and(|suffix| !suffix.is_empty() && suffix != EXCLUDED_SUFFIX)
 }
 
-/// The `id` IDL exposes: the bus name's suffix after the discovery prefix (ADR-0036, reversible
-/// with [`service_name_for_id`]). Only ever meaningful on a name [`is_trackable_player`] accepted.
+/// IDL `id`: bus-name suffix after the discovery prefix, reversible with
+/// [`service_name_for_id`] (ADR-0036). Meaningful only for names accepted by
+/// [`is_trackable_player`].
 pub(super) fn player_id(bus_name: &str) -> &str {
     bus_name.strip_prefix(MPRIS_SERVICE_PREFIX).unwrap_or(bus_name)
 }
 
-/// Reconstructs the full bus name from an `id` a write command's `arguments[0]` carries -- the
-/// other half of [`player_id`]'s reversible transform (ADR-0036). No `id -> bus_name` lookup
-/// table is kept; every write dispatch recomputes this.
+/// Reconstructs the bus name from write argument `id`, the inverse of [`player_id`] (ADR-0036);
+/// writes recompute it instead of keeping a lookup table.
 pub(super) fn service_name_for_id(id: &str) -> String {
     format!("{MPRIS_SERVICE_PREFIX}{id}")
 }
 
-/// `ListNames` scanned once, filtered by [`is_trackable_player`], each match handed to
-/// [`register_player`].
+/// Scans `ListNames` once, filters with [`is_trackable_player`], and registers each match.
 async fn discover_existing(
     connection: &zbus::Connection,
     dbus_proxy: &zbus::fdo::DBusProxy<'static>,
@@ -60,17 +56,13 @@ async fn discover_existing(
     }
 }
 
-/// Binds `org.freedesktop.DBus`, subscribes to `NameOwnerChanged` *before* running the
-/// initial [`discover_existing`] scan, then spawns the ongoing forwarder loop over that
-/// already-live subscription. Degrades to "no discovery" (logged) if either bind or
-/// subscribe fails.
+/// Binds `org.freedesktop.DBus`, subscribes to `NameOwnerChanged`, scans with
+/// [`discover_existing`], then starts the forwarder over that live subscription. Bind or
+/// subscribe failure logs and disables discovery.
 ///
-/// Subscribe-then-scan, not scan-then-subscribe: scanning first leaves a window where a
-/// player that appears or disappears between the `ListNames` reply and the subscription
-/// being installed is silently missed forever. A `NameOwnerChanged` landing on this
-/// subscription before `discover_existing`'s own scan reaches that name is a harmless
-/// double-registration, already handled by `register_player`'s insert-returns-previous-abort
-/// logic.
+/// Subscribe before scanning: scan-first can permanently miss a player appearing or disappearing
+/// between the `ListNames` reply and subscription. A signal arriving before the scan reaches its
+/// name only double-registers it, handled by `register_player`'s replace-and-abort logic.
 pub(super) async fn spawn_discovery(
     connection: zbus::Connection,
     registry: PlayerRegistry,

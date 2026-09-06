@@ -1,11 +1,8 @@
--- The OSD card, `OSDCard.qml` minus its animation: a glass card at the bottom centre, with the two
--- layouts that file has, switched by whether the entry carries a level. What to show and when is
--- `modules/osd/service.lua`'s; this file only draws the entry it holds.
+-- `OSDCard.qml` without animation: bottom-centered glass card, switching its two layouts on whether
+-- the entry has a level. `modules/osd/service.lua` decides what/when; this draws the entry.
 --
--- One `panel`, two stacked rows switched by `visible`, rather than two panels: § 6 gives every
--- surface its own compositor identity, and a volume change while a toggle card is still up would
--- otherwise be two overlapping surfaces fighting over one screen position instead of one replacing
--- the other.
+-- One `panel` with two `visible`-switched rows, not two panels. § 6 gives each surface its own
+-- compositor identity; otherwise a volume change during a toggle would overlap at one position.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local meter = require("components.meter")
@@ -23,7 +20,7 @@ local function bold(field)
     end)
 end
 
--- The slider layout: glyph in the accent colour, a track that fills, a bold readout.
+-- Slider layout: accent glyph, filling track, bold readout.
 local level_row = row {
     width = "Fill",
     height = "Fill",
@@ -51,7 +48,7 @@ local level_row = row {
     },
 }
 
--- The toggle layout: the glyph in an accent-tinted tile, a bold line beside it, the pair centred.
+-- Toggle layout: glyph in an accent-tinted tile and bold text beside it, centered.
 local fact_row = row {
     width = "Fill",
     height = "Fill",
@@ -62,8 +59,7 @@ local fact_row = row {
         return e.level == nil
     end),
     children = {
-        -- A box's `align_*` place the box in its parent, not its child in it, so the glyph is centred
-        -- by a filling row inside the tile, the battery pill's own arrangement.
+        -- `align_*` places the box, not its child; a filling row centers the glyph inside the tile.
         rect {
             width = theme.osd_tile,
             height = theme.osd_tile,
@@ -92,10 +88,10 @@ local fact_row = row {
 return panel {
     id = "osd",
     layer = "Overlay",
-    -- No `left`/`right`: § 6's anchor booleans pass straight through to `zwlr_layer_surface_v1`
-    -- (`renderer/src/wayland/layer.rs`'s `anchor_for` is a bare bitflag map, nothing more), and the
-    -- protocol centers an axis with neither of its edges anchored. Explicit `width`/`height` are
-    -- required because `bottom` alone doesn't anchor both edges of either axis.
+    -- No `left`/`right`: § 6's anchors map directly to `zwlr_layer_surface_v1`
+    -- (`renderer/src/wayland/layer.rs`'s `anchor_for` is a bare bitflag map), and the protocol
+    -- centers an axis with neither edge anchored. Explicit `width`/`height` are required because
+    -- `bottom` alone anchors neither full axis.
     anchor = { bottom = true },
     margin = { bottom = theme.s(132, 90) },
     width = theme.osd_width,

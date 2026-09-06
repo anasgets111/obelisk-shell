@@ -1,5 +1,5 @@
-//! Pure `Metadata` (`a{sv}`) parsing, album-art trust-checking, and track-identity comparison
-//! (ADR-0036). Split from `dbus::mpris` -- see `dbus/mpris/mod.rs` for the module-level doc.
+//! Pure `Metadata` (`a{sv}`) parsing, album-art trust checks, and track identity comparison
+//! (ADR-0036). Split from `dbus::mpris`; see `dbus/mpris/mod.rs`.
 
 use std::path::Path;
 
@@ -12,8 +12,7 @@ fn value_as_str<'a>(value: &'a Value<'_>) -> Option<&'a str> {
     }
 }
 
-/// `xesam:artist` is `as` (array of strings) on every real player checked; some malformed
-/// metadata could still hand back a bare string, so that's accepted too rather than dropped.
+/// `xesam:artist` is `as` on every checked player; accept a bare string too for malformed metadata.
 fn value_as_str_or_joined_array(value: &Value<'_>) -> Option<String> {
     match value {
         Value::Str(s) => Some(s.as_str().to_string()),
@@ -34,9 +33,8 @@ fn value_as_i64(value: &Value<'_>) -> Option<i64> {
     }
 }
 
-/// `mpris:trackid` is an object path (`o`) on every real player checked (Zen, mpv-mpris), but
-/// Quickshell's own implementation (`player.cpp:266-274`) also accepts a bare string for players
-/// that get the type wrong -- matched here too, same defensive posture.
+/// `mpris:trackid` is an object path (`o`) on checked players (Zen, mpv-mpris), but Quickshell's
+/// `player.cpp:266-274` accepts a bare string for type-wrong players, so accept that too.
 fn value_as_trackid(value: &Value<'_>) -> Option<String> {
     match value {
         Value::ObjectPath(path) => Some(path.as_str().to_string()),
@@ -45,9 +43,8 @@ fn value_as_trackid(value: &Value<'_>) -> Option<String> {
     }
 }
 
-/// One `Metadata` dict, parsed down to exactly what `oblisk.mpris` needs -- everything else in a
-/// real player's `Metadata` (album, disc/track number, genre, ...) is outside the IDL's declared
-/// player object shape and dropped.
+/// One `Metadata` dict reduced to `oblisk.mpris`'s fields; album, disc/track number, genre, and
+/// other keys outside the IDL player shape are dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ParsedMetadata {
     pub(super) title: String,
@@ -71,9 +68,8 @@ pub(super) fn parse_metadata(metadata: &std::collections::HashMap<String, OwnedV
 }
 
 /// [`ParsedMetadata::track_identity`]'s composite key (ADR-0036, CONTEXT.md "Track identity"):
-/// `trackid`/`url`/`title` each checked independently -- real players are observed to leave
-/// any *one* of these unchanged across a genuine track change, so equality requires all
-/// three to match, not just one.
+/// require `trackid`/`url`/`title` all to match. Real players leave any one unchanged across a
+/// genuine track change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct TrackIdentity {
     trackid: Option<String>,
@@ -87,13 +83,10 @@ impl ParsedMetadata {
     }
 }
 
-/// `album_art_path`'s resolution (ADR-0036): `art_url` must be `file://`-scheme and resolve,
-/// via `canonicalize()`, to a real existing regular file. No directory allowlist -- real
-/// players cache art in widely varying, non-standard locations (confirmed live: Zen's own
-/// cache lives under `~/.config/zen/...`, not any XDG-standard cache dir), and the source is
-/// a player the user is already running with their own privileges. Any other scheme (a
-/// remote `http(s)://` `artUrl`) or a missing/dangling path degrades to an empty string --
-/// no HTTP-fetch dependency exists in this workspace.
+/// `art_url` must be `file://` and canonicalize to an existing regular file (ADR-0036). No
+/// directory allowlist: players use varied locations, confirmed by Zen's
+/// `~/.config/zen/...` cache; the player already runs with the user's privileges. Other schemes,
+/// remote `http(s)://`, and missing/dangling paths become empty; no HTTP-fetch dependency exists.
 pub(super) fn resolve_album_art_path(art_url: Option<&str>) -> String {
     let Some(art_url) = art_url else { return String::new() };
     let Some(path) = art_url.strip_prefix("file://") else { return String::new() };
@@ -101,9 +94,8 @@ pub(super) fn resolve_album_art_path(art_url: Option<&str>) -> String {
     if canonical.is_file() { canonical.to_string_lossy().into_owned() } else { String::new() }
 }
 
-/// `mpris:seek`/`seek_relative`'s absolute target, clamped to `[0, length]` before the real
-/// `SetPosition`/`Seek` D-Bus call (ADR-0036). `length_us` is the cached `-1` sentinel when
-/// unknown, in which case only the lower bound applies.
+/// Absolute target for `mpris:seek`/`seek_relative`, clamped to `[0, length]` before
+/// `SetPosition`/`Seek` (ADR-0036). With cached `length_us == -1`, only the lower bound applies.
 pub(super) fn clamp_seek_target(target_us: i64, length_us: i64) -> i64 {
     let lower = target_us.max(0);
     if length_us >= 0 { lower.min(length_us) } else { lower }
@@ -166,7 +158,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_accepts_a_bare_string_trackid_defensively() {
-        // Real players sometimes get the D-Bus type wrong.
+        // Real players sometimes publish the wrong D-Bus type.
         let mut map = HashMap::new();
         map.insert("mpris:trackid".to_string(), owned(Value::Str(Str::from("/0"))));
         assert_eq!(parse_metadata(&map).trackid.as_deref(), Some("/0"));

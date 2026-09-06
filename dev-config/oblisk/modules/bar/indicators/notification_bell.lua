@@ -1,13 +1,10 @@
--- The bell half of the mirror's DateTimeDisplay, which puts the notification state and the clock in
--- one control rather than two. Returned as parts so `right_side.lua` can assemble that, since the
--- two halves open different panels: the bell opens the history, the date opens the calendar.
+-- The bell half of DateTimeDisplay. The bell opens history; the date opens the calendar. Returned
+-- as parts so `right_side.lua` can put bell and clock in one control while they open different
+-- panels.
 --
--- Two glyphs, and which one shows is the whole readout: waiting with a count, or nothing. The count
--- is part of the glyph's own string rather than a badge beside it, which is what the mirror does.
+-- The readout is a glyph with an inline count while waiting, or the plain bell.
 --
--- The mirror's third glyph, do-not-disturb, reads `notifications.dnd` and wins over the count: a
--- bell that is off says so before it says how many it is holding back. The toggle is in the
--- history panel this opens.
+-- DND (`notifications.dnd`) wins over the count. Its toggle is in the history panel.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")

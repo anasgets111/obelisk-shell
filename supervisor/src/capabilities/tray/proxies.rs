@@ -1,5 +1,5 @@
-//! Hand-written proxies for `org.kde.StatusNotifierItem`, `com.canonical.dbusmenu`, and
-//! `org.kde.StatusNotifierWatcher` (ADR-0031: no maintained zbus proxy crate for SNI/DBusMenu).
+//! Hand-written proxies for SNI, DBusMenu, and the watcher (ADR-0031: no maintained zbus proxy
+//! crate).
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
@@ -14,12 +14,11 @@ use super::{RawIconPixmap, RawToolTip};
 pub(super) trait StatusNotifierItem {
     #[zbus(name = "Activate")]
     fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
-    /// Middle-click. A separate method in the spec rather than a flag on `Activate`, and Telegram,
-    /// Chromium and Qt's own tray all export it.
+    /// Middle-click, a separate spec method exported by Telegram, Chromium, and Qt tray.
     #[zbus(name = "SecondaryActivate")]
     fn secondary_activate(&self, x: i32, y: i32) -> zbus::Result<()>;
-    /// A scroll over the icon. `orientation` is the spec's `"vertical"` or `"horizontal"`, and
-    /// `delta` its sign and magnitude, which is how a media player takes volume off the tray.
+    /// Scroll over the icon. `orientation` is normally `"vertical"`/`"horizontal"`; `delta` carries
+    /// sign and magnitude.
     #[zbus(name = "Scroll")]
     fn scroll(&self, delta: i32, orientation: &str) -> zbus::Result<()>;
 
@@ -51,9 +50,7 @@ pub(super) trait StatusNotifierItem {
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property, name = "WindowId")]
     fn window_id(&self) -> zbus::Result<i32>;
-    /// A directory the application ships its own icons in, to be searched before the session theme.
-    /// Set by applications that bundle artwork the theme has never heard of, which is most of the
-    /// packaged-runtime ones.
+    /// Application icon directory, searched before the session theme.
     #[zbus(property, name = "IconThemePath")]
     fn icon_theme_path(&self) -> zbus::Result<String>;
 
@@ -71,15 +68,10 @@ pub(super) trait StatusNotifierItem {
     fn new_status(&self, status: String);
 }
 
-/// `GetLayout`'s `(ia{sv}av)` reply structure, decoded field-by-field via a real
-/// `#[derive(Type, Deserialize)]` struct rather than a bare `zvariant::OwnedValue`. This
-/// matters for correctness, not just style: `Body::deserialize` checks the declared Rust
-/// type's own static signature against the real message's signature, and `OwnedValue`'s
-/// signature is always `"v"` (a bare variant), which does not equal the real wire signature
-/// `"(ia{sv}av)"` -- a proxy method declared to return `(u32, OwnedValue)` would fail every
-/// real `GetLayout` call with a signature-mismatch error. `properties`/`children` stay
-/// `OwnedValue`-typed; their contents are already fully decoded once this struct
-/// deserializes successfully, which is what [`parse_menu_node`] walks.
+/// `GetLayout`'s `(ia{sv}av)` reply, decoded by `#[derive(Type, Deserialize)]` rather than
+/// `OwnedValue`. `Body::deserialize` checks the Rust signature, while `OwnedValue` is always `"v"`
+/// and would reject the real signature with a mismatch. `properties`/`children` remain
+/// `OwnedValue` after successful decoding for [`parse_menu_node`] to walk.
 #[derive(Debug, Deserialize, Type)]
 pub(super) struct RawMenuLayout {
     id: i32,
@@ -87,16 +79,13 @@ pub(super) struct RawMenuLayout {
     children: Vec<OwnedValue>,
 }
 
-/// Reconstructs the `zvariant::Value::Structure` shape [`parse_menu_node`] expects from an
-/// already-decoded [`RawMenuLayout`] -- lets the top-level `GetLayout` reply and every
-/// recursive child share the exact same parsing logic instead of duplicating it.
+/// Rebuilds the `Value::Structure` expected by [`parse_menu_node`] so the top-level reply and
+/// recursive children share one parser.
 pub(super) fn raw_menu_layout_to_value(raw: RawMenuLayout) -> Value<'static> {
     let mut properties = Dict::new(&Signature::Str, &Signature::Variant);
     for (key, value) in raw.properties {
-        // The dict's own declared value signature is `Variant` ("v") -- `Dict::append` checks
-        // the inserted value's *own* `value_signature()` against that, which is only ever `"v"`
-        // for a `Value::Value(Box<Value>)` (every other variant's `value_signature()` is its own
-        // concrete type, e.g. `Value::Str(_)` -> `"s"`). Explicit wrap required, not optional.
+        // The dict declares variant values (`"v"`); only `Value::Value(Box<Value>)` has that
+        // signature. Explicit wrapping is required.
         properties
             .append(Value::Str(Str::from(key)), Value::Value(Box::new(Value::from(value))))
             .expect("Str key / explicitly-wrapped-variant value always matches this dict's own declared signature");
@@ -136,10 +125,8 @@ pub(super) trait DBusMenu {
     fn layout_updated(&self, revision: u32, parent: i32);
 }
 
-/// Client-side proxy for calling `RegisterStatusNotifierHost` against whichever process ends up
-/// owning `org.kde.StatusNotifierWatcher` (ADR-0031's "dual-role dance") -- addressed at the
-/// well-known name, not a resolved unique name, so D-Bus routing delivers the call to the real
-/// owner regardless of whether that's this process or a real DE's tray host.
+/// Calls `RegisterStatusNotifierHost` at the well-known watcher name, so D-Bus routes to whichever
+/// process owns it (ADR-0031).
 #[zbus::proxy(
     interface = "org.kde.StatusNotifierWatcher",
     default_service = "org.kde.StatusNotifierWatcher",
@@ -150,8 +137,8 @@ pub(super) trait StatusNotifierWatcherClient {
     fn register_status_notifier_host(&self, service: &str) -> zbus::Result<()>;
 }
 
-/// `destination` rather than the item's unique name: a Chromium tray item answers only the
-/// well-known name it registered under (ADR-0072).
+/// Binds to `destination`, not the item's unique name: Chromium answers only its registered
+/// well-known name (ADR-0072).
 pub(super) async fn bind_item(
     connection: &zbus::Connection,
     destination: &OwnedBusName,
@@ -177,9 +164,8 @@ mod tests {
 
     #[test]
     fn raw_menu_layout_signature_matches_the_real_dbusmenu_wire_shape() {
-        // GetLayout's real reply signature (the DBusMenu spec's own "(ia{sv}av)") -- a mismatch
-        // here means every real GetLayout call would fail with a signature-mismatch error
-        // despite this module's own tests passing.
+        // The DBusMenu wire signature must match or every real `GetLayout` fails, even if local
+        // tests pass.
         assert_eq!(RawMenuLayout::SIGNATURE.to_string(), "(ia{sv}av)");
     }
 

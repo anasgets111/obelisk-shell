@@ -26,10 +26,9 @@ impl StatusNotifierWatcher {
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(|s| s.to_string());
-        // Logged as well as returned. The error reply goes to the registering application, which
-        // is usually a tray icon that then shows nothing and says nothing, so without this a
-        // refused registration is invisible from the shell's side -- which is how a Vesktop
-        // registration went missing for a whole debugging session.
+        // Log as well as return: the registering icon usually shows nothing, so a refused
+        // registration is otherwise invisible to the shell. A Vesktop registration vanished this
+        // way for a whole debugging session.
         let resolved = resolve_registration(&self.connection, &service, sender.as_deref()).await.map_err(|err| {
             eprintln!("tray: RegisterStatusNotifierItem({service:?}) could not be resolved: {err}");
             zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"))
@@ -51,9 +50,8 @@ impl StatusNotifierWatcher {
         _service: String,
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) {
-        // Accepted trivially (ADR-0031): Oblisk is the only host that matters here; this
-        // exists for spec completeness (we may register ourselves as our own host too, see
-        // TrayController::new).
+        // Accepted trivially (ADR-0031). Oblisk is the relevant host; this exists for spec
+        // completeness and permits self-registration (see `TrayController::new`).
         let was_registered = {
             let mut guard = self.host_registered.lock().unwrap();
             let was = *guard;
@@ -110,14 +108,10 @@ mod tests {
     use super::*;
     use crate::capabilities::test_support::p2p_pair;
 
-    // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
-    //      must be rejected, since a connection can only ever truthfully claim its own real
-    //      unique name (the bus-daemon-authenticated sender) ----
+    // ---- fabricated unique names must be rejected ----
 
-    /// Builds a real `RegisterStatusNotifierItem` method-call `Message` carrying `sender` in
-    /// its own `SENDER` header field, so `header.sender()` returns exactly what a real call
-    /// from that unique name would -- lets these tests exercise the real interface method,
-    /// not just `resolve_registration` in isolation.
+    /// Builds a real method call with `sender` in its `SENDER` header, so `header.sender()` matches
+    /// a real call and the test exercises the interface method.
     fn register_call_message(sender: &str) -> zbus::Message {
         zbus::Message::method_call(WATCHER_OBJECT_PATH, "RegisterStatusNotifierItem")
             .expect("valid method-call builder")
@@ -132,13 +126,9 @@ mod tests {
         StatusNotifierWatcher { connection, registry, host_registered: Arc::new(Mutex::new(false)), events }
     }
 
-    /// Minimal server-side stub answering only the `org.kde.StatusNotifierItem` properties
-    /// `fetch_tray_item_base`/`register_item` actually read -- a bare p2p connection with
-    /// nothing exported on the peer's object server never replies to these at all, so
-    /// `register_item`'s real outbound calls would otherwise hang forever (confirmed live:
-    /// without this, the "accepts" test below hung until SIGKILL'd). `Menu` returns `"/"` so
-    /// `register_item`'s own `path.as_str() != "/"` check skips the whole DBusMenu/GetLayout
-    /// path.
+    /// Stub for the properties `register_item` reads. A bare p2p peer never replies, so the real
+    /// calls hang; without this, the accepts test hung until SIGKILL. `Menu` returns `/`, skipping
+    /// DBusMenu/GetLayout.
     struct StubStatusNotifierItem;
 
     #[zbus::interface(name = "org.kde.StatusNotifierItem")]
@@ -177,9 +167,7 @@ mod tests {
         }
     }
 
-    /// Minimal server-side stub answering `org.freedesktop.DBus.NameHasOwner` -- the
-    /// pre-insert liveness check in `register_item` calls this against `self.connection`; on
-    /// a bare p2p connection nothing else would ever answer it either.
+    /// Stub for `NameHasOwner`, which the pre-insert liveness check calls on a p2p connection.
     struct StubDBusDaemon;
 
     #[zbus::interface(name = "org.freedesktop.DBus")]
@@ -222,7 +210,7 @@ mod tests {
         let emitter =
             zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
 
-        // The real sender is :1.5; the call claims to be the fabricated, never-connected :999.1.
+        // The real sender is :1.5; the call claims fabricated, never-connected :999.1.
         let message = register_call_message(":1.5");
         let result = watcher.register_status_notifier_item(":999.1".to_string(), message.header(), emitter).await;
 

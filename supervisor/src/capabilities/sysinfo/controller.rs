@@ -1,45 +1,42 @@
-//! `SysinfoController`: three independently-configurable, watch-driven poll tasks (cpu; ram+
-//! swap; temp_cores+temp_gpu) feeding one shared `SysinfoState` (ADR-0035).
+//! [`SysinfoController`] runs three configurable poll tasks, for cpu, ram+swap, and
+//! temp_cores+temp_gpu, feeding one `SysinfoState` (ADR-0035).
 
 use std::time::Duration;
 
-/// `oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12). Field
-/// names are the `StateSnapshot` payload's JSON keys verbatim -- the Renderer routes them
-/// straight into the Lua signal table by name, unchanged.
+/// `oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12), with field
+/// names unchanged from the `StateSnapshot` JSON keys.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct SysinfoState {
-    /// Total CPU utilization, `0` to `100`, across all cores. `0` before the first sample, which
-    /// needs two reads a tick apart to produce a delta.
+    /// Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.
     pub cpu_percent: u8,
     /// Physical memory in use, `0` to `100`.
     pub ram_percent: u8,
-    /// Swap in use, `0` to `100`. `0` on a machine with no swap, which is indistinguishable from
-    /// swap that is simply empty.
+    /// Swap in use, `0` to `100`; `0` means either no swap or empty swap.
     pub swap_percent: u8,
-    /// Per-core temperatures in Celsius, from one hwmon pass. Empty on a machine that exposes
-    /// none. Length is the sensor count, not the core count, and the order is hwmon's.
+    /// Per-core Celsius temperatures from one hwmon pass. Empty when none are exposed. Length is
+    /// sensor count, not core count, in hwmon order.
     pub temp_cores: Vec<i64>,
-    /// GPU temperature in Celsius, or `-1` when no GPU sensor was found. Read from the same hwmon
-    /// pass as [`SysinfoState::temp_cores`], so it is never newer or older than they are.
+    /// GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as
+    /// [`SysinfoState::temp_cores`], so neither is newer than the other.
     pub temp_gpu: i64,
 }
 
 impl Default for SysinfoState {
-    /// Pre-first-sample sentinels (ADR-0035): `0` for the three percent fields (no
-    /// second sentinel convention needed alongside `temp_gpu`'s own IDL-mandated `-1`).
+    /// Pre-first-sample sentinels (ADR-0035): `0` for the three percent fields; `temp_gpu` uses
+    /// its IDL-mandated `-1`.
     fn default() -> Self {
         Self { cpu_percent: 0, ram_percent: 0, swap_percent: 0, temp_cores: Vec::new(), temp_gpu: -1 }
     }
 }
 
-/// Whether a metric task should arm a real ticking timer or park itself with zero wakeups
-/// (ADR-0035's suspend-at-zero mechanism). The pure decision a task's loop branches on
-/// every time its `watch::Receiver` reports a changed interval.
+/// Whether a metric task ticks or parks with zero wakeups (ADR-0035), reevaluated when its
+/// `watch::Receiver` reports an interval change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollMode {
-    /// `interval == 0`: no `tokio::time::interval` armed; the loop awaits only `watch::Receiver::changed()`.
+    /// `interval == 0`: no timer; await only `watch::Receiver::changed()`.
     Dormant,
-    /// `interval != 0`: the loop races `tokio::time::interval(_).tick()` against `watch::Receiver::changed()`.
+    /// `interval != 0`: race `tokio::time::interval(_).tick()` against
+    /// `watch::Receiver::changed()`.
     Ticking(Duration),
 }
 
@@ -47,16 +44,15 @@ pub fn poll_mode(interval: Duration) -> PollMode {
     if interval.is_zero() { PollMode::Dormant } else { PollMode::Ticking(interval) }
 }
 
-/// Wakes `main.rs`'s `select!` to push a fresh `StateSnapshot`. A single-variant enum, not a
-/// bare `()`, keeps the `select!` arm self-documenting.
+/// Wakes `main.rs`'s `select!` to push a `StateSnapshot`; a named single variant keeps the arm
+/// clear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysinfoSignal {
     Changed,
 }
 
-/// `sysinfo:configure({cpu_interval, ram_interval, temp_interval})`'s parsed argument
-/// (ADR-0035). A present key overrides that task's interval; an absent key leaves it
-/// unchanged.
+/// Parsed `sysinfo:configure({cpu_interval, ram_interval, temp_interval})` argument (ADR-0035).
+/// Present keys override intervals; absent keys stay unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SysinfoConfigure {
     pub cpu_interval: Option<u64>,
@@ -64,9 +60,8 @@ pub struct SysinfoConfigure {
     pub temp_interval: Option<u64>,
 }
 
-/// `sysinfo:configure(cfg)`'s `arguments: [cfg]` -- takes a table argument rather than
-/// positional ones. `arguments[0]` is a JSON object; any present key with the wrong type
-/// drops the whole call (`None`) -- no partial-apply.
+/// `sysinfo:configure(cfg)`'s `arguments: [cfg]`: `arguments[0]` is a JSON object, and any wrong
+/// present-key type drops the whole call (`None`), with no partial apply.
 pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoConfigure> {
     let table = arguments.first()?.as_object()?;
     let read_seconds = |key: &str| -> Option<Option<u64>> {
@@ -82,9 +77,8 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoCo
     })
 }
 
-/// Owns the three watch-driven poll tasks and the state they write into. Not `Clone` --
-/// `configure` is a synchronous, non-blocking local operation, so callers hold
-/// `&SysinfoController` directly rather than cloning it into a spawned task.
+/// Owns the three poll tasks and their state. Not `Clone`: synchronous, non-blocking `configure`
+/// uses `&SysinfoController` directly.
 pub struct SysinfoController {
     state: std::sync::Arc<std::sync::Mutex<SysinfoState>>,
     cpu_interval: tokio::sync::watch::Sender<Duration>,
@@ -93,10 +87,9 @@ pub struct SysinfoController {
 }
 
 impl SysinfoController {
-    /// Spawns the three tasks, all starting dormant (`Duration::ZERO`, no polling until Lua
-    /// calls `configure`). `signal_tx` is shared by all three; each sends [`SysinfoSignal::Changed`]
-    /// only after actually updating `state` on a real tick. The temp chip(s) are resolved here,
-    /// once, before the temp task is spawned -- `hwmon_root` itself is never threaded into the task.
+    /// Spawns all three dormant (`Duration::ZERO`) until Lua calls `configure`. They share
+    /// `signal_tx` and signal only after real-tick state updates. Resolve temp chips once here;
+    /// `hwmon_root` is not threaded into the task.
     pub fn new(
         proc_root: std::path::PathBuf,
         hwmon_root: std::path::PathBuf,
@@ -118,9 +111,8 @@ impl SysinfoController {
         Self { state, cpu_interval, ram_interval, temp_interval }
     }
 
-    /// Applies a parsed `sysinfo:configure(cfg)` call -- a present interval overrides that task's
-    /// watch value (waking it from dormant, resuming at a new cadence, or suspending at `0`); an
-    /// absent one leaves it untouched. `send` only errors if the task panicked; logged, not propagated.
+    /// Applies parsed `sysinfo:configure(cfg)`: present intervals wake, retime, or suspend their
+    /// task at `0`; absent ones stay unchanged. `send` errors only after task panic, logged here.
     pub fn configure(&self, cfg: SysinfoConfigure) {
         if let Some(sec) = cfg.cpu_interval
             && self.cpu_interval.send(Duration::from_secs(sec)).is_err()
@@ -139,18 +131,15 @@ impl SysinfoController {
         }
     }
 
-    /// The current combined state -- what `main.rs`'s signal-channel `select!` arm clones and
-    /// pushes as a fresh `StateSnapshot`.
+    /// Current combined state for `main.rs`'s signal-channel `select!` snapshot push.
     pub fn snapshot(&self) -> SysinfoState {
         self.state.lock().expect("sysinfo state mutex poisoned").clone()
     }
 }
 
-/// `cpu_percent`'s task: keeps the previous `/proc/stat` sample in loop-local state across
-/// ticks; the first tick after a cold start or resume only stores a sample, no delta yet. The
-/// three task loops below are near-identical, kept as separate functions since a closure
-/// returning a `Future` that borrows its own captured state can't escape a plain `FnMut` in
-/// stable Rust.
+/// `cpu_percent` task. Keeps the previous `/proc/stat` sample across ticks; the first tick after
+/// cold start or resume stores only a sample. The three similar loops stay separate because a
+/// closure returning a future borrowing its own state cannot escape stable Rust's plain `FnMut`.
 async fn run_cpu_task(
     proc_root: std::path::PathBuf,
     mut interval_rx: tokio::sync::watch::Receiver<Duration>,
@@ -162,8 +151,8 @@ async fn run_cpu_task(
         let interval = *interval_rx.borrow_and_update();
         match poll_mode(interval) {
             PollMode::Dormant => {
-                // Discard any sample from before going dormant -- /proc/stat's counters are
-                // cumulative since boot, so a stale delta would publish a bogus averaged reading.
+                // `/proc/stat` counters are cumulative since boot; discard pre-dormancy samples or
+                // the next delta is bogus.
                 previous = None;
                 if interval_rx.changed().await.is_err() {
                     return; // every SysinfoController that could reconfigure this task is gone
@@ -200,8 +189,8 @@ async fn run_cpu_task(
     }
 }
 
-/// `ram_percent`/`swap_percent`'s task -- both computed from one `/proc/meminfo` read on
-/// every tick (ADR-0035: `swap_percent` rides `ram_interval`, no separate interval).
+/// `ram_percent`/`swap_percent` task. One `/proc/meminfo` read per tick; `swap_percent` rides
+/// `ram_interval` with no separate interval (ADR-0035).
 async fn run_ram_task(
     proc_root: std::path::PathBuf,
     mut interval_rx: tokio::sync::watch::Receiver<Duration>,
@@ -248,10 +237,9 @@ async fn run_ram_task(
     }
 }
 
-/// `temp_cores`/`temp_gpu`'s task -- both read from one hwmon pass per tick (`temp_gpu` rides
-/// `temp_interval`, no separate interval). `core_source`/`gpu_chip` are resolved once in
-/// `SysinfoController::new`, before this task spawns -- onboard sensors don't hotplug, so
-/// re-scanning `hwmon_root` every tick would be pure waste.
+/// `temp_cores`/`temp_gpu` task. One hwmon pass per tick; `temp_gpu` rides `temp_interval`. Resolve
+/// `core_source`/`gpu_chip` once in `new`: onboard sensors do not hotplug, so rescanning each tick
+/// wastes work.
 async fn run_temp_task(
     core_source: super::temp::CoreTempSource,
     gpu_chip: Option<std::path::PathBuf>,

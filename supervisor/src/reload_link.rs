@@ -1,10 +1,8 @@
-//! Real [`reload::CandidateLink`] implementation over the control socket (ADR-0019 item
-//! 1/6): [`SocketCandidateLink`] is the production implementation `main.rs` drives
-//! `reload::run_pba`'s handshake with.
+//! Real [`reload::CandidateLink`] over the control socket (ADR-0019 item 1/6), driven by
+//! `main.rs`'s `reload::run_pba` handshake.
 //!
-//! Borrows the Supervisor's shared `inbound_frames` channel for the duration of one in-flight
-//! handshake, rather than a dedicated per-candidate channel (ADR-0025). A frame here that
-//! isn't relevant to this handshake is logged and dropped, not routed anywhere else.
+//! Borrows shared `inbound_frames` for one handshake rather than a per-candidate channel
+//! (ADR-0025). Irrelevant frames are logged and dropped, not routed elsewhere.
 
 use std::time::Duration;
 
@@ -14,14 +12,13 @@ use tokio::sync::mpsc;
 use crate::reload::CandidateLink;
 use crate::socket::{GenerationRegistry, InboundFrame, SendFrameError};
 
-/// What a [`SocketCandidateLink`] call can fail with.
+/// [`SocketCandidateLink`] failure.
 #[derive(Debug)]
 pub enum SocketLinkError {
-    /// [`GenerationRegistry::send_frame`] failed (serialize error, or no connection registered
-    /// for the candidate generation).
+    /// [`GenerationRegistry::send_frame`] failed while serializing or finding the candidate
+    /// connection.
     Send(SendFrameError),
-    /// The shared inbound-frame channel closed while this link was waiting on it -- the
-    /// listener task is gone, which is fatal to the whole process, not just this handshake.
+    /// Shared inbound channel closed while waiting; the listener is gone, fatal to the process.
     ConnectionClosed,
 }
 
@@ -38,21 +35,19 @@ impl std::fmt::Display for SocketLinkError {
 
 impl std::error::Error for SocketLinkError {}
 
-/// The real [`CandidateLink`] implementation: `push_state_snapshot`/`send_activate_draw` go
-/// through [`GenerationRegistry::send_frame`]; `recv_ready_signal`/`recv_presentation_evidence`
-/// loop-and-filter `inbound`, ignoring (with a log line) anything not tagged for this candidate.
+/// `push_state_snapshot`/`send_activate_draw` use [`GenerationRegistry::send_frame`]; receive
+/// methods filter `inbound` and log frames not tagged for this candidate.
 pub struct SocketCandidateLink<'a> {
     pub registry: GenerationRegistry,
     pub candidate_generation_id: u32,
-    /// Borrowed for the duration of one in-flight handshake -- see the module doc comment.
+    /// Borrowed for one in-flight handshake; see the module comment.
     pub inbound: &'a mut mpsc::UnboundedReceiver<InboundFrame>,
 }
 
 impl SocketCandidateLink<'_> {
-    /// Loops `self.inbound.recv()` until a frame from `self.candidate_generation_id` matches
-    /// `extract`, logging and dropping everything else. `ConnectionClosed` if the channel ends
-    /// first. `extract`'s `Err` carries the rejected frame boxed: `RendererFrame` is large
-    /// enough that clippy's `result_large_err` flags an unboxed `Result` closure return.
+    /// Receives until the candidate's frame matches `extract`, logging/dropping others. Returns
+    /// `ConnectionClosed` if the channel ends. Box rejected frames because clippy's
+    /// `result_large_err` flags an unboxed `RendererFrame` error.
     async fn recv_matching<T>(
         &mut self,
         what: &str,
@@ -80,22 +75,18 @@ impl SocketCandidateLink<'_> {
     }
 }
 
-/// How long to wait between retries of a `send_frame` that failed because the Candidate hasn't
-/// registered a connection yet -- see [`SocketCandidateLink::push_state_snapshot`].
+/// Delay between `send_frame` retries while the Candidate has no connection.
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 impl CandidateLink for SocketCandidateLink<'_> {
     type Error = SocketLinkError;
 
-    /// Retries on `SendFrameError::NoConnection` rather than failing on the first attempt: the
-    /// Candidate was just spawned a moment before `run_pba` calls this, and real process/
-    /// Wayland/EGL/Lua-VM startup plus the initial socket connect take real wall-clock time.
-    /// Unbounded on its own, but safe: `drive_handshake` wraps this whole call in one
-    /// `timeout(ready_timeout, ..)`. Found live (a real spawned process racing a real socket
-    /// connect), not in review -- the fakes in this module's tests register instantly.
+    /// Retries `NoConnection`: the just-spawned Candidate needs real process/Wayland/EGL/Lua
+    /// startup and socket-connect time. The loop is unbounded alone but `drive_handshake` wraps it
+    /// in `timeout(ready_timeout, ..)`. Observed live; tests register fakes instantly.
     ///
-    /// Sends one `StateSnapshot` frame per entry in `snapshots` (ADR-0029: every known
-    /// capability), not just the first -- the retry loop only matters for the first frame.
+    /// Sends one `StateSnapshot` per snapshot (ADR-0029), not just the first; retry matters only
+    /// for the first frame.
     async fn push_state_snapshot(&mut self, snapshots: &[StateSnapshot]) -> Result<(), Self::Error> {
         for snapshot in snapshots {
             let frame = SupervisorFrame::StateSnapshot(snapshot.clone());
@@ -129,8 +120,7 @@ impl CandidateLink for SocketCandidateLink<'_> {
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error> {
         self.recv_matching("PresentationEvidence", |frame| match frame {
             RendererFrame::PresentationEvidence(evidence) if evidence.nonce == nonce => Ok(evidence.surface_id),
-            // A mismatched nonce is a stale message from an aborted prior attempt, not a
-            // protocol desync -- logged-and-skipped like any other irrelevant frame.
+            // A mismatched nonce is stale from an aborted attempt, not protocol desync; skip it.
             other => Err(Box::new(other)),
         })
         .await
@@ -163,8 +153,7 @@ mod tests {
         })
     }
 
-    /// A `GenerationRegistry` with one fake connection registered for `generation_id`, plus the
-    /// receiver end so a test can assert what `send_frame` actually wrote.
+    /// Registry with a fake connection and receiver for asserting `send_frame` output.
     fn registry_with_connection(generation_id: u32) -> (GenerationRegistry, mpsc::UnboundedReceiver<Vec<u8>>) {
         let registry = GenerationRegistry::default();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -185,9 +174,8 @@ mod tests {
         assert_eq!(frame, SupervisorFrame::StateSnapshot(snapshot()));
     }
 
-    /// Regression test: found running live against a real spawned Candidate process --
-    /// `push_state_snapshot` used to fail immediately with `NoConnection` because it ran before
-    /// the just-spawned Candidate had finished registering its connection.
+    /// Regression from a real spawned Candidate: the old method failed immediately with
+    /// `NoConnection` before the Candidate registered its connection.
     #[tokio::test]
     async fn push_state_snapshot_retries_until_the_candidate_connection_registers() {
         let registry = GenerationRegistry::default();
@@ -248,7 +236,7 @@ mod tests {
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
 
-        // Wrong generation (the still-authoritative one reporting something unrelated).
+        // Wrong generation, still authoritative, reporting something unrelated.
         inbound_tx
             .send(InboundFrame {
                 generation_id: 0,

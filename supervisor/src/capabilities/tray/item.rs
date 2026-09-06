@@ -1,5 +1,4 @@
-//! `TrayItem` hydration: reading every `StatusNotifierItem` property `tray.items` needs (except
-//! `menu`, fetched separately -- see [`super::menu::fetch_menu_via`]).
+//! `TrayItem` hydration from `StatusNotifierItem` properties; `menu` is fetched separately.
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
 use serde::Serialize;
@@ -12,49 +11,45 @@ use super::registration::sanitize_unique_name;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
-    /// § 2.14's stable id: the registering process's D-Bus unique name, sanitized (e.g. `"1.234"`).
-    /// What every `tray:` command takes to name the item it acts on.
+    /// docs/oblisk-idl-api-specs.md §2.14 id: sanitized registering-process D-Bus unique name,
+    /// e.g. `"1.234"`. Used by every
+    /// `tray:` command.
     pub id: String,
-    /// The display name. `Title`, falling back to `Id` when the item leaves `Title` empty.
+    /// Display name: `Title`, falling back to `Id` when `Title` is empty.
     pub name: String,
-    /// A theme icon name, for `icon { name = ... }`. Exactly one of this and [`TrayItem::icon_path`]
-    /// is ever set, so a config draws whichever is present.
+    /// Theme icon name for `icon { name = ... }`; exclusive with [`TrayItem::icon_path`].
     pub icon_name: Option<String>,
-    /// A decoded, bounds-checked PNG spooled to the runtime directory, for `image { source = ... }`.
-    /// Set when the item sent pixels rather than a theme name.
+    /// Decoded, bounds-checked PNG in the runtime directory for `image { source = ... }`; set when
+    /// the item sent pixels instead of a theme name.
     pub icon_path: Option<String>,
-    /// The `NeedsAttention` artwork, resolved the same way as `icon_name`/`icon_path`. Draw these
-    /// instead of the base pair while `status` is `"NeedsAttention"`. Both stay `nil` for an item
-    /// that declares no attention icon, which is most of them.
+    /// `NeedsAttention` artwork, resolved like `icon_name`/`icon_path`; draw it instead of the base
+    /// pair when `status == "NeedsAttention"`. Both are `nil` when undeclared.
     pub attention_icon_name: Option<String>,
-    /// The file half of the attention artwork, on the same terms as `attention_icon_name`.
+    /// File half of the attention artwork, matching `attention_icon_name`.
     pub attention_icon_path: Option<String>,
-    /// A badge, meant to be drawn over the base icon's corner rather than instead of it. Carried
-    /// rather than composited: a `stack` node is what puts one image on another, and the Supervisor
-    /// has no canvas. Both stay `nil` when the item declares no badge.
+    /// Badge to draw over the base icon's corner. Carried, not composited, because a `stack` node
+    /// overlays images and the Supervisor has no canvas. Both are `nil` when undeclared.
     pub overlay_icon_name: Option<String>,
-    /// The file half of the badge, on the same terms as `overlay_icon_name`.
+    /// File half of the badge, matching `overlay_icon_name`.
     pub overlay_icon_path: Option<String>,
-    /// The item's tooltip title and text, flattened to one string. `nil` when it has none.
+    /// Tooltip title and text flattened to one string, or `nil` when absent.
     pub tooltip: Option<String>,
-    /// SNI's own `Status`: `"Active"`, `"Passive"` or `"NeedsAttention"`. `"Passive"` is the
-    /// item asking to be hidden, which is a config's decision to honour or ignore.
+    /// SNI status: `"Active"`, `"Passive"`, or `"NeedsAttention"`. `"Passive"` asks config to hide
+    /// the item.
     pub status: String,
-    /// The item saying a left click must open its menu instead of activating it. Honour it, or
-    /// a click does nothing on the items that set it.
+    /// `true` means left click opens the menu instead of activating the item.
     pub item_is_menu: bool,
-    /// The top-level menu entries, or `nil` for an item with no `com.canonical.dbusmenu` menu.
-    /// Fetched once when the item registers, then again on the item's own layout updates.
+    /// Top-level menu entries, or `nil` without `com.canonical.dbusmenu`. Fetched at registration
+    /// and on layout updates.
     pub menu: Option<Vec<MenuItem>>,
 }
 
-/// `Title`, falling back to `Id` when empty (ADR-0031's `TrayItem.name` field).
+/// Resolves `TrayItem.name`: `Title`, falling back to `Id` when empty (ADR-0031).
 fn resolve_display_name(title: &str, id: &str) -> String {
     if title.is_empty() { id.to_string() } else { title.to_string() }
 }
 
-/// Flattens `ToolTip`'s title+text into one display string (ADR-0031: "your call on exact
-/// formatting, keep it simple").
+/// Flattens `ToolTip`'s title and text (ADR-0031 leaves exact formatting open).
 fn flatten_tooltip(title: &str, text: &str) -> Option<String> {
     match (title.is_empty(), text.is_empty()) {
         (true, true) => None,
@@ -64,10 +59,8 @@ fn flatten_tooltip(title: &str, text: &str) -> Option<String> {
     }
 }
 
-/// Reads every property `tray.items` needs except `menu` (fetched separately -- see
-/// [`fetch_menu_via`] -- since the caller reuses an already-bound [`DBusMenuProxy`] rather
-/// than re-resolving `Menu`'s object path on every refresh). A property read failure
-/// degrades to that property's empty/default value rather than failing the whole item.
+/// Reads every property `tray.items` needs except `menu`, which uses the caller's bound proxy via
+/// [`fetch_menu_via`]. A failed property read falls back to that property's empty/default value.
 pub(super) async fn fetch_tray_item_base(
     item: &StatusNotifierItemProxy<'static>,
     unique_name: &OwnedUniqueName,
@@ -77,8 +70,7 @@ pub(super) async fn fetch_tray_item_base(
     let status = item.status().await.unwrap_or_default();
     let item_is_menu = item.item_is_menu().await.unwrap_or(false);
     let tooltip = item.tool_tip().await.ok();
-    // Read once and used by all three icon resolutions below: the directory is the item's, not any
-    // one icon's (ADR-0074).
+    // Read once for all three icon variants; the directory belongs to the item (ADR-0074).
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
 
     let sanitized = sanitize_unique_name(unique_name.as_str());
@@ -123,12 +115,10 @@ pub(super) async fn fetch_tray_item_base(
     }
 }
 
-/// One icon triple (`{X}IconName`, `{X}IconPixmap`, the item's `IconThemePath`) resolved to the
-/// `(name, path)` pair a config reads, for whichever of the three variants § 2.5 defines
-/// (ADR-0074).
-///
-/// `spool_suffix` distinguishes the spooled PNGs, since an item's three pixmaps would otherwise all
-/// land on `{unique_name}.png` and the last write would win.
+/// One icon triple defined by docs/oblisk-idl-api-specs.md §2.5 (`{X}IconName`, `{X}IconPixmap`,
+/// `IconThemePath`) resolved to the config's `(name, path)` pair (ADR-0074). `spool_suffix` keeps
+/// the three PNGs distinct; otherwise the last
+/// write to `{unique_name}.png` would win.
 fn resolve_variant(
     icon_name_prop: String,
     pixmaps_raw: Vec<(i32, i32, Vec<u8>)>,

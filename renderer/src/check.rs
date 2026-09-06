@@ -1,10 +1,9 @@
-//! `oblisk check`: evaluate config, report declared surfaces, and exit.
+//! `oblisk check`: evaluate config, report declared surfaces, and exit through the Renderer's Lua
+//! loader. The Supervisor has no `mlua` runtime, so it re-execs this binary with
+//! `shared::CHECK_ENV` and forwards the exit code.
 //!
-//! Evaluates via the Renderer's Lua loader. The Supervisor has no `mlua` runtime, so it re-execs
-//! the renderer binary with `shared::CHECK_ENV` set and forwards the exit code.
-//!
-//! Runs without Wayland, surfaces, or GPU. Matches the cold evaluation before the first
-//! `StateSnapshot` arrives: every capability signal reads `nil` (ADR-0044).
+//! No Wayland, surfaces, or GPU. Matches pre-first-`StateSnapshot` evaluation: every capability
+//! signal reads `nil` (ADR-0044).
 
 use std::path::Path;
 
@@ -38,13 +37,12 @@ pub fn run(config_dir: &Path) -> Result<String, String> {
     let dirty = DirtyFlag::new();
     let loader = Loader::new(dirty.clone(), config_dir).map_err(|err| format!("{}: {err}", shell_lua.display()))?;
 
-    // The `oblisk` namespace and `process.run`, because a config reaches for both at evaluation
-    // time and a bare `Loader` dies on the first `oblisk.` anything. Every capability reads `nil`
-    // here, which is the state a real boot evaluates in too: no snapshot has arrived yet.
+    // Register `oblisk` and `process.run`: configs reach for both during evaluation, and a bare
+    // `Loader` dies on the first `oblisk.` access. Capabilities read `nil`, as at real boot before
+    // the first snapshot.
     //
-    // Frames go into a channel nobody drains. There is no Supervisor to send them to, and a
-    // `process.run` fired during evaluation has nowhere to run. That is correct: this evaluates a
-    // config, it does not start one.
+    // Frames go into an undrained channel: without a Supervisor, `process.run` has nowhere to run.
+    // Correct for a checker that evaluates, but does not start, a config.
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel();
     let commands = CommandSender::new(0, outbound_tx.clone());
     loader.register_process(ProcessRegistry::new(0, outbound_tx)).map_err(|err| err.to_string())?;
@@ -64,8 +62,8 @@ pub fn run(config_dir: &Path) -> Result<String, String> {
 mod tests {
     use std::path::Path;
 
-    /// Against the shipped dev config, which is thirty-odd files reaching each other through
-    /// `require`, so this is also a check that `oblisk check` sees what a real boot sees.
+    /// The shipped dev config spans thirty-odd files joined by `require`, so this checks that
+    /// `oblisk check` sees what a real boot sees.
     #[test]
     fn checking_the_shipped_dev_config_reports_its_surfaces() {
         let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");

@@ -6,17 +6,15 @@ use zbus::zvariant::OwnedObjectPath;
 
 use super::DEFAULT_ITEM_OBJECT_PATH;
 
-/// How `RegisterStatusNotifierItem`'s raw `service` argument classifies, before any D-Bus I/O
-/// (ADR-0031). Pure and total: every `&str` lands in exactly one branch.
+/// Classifies `RegisterStatusNotifierItem`'s `service` before D-Bus I/O (ADR-0031); every `&str`
+/// lands in one branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegistrationTarget {
-    /// `service` was an object path (`service.starts_with('/')`) -- the bus name comes from the
-    /// calling message's own sender, not from `service` itself.
+    /// Object path (`service.starts_with('/')`); the bus name comes from the message sender.
     ObjectPathFromSender { object_path: String },
-    /// `service` was already a unique name (`:N.M`) -- used directly.
+    /// Existing unique name (`:N.M`), used directly.
     UniqueName { unique_name: String },
-    /// `service` was a well-known bus name -- needs a `GetNameOwner` round trip (done by the
-    /// caller) to resolve to a unique name.
+    /// Well-known bus name; caller resolves it with `GetNameOwner`.
     WellKnownName { well_known_name: String },
 }
 
@@ -35,10 +33,8 @@ pub(super) enum RegistrationError {
     NoSender,
     InvalidName(String),
     Dbus(String),
-    /// `service` was already a unique name (`:N.M`) but didn't equal the real, authenticated
-    /// sender of this call: a connection can only ever truthfully claim its own unique name
-    /// (bus-daemon-filled, unspoofable), so any mismatch means the caller fabricated a name
-    /// it doesn't own.
+    /// Claimed unique name (`:N.M`) differs from the authenticated sender. A connection can only
+    /// claim its own bus-daemon-filled, unspoofable unique name.
     UniqueNameMismatch {
         claimed: String,
         sender: String,
@@ -62,13 +58,9 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-/// One resolved `RegisterStatusNotifierItem` call: who the registry files the item under, and
-/// where its messages are actually addressed.
-///
-/// Two names rather than one because they answer different questions and a Chromium tray item
-/// answers only one of them (ADR-0072). `unique_name` is the identity: it is what
-/// `NameOwnerChanged` reports on, what the registry keys by, and what the spool filename is built
-/// from. `destination` is the address every `Get` and `GetLayout` carries.
+/// Resolved registration identity and message address. They differ because Chromium answers only
+/// one name (ADR-0072): `unique_name` is the identity reported by `NameOwnerChanged`; it keys the
+/// registry, cleanup, and spool filename. `destination` addresses every `Get` and `GetLayout`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedRegistration {
     pub(super) unique_name: OwnedUniqueName,
@@ -76,16 +68,12 @@ pub(super) struct ResolvedRegistration {
     pub(super) object_path: OwnedObjectPath,
 }
 
-/// Resolves `RegisterStatusNotifierItem`'s `service` argument plus the calling message's sender
-/// into a [`ResolvedRegistration`] (ADR-0031). The well-known-name branch is the only one that
-/// performs I/O (`GetNameOwner`); the other two are resolved synchronously.
+/// Resolves `service` plus the message sender into [`ResolvedRegistration`] (ADR-0031). Only the
+/// well-known branch performs `GetNameOwner` I/O.
 ///
-/// That branch keeps the well-known name as the `destination` rather than substituting the owner
-/// it just looked up. Resolving to the owner is the textbook thing to do and it is what made Slack
-/// invisible: its Chromium D-Bus code answers a property `Get` addressed to
-/// `org.freedesktop.StatusNotifierItem-PID-1` and fails the identical `Get` addressed to the
-/// unique name that owns it. The lookup still happens, because the identity half of the answer
-/// needs it (ADR-0072).
+/// Keep the well-known name as `destination`, not the looked-up owner. Slack's Chromium code
+/// answers `Get` at `org.freedesktop.StatusNotifierItem-PID-1` but fails the same `Get` at its
+/// owner unique name, making Slack invisible (ADR-0072). The lookup still supplies identity.
 pub(super) async fn resolve_registration(
     connection: &zbus::Connection,
     service: &str,
@@ -102,12 +90,8 @@ pub(super) async fn resolve_registration(
             Ok(ResolvedRegistration { unique_name, destination, object_path })
         }
         RegistrationTarget::UniqueName { unique_name } => {
-            // A connection can only ever truthfully claim its own real unique name: reject any
-            // claimed unique name that doesn't equal the real, bus-daemon-authenticated
-            // sender. Otherwise any session-bus peer could call
-            // `RegisterStatusNotifierItem(":999.1")` repeatedly with made-up names, planting
-            // registry entries `NameOwnerChanged` can never clean up (it only fires for a
-            // name that was ever real and then genuinely disconnects).
+            // Reject made-up names: otherwise a peer could plant entries that `NameOwnerChanged`
+            // can never clean up, since it only fires for names that were real.
             let sender = sender.ok_or(RegistrationError::NoSender)?;
             if unique_name != sender {
                 return Err(RegistrationError::UniqueNameMismatch { claimed: unique_name, sender: sender.to_string() });
@@ -131,15 +115,9 @@ pub(super) async fn resolve_registration(
     }
 }
 
-/// The well-known branch's answer, split from the `GetNameOwner` that produces `owner` so the
-/// part that broke Slack is testable without a bus.
-///
-/// `destination` is the well-known name and not `owner`. Substituting the owner is the textbook
-/// resolution and it is what made Slack's item unreadable (ADR-0072): its Chromium D-Bus code
-/// dispatches property reads on the message's destination field, answering
-/// `org.freedesktop.StatusNotifierItem-PID-1` and failing the same read sent to `:1.N`, which owns
-/// it. `owner` is still what comes back as `unique_name`, because identity is the other half of
-/// the answer and only the owner can carry it.
+/// Builds the well-known branch's answer separately from `GetNameOwner`, keeping Slack's case
+/// testable without a bus. `destination` stays well-known because Chromium answers that name;
+/// `owner` becomes `unique_name` for identity and cleanup (ADR-0072).
 fn well_known_registration(well_known: WellKnownName<'_>, owner: OwnedUniqueName) -> ResolvedRegistration {
     let destination = OwnedBusName::from(BusName::WellKnown(well_known.to_owned()));
     ResolvedRegistration { unique_name: owner, destination, object_path: default_item_object_path() }
@@ -150,9 +128,8 @@ fn default_item_object_path() -> OwnedObjectPath {
         .expect("DEFAULT_ITEM_OBJECT_PATH is a valid object path literal")
 }
 
-/// The leading `:` stripped from a `:N.M` unique name -- both the internal Lua-facing `id` and
-/// the PNG spool filename component (ADR-0031). D-Bus guarantees a unique name contains only
-/// digits/colons/dots, so no further sanitization is needed.
+/// Strips the leading `:` from `:N.M` for Lua `id` and PNG filenames (ADR-0031). D-Bus guarantees
+/// unique names contain only digits, colons, and dots.
 pub(super) fn sanitize_unique_name(unique_name: &str) -> String {
     unique_name.trim_start_matches(':').to_string()
 }
@@ -196,9 +173,7 @@ mod tests {
         assert_eq!(sanitize_unique_name("1.234"), "1.234");
     }
 
-    // ---- resolve_registration / register_status_notifier_item: a fabricated unique name
-    //      must be rejected, since a connection can only ever truthfully claim its own real
-    //      unique name (the bus-daemon-authenticated sender) ----
+    // ---- fabricated unique names must be rejected ----
 
     use crate::capabilities::test_support::p2p_pair;
 
@@ -221,9 +196,8 @@ mod tests {
 
     #[test]
     fn a_well_known_registration_is_addressed_by_the_name_it_registered_not_its_owner() {
-        // The Slack case. Both halves matter and they are different names: the registry files the
-        // item under `:1.659` so `NameOwnerChanged` can clean it up, and every `Get` goes to the
-        // well-known name because that is the only one Chromium answers.
+        // Slack's identity is `:1.659` for cleanup; Chromium receives every `Get` at the
+        // well-known name.
         let well_known = WellKnownName::try_from("org.freedesktop.StatusNotifierItem-1240273-1").unwrap();
         let owner = OwnedUniqueName::try_from(":1.659").unwrap();
         let resolved = well_known_registration(well_known, owner);
@@ -239,8 +213,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_registration_rejects_a_fabricated_unique_name() {
         let (connection, _peer) = p2p_pair().await;
-        // The real sender is :1.5, but `service` claims a completely different,
-        // never-connected unique name.
+        // The real sender is :1.5; `service` claims never-connected :999.1.
         match resolve_registration(&connection, ":999.1", Some(":1.5")).await {
             Err(RegistrationError::UniqueNameMismatch { claimed, sender }) => {
                 assert_eq!(claimed, ":999.1");

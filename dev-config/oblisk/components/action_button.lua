@@ -1,23 +1,16 @@
--- A labelled button, which is what `icon_button` is not: a glyph circle says what it does by being
--- a picture of it, and this is for the cases where the word is the point -- a notification action
--- the sender named, "Update", "Retry", "Close".
---
--- This was a local in `components/notification_card.lua`, with a comment saying one call site is a
--- local and two in agreement are a component. `modules/bar/panels/update_panel.lua` is the second,
--- and it agrees about all of it but the ground: an action you are being *offered* is accent, and a
--- "Close" that only tidies away a result you have already read should not compete with it.
---
--- `opts.icon` is the theme icon a notification sender that set `action-icons` named through the key
--- (ADR-0090), drawn beside the label, or alone when the sender sent no label -- a media
--- notification's prev/play/next is three glyphs, not three words.
+-- A labelled button, unlike `icon_button`: use it when the word is the point, such as a
+-- notification action named "Update", "Retry", or "Close".
+-- Extraction rule: one call site is a local; two agreeing call sites are a component. This was the
+-- second: `modules/bar/panels/update_panel.lua`. Offered actions use accent; "Close" should not
+-- compete with the result.
+-- `opts.icon` is the theme icon named by a sender's `action-icons` key (ADR-0090), beside the label
+-- or alone when there is no label. A media notification's prev/play/next are glyphs, not words.
 local theme = require("config.theme")
 local cell = require("components.cell")
 
--- `solid` is the mirror's `variant: "primary"`, and it is the only opaque ground here. The other two
--- are tints, which is right for a row of equal choices on a notification card and wrong for the one
--- control a panel is open for: at 15% alpha over a glass card you read the window behind the shell
--- through the word "update". It picks its own foreground, because a control that chooses its own
--- background has to choose the text on it or every caller has to remember to do both.
+-- `solid` mirrors `variant: "primary"` and is the only opaque ground. The other tints suit equal
+-- notification choices, but at 15% alpha a panel's active control shows the glass behind "update".
+-- It picks its foreground too, so callers cannot mismatch a chosen background and text.
 local GROUND = {
     accent = { rest = theme.ACCENT_SUBTLE, hover = theme.ACCENT_LIGHT, border = theme.ACCENT_MEDIUM },
     quiet = { rest = theme.GLASS_CONTROL, hover = theme.GLASS_CONTROL_HOVER, border = theme.GLASS_BORDER },
@@ -37,12 +30,10 @@ return function(label, on_activate, slot, opts)
     opts = opts or {}
     local ground = GROUND[opts.tone or "accent"]
     local hovered = hover(slot)
-    -- A `button` stacks, so its one child is placed by `align_h`; a `row` does not, so its children
-    -- sit at its start. That is fine on a content-sized button, whose row is exactly as wide as the
-    -- word in it, and wrong on a filling one, where the row inherits nothing and leaves the label
-    -- against the left padding -- which is where "update" sat across the whole width of the update
-    -- panel. Filling the row and the label both is what puts the word back in the middle, and
-    -- `cell`'s `text_align` is what centres it inside the box the fill just gave it.
+    -- `button` centres its one child with `align_h`; a `row` starts its children. This is fine on a
+    -- content-sized button, whose row is exactly as wide as the word, but wrong on a filling one:
+    -- it left "update" against the padding. Fill both row and label, then let `cell`'s `text_align`
+    -- centre the label in the filled box.
     local fill = opts.width == "Fill" and "Fill" or nil
     local children = {}
     if opts.icon then

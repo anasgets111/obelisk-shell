@@ -1,23 +1,17 @@
-//! Every lazily-started capability: what is running, how each one starts, where each one's signal
-//! arrives, and which command goes to which (ADR-0037, ADR-0070, ADR-0076).
+//! Lazy capability startup, signal routing, and command dispatch (ADR-0037, ADR-0070, ADR-0076).
 //!
-//! `run_supervisor` was the only scope where sixteen controllers and their twenty channels
-//! coexisted, five locals apiece in an 800-line function, six edits across five regions of
-//! `main.rs` per new capability. Fields on [`Capabilities`] instead: start, push, accept a
-//! command are three exhaustive matches over `shared::Capability`, so a new variant fails the
-//! build at exactly the arms that need code.
+//! `run_supervisor` once held sixteen controllers, twenty channels, five locals each, and 800
+//! lines, requiring six edits across five `main.rs` regions per capability. [`Capabilities`] now
+//! owns the fields; exhaustive start, push, and dispatch matches fail at each required arm.
 //!
-//! Not a trait, not a registry of boxed objects: controllers have genuinely different shapes
-//! (`build_state` vs `snapshot` vs an `async handle_signal`, one that is a channel rather than a
-//! controller at all), and `main.rs` needs the concrete types anyway. ADR-0037 decision 3 already
-//! settled the dispatch as "static calls, no registry, no trait"; this is that, moved.
+//! No trait or boxed registry: controllers differ (`build_state`, `snapshot`, async
+//! `handle_signal`, or a channel), and `main.rs` needs concrete types. ADR-0037 decision 3 chose
+//! static calls; this module moves that dispatch here.
 //!
-//! **One child module per roster entry, flat.** The same name appears in `shared::Capability`, in
-//! `oblisk.<name>`, and in every command's `capability` field, but these modules used to sit at
-//! four depths under a `dbus/` and a `hardware/` grouped by transport, splitting `battery` and
-//! `power` for no visible reason. [`read_attr`] and [`parse_bool_arg`] are the two helpers that
-//! grouping shared, moved here; `polkit` moved to `crate::polkit`; `shm_icons` sits beside the two
-//! capabilities it serves (ADR-0076).
+//! **One flat child module per roster entry.** Shared names cover `shared::Capability`,
+//! `oblisk.<name>`, and command `capability`; the former four-level `dbus/`/`hardware/` grouping
+//! split `battery` and `power` without benefit. [`read_attr`] and [`parse_bool_arg`] moved here,
+//! `polkit` to `crate::polkit`, and `shm_icons` beside its two consumers (ADR-0076).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,26 +68,22 @@ pub mod tray;
 pub mod updates;
 pub mod workspaces;
 
-/// Reads and trims one sysfs attribute file under `entry_dir`. `None` for both "file missing"
-/// and any other read error: unreadable is treated as absent. Shared by `battery`/`brightness`.
+/// Reads and trims a sysfs attribute under `entry_dir`; missing or unreadable means absent.
 pub fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(entry_dir.join(name)).ok().map(|text| text.trim().to_string())
 }
 
-/// Shared `arguments: [en]` boolean-argument parse for `*:set_*_enabled(en)`-style write actions.
-/// Reads the first argument as a JSON bool, or `None`.
+/// Parses the first JSON boolean in `arguments: [en]` for `*:set_*_enabled(en)` actions.
 pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
     arguments.first()?.as_bool()
 }
 
-/// One capability signal, received but not yet acted on. The split from [`Capabilities::push`]
-/// keeps the main loop correct: [`Signals::next`] only ever awaits `recv()`, so losing the
-/// `tokio::select!` race drops nothing but an unstarted read, and the signal is acted on in the
-/// winning arm's body, which `select!` never cancels. `network`/`bluetooth` `await` while
-/// building state, so folding that into the raced future could drop a signal mid-flight.
+/// A received signal waiting for [`Capabilities::push`]. [`Signals::next`] only awaits `recv()`,
+/// so losing the `tokio::select!` race drops no signal; the winning arm's body is not canceled.
+/// This matters because `network`/`bluetooth` await while building state.
 #[derive(Debug)]
 pub enum Signal {
-    /// Carries its payload, not a controller name: the mixer thread sends state, not read off one.
+    /// Carries mixer state directly, not a controller name.
     Audio(AudioState),
     Network(NetworkSignal),
     Bluetooth(BluetoothSignal),
@@ -112,31 +102,25 @@ pub enum Signal {
     System,
     Privacy,
     Updates,
-    /// Carries its payload for `Signal::Audio`'s reason: the logind inhibitor watch sends state,
-    /// and there is no controller here to read it back off (ADR-0141).
+    /// Carries inhibitor state directly; no controller reads it back (ADR-0141).
     Idle(IdleState),
 }
 
-/// Declares every capability channel once, deriving the receiving half ([`Signals`]), the sending
-/// half ([`Senders`]), the cancel-safe [`Signals::next`] that races them, and the constructor.
+/// Declares each capability channel once, generating [`Signals`], [`Senders`], cancel-safe
+/// [`Signals::next`], and their constructor.
 ///
-/// A macro rather than four hand-kept lists, for the reason ADR-0076 gave for making the roster an
-/// enum: the failure it removes was measured, not imagined. Add a variant to `shared::Capability`
-/// and exactly two things fail to compile, [`Capabilities::start`] and [`Capabilities::dispatch`].
-/// Fill those in and the workspace builds clean with a capability that has a Lua member, stubs, a
-/// schema-check entry, a controller and command dispatch, and no way to push a `StateSnapshot`:
-/// its member reads `nil` forever, the same silent failure ADR-0076 kills.
+/// One macro replaces four hand-kept lists. Adding `shared::Capability` then fails `start` and
+/// `dispatch`; filling them without a signal path would otherwise build while Lua reads `nil`, the
+/// silent failure ADR-0076 removes.
 ///
-/// The `without_channel` section is not decoration: every roster variant appears in one section or
-/// the other, and [`every_capability_has_a_channel_row`] proves it exhaustively, so a missing row
-/// is an `E0004` naming this list. `Signal` itself stays hand-written above: its variants carry a
-/// real decision each, which payload travels and which collapses to a unit, plus doc comments a
-/// macro row would flatten to punctuation; [`Capabilities::push`]'s exhaustive match guards it.
+/// Every roster variant appears in `channels` or `without_channel`; the exhaustive helper makes a
+/// missing row an `E0004` here. `Signal` stays hand-written because variants choose their payload;
+/// per-variant doc comments would flatten to punctuation in a macro row, while
+/// [`Capabilities::push`] guards the mapping exhaustively.
 ///
-/// The chain is walked, not assumed: a new roster variant fails `start`, `dispatch` and
-/// [`every_capability_has_a_channel_row`] at once; a channel row for it then fails on the missing
-/// `Signal` variant; adding that variant then fails `push`. Four refusals, each naming the next
-/// thing to write, where before the third onward was silence.
+/// The chain is exhaustive: a new roster variant fails `start`, `dispatch`, and the channel helper;
+/// its channel row then fails on `Signal`, and that variant fails `push`. Each compiler error names
+/// the next required edit instead of allowing silent loss after the second.
 macro_rules! capability_channels {
     (
         channels {
@@ -144,30 +128,28 @@ macro_rules! capability_channels {
         }
         without_channel { $($no_channel:ident),* $(,)? }
     ) => {
-        /// The receiving half of every capability channel: what the main loop awaits.
+        /// Receiving half of each capability channel.
         pub struct Signals {
             $($field: UnboundedReceiver<$payload>,)+
         }
 
-        /// The sending half, handed to each controller as it is constructed.
+        /// Sending half handed to controllers.
         struct Senders {
             $($field: UnboundedSender<$payload>,)+
         }
 
         impl Senders {
-            /// Every channel, both halves. One `unbounded_channel()` per roster entry that has one.
+            /// Builds both halves for each channel-bearing roster entry.
             fn channels() -> (Self, Signals) {
-                // One binding per field holds both halves; each struct then takes its own via a
-                // partial move, avoiding a second metavariable for the receiver.
+                // Bind both halves once, then partially move each into its struct.
                 $(let $field = unbounded_channel();)+
                 (Self { $($field: $field.0,)+ }, Signals { $($field: $field.1,)+ })
             }
         }
 
         impl Signals {
-            /// Awaits whichever speaks first. Cancel-safe: every branch is a bare `recv()`.
-            /// `None` only once every sender drops, which can't happen while [`Capabilities`] is
-            /// alive; an unread capability just keeps an idle sender.
+            /// Awaits the first signal. Bare `recv()` branches are cancel-safe; `None` requires all
+            /// senders to drop, which cannot happen while [`Capabilities`] lives.
             pub async fn next(&mut self) -> Option<Signal> {
                 tokio::select! {
                     $($pattern = self.$field.recv() => Some($signal),)+
@@ -176,8 +158,7 @@ macro_rules! capability_channels {
             }
         }
 
-        /// Never called: exists so a roster variant with no channel and no stated reason is a
-        /// build failure here, not a capability that starts, accepts commands, and never answers.
+        /// Exhaustiveness guard for roster entries without a channel.
         #[allow(dead_code)]
         fn every_capability_has_a_channel_row(capability: Capability) {
             match capability {
@@ -190,12 +171,12 @@ macro_rules! capability_channels {
 
 capability_channels! {
     channels {
-        // Payload signal, mixer thread sends state directly (see `Signal::Audio` above).
+        // Mixer sends state directly (see `Signal::Audio`).
         Audio => audio: AudioState, Some(state) => Signal::Audio(state);
-        // The two that carry meaning: controller owns the signal's state semantics (ADR-0037).
+        // Controllers own signal semantics (ADR-0037).
         Network => network: NetworkSignal, Some(signal) => Signal::Network(signal);
         Bluetooth => bluetooth: BluetoothSignal, Some(signal) => Signal::Bluetooth(signal);
-        // The rest are single-variant `Changed` signals, collapsed to a unit `Signal`.
+        // Other `Changed` signals collapse to unit `Signal` variants.
         Tray => tray: TraySignal, Some(TraySignal::RegistryChanged) => Signal::Tray;
         Mpris => mpris: MprisSignal, Some(MprisSignal::Changed) => Signal::Mpris;
         Notifications => notifications: NotificationsSignal,
@@ -213,21 +194,16 @@ capability_channels! {
             Some(ApplicationsSignal::Changed) => Signal::Applications;
         Files => files: FilesSignal, Some(FilesSignal::Changed) => Signal::Files;
         Storage => storage: StorageSignal, Some(StorageSignal::Changed) => Signal::Storage;
-        // Payload signal, like `Audio`: the inhibitor watch in `idle/controller.rs` owns the state
-        // and sends it, rather than a controller this struct could read it off (ADR-0141).
+            // `idle/controller.rs`'s inhibitor watch owns and sends state, like `Audio` (ADR-0141).
         Idle => idle: IdleState, Some(state) => Signal::Idle(state);
     }
-    // `lock` has no signal channel, deliberately: built at boot in `main.rs` since the relock
-    // path commands it before any config reads (ADR-0060); it reports through `LockOutcome`
-    // frames `main.rs` already handles, not a `StateSnapshot` here (ADR-0052 decision 4).
+    // `lock` has no channel: boot-built in `main.rs` for relock (ADR-0060), it reports through
+    // existing `LockOutcome` frames, not a `StateSnapshot` (ADR-0052 decision 4).
     without_channel { Lock, Polkit }
 }
 
-/// Every controller that starts on demand, plus what starting one needs. `audio` has no
-/// controller: starting it spawns the PipeWire mixer thread and keeps the command channel that
-/// thread reads, as an `Option` of that channel. `lock` has one, but it is built at boot in
-/// `main.rs` instead, since the relock path (ADR-0060) commands it before any config has read
-/// anything, so [`Capabilities::dispatch`] is handed it.
+/// On-demand controllers and their inputs. `audio` starts the PipeWire mixer and stores its command
+/// channel; `lock` is boot-built in `main.rs` for relock (ADR-0060) and passed to dispatch.
 pub struct Capabilities {
     network: Option<NetworkController>,
     bluetooth: Option<BluetoothController>,
@@ -250,23 +226,21 @@ pub struct Capabilities {
     idle: Option<IdleController>,
 
     senders: Senders,
-    /// No [`Senders`] field, not a roster entry: event-shaped (ADR-0032), never pushes a
-    /// `StateSnapshot`; events go to `main.rs` directly. Kept here so the bundle stays the roster.
+    /// Event-shaped, not a roster entry: never pushes a `StateSnapshot`; events go to `main.rs`
+    /// (ADR-0032).
     idle_tx: UnboundedSender<shared::IdleEvent>,
-    /// The Supervisor's system bus, shared by every controller that rides it (ADR-0034). The three
-    /// session-bus capabilities open their own.
+    /// Shared Supervisor system bus (ADR-0034); session-bus capabilities open their own.
     connection: zbus::Connection,
     sound_tx: std::sync::mpsc::Sender<PathBuf>,
-    /// The mixer thread's privacy half (ADR-0034, ADR-0137), in `Option`s because starting either
-    /// `audio` or `privacy` moves one end: the mixer thread owns the sender, `privacy` the
-    /// receiver.
+    /// Mixer privacy channel (ADR-0034, ADR-0137). `audio` or `privacy` may start the mixer first;
+    /// mixer owns the sender and privacy the receiver.
     privacy_tx: Option<UnboundedSender<PrivacySources>>,
     privacy_sources: Option<UnboundedReceiver<PrivacySources>>,
 }
 
 impl Capabilities {
-    /// Builds every channel and returns the two halves. Nothing is constructed here: a controller
-    /// exists only once the config reads its `oblisk` member (ADR-0070 decision 1).
+    /// Builds channels and returns both halves. Controllers start only when config reads their
+    /// `oblisk` member (ADR-0070 decision 1).
     pub fn new(
         connection: zbus::Connection,
         sound_tx: std::sync::mpsc::Sender<PathBuf>,
@@ -305,22 +279,20 @@ impl Capabilities {
         (capabilities, signals)
     }
 
-    /// The live `idle` controller, for resetting a generation's threshold registrations across
-    /// an in-place reload (ADR-0006). `None` when no threshold was ever configured to reset.
+    /// Live `idle` controller for resetting generation threshold registrations on reload
+    /// (ADR-0006); `None` when no threshold was configured.
     pub fn idle(&self) -> Option<&IdleController> {
         self.idle.as_ref()
     }
 
-    /// The live `network` controller, for `secure_submit(network, connect)`: the pending connect
-    /// intent is the controller's, and the plaintext secret never enters this module (ADR-0029).
+    /// Live `network` controller for `secure_submit(network, connect)`; it owns pending intent, and
+    /// plaintext secrets never enter this module (ADR-0029).
     pub fn network(&self) -> Option<&NetworkController> {
         self.network.as_ref()
     }
 
-    /// ADR-0070: the config read `oblisk.<capability>`, the first time anything in this process
-    /// has. Awaited inline rather than spawned (decision 4). Re-entrant by design: every
-    /// generation resends its own starts on a swap (decision 3); each arm is a no-op once its
-    /// controller already exists.
+    /// ADR-0070 lazy start: inline await (decision 4), re-entrant across generation swaps (decision
+    /// 3), with each arm a no-op after construction.
     pub async fn start(&mut self, capability: Capability) {
         match capability {
             Capability::Network => {
@@ -339,7 +311,7 @@ impl Capabilities {
                         Some(BluetoothController::new(self.connection.clone(), self.senders.bluetooth.clone()).await);
                 }
             }
-            // Own session bus, unlike NetworkManager/BlueZ/polkit; a missing one is `inert`.
+            // Own session bus; missing it yields `inert`.
             Capability::Tray => {
                 if self.tray.is_none() {
                     self.tray = Some(match zbus::Connection::session().await {
@@ -353,8 +325,8 @@ impl Capabilities {
                     });
                 }
             }
-            // Own session bus (ADR-0033): a desktop already owning org.freedesktop.Notifications
-            // degrades this to inert via RequestName's DoNotQueue.
+            // Own session bus (ADR-0033); an existing notification owner makes this inert via
+            // RequestName's DoNotQueue.
             Capability::Notifications => {
                 if self.notifications.is_none() {
                     self.notifications = Some(match zbus::Connection::session().await {
@@ -371,7 +343,7 @@ impl Capabilities {
                     });
                 }
             }
-            // Own session bus too (ADR-0036); `new` isn't async, it spawns discovery and returns.
+            // Own session bus (ADR-0036); `new` spawns discovery and returns.
             Capability::Mpris => {
                 if self.mpris.is_none() {
                     self.mpris = Some(match zbus::Connection::session().await {
@@ -385,7 +357,7 @@ impl Capabilities {
                     });
                 }
             }
-            // Three configurable poll tasks, dormant until Lua calls sysinfo:configure (ADR-0035).
+            // Three dormant poll tasks until `sysinfo:configure` (ADR-0035).
             Capability::Sysinfo => {
                 if self.sysinfo.is_none() {
                     self.sysinfo = Some(SysinfoController::new(
@@ -395,7 +367,7 @@ impl Capabilities {
                     ));
                 }
             }
-            // Missing KbdBacklight gives -1; missing lock source gives `false` (ADR-0034).
+            // Missing KbdBacklight -> -1; missing lock source -> `false` (ADR-0034).
             Capability::Keyboard => {
                 if self.keyboard.is_none() {
                     self.keyboard = Some(
@@ -408,9 +380,8 @@ impl Capabilities {
                     );
                 }
             }
-            // /dev/videoN open/close via inotify plus a /proc fd-scan for the camera, enriched by
-            // privacy_sources (ADR-0034); microphone and screencast come off that same channel and
-            // have no second source (ADR-0137).
+            // Camera `/dev/videoN` inotify plus `/proc` scan, enriched by `privacy_sources`
+            // (ADR-0034); microphone/screencast share that channel (ADR-0137).
             Capability::Privacy => {
                 if self.privacy.is_none() {
                     self.ensure_mixer_thread();
@@ -424,24 +395,21 @@ impl Capabilities {
                     }
                 }
             }
-            // Separate from sysinfo's scheduler, dormant until Lua sets an interval (ADR-0034).
-            // Detects this machine's package manager on the way up and pushes its name straight
-            // away, so a config learns there is nothing to check here without waiting for a
-            // failed check to tell it (ADR-0134).
+            // Separate from sysinfo's scheduler, dormant until Lua sets an interval; construction
+            // detects the package manager and pushes its name immediately (ADR-0034, ADR-0134).
             Capability::Updates => {
                 if self.updates.is_none() {
                     self.updates = Some(UpdatesController::new(self.senders.updates.clone()));
                 }
             }
-            // UPower's DisplayDevice, composite across every battery; no UPower means never
-            // pushes (ADR-0080, § 2.2).
+            // UPower DisplayDevice, composite across batteries; no UPower means no push
+            // (ADR-0080, § 2.2).
             Capability::Battery => {
                 if self.battery.is_none() {
                     self.battery = Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
                 }
             }
-            // Ranked firmware over platform over raw; no device found means it never pushes,
-            // see `brightness`'s module doc.
+            // Firmware > platform > raw; no device means no push (see `brightness`).
             Capability::Brightness => {
                 if self.brightness.is_none() {
                     self.brightness = Some(BrightnessController::new(
@@ -451,26 +419,26 @@ impl Capabilities {
                     ));
                 }
             }
-            // niri's IPC stream via $NIRI_SOCKET. A session with no implementor never pushes.
+            // niri IPC via `$NIRI_SOCKET`; no implementor means no push.
             Capability::Workspaces => {
                 if self.workspaces.is_none() {
                     self.workspaces = Some(WorkspacesController::new(self.senders.workspaces.clone()));
                 }
             }
-            // UPower for on_battery/energy_rate, power-profiles-daemon for active_profile/
-            // profiles; either can be missing (§ 2.13, ADR-0053).
+            // UPower supplies on_battery/energy_rate; power-profiles-daemon supplies profiles;
+            // either may be missing (§ 2.13, ADR-0053).
             Capability::Power => {
                 if self.power.is_none() {
                     self.power = Some(PowerController::new(self.connection.clone(), self.senders.power.clone()));
                 }
             }
-            // The 1 Hz clock, and nothing else since ADR-0136 (§ 2.11, ADR-0053).
+            // 1Hz clock, and nothing else since ADR-0136 (§ 2.11, ADR-0053).
             Capability::System => {
                 if self.system.is_none() {
                     self.system = Some(SystemController::new(self.senders.system.clone()));
                 }
             }
-            // The installed `.desktop` entries; scans in background, returns before parsing starts.
+            // Installed `.desktop` entries; scans in background and returns before parsing starts.
             Capability::Applications => {
                 if self.applications.is_none() {
                     self.applications = Some(ApplicationsController::new(
@@ -483,23 +451,21 @@ impl Capabilities {
                     ));
                 }
             }
-            // Nothing to list until a config names a folder: `files:watch` is what starts work.
+            // `files:watch` starts work; nothing is listed before it.
             Capability::Files => {
                 if self.files.is_none() {
                     self.files = Some(FilesController::new(self.senders.files.clone()));
                 }
             }
-            // Nothing is open until a config declares one: `persistent_table` is what starts work.
+            // `persistent_table` opens storage on demand.
             Capability::Storage => {
                 if self.storage.is_none() {
                     self.storage = Some(StorageController::new(self.senders.storage.clone()));
                 }
             }
             Capability::Audio => self.ensure_mixer_thread(),
-            // On the roster since ADR-0141, so its start is here rather than in a `start_idle` of
-            // its own. The push is what the lazy start owes a config that has just read the member:
-            // the inhibitor watch only speaks when something changes, and on a quiet machine that
-            // is never.
+            // On the roster since ADR-0141. Push immediately after lazy start because a quiet
+            // inhibitor watch may never speak.
             Capability::Idle => {
                 if self.idle.is_none() {
                     self.idle = Some(
@@ -511,13 +477,13 @@ impl Capabilities {
                     let _ = self.senders.idle.send(idle.snapshot());
                 }
             }
-            // Not owned here: `LockController` is built at boot in `main.rs` (ADR-0060), so this
-            // read is free. `polkit`'s start is its agent registration, in `main.rs`'s arm.
+            // `LockController` is boot-built in `main.rs` (ADR-0060); polkit starts its agent
+            // there.
             Capability::Lock | Capability::Polkit => {}
         }
     }
 
-    /// Starts the PipeWire mixer thread once, for whichever of `audio`/`privacy` asked first.
+    /// Starts the PipeWire mixer once for whichever of `audio`/`privacy` asks first.
     fn ensure_mixer_thread(&mut self) {
         if self.audio.is_some() {
             return;
@@ -529,8 +495,8 @@ impl Capabilities {
         self.audio = Some(command_tx);
     }
 
-    /// Turns one received [`Signal`] into its snapshot push; runs in the winning `select!` arm's
-    /// body, never raced, so `network`/`bluetooth` can `await` without a dropped signal.
+    /// Pushes one received [`Signal`] from the winning `select!` arm; `network`/`bluetooth` may
+    /// await without a dropped signal.
     pub async fn push(
         &self,
         signal: Signal,
@@ -546,7 +512,7 @@ impl Capabilities {
         }
         match signal {
             Signal::Audio(state) => push!(Capability::Audio, &state),
-            // The controller owns the signal's state semantics (ADR-0037), and answers async.
+            // Controller owns signal semantics and answers async (ADR-0037).
             Signal::Network(signal) => {
                 if let Some(network) = &self.network {
                     push!(Capability::Network, &network.handle_signal(signal).await);
@@ -557,8 +523,7 @@ impl Capabilities {
                     push!(Capability::Bluetooth, &bluetooth.handle_signal(signal).await);
                 }
             }
-            // No debounce (ADR-0031): `build_state` snapshots already-live data the forwarder
-            // task recomputed before sending.
+            // No debounce: `build_state` already snapshots recomputed data (ADR-0031).
             Signal::Tray => {
                 if let Some(tray) = &self.tray {
                     push!(Capability::Tray, &tray.build_state());
@@ -570,14 +535,13 @@ impl Capabilities {
                     push!(Capability::Mpris, &mpris.build_state());
                 }
             }
-            // No debounce (ADR-0033): every mutation fully re-derives notifications state first.
+            // No debounce; each mutation re-derives notification state (ADR-0033).
             Signal::Notifications => {
                 if let Some(notifications) = &self.notifications {
                     push!(Capability::Notifications, &notifications.build_state());
                 }
             }
-            // No debounce: whichever poll task fired already wrote its field(s) under its own
-            // lock (ADR-0035); this just clones and pushes.
+            // Poll task already wrote fields under its lock; clone and push (ADR-0035).
             Signal::Sysinfo => {
                 if let Some(sysinfo) = &self.sysinfo {
                     push!(Capability::Sysinfo, &sysinfo.snapshot());
@@ -593,19 +557,19 @@ impl Capabilities {
                     push!(Capability::Battery, &battery.snapshot());
                 }
             }
-            // Fires only when a backlight device was found (ADR-0053).
+            // Only emitted when a backlight device exists (ADR-0053).
             Signal::Brightness => {
                 if let Some(brightness) = &self.brightness {
                     push!(Capability::Brightness, &brightness.snapshot());
                 }
             }
-            // The controller filters the compositor's stream down to real changes already.
+            // Controller already filters compositor events to real changes.
             Signal::Workspaces => {
                 if let Some(workspaces) = &self.workspaces {
                     push!(Capability::Workspaces, &workspaces.snapshot());
                 }
             }
-            // UPower re-emits EnergyRate roughly once a minute; the controller filters that first.
+            // Controller filters UPower's roughly once-per-minute EnergyRate repeats.
             Signal::Power => {
                 if let Some(power) = &self.power {
                     push!(Capability::Power, &power.snapshot());
@@ -616,20 +580,20 @@ impl Capabilities {
                     push!(Capability::Applications, &applications.snapshot());
                 }
             }
-            // Fires on `watch`/`unwatch` and after every settled burst of folder changes.
+            // `watch`/`unwatch` and each settled folder-change burst.
             Signal::Files => {
                 if let Some(files) = &self.files {
                     push!(Capability::Files, &files.snapshot());
                 }
             }
-            // Fires on every `open` and every `set`, ahead of the debounced save (ADR-0136).
+            // Every `open`/`set`, before debounced save (ADR-0136).
             Signal::Storage => {
                 if let Some(storage) = &self.storage {
                     push!(Capability::Storage, &storage.snapshot());
                 }
             }
-            // The only capability pushing on a timer, once per wall-clock second, emitted only
-            // when the epoch second actually changed (ADR-0053 decision 2).
+            // Only timer-driven capability: once per wall-clock second when epoch changes
+            // (ADR-0053 decision 2).
             Signal::System => {
                 if let Some(system) = &self.system {
                     push!(Capability::System, &system.snapshot());
@@ -640,23 +604,20 @@ impl Capabilities {
                     push!(Capability::Privacy, &privacy.snapshot());
                 }
             }
-            // Fires after a periodic check and on install progress updates.
+            // Periodic checks and install progress updates.
             Signal::Updates => {
                 if let Some(updates) = &self.updates {
                     push!(Capability::Updates, &updates.snapshot());
                 }
             }
-            // Carries its own payload, like `Audio`: the inhibitor watch sends state rather than
-            // poking a controller this struct would read it back off.
+            // Inhibitor watch sends state directly, like `Audio`.
             Signal::Idle(state) => push!(Capability::Idle, &state),
         }
     }
 
-    /// Routes one command to the capability it names (ADR-0037: each module owns its own
-    /// action match, argument parse, and write-action spawn). Every arm but `lock` reads an
-    /// `Option`, since a controller exists only once the config reads its member (ADR-0070),
-    /// see `log_unstarted`. `lock` is passed in since it's built at boot; `battery` and `privacy`
-    /// are read-only and have no `dispatch` at all.
+    /// Routes a command to its module (ADR-0037). Optional controllers exist only after the config
+    /// reads their member (ADR-0070), so missing ones call `log_unstarted`; boot-built `lock` is
+    /// passed in, and read-only `battery`/`privacy` have no dispatch.
     pub async fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
         macro_rules! to {
             ($held:expr, $dispatch:path) => {
@@ -684,10 +645,10 @@ impl Capabilities {
             Capability::Audio => to!(self.audio, audio::dispatch),
             Capability::Idle => to!(self.idle, idle::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),
-            // Answered in `Supervisor::dispatch_capability_command` before this is reached: its
-            // controller lives there, beside the state push a cancel needs.
+            // Answered in `Supervisor::dispatch_capability_command`, where its controller lives
+            // beside the state push that cancel handling needs.
             Capability::Polkit => {}
-            // Read-only (§ 2): no action enum; a command naming one is a Renderer sending garbage.
+            // Read-only (§ 2): no action enum; a named command is malformed Renderer input.
             Capability::Battery | Capability::Privacy | Capability::System => {
                 eprintln!(
                     "{capability}: read-only capability received a command from generation {}; dropping",
@@ -711,8 +672,8 @@ mod tests {
 
     #[test]
     fn startable_rejects_a_name_this_supervisor_builds_nothing_for() {
-        // `process` is addressable by commands but is never started, so it must miss here rather
-        // than resolve to something that would silently accept a start.
+        // `process` is command-addressable but never started; it must not resolve to a silent
+        // start.
         assert_eq!(Capability::from_name("process"), None);
         assert_eq!(Capability::from_name("screens"), None);
         assert_eq!(Capability::from_name(""), None);

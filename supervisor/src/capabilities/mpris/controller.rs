@@ -1,5 +1,5 @@
-//! [`MprisController`]: the `oblisk.mpris` write-action dispatcher and state owner. Split from
-//! `dbus::mpris` -- see `dbus/mpris/mod.rs` for the module-level doc.
+//! [`MprisController`]: `oblisk.mpris`'s write dispatcher and state owner. Split from
+//! `dbus::mpris`; see `dbus/mpris/mod.rs`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,10 +13,10 @@ use super::watcher::{service_name_for_id, spawn_discovery};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MprisState {
-    /// Every MPRIS player on the bus, longest-running first. A player that appears appends, and one
-    /// pushing position updates does not move, so `players[1]` keeps meaning the same player.
+    /// Every MPRIS player, longest-running first. New players append and position updates do not
+    /// move entries, so `players[1]` keeps its meaning.
     ///
-    /// Empty when nothing is running, which is not an error.
+    /// Empty when no player is running, which is valid, not an error.
     pub players: Vec<PlayerState>,
 }
 
@@ -42,66 +42,60 @@ impl std::error::Error for MprisActionError {}
 
 const VALID_COMMANDS: [&str; 5] = ["play", "pause", "play_pause", "next", "previous"];
 
-/// `mpris:send_command(id, cmd)`'s `arguments: [id, cmd]`. `cmd` validated against the IDL's
-/// own five-value enum right here (drops the whole call on anything else).
+/// `mpris:send_command(id, cmd)`'s `arguments: [id, cmd]`; rejects anything outside the IDL's
+/// five command values.
 pub fn parse_control_args(arguments: &[serde_json::Value]) -> Option<(String, String)> {
     let id = arguments.first()?.as_str()?.to_string();
     let cmd = arguments.get(1)?.as_str()?.to_string();
     VALID_COMMANDS.contains(&cmd.as_str()).then_some((id, cmd))
 }
 
-/// `mpris:seek(id, pos_us)`'s `arguments: [id, pos_us]`. Absolute microseconds, intentionally
-/// unclamped here -- clamping happens once, in [`MprisController::seek`].
+/// `mpris:seek(id, pos_us)`'s `arguments: [id, pos_us]`. Absolute microseconds; clamp once in
+/// [`MprisController::seek`], not here.
 pub fn parse_seek_args(arguments: &[serde_json::Value]) -> Option<(String, i64)> {
     let id = arguments.first()?.as_str()?.to_string();
     let pos_us = arguments.get(1)?.as_i64()?;
     Some((id, pos_us))
 }
 
-/// `mpris:seek_relative(id, off)`'s `arguments: [id, off]`. Same shape as [`parse_seek_args`],
-/// kept as a distinct function so each write action's parser matches its own command name.
+/// `mpris:seek_relative(id, off)`'s `arguments: [id, off]`, kept separate from
+/// [`parse_seek_args`] so its parser matches its command.
 pub fn parse_seek_relative_args(arguments: &[serde_json::Value]) -> Option<(String, i64)> {
     let id = arguments.first()?.as_str()?.to_string();
     let off = arguments.get(1)?.as_i64()?;
     Some((id, off))
 }
 
-/// No `events` field, unlike `TrayController` (ADR-0031): every write action here
-/// (`control`/`seek`/`seek_relative`) issues its real D-Bus call and returns without ever
-/// self-sending a signal (ADR-0036's "state flows through the signal, not the write call")
-/// -- the next real player event is what triggers the next push.
-/// `events` is only needed by [`watcher::spawn_discovery`]'s background task,
-/// consumed directly at construction rather than stored redundantly.
+/// No `events` field, unlike `TrayController` (ADR-0031): `control`/`seek`/`seek_relative` issue
+/// real D-Bus calls and never self-send a signal (ADR-0036); the next player event triggers the
+/// push. The channel belongs to [`watcher::spawn_discovery`] and is consumed at construction.
 #[derive(Clone)]
 pub struct MprisController {
     registry: super::player::PlayerRegistry,
 }
 
 impl MprisController {
-    /// Spawns discovery (`ListNames` scan, then live `NameOwnerChanged` tracking) on
-    /// `connection` -- the session bus (MPRIS, unlike NetworkManager/BlueZ/polkit's system
-    /// bus). Returns immediately; the registry fills in as discovery's tasks run.
+    /// Spawns discovery (`ListNames`, then `NameOwnerChanged`) on the session bus. Returns
+    /// immediately; discovery fills the registry in background tasks.
     pub fn new(connection: zbus::Connection, events: UnboundedSender<MprisSignal>) -> Self {
         let registry: super::player::PlayerRegistry = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(spawn_discovery(connection, registry.clone(), events));
         Self { registry }
     }
 
-    /// Fully inert controller: empty registry, no discovery task. Used when a dedicated
-    /// session-bus connection couldn't even be established.
+    /// Inert controller with an empty registry and no discovery task, used when the session-bus
+    /// connection cannot be established.
     pub fn inert(_events: UnboundedSender<MprisSignal>) -> Self {
         Self { registry: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Full, live re-derivation of `mpris.players` from the entire tracked registry.
-    /// Synchronous: every registry entry's `last_known` is already up to date (the forwarder
-    /// tasks recompute it before ever sending an [`MprisSignal`]).
+    /// Re-derives `mpris.players` from the full registry. Synchronous because forwarders update
+    /// each entry's `last_known` before sending an [`MprisSignal`].
     pub fn build_state(&self) -> MprisState {
         MprisState { players: super::player::ordered_players(&self.registry) }
     }
 
-    /// `mpris:send_command(id, cmd)`. `cmd` is already validated by [`parse_control_args`] against
-    /// the IDL's five-value enum by the time it reaches here.
+    /// `mpris:send_command(id, cmd)` after [`parse_control_args`] validates the IDL's five values.
     pub async fn control(&self, id: &str, cmd: &str) {
         let Some(player) = self.find_player(id) else {
             eprintln!("mpris: send_command({id:?}, {cmd:?}) failed: {}", MprisActionError::UnknownPlayer);
@@ -120,19 +114,16 @@ impl MprisController {
         }
     }
 
-    /// `mpris:seek(id, pos_us)`: `SetPosition(cached trackid, clamped pos_us)` when a
-    /// trackid is cached, otherwise a relative `Seek` from the last known position -- some
-    /// real players never report `mpris:trackid` (ADR-0036). State updates only once the
-    /// real `Seeked`/`PropertiesChanged` signal arrives, never optimistically here.
+    /// `mpris:seek(id, pos_us)`: `SetPosition(cached trackid, clamped pos_us)` when available;
+    /// otherwise relative `Seek` from the last known position because some players never report
+    /// `mpris:trackid` (ADR-0036). State waits for real `Seeked`/`PropertiesChanged` signals.
     pub async fn seek(&self, id: &str, pos_us: i64) {
         self.seek_to(id, pos_us).await;
     }
 
-    /// `mpris:seek_relative(id, off)`: same clamp-and-dispatch path as [`Self::seek`],
-    /// computed from a live `Position` read, not the registry's cached one -- `Position` is
-    /// excluded from `PropertiesChanged`, so the cached value can be arbitrarily stale. A
-    /// live read costs one extra round trip but is the only way to make "-10s" mean 10
-    /// seconds before now, not before whenever the registry last resynced.
+    /// `mpris:seek_relative(id, off)`: same clamp/dispatch as [`Self::seek`], based on a live
+    /// `Position` read. `Position` is excluded from `PropertiesChanged`, so cached time can be
+    /// arbitrarily stale; the extra round trip makes `-10s` mean ten seconds before now.
     pub async fn seek_relative(&self, id: &str, off: i64) {
         let Some(position) = self.live_position(id).await else {
             eprintln!("mpris: seek_relative({id:?}, {off}) failed: {}", MprisActionError::UnknownPlayer);
@@ -141,8 +132,7 @@ impl MprisController {
         self.seek_to(id, position.saturating_add(off)).await;
     }
 
-    /// A real, live `Position` read (not the registry's cached snapshot) -- see
-    /// [`Self::seek_relative`]'s own doc comment for why this matters.
+    /// A live `Position` read, not the cached snapshot; see [`Self::seek_relative`].
     async fn live_position(&self, id: &str) -> Option<i64> {
         let player = self.find_player(id)?;
         match player.position().await {
@@ -171,9 +161,8 @@ impl MprisController {
                     context.player.seek(target - self.live_position(id).await.unwrap_or(0)).await
                 }
             },
-            // No trackid cached (some real players never report `mpris:trackid` at all) --
-            // `Player.Seek` itself takes a relative offset, so `target` (already absolute) is
-            // converted against a live position read, same reasoning as seek_relative's own.
+            // Some players never report `mpris:trackid`; `Player.Seek` takes a relative offset, so
+            // convert the absolute target against a live position as in seek_relative.
             None => context.player.seek(target - self.live_position(id).await.unwrap_or(0)).await,
         };
         if let Err(err) = result {
@@ -204,8 +193,8 @@ impl MprisController {
     }
 }
 
-/// [`MprisController::find_seek_context`]'s return shape -- a small named struct instead of a
-/// four-element tuple, so `seek_to`'s call site reads by field name.
+/// [`MprisController::find_seek_context`]'s named return instead of a four-element tuple, so
+/// `seek_to` reads fields by name.
 struct SeekContext {
     bus_name: String,
     player: super::proxies::MprisPlayerProxy<'static>,
@@ -246,7 +235,7 @@ mod tests {
 
     #[test]
     fn parse_seek_args_accepts_a_negative_position() {
-        // Unclamped at parse time by design (ADR-0036) -- clamping happens once, at the write.
+        // Parse unclamped by design (ADR-0036); clamp once at the write.
         let args = vec![serde_json::json!("id"), serde_json::json!(-500)];
         assert_eq!(parse_seek_args(&args), Some(("id".to_string(), -500)));
     }

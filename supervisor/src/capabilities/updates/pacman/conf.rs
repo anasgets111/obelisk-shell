@@ -1,12 +1,9 @@
-//! `pacman.conf`/mirrorlist parsing for `oblisk.updates` (ADR-0034): the real, non-hardcoded
-//! repo list and mirror server set this machine's pacman is actually configured with. This
-//! dev machine's real `/etc/pacman.conf` has repos in two forms -- most `Include =` a
-//! mirrorlist file, `omarchy` inlines a `Server =` line directly -- both handled here.
+//! Parses the configured, non-hardcoded repo and mirror set (ADR-0034). Real `pacman.conf` uses
+//! both `Include =` mirrorlists and inline `Server =` lines, including `omarchy`.
 
 use std::path::Path;
 
-/// One configured repo's resolved, `$repo`/`$arch`-substituted mirror server URLs, ready to
-/// hand to `alpm::Db::add_server`.
+/// Configured repo with `$repo`/`$arch`-substituted URLs for `alpm::Db::add_server`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoServers {
     pub name: String,
@@ -17,9 +14,8 @@ fn strip_comment_and_trim(line: &str) -> &str {
     line.trim()
 }
 
-/// Parses `text` (real `pacman.conf` syntax) into every non-`[options]` section's name, its
-/// `Include = ` paths, and its inline `Server = ` lines, in file order. Pure -- directly
-/// testable against literal `pacman.conf` text without needing real mirrorlist files.
+/// Parses real `pacman.conf` text into each non-`[options]` section's name, include paths, and
+/// inline servers in file order. Pure and testable without mirrorlist files.
 fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     let mut repos = Vec::new();
     let mut current: Option<(String, Vec<String>, Vec<String>)> = None;
@@ -54,9 +50,8 @@ fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     repos
 }
 
-/// Extracts every `Server = ` line's value from a mirrorlist file's text -- same key parsing as
-/// `parse_pacman_conf`'s inline-`Server` case, applied to a standalone mirrorlist file instead
-/// of a `pacman.conf` section.
+/// Extracts `Server =` values from standalone mirrorlist text using the same key parsing as
+/// `parse_pacman_conf`.
 fn parse_mirrorlist(text: &str) -> Vec<String> {
     text.lines()
         .map(strip_comment_and_trim)
@@ -71,10 +66,8 @@ fn substitute(template: &str, repo_name: &str) -> String {
     template.replace("$repo", repo_name).replace("$arch", std::env::consts::ARCH)
 }
 
-/// Parses `pacman_conf_path` and resolves every configured repo's full mirror server list --
-/// `Server =` lines directly under its section, plus every `Include =` file's own `Server =`
-/// lines. No root-injection parameter needed: an `Include` path in real `pacman.conf` is
-/// already absolute. Silently skips a repo whose `Include` file can't be read.
+/// Resolves each repo's inline and included `Server =` lines. Real include paths are absolute, so
+/// no root parameter is needed. Unreadable include files are skipped.
 pub fn resolve_repo_servers(pacman_conf_path: &Path) -> Vec<RepoServers> {
     let Ok(text) = std::fs::read_to_string(pacman_conf_path) else { return Vec::new() };
 
@@ -116,7 +109,7 @@ mod tests {
 
     #[test]
     fn parse_pacman_conf_collects_an_inline_server_line_with_no_include() {
-        // This dev machine's real `[omarchy]` section -- confirmed, not hypothetical.
+        // The real machine has an inline `[omarchy]` server, not only includes.
         let text = "[omarchy]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy.org/edge/$arch\n";
         let repos = parse_pacman_conf(text);
         assert_eq!(

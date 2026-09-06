@@ -1,20 +1,13 @@
--- A panel's masthead, `Components/PanelHeader.qml`: a glyph on a tinted plate, a title over one
--- line of state, and whatever the panel keeps at hand on the right -- its radio switch, a rescan,
--- a close button.
---
--- The plate is the panel's state at a glance. It and the glyph go accent while the thing the panel
--- fronts is on and dim while it is off, so "network" and "bluetooth" read as two switches before
--- either word is read. `opts.active` is that one fact; the caller says which field it is.
---
--- This was a title and a close button, for `modules/bar/panels/settings.lua`. The network and
--- bluetooth panels each opened with a `section_header` and a `panel_toggle_card` under it -- a
--- small grey word, then a row saying "wi-fi" beside a switch -- which is the same information the
--- mirror puts in one line with a glyph, and the reason those two panels looked like settings lists
--- rather than the thing they are for.
---
--- The title column takes `width = "Fill"`, which pins the trailing controls to the far edge in one
--- property. That is what `scene.rs` sizing a `Fill` child from what its siblings leave is for, and
--- the title elides rather than pushing a control out because every `cell` declares `elide = "End"`.
+-- Panel masthead matching `Components/PanelHeader.qml`: glyph on a tinted plate, title over one
+-- state line, and trailing controls such as a radio switch, rescan, or close button.
+-- The plate and glyph turn accent when the panel's subject is on and dim when off, so "network" and
+-- "bluetooth" read as switches before their labels. The caller supplies that fact as `opts.active`.
+-- Replaced the title/close pair in `modules/bar/panels/settings.lua`. Network and bluetooth had a
+-- `section_header` plus `panel_toggle_card`, making a grey heading and a "wi-fi" switch row where
+-- the mirror uses one glyph line, so they looked like settings lists instead of their subject.
+-- `width = "Fill"` leaves the title's remaining space and pins trailing controls to the far edge.
+-- `scene.rs` sizes it from its siblings; `cell`'s `elide = "End"` keeps a long title from pushing
+-- controls out.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local icons = require("config.icons")
@@ -70,8 +63,8 @@ return function(opts)
         }
     end
 
-    -- Bold, as the mirror's `titleBold`; a run rather than a property because weight lives on the
-    -- `TextRun` (`lua-meta/nodes.lua`), and a title is a plain string here.
+    -- Bold like the mirror's `titleBold`; weight lives on the `TextRun` (`lua-meta/nodes.lua`), not
+    -- the plain title string's node.
     local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, title_size, { width = "Fill" }) }
     if opts.subtitle then
         lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.TEXT_OFF, opts.subtitle_size or theme.font.xs, { width = "Fill" })

@@ -1,6 +1,5 @@
--- A bar graphic, which is what a percentage actually wants to look like. The trick is that `width`
--- accepts a "NN%" string and a signal resolves before the property is parsed (ADR-0044), so a
--- signal that maps to "45%" is a live-width rect with no engine support for progress bars at all.
+-- A percentage bar using `width`'s "NN%" strings. Signals resolve before property parsing
+-- (ADR-0044), so mapping to "45%" makes a live-width rect without progress-bar engine support.
 local theme = require("config.theme")
 
 return function(signal, read, color, width, height, visible)
@@ -20,11 +19,11 @@ return function(signal, read, color, width, height, visible)
                 if not ok or pct == nil then
                     return "0%"
                 end
-                -- `math.floor`, and it is load-bearing rather than tidy. Lua 5.4's `%d` raises on a
-                -- float with no integer representation, and `audio.volume * 100` is 45.00027 on a
-                -- real session. A raise inside a signal getter fails the whole re-resolve, and the
-                -- engine then rolls the scene back and keeps the last good frame (ADR-0044), so one
-                -- bad number here freezes every module on the bar, not just this meter.
+                -- Keep `math.floor`: Lua 5.4's `%d` raises on non-integral floats, and
+                -- `audio.volume * 100` measured 45.00027 in a real session. A getter raise fails
+                -- the
+                -- re-resolve; the engine rolls back to the last good frame (ADR-0044), freezing the
+                -- whole bar rather than just this meter.
                 return string.format("%d%%", math.floor(math.max(0, math.min(100, pct)) + 0.5))
             end),
             height = "Fill",

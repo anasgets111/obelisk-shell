@@ -21,30 +21,23 @@ use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, bind_dbusmenu, bind_item};
 use super::registration::ResolvedRegistration;
 
-/// Hands out [`ItemEntry::registered`]. Process-wide rather than per-registry, because it only has
-/// to increase and one `TrayController` exists per session; two registries in one test process
-/// still each see a monotonic sequence, which is all the sort needs.
+/// Process-wide sequence for [`ItemEntry::registered`]. It only needs to increase; each registry
+/// still sees a monotonic order in tests.
 static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct ItemEntry {
     pub(super) item: StatusNotifierItemProxy<'static>,
     pub(super) menu: Option<DBusMenuProxy<'static>>,
     pub(super) last_known: TrayItem,
-    /// When this item first registered, and the order [`ordered_items`] puts the strip in.
-    ///
-    /// The registry is a `HashMap`, so before this existed `tray.items` came out in whatever order
-    /// the hash seed produced: a different sequence between two pushes over the same set, which
-    /// reshuffled a bar's tray icons every time one unrelated item updated a property.
+    /// First-registration sequence used by [`ordered_items`]. Without it, `HashMap` iteration made
+    /// two pushes of the same set differ and an unrelated property update reshuffled the tray.
     registered: u64,
     properties_forwarder: JoinHandle<()>,
     menu_forwarder: Option<JoinHandle<()>>,
 }
 
-/// `tray.items`, oldest registration first.
-///
-/// Registration order rather than a sort on [`TrayItem::id`]: the id is a D-Bus unique name like
-/// `"1.234"`, so sorting it lexicographically puts `1.100` before `1.20` and drops a newly started
-/// app into the middle of the strip. Both orders are stable; only this one also appends.
+/// `tray.items` in registration order. Sorting D-Bus ids lexicographically puts `1.100` before
+/// `1.20` and inserts a new app mid-strip; registration order also appends.
 pub(super) fn ordered_items(registry: &ItemRegistry) -> Vec<TrayItem> {
     let guard = registry.lock().expect("tray registry mutex poisoned");
     let mut entries: Vec<&ItemEntry> = guard.values().collect();
@@ -55,10 +48,9 @@ pub(super) fn ordered_items(registry: &ItemRegistry) -> Vec<TrayItem> {
 pub(super) type ItemKey = (OwnedUniqueName, OwnedObjectPath);
 pub(super) type ItemRegistry = Arc<Mutex<HashMap<ItemKey, ItemEntry>>>;
 
-/// Binds `unique_name`/`object_path` as a `StatusNotifierItem`, hydrates its full [`TrayItem`]
-/// (including its menu tree, if it has one -- ADR-0031's "eager top-level fetch"), spawns its
-/// signal forwarder(s), and inserts the resulting entry into `registry`. Aborts and replaces
-/// a prior entry at the same key rather than leaking its forwarder tasks.
+/// Binds and hydrates a `StatusNotifierItem` and its menu (ADR-0031 eager fetch), spawns
+/// forwarders,
+/// and inserts it into `registry`. Replaces the same key and aborts its old forwarders.
 pub(super) async fn register_item(
     connection: &zbus::Connection,
     registry: &ItemRegistry,
@@ -94,15 +86,11 @@ pub(super) async fn register_item(
 
     let key: ItemKey = (unique_name.clone(), object_path.clone());
 
-    // Narrow TOCTOU guard: every `.await` above (property reads, an optional GetLayout) is a
-    // window in which the registering connection could have disconnected --
-    // NameOwnerChanged-based cleanup only ever removes an entry that already exists, so a
-    // disconnect landing in that window would otherwise plant an unreachable ghost entry no
-    // later signal can ever remove. One more liveness check right here, before the insert
-    // below (nothing else `.await`s between this and it), narrows that whole multi-await
-    // window down to a single check-then-insert. Best-effort: a failure to even ask proceeds
-    // with the insert rather than blocking a legitimate registration on an unrelated D-Bus
-    // hiccup -- this narrows the race, it doesn't need to be perfect.
+    // TOCTOU guard: the property/GetLayout awaits can outlive the connection, while
+    // NameOwnerChanged only removes entries that already exist. Check liveness immediately before
+    // insertion, with no await after it. Best-effort failures proceed; this narrows, not
+    // eliminates,
+    // the race.
     if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(connection).await {
         match dbus_proxy.name_has_owner(BusName::from(unique_name.clone())).await {
             Ok(false) => {
@@ -132,9 +120,8 @@ pub(super) async fn register_item(
     let previous = {
         let mut guard = registry.lock().unwrap();
         entry.registered = match guard.get(&key) {
-            // The same key is the same item registering again, so it holds its place in the strip
-            // rather than jumping to the end. An application that re-registers on its own restart
-            // gets a new unique name and therefore a new key, which is a genuinely new item.
+            // Same key means re-registration, so keep its place. A restart gets a new unique name
+            // and key, so it is a new item.
             Some(existing) => existing.registered,
             None => NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed),
         };
@@ -150,11 +137,9 @@ pub(super) async fn register_item(
     Ok(())
 }
 
-/// Runs until every `NewX` signal stream ends, re-fetching the full [`TrayItem`] (base
-/// properties plus, if `menu` is `Some`, a full menu-tree refetch via the already-bound
-/// proxy) on any of them and updating the registry entry in place -- no debounce, no
-/// fine-grained per-property patching. One instance per tracked item; its `JoinHandle` lives
-/// in the item's own [`ItemEntry`] and is aborted on unregistration.
+/// Re-fetches the full [`TrayItem`] on every `NewX` signal, including its menu through the bound
+/// proxy, and updates the entry in place without debounce or per-property patching. One task per
+/// item; its handle lives in [`ItemEntry`] and is aborted on unregistration.
 fn spawn_item_signal_forwarder(
     item: StatusNotifierItemProxy<'static>,
     unique_name: OwnedUniqueName,
@@ -202,10 +187,8 @@ fn spawn_item_signal_forwarder(
     })
 }
 
-/// Runs until `LayoutUpdated` stops firing, re-fetching `menu`'s full layout and updating the
-/// registry entry's `menu` field in place on every occurrence (ADR-0031: "`GetLayout`... is
-/// re-fetched on `LayoutUpdated`"). One instance per tracked item that has a menu; aborted
-/// alongside [`spawn_item_signal_forwarder`]'s handle on unregistration.
+/// Refetches the full menu on each `LayoutUpdated` and updates `menu` in place (ADR-0031). One
+/// task per menu-bearing item, aborted with the item task on unregistration.
 fn spawn_menu_signal_forwarder(
     menu: DBusMenuProxy<'static>,
     key: ItemKey,
@@ -231,10 +214,9 @@ fn spawn_menu_signal_forwarder(
     })
 }
 
-/// Runs until the underlying signal stream ends, removing every registry entry whose unique name
-/// just dropped off the bus (`new_owner` empty) -- the base SNI spec has no
-/// `UnregisterStatusNotifierItem` signal, so this is the only liveness signal a host has
-/// (ADR-0031's module doc comment). One global subscription, not per-item.
+/// Removes entries whose unique name drops off the bus (`new_owner` empty). SNI has no
+/// `UnregisterStatusNotifierItem` signal, so this one global subscription supplies liveness
+/// (ADR-0031).
 pub(super) fn spawn_name_owner_changed_forwarder(
     dbus_proxy: zbus::fdo::DBusProxy<'static>,
     registry: ItemRegistry,
@@ -263,11 +245,9 @@ pub(super) fn spawn_name_owner_changed_forwarder(
                 if let Some(handle) = entry.menu_forwarder {
                     handle.abort();
                 }
-                // The item's own spooled pixmaps, gone with it. All three variants, since each
-                // spools to its own filename (ADR-0074). `/dev/shm` outlives this process, so
-                // without this every application restart leaves more PNGs resident until reboot:
-                // the filename is built from the connection's unique name, and a reconnecting
-                // application never gets the same one back.
+                // Remove all three variant files (ADR-0074). `/dev/shm` outlives this process, and
+                // reconnecting apps get a new unique name, so stale PNGs otherwise survive to
+                // reboot.
                 for path in [
                     &entry.last_known.icon_path,
                     &entry.last_known.attention_icon_path,
@@ -291,9 +271,8 @@ mod tests {
     use super::*;
     use crate::capabilities::test_support::p2p_pair;
 
-    /// An entry with everything but the two fields the ordering depends on stubbed out. The proxy
-    /// is bound against a p2p pair rather than mocked: binding makes no call, so it needs no peer
-    /// that answers.
+    /// Minimal entry for ordering tests. A p2p proxy bind makes no call, so no answering peer is
+    /// needed.
     async fn entry(connection: &zbus::Connection, id: &str, registered: u64) -> ItemEntry {
         let destination = zbus::names::OwnedBusName::try_from("org.example.Item").expect("a valid bus name");
         let path = OwnedObjectPath::try_from("/StatusNotifierItem").expect("a valid object path");
@@ -314,19 +293,17 @@ mod tests {
         )
     }
 
-    /// The whole point: a `HashMap`'s iteration order is seeded per process, so this used to be
-    /// whatever the seed said, and a bar's tray reshuffled when one unrelated item updated.
+    /// `HashMap` iteration is process-seeded; without registration order, an unrelated update
+    /// reshuffled the tray.
     #[tokio::test]
     async fn the_strip_is_in_registration_order_whatever_the_map_says() {
         let (connection, _peer) = p2p_pair().await;
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
-        // Built before the lock: `entry` is async, and holding a `std::sync::Mutex` guard across an
-        // await is the thing `clippy::await_holding_lock` exists to stop.
+        // Build entries before locking; the helper awaits and a std mutex guard must not cross it.
         let third = entry(&connection, "third", 2).await;
         let first = entry(&connection, "first", 0).await;
         let second = entry(&connection, "second", 1).await;
-        // Inserted in an order that is not the registration order, which is what a `HashMap` is
-        // free to hand back.
+        // Insert out of registration order; a `HashMap` may return that order.
         {
             let mut guard = registry.lock().unwrap();
             guard.insert(key(":1.30"), third);
@@ -337,8 +314,7 @@ mod tests {
         assert_eq!(ids, ["first", "second", "third"]);
     }
 
-    /// Registration order, not id order. These ids sort lexicographically the other way, which is
-    /// exactly the trap a sort on `TrayItem::id` would fall into with real D-Bus unique names.
+    /// Registration order, not lexicographic id order.
     #[tokio::test]
     async fn a_later_registration_appends_even_when_its_id_sorts_first() {
         let (connection, _peer) = p2p_pair().await;
@@ -354,7 +330,7 @@ mod tests {
         assert_eq!(ids, ["1.9", "1.100"], "a lexicographic sort would put 1.100 first");
     }
 
-    /// An item updating in place must not move, which is the failure a config actually sees.
+    /// In-place updates must not move an item.
     #[tokio::test]
     async fn an_item_that_re_registers_holds_its_place() {
         let (connection, _peer) = p2p_pair().await;
@@ -367,7 +343,7 @@ mod tests {
             guard.insert(key(":1.20"), second);
         }
         let mut replacement = entry(&connection, "first-again", 999).await;
-        // What `register_item` does on a repeat registration at a live key: keep the old sequence.
+        // Repeat registration at a live key keeps the old sequence.
         replacement.registered = registry.lock().unwrap().get(&key(":1.10")).expect("just inserted").registered;
         registry.lock().unwrap().insert(key(":1.10"), replacement);
 

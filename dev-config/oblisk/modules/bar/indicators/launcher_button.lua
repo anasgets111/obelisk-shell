@@ -1,5 +1,4 @@
--- Mirrors the `IconButton` LeftSide.qml puts between the battery and the workspaces: one glyph,
--- circular, opening the launcher.
+-- Mirrors LeftSide.qml's circular `IconButton` between the battery and workspaces.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -10,8 +9,8 @@ local tooltip = require("components.tooltip")
 local SLOT = "launcher"
 
 local launcher_button = icon_button(icons.launcher, function()
-    -- Refreshing on the way open rather than on a timer, because the enumeration is a directory
-    -- walk and nothing outside this click cares whether it is current (ADR-0061).
+    -- Refresh on open, not a timer: enumeration walks a directory and only this click needs it
+    -- current (ADR-0061).
     local opening = not ui_state.launcher_open:get()
     if opening then
         oblisk.applications:invoke("refresh")

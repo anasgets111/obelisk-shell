@@ -1,14 +1,11 @@
--- Mirrors IdleInhibitor.qml: one circle that says whether anything is holding the session awake,
--- and takes a hold of its own when clicked.
+-- Mirrors IdleInhibitor.qml: one circle shows session holds and adds a manual hold on click.
 --
--- Two glyphs, the mirror's own pair, and the swap is on the *manual* hold rather than on the
--- inhibited state: the cup means "I asked for this", the crossed-out zeds mean "the shell is
--- watching". The accent ground is what says something is holding it, whoever that is. So a film
--- playing lights the circle without changing the glyph, and clicking it still adds a manual hold
--- that survives the film ending -- which is the distinction the mirror draws too.
+-- Two glyphs swap on the *manual* hold: the cup means "I asked for this", crossed-out zeds mean
+-- "the shell is watching". The accent ground means any hold, so media can light the circle without
+-- changing its glyph; a clicked hold survives media ending.
 --
--- Right-click opens `modules/global/idle_settings.lua`, which is what `IdleInhibitor.qml` does
--- too (`ShellUiState.openModal("idleSettings")`).
+-- Right-click opens `modules/global/idle_settings.lua`, matching
+-- `IdleInhibitor.qml`'s `ShellUiState.openModal("idleSettings")`.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -62,7 +59,7 @@ local idle_tooltip = tooltip({
                 if held then
                     return "click to drop the manual hold"
                 end
-                -- The armed stage's own countdown, the same number the modal's masthead draws.
+                -- The armed stage's countdown, matching the modal masthead.
                 for _, entry in ipairs(plan.list) do
                     if entry.key == arming.key then
                         return string.format("%s in %s", entry.title, idle.clock(math.max(0, entry.delay - arming.elapsed)))

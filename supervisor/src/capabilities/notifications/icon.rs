@@ -1,6 +1,6 @@
-//! Path-trust validator and icon-data handler: checks `<img src>`/`image-path`/action-icon paths
-//! against a trusted allowlist, decodes/bounds-checks/spools raw image-data hints, and deletes
-//! spooled icons safely. Split from `dbus::notifications`; see `dbus/notifications/mod.rs`.
+//! Path-trust validator for `<img src>`, `image-path`, action-icon paths, and registered sound
+//! files; decodes and spools image-data hints, and safely deletes spooled icons. Split from
+//! `dbus::notifications`; see `dbus/notifications/mod.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,14 +11,7 @@ use crate::capabilities::shm_icons::{self, PngEncodeError};
 use super::markup::parse_markup;
 use super::{MAX_APP_ICON_NAME_BYTES, MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan, truncate_utf8_bytes};
 
-// -------------------------------------------------------------------------------------------
-// Path-trust validator (TDD seam 3): shared by `<img src>`, `image-path`, action-icon names, and
-// registered sound files.
-// -------------------------------------------------------------------------------------------
-
-/// The trusted icon directories ADR-0033 names, resolved against the real `$HOME`. Production
-/// callers use this; tests inject their own roots (real `tempfile` fixtures) directly into
-/// [`validate_trusted_path`] instead, so this function itself needs no test coverage of its own.
+/// ADR-0033's trusted icon roots, with `$HOME` resolved at runtime. Tests inject fixture roots.
 pub(super) fn default_trusted_icon_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/usr/share/icons"), PathBuf::from("/usr/share/pixmaps")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -29,12 +22,9 @@ pub(super) fn default_trusted_icon_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Accepts `path` only as an absolute path that really exists as a regular file under one of
-/// `trusted_roots` (ADR-0033). `canonicalize()` resolves `..` traversal and symlinks first, then
-/// compares fully resolved paths (`canonical.starts_with(canonicalized_root)`), so a symlink
-/// inside a trusted directory pointing outside it is rejected too. A relative path or bare theme
-/// name (no `/`) fails the `is_absolute` check, degrading to "no icon": theme-name resolution is
-/// a separate, unbuilt IDL row (`system:find_icon`, ADR-0033).
+/// Accepts only an existing regular file under a trusted absolute root (ADR-0033). Canonicalizing
+/// both sides rejects `..` traversal and symlinks escaping the root. Relative paths and bare theme
+/// names degrade to no icon; theme lookup is the unbuilt `system:find_icon` row.
 pub(super) fn validate_trusted_path(path: &str, trusted_roots: &[PathBuf]) -> Option<PathBuf> {
     let candidate = Path::new(path);
     if !candidate.is_absolute() {
@@ -49,16 +39,13 @@ pub(super) fn validate_trusted_path(path: &str, trusted_roots: &[PathBuf]) -> Op
     is_trusted.then_some(canonical)
 }
 
-/// Strips a `file://` URI scheme prefix, if present, leaving a raw filesystem path either way
-/// (§1's `image-path`/`app_icon` hints can arrive as either form).
+/// Strips `file://` from §1 `image-path`/`app_icon` hints.
 pub(super) fn strip_file_uri(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
 }
 
-/// Runs `Notify`'s raw `body` through the sanitize pipeline: byte-cap truncation
-/// ([`truncate_utf8_bytes`]), the allowlist grammar ([`parse_markup`]), then the path-trust
-/// validator on every `<img src>`, dropping images whose path isn't a real, trusted file
-/// (ADR-0033: "closes off arbitrary local-file disclosure through body markup").
+/// Truncates and parses `Notify` body markup, then validates every `<img src>` path. Untrusted
+/// images are dropped (ADR-0033 closes arbitrary local-file disclosure through body markup).
 pub(super) fn sanitize_body(raw_body: &str, trusted_roots: &[PathBuf]) -> Vec<NotificationSpan> {
     let truncated = truncate_utf8_bytes(raw_body, MAX_BODY_BYTES);
     parse_markup(&truncated)
@@ -71,12 +58,9 @@ pub(super) fn sanitize_body(raw_body: &str, trusted_roots: &[PathBuf]) -> Vec<No
         .collect()
 }
 
-// -------------------------------------------------------------------------------------------
-// Image hint decoding: the freedesktop `image-data`/`icon_data` struct shape `(iiibiiay)`
-// (width, height, rowstride, has_alpha, bits_per_sample, channels, data), decoded by hand from
-// the unwrapped `zvariant::Value`, the same technique `dbus::tray::parse_menu_node` uses for a
-// `Value::Structure`. Not tray's `IconPixmap` (square-only ARGB32): a different struct layout.
-// -------------------------------------------------------------------------------------------
+// Freedesktop `image-data`/`icon_data` is `(iiibiiay)`, unlike tray's square-only ARGB32
+// `IconPixmap`; decode the unwrapped `zvariant::Value::Structure` by hand, using the same
+// technique `dbus::tray::parse_menu_node` uses for a `Value::Structure`.
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RawImageData {
@@ -126,8 +110,8 @@ fn value_as_bytes(value: &Value<'_>) -> Option<Vec<u8>> {
     }
 }
 
-/// Decodes an `image-data`/`icon_data` hint's `(iiibiiay)` structure; `None` for anything but a
-/// 7-field structure with this exact type layout, so a malformed hint yields no image, not a panic.
+/// Decodes an `image-data`/`icon_data` `(iiibiiay)` structure. Malformed or non-7-field values
+/// yield no image, not a panic.
 pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     let Value::Structure(structure) = value else { return None };
     let fields = structure.fields();
@@ -145,11 +129,10 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     })
 }
 
-/// Bounds-checks a decoded `image-data`/`icon_data` hint (docs/oblisk-supervisor-services-dbus.md
-/// §1.1's "ARGB icon rejection" extended to this struct shape): positive dimensions capped at
-/// [`MAX_IMAGE_DIMENSION`], 8-bit samples only (ponytail: no 16-bit/float support, no real sender
-/// checked uses anything else), `channels` matching `has_alpha` (3=RGB, 4=RGBA), no row padding
-/// (`rowstride == width * channels`), and `data.len() == rowstride * height`.
+/// Validates `docs/oblisk-supervisor-services-dbus.md §1.1`'s image-data bounds and its "ARGB
+/// icon rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit
+/// samples only, channels matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length.
+/// ponytail: no 16-bit/float support until a real sender needs it.
 pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
     image.width > 0
         && image.height > 0
@@ -161,9 +144,9 @@ pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
         && image.data.len() == (image.rowstride as usize) * (image.height as usize)
 }
 
-/// Encodes an already-bounds-checked [`RawImageData`] to PNG. Unlike `dbus::tray`'s
-/// `encode_argb32_to_png`, no channel reordering is needed: the freedesktop `image-data` hint is
-/// already RGB(A) row-major, not ARGB network byte order.
+/// Encodes checked [`RawImageData`] to PNG. Unlike `dbus::tray`'s `encode_argb32_to_png`, no
+/// channel reorder is needed: freedesktop data is RGB(A) row-major, not ARGB network-byte-order
+/// pixmaps.
 pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, PngEncodeError> {
     let mut buffer = Vec::new();
     {
@@ -176,9 +159,8 @@ pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, 
     Ok(buffer)
 }
 
-/// `$XDG_RUNTIME_DIR/oblisk/notifications` (ADR-0033: "gets the `$UID` fix ADR-0031 already
-/// established for tray"): our own icon spool root, the only directory [`delete_icon_file`] may
-/// ever delete from (finding 1).
+/// Our icon spool root, `$XDG_RUNTIME_DIR/oblisk/notifications` (ADR-0033's `$UID` fix from
+/// ADR-0031); [`delete_icon_file`] may delete only here (finding 1).
 fn notifications_icon_dir() -> PathBuf {
     shm_icons::icon_dir("notifications")
 }
@@ -187,13 +169,10 @@ pub(super) fn write_icon_png(id: u32, png_bytes: &[u8]) -> std::io::Result<Strin
     shm_icons::write_png("notifications", &format!("notif-{id}.png"), png_bytes)
 }
 
-/// Whether `path` is safe for [`delete_icon_file`] to delete: it must canonicalize to a real file
-/// under `spool_root` (also canonicalized), the same both-sides care [`validate_trusted_path`]
-/// takes. `false` if canonicalization fails or resolves outside `spool_root`.
+/// Whether `path` canonicalizes to a real file under canonicalized `spool_root`.
 ///
-/// Finding 1: `Notification.image_path` looks the same whether it's our own SHM spool copy or a
-/// client-supplied `image-path`/`app_icon` hint resolved to a real, externally-owned theme icon
-/// (`/usr/share/icons`, `~/.local/share/icons`, etc.); deleting must never touch the latter.
+/// Finding 1: `Notification.image_path` may be our SHM copy or an externally-owned
+/// `image-path`/`app_icon` (for example under `/usr/share/icons`); deletion must distinguish them.
 fn path_is_within_spool_root(path: &str, spool_root: &Path) -> bool {
     let Ok(spool_root) = spool_root.canonicalize() else { return false };
     match Path::new(path).canonicalize() {
@@ -202,9 +181,8 @@ fn path_is_within_spool_root(path: &str, spool_root: &Path) -> bool {
     }
 }
 
-/// Deletes `path` only if it lives under our own SHM spool root ([`notifications_icon_dir`]),
-/// never a client-supplied icon hint resolved to a real, externally-owned file (finding 1). Outside
-/// the spool root this is a silent no-op: we forget the reference but never touch the file.
+/// Deletes only under our SHM spool root, never a client-supplied external icon (finding 1).
+/// Outside it, forget the reference without touching the file.
 pub(super) fn delete_icon_file(path: &str) {
     if !path_is_within_spool_root(path, &notifications_icon_dir()) {
         return;
@@ -214,14 +192,11 @@ pub(super) fn delete_icon_file(path: &str) {
     }
 }
 
-/// Where the attached *picture* came from, in the base spec's own precedence
-/// (docs/oblisk-supervisor-services-dbus.md §1): `image-data`/`image_data` >
-/// `image-path`/`image_path` > `icon_data`.
+/// Attached-picture precedence from §1: `image-data`/`image_data` > `image-path`/`image_path` >
+/// `icon_data`.
 ///
-/// All three name the same thing under three spellings the spec accumulated across 1.0, 1.1 and
-/// 1.2. The positional `app_icon` argument used to sit in this chain between the second and the
-/// third, which is what made an application's own icon and the picture it attached compete for one
-/// field; it is [`resolve_app_icon`]'s now (ADR-0091).
+/// The three spellings accumulated across spec versions. `app_icon` no longer competes with this
+/// picture chain (ADR-0091); [`resolve_app_icon`] owns the application's icon.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ImageInput {
     ImageData(RawImageData),
@@ -247,18 +222,15 @@ pub(super) fn resolve_image_input(
     ImageInput::None
 }
 
-/// Splits the `image-path`/`image_path` hint into the two different things senders put in it:
-/// `(a picture to resolve, a theme name)` (ADR-0096).
+/// Splits `image-path`/`image_path` into `(picture, theme name)` (ADR-0096).
 ///
-/// §1.2 allows both -- "an URI (file:// is the only URI schema supported right now) or a name in a
-/// freedesktop.org-compliant icon theme" -- and they want opposite handling. A path is a picture
-/// and goes through [`validate_trusted_path`] like every other client-supplied path. A name has no
-/// path to validate, so leaving it in the picture chain drops it on the floor, which is exactly
-/// the bug ADR-0091 found in `app_icon`; it belongs with the application's icon instead.
+/// §1.2 allows a `file://` URI or a freedesktop theme name; `file://` is the only URI schema
+/// supported right now. Paths use [`validate_trusted_path`];
+/// names have no path to validate. Leaving names in the picture chain caused ADR-0091's
+/// `app_icon` bug, so they move to the application-icon path.
 ///
-/// Told apart by a path separator, on [`resolve_app_icon`]'s reasoning: `"../../etc/passwd"` is
-/// not absolute either, and an `is_absolute` split would hand it on as a "theme name" and let the
-/// renderer's icon lookup take it from there.
+/// Split on `/`: using `is_absolute` would misclassify `"../../etc/passwd"` as a theme name and
+/// pass it to renderer lookup.
 pub(super) fn split_image_path_hint(hint: Option<String>) -> (Option<String>, Option<String>) {
     match hint.filter(|hint| !hint.is_empty()) {
         Some(hint) if !strip_file_uri(&hint).contains('/') => (None, Some(hint)),
@@ -266,22 +238,16 @@ pub(super) fn split_image_path_hint(hint: Option<String>) -> (Option<String>, Op
     }
 }
 
-/// `Notify`'s positional `app_icon` argument, as something a config can actually draw (ADR-0091).
+/// Resolves `Notify`'s positional `app_icon` into something a config can draw (ADR-0091).
 ///
-/// Two forms, because senders send both: a theme name (`"firefox"`,
-/// `"org.telegram.desktop"`), which is what the base spec asks for and what the great majority
-/// send, and an absolute path or `file://` URI, which plenty send anyway. A name is carried as a
-/// name -- `icon { name = ... }` resolves theme names in the renderer (ADR-0054 decision 2), so
-/// there is nothing to validate and nothing to spool. A path goes through the same trusted-root
-/// check every other client-supplied path does.
+/// Theme names (`"firefox"`, `"org.telegram.desktop"`) pass through for renderer resolution
+/// (`icon { name = ... }`, ADR-0054 decision 2); absolute paths and `file://` URIs use the trusted
+/// root check.
 ///
-/// The distinction is drawn on a path separator rather than on `is_absolute`, so a *relative* path
-/// like `../../etc/passwd` is rejected outright instead of being carried as a "theme name" the
-/// renderer would then try to resolve.
+/// A separator check, not `is_absolute`, keeps `../../etc/passwd` from becoming a theme name.
 ///
-/// Before this, the whole value ran through [`validate_trusted_path`], which rejects anything that
-/// is not an absolute path -- so the common case, a bare theme name, resolved to no icon at all
-/// and nearly every notification in the shell drew the same generic fallback.
+/// Before ADR-0091, validating the whole value rejected bare names, so nearly every notification
+/// drew the same generic fallback.
 pub(super) fn resolve_app_icon(app_icon: Option<String>, trusted_roots: &[PathBuf]) -> Option<String> {
     let app_icon = app_icon.filter(|icon| !icon.is_empty())?;
     let stripped = strip_file_uri(&app_icon);
@@ -294,8 +260,6 @@ pub(super) fn resolve_app_icon(app_icon: Option<String>, trusted_roots: &[PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- validate_trusted_path (TDD seam 3) ----
 
     #[test]
     fn validate_trusted_path_accepts_a_real_file_under_a_trusted_root() {
@@ -341,10 +305,7 @@ mod tests {
         let outside_file = outside_dir.path().join("secret.png");
         std::fs::write(&outside_file, b"x").unwrap();
 
-        // "<trusted_dir>/../<outside_dir's own name>/secret.png" only actually escapes if the two
-        // temp dirs share a parent -- construct the traversal against the trusted dir's own parent
-        // directly instead of assuming that, so this test is robust to however the OS lays out
-        // temp directories.
+        // Build traversal through the trusted dir's parent instead of assuming temp-dir layout.
         let escape_path =
             trusted_dir.path().join("..").join(outside_dir.path().file_name().unwrap()).join("secret.png");
         assert_eq!(validate_trusted_path(escape_path.to_str().unwrap(), &[trusted_dir.path().to_path_buf()]), None);
@@ -379,8 +340,6 @@ mod tests {
         assert_eq!(strip_file_uri("/usr/share/icons/x.png"), "/usr/share/icons/x.png");
     }
 
-    // ---- path_is_within_spool_root (finding 1: never delete a file we don't own) ----
-
     #[test]
     fn path_is_within_spool_root_accepts_a_real_file_under_the_spool_root() {
         let spool_root = tempfile::tempdir().unwrap();
@@ -392,9 +351,7 @@ mod tests {
 
     #[test]
     fn path_is_within_spool_root_rejects_a_file_outside_the_spool_root() {
-        // A real, existing file living somewhere else entirely -- exactly the shape of a
-        // client-supplied image-path/app_icon hint resolved to a real theme icon under
-        // /usr/share/icons or ~/.local/share/icons, which delete_icon_file must never touch.
+        // An external resolved theme icon is exactly what delete_icon_file must never touch.
         let spool_root = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let external_file = elsewhere.path().join("theme-icon.png");
@@ -422,8 +379,6 @@ mod tests {
 
         assert!(!path_is_within_spool_root(symlink_path.to_str().unwrap(), spool_root.path()));
     }
-
-    // ---- image-data decoding + bounds checks ----
 
     fn valid_rgba_image(width: i32, height: i32) -> RawImageData {
         let channels = 4;
@@ -486,8 +441,7 @@ mod tests {
 
     #[test]
     fn encode_image_data_to_png_round_trips_a_known_pixel() {
-        // One 1x1 RGBA pixel: R=0x11, G=0x22, B=0x33, A=0x44 (already RGBA row-major, unlike
-        // tray's ARGB network-byte-order pixmaps -- no reordering needed).
+        // One RGBA row-major pixel, unlike tray's ARGB network-byte-order pixmaps.
         let image = RawImageData {
             width: 1,
             height: 1,
@@ -548,8 +502,6 @@ mod tests {
         let value = structure_value(vec![Value::I32(1), Value::I32(1)]);
         assert_eq!(decode_raw_image_data(&value), None);
     }
-
-    // ---- resolve_image_input ----
 
     fn tiny_image() -> RawImageData {
         valid_rgba_image(1, 1)
@@ -619,8 +571,6 @@ mod tests {
     fn resolve_image_input_treats_an_empty_image_path_as_absent() {
         assert_eq!(resolve_image_input(None, Some(String::new()), None), ImageInput::None);
     }
-
-    // ---- resolve_app_icon (ADR-0091) ----
 
     /// The case that was silently broken: a bare theme name is what the base spec asks senders for
     /// and what nearly all of them send, and it used to resolve to nothing.

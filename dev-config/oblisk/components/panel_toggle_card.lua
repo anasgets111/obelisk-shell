@@ -1,17 +1,11 @@
--- A radio as a tile, `Components/PanelToggleCard.qml`: a glyph over a word, the whole tile a
--- button, lit accent while the thing is on. Two of them side by side under a panel's header is
--- how the mirror lays out wi-fi beside ethernet, and it is the one place on this bar where the
--- ground lights up: a filled ground means "this is on" (`modules/bar/panels/power_menu.lua` states
--- the rule), and a radio being on is exactly that.
---
--- This was a label beside a `components/toggle.lua` -- the settings-row shape -- and the switch
--- itself now sits in the panel's header (`components/panel_header.lua`), which is where the
--- mirror puts the master switch. What this tile answers is the next question down: with
--- networking on, which radios?
---
--- Takes the raw signal and a `read` function rather than a boolean signal, the split
--- `components/toggle.lua` and `components/meter.lua` both make for the same reason: the
--- capability pushes a table, and only the caller knows which field is the switch.
+-- Radio tile matching `Components/PanelToggleCard.qml`: glyph over a word, whole tile a button,
+-- accent-lit when on. Side-by-side tiles put wi-fi beside ethernet; here a filled ground means
+-- "this is on" (`modules/bar/panels/power_menu.lua`), exactly matching radio state.
+-- Replaced a label beside `components/toggle.lua`'s settings-row switch. The master switch now sits
+-- in `components/panel_header.lua`, as in the mirror; this tile answers which radios are on.
+-- Takes the raw signal plus `read`, like `components/toggle.lua` and `components/meter.lua`,
+-- because
+-- the capability pushes a table and only the caller knows which field is the switch.
 local theme = require("config.theme")
 local cell = require("components.cell")
 
@@ -39,8 +33,7 @@ return function(opts)
         return read_bool(value, opts.read)
     end)
 
-    -- The mirror's three colour bindings, each on the pair (checked, hovered): the ground, its ring,
-    -- and the ink the glyph and word share.
+    -- Mirror colour bindings on `(checked, hovered)`: ground, ring, and shared glyph/word ink.
     local ground = computed({ checked, hovered }, function(on, hot)
         if on then
             return hot and theme.ACCENT_LIGHT or theme.ACCENT_SUBTLE
@@ -92,8 +85,7 @@ return function(opts)
             end
             opts.on_change(not read_bool(opts.signal:get(), opts.read))
         end,
-        -- A `button` stacks its children; the column is what puts the word under the glyph, and its
-        -- own two alignments centre the stack in the tile.
+        -- `button` stacks children; the column puts the word under the glyph and centres the stack.
         children = { column { align_h = "Center", align_v = "Center", spacing = theme.spacing.xs, children = lines } },
     }
 end

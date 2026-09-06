@@ -1,12 +1,9 @@
--- Small pure helpers with no node in them, which is what keeps them out of `components/`. The
--- Quickshell config this layout mirrors draws the same line: `Components/` holds widgets,
--- `Services/Utils/` holds functions.
+-- Pure helpers with no nodes, kept out of `components/`; like the mirrored config, `Components/`
+-- holds widgets and `Services/Utils/` holds functions.
 local util = {}
 
--- Every capability signal reads `nil` until the Supervisor's first snapshot for it arrives, and a
--- payload can be malformed in ways a config should not crash the whole evaluation over. This fixes
--- both once: `nil` renders as "--", a raising reader renders as "!", and each module is left as the
--- one line that reads its own payload.
+-- Capability signals are `nil` until the first Supervisor snapshot, and payload readers may raise.
+-- Map `nil` to "--" and reader errors to "!", leaving each module one line for its payload.
 function util.label(signal, read)
     return signal:map(function(value)
         if value == nil then
@@ -20,14 +17,12 @@ function util.label(signal, read)
     end)
 end
 
--- `oblisk.battery.state`'s seven UPower names as words a person reads. Three files show this line
--- (the pill's tooltip, the power menu, the lock screen) and the wording has to be the same in all
--- three, which is the whole reason it is not written out at each of them.
---
--- `PendingCharge` is the one worth having: a laptop with `charge_control_end_threshold` set sits
--- there whenever it is plugged in and at the limit, and under the old `charging` boolean it read as
--- "discharging" -- the opposite of what the cable was doing. `PendingDischarge` is its mirror, the
--- battery draining down to a limit that was lowered under it.
+-- Human-readable words for `oblisk.battery.state`'s seven UPower names. The pill tooltip, power
+-- menu,
+-- and lock screen share this wording.
+-- `PendingCharge` matters when a laptop with `charge_control_end_threshold` set sits plugged in at
+-- the limit; the old `charging` boolean called it "discharging", opposite to the cable state.
+-- `PendingDischarge` is the mirror: draining to a lowered limit.
 local BATTERY_PHRASES = {
     Charging = "charging",
     Discharging = "discharging",
@@ -42,12 +37,12 @@ function util.battery_phrase(state)
     return BATTERY_PHRASES[state] or "state unknown"
 end
 
--- Whether a battery is actually running down, which is the only time a low reading is worth
--- colouring. `Discharging` on mains does not exist; `PendingDischarge` is on mains by definition and
--- stops at the limit, so it is not the same thing and does not warn.
--- `", 2h 14m left"` or `""`. UPower estimates one of the two durations at a time and neither while
--- it is still learning the rate, so the empty string is the common case for the first minute after
--- a plug or a boot rather than an error.
+-- Whether a battery is actually running down, the only time a low reading is coloured.
+-- `Discharging`
+-- is not mains; `PendingDischarge` is mains and stops at its limit, so it does not warn.
+-- ETA is `", 2h 14m left"` or `""`. UPower estimates one duration at a time and neither while it
+-- is still learning the rate, so the empty string is common during the first minute after a plug or
+-- a boot, not an error.
 function util.battery_eta(b)
     local seconds, suffix
     if b.time_to_empty then
@@ -69,13 +64,12 @@ function util.battery_is_draining(state)
     return state == "Discharging" or state == "Empty"
 end
 
--- Percent marks, `BatteryService.qml`'s `lowThreshold`/`criticalThreshold`/`suspendThreshold` as
--- whole numbers. One table so the pill's colour, the two notifications and the automatic suspend
--- agree on where "low" starts.
+-- `BatteryService.qml`'s `lowThreshold`/`criticalThreshold`/`suspendThreshold` as whole numbers;
+-- one table keeps the pill, two notifications, and automatic suspend in agreement.
 util.battery_thresholds = { low = 20, critical = 10, suspend = 8 }
 
--- Whether `b` is draining at or under `percent`. Every threshold above is read through this, so
--- red at 14% with the charger in cannot happen: the reference gates on `isOnBattery` too.
+-- Whether `b` drains at or under `percent`. Every threshold uses this gate, so 14% with the charger
+-- in cannot turn red, matching the reference's `isOnBattery` check.
 function util.battery_at_most(b, percent)
     return b ~= nil and b.present and util.battery_is_draining(b.state) and b.percent <= percent
 end
@@ -84,15 +78,12 @@ function util.count(list)
     return list and #list or 0
 end
 
--- An `app_id` to its `.desktop` entry, through `oblisk.applications`'s own `by_app_id` map
--- (ADR-0061). Three callers want this and each holds a differently-spelled id:
--- `modules/global/launcher.lua` has a real desktop file id, `modules/bar/indicators/active_window.lua`
--- has whatever the compositor reports as a toplevel's `app_id`, and
--- `modules/bar/indicators/sys_tray.lua` has a StatusNotifierItem's self-declared `Id`.
---
--- The lowercase retry is here rather than in the capability because the map already carries a
--- case-folded key for every entry: this only has to fold the *caller's* spelling to reach it, and
--- doing that in Rust would mean the capability guessing which of its keys a caller meant.
+-- Resolve an `app_id` through `oblisk.applications.by_app_id` (ADR-0061). Callers supply different
+-- spellings: a desktop file id (`modules/global/launcher.lua`), compositor toplevel `app_id`
+-- (`modules/bar/indicators/active_window.lua`), or StatusNotifierItem `Id`
+-- (`modules/bar/indicators/sys_tray.lua`).
+-- Fold only the caller's spelling here; the map already carries case-folded keys. Doing it in Rust
+-- would make the capability guess which caller key was intended.
 function util.app_entry(applications, app_id)
     if applications == nil or app_id == nil or app_id == "" then
         return nil
@@ -104,12 +95,11 @@ function util.app_entry(applications, app_id)
     return by_app_id[app_id] or by_app_id[string.lower(app_id)]
 end
 
--- The icon-name mapping `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua` both need:
--- pulled out once a second real call site made it a duplicate rather than a one-off
--- (`components/pill.lua`'s own bar for a shared file). Takes the raw `oblisk.audio` payload, not a
--- signal, so a caller decides for itself whether `nil` gets its own branch or an empty icon name.
--- The same five steps as `volume_icon_name`, as nerd-font glyphs, for the OSD, which draws its
--- icon in the accent colour and a themed icon cannot be tinted.
+-- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`,
+-- extracted
+-- at the second call site (`components/pill.lua`). It takes raw `oblisk.audio`, not a signal, so
+-- callers choose their `nil` behavior. It mirrors `volume_icon_name`'s five steps as Nerd Font
+-- glyphs because the OSD accent-tints them and themed icons cannot be tinted.
 function util.volume_glyph(a)
     local icons = require("config.icons")
     if a == nil or a.muted then
@@ -142,22 +132,16 @@ function util.volume_icon_name(a)
     return "audio-volume-high"
 end
 
--- A module that has nothing to say should not be a pill containing "--". `visible` is an ordinary
--- base property (§ 5.1) and takes a signal like any other, so a module can hide itself on the same
--- pass that resolves its text, and a hidden child is skipped by the row's own positioning rather
--- than laid out at zero width.
--- A codepoint budget, and the one place `components/cell.lua`'s argument against character counts
--- does not apply. That component is right that a box is the better unit: it elides against pixels
--- and the caller never guesses. But eliding needs a bounded box, and the two modules in the bar's
--- centre zone need the opposite -- a node exactly as wide as its content, so the content-sized zone
--- between two `Fill` sides puts its midpoint on the bar's midpoint. Bound the box and a short title
--- floats somewhere inside a fixed reservation instead, which is what "(1) WhatsApp" sitting a
--- hundred pixels left of centre was.
---
--- ponytail: the ceiling is that "WWWW" and "iiii" are the same four codepoints and twice different
--- widths, so this cuts to a ragged pixel width. The upgrade is a `max_width` on `text` that lets
--- the engine measure and elide while still reporting the string's own width when it fits, which is
--- a layout change rather than a config one.
+-- Hide a module with no content instead of showing a "--" pill. `visible` is a signal-bound base
+-- property (§ 5.1), so hidden children are skipped by row positioning rather than laid out at zero
+-- width.
+-- Use a codepoint budget here, the exception to `components/cell.lua`'s pixel-box rule. Centre-zone
+-- modules need content-sized nodes between two `Fill` sides; bounding them made short
+-- "(1) WhatsApp"
+-- sit a hundred pixels left of centre.
+-- ponytail: "WWWW" and "iiii" share four codepoints but differ in width, so this cuts to a ragged
+-- pixel width. Upgrade with `text.max_width`, letting the engine measure/elide while reporting the
+-- string's own width when it fits; that requires a layout change, not config.
 function util.truncate(value, limit)
     local s = tostring(value or "")
     local count = utf8.len(s)
@@ -167,21 +151,16 @@ function util.truncate(value, limit)
     return s:sub(1, utf8.offset(s, limit + 1) - 1) .. "..."
 end
 
--- `notification.body` is a span array, not a string: the freedesktop body is markup, and the
--- Supervisor parses it once so no config has to (§ 2.7, ADR-0033). `text.content` takes an array of
--- runs of the same shape (ADR-0104), so this is a near pass-through: a text span becomes a run, and
--- a link becomes an underlined run in `link_color` carrying its `href`, which is where "what does a
--- link look like" gets decided -- the engine draws runs and reports which was pressed, and knows
--- nothing about URLs.
---
--- Image spans are left out here and drawn by `util.notification_images`: a picture inside a line of
--- text has nowhere to go, and `text` refuses a run with no `text` for exactly that reason.
--- A web address written out in plain words becomes a link, as the mirror's `NotificationText`
--- makes it (its `linkify` step): most senders do not mark their links up, they paste them, and a
--- pasted address that cannot be pressed is the card telling you to retype it. Only text spans that
--- are not already links are scanned, so an `<a href>` around different words keeps its target.
--- Trailing sentence punctuation stays out of the address; a full stop after a URL is almost never
--- part of it.
+-- `notification.body` is a parsed freedesktop markup span array (§ 2.7, ADR-0033), not a string.
+-- The Supervisor parses it once, so config consumes it without reparsing.
+-- `text.content` accepts the same run shape (ADR-0104): text passes through; links become
+-- underlined `link_color` runs with `href`. The engine draws/reports pressed runs but knows no
+-- URLs.
+-- Image spans go to `util.notification_images`: `text` refuses runs without `text`, and pictures
+-- have no place inside a text line. Like `NotificationText`'s `linkify`, scan only unlinked text so
+-- senders' commonly pasted web/file addresses become pressable instead of forcing retyping, while
+-- `<a href>` targets survive. Strip trailing sentence punctuation, which is almost never part of a
+-- URL.
 local URL_PATTERNS = { "%f[%S]https?://[^%s<>'\"]+", "%f[%S]file://[^%s<>'\"]+" }
 
 local function linkified(spans)
@@ -248,8 +227,8 @@ function util.notification_body(spans, link_color)
                 italic = span.italic or false,
                 underline = span.underline or is_link,
                 color = is_link and link_color or nil,
-                -- Carried through to the run so a press on these words reaches the node's
-                -- `on_link` (ADR-0106); the engine never opens it, the card does.
+                -- Carries the target to node `on_link` (ADR-0106); the engine never opens it, the
+                -- card does.
                 href = is_link and span.href or nil,
             }
         end
@@ -257,8 +236,7 @@ function util.notification_body(spans, link_color)
     return runs
 end
 
--- How many characters a run array holds, for the "is there enough here to be worth an expander"
--- guess `components/notification_card.lua` makes before the engine has measured anything.
+-- Run character count for `components/notification_card.lua`'s pre-measurement expander guess.
 function util.runs_length(runs)
     local total = 0
     for _, run in ipairs(runs or {}) do
@@ -267,8 +245,7 @@ function util.runs_length(runs)
     return total
 end
 
--- The distinct link targets in a body, in first-seen order. A body that links the same page twice
--- gets one button for it.
+-- Distinct body link targets in first-seen order; repeated pages get one button.
 function util.notification_links(spans)
     local links, seen = {}, {}
     for _, span in ipairs(linkified(spans)) do
@@ -281,8 +258,9 @@ function util.notification_links(spans)
     return links
 end
 
--- The pictures a body carried inline (`<img src>`), already validated against the trusted roots by
--- the Supervisor. Drawn under the text rather than in it, see `util.notification_body`.
+-- Inline body pictures (`<img src>`), trusted-root validated by the Supervisor; draw under text,
+-- not
+-- in it, as `util.notification_body` does.
 function util.notification_images(spans)
     local paths = {}
     for _, span in ipairs(spans or {}) do
@@ -293,8 +271,8 @@ function util.notification_images(spans)
     return paths
 end
 
--- What a link button says: the host for a web address, the address for `mailto:`, and the URL
--- itself for anything else. A full URL on a button is unreadable at any width that fits a card.
+-- Link label: web host, `mailto:` address, or the full URL otherwise. Full URLs do not fit a card
+-- button.
 function util.link_label(href)
     local rest = href:match("^[%a][%w+.-]*://(.*)$")
     if rest then
@@ -303,33 +281,22 @@ function util.link_label(href)
     return href:match("^mailto:(.+)$") or href
 end
 
--- What identifies one notification's *content*, for the config's own bookkeeping about what it has
--- already shown. Not the id on its own: `replaces_id` deliberately reuses an id to put new content
--- at it, so an id-keyed note would suppress the replacement as though it were the thing it
--- replaced. `timestamp` moves on every `Notify` and stays put otherwise (ADR-0093), which is
--- exactly the distinction wanted.
+-- Content identity for popup bookkeeping. Include `timestamp`, not only id: `replaces_id` reuses an
+-- id for new content, while timestamp changes on every `Notify` and otherwise stays put (ADR-0093).
 function util.notification_key(notification)
     return string.format("%d:%d", notification.id or 0, notification.timestamp or 0)
 end
 
--- The feed as one entry per sending application rather than one per notification, which is what
--- turns eight messages from one chat app into one card instead of eight (`NotificationCard.qml`'s
--- `group`).
---
--- Keyed on `desktop_entry` where the sender set one (ADR-0101) and on `app_name` where it did
--- not. The desktop id is the better key -- two apps can share a display name and one can change
--- its own -- and it is also the key into `applications.by_app_id` (ADR-0061), so a group named
--- by its desktop file gets the installed application's own `Name=` and `Icon=` rather than the
--- sender's description of itself. `applications` is the `oblisk.applications` payload, or `nil`
--- before its first push, in which case the sender's own name and icon stand in.
---
--- Ordered the way the mirror's `_compareGroups` orders: critical groups first, then by each
--- group's *newest* notification, since the feed arrives newest-first and an app that just spoke
--- should not sit below one that spoke an hour ago. The key is the tiebreak, so two groups with the
--- same second do not swap places from one pass to the next.
---
--- `opts.skip_transient` leaves out notifications the sender marked `transient` (ADR-0100): the
--- history never shows them, the popup does.
+-- Group the feed by sending application, turning eight chat messages into one card
+-- (`NotificationCard.qml`'s `group`).
+-- Key by sender `desktop_entry` (ADR-0101), or `app_name` when absent. Desktop ids avoid shared or
+-- changing display names and key `applications.by_app_id` (ADR-0061), supplying installed `Name=`/
+-- `Icon=`; before the first `oblisk.applications` push (`nil`), use the sender's name and icon.
+-- Match `_compareGroups`: critical first, then newest notification. The newest-first feed keeps a
+-- recently speaking app above one silent for an hour; key breaks equal-second ties between passes.
+-- `opts.skip_transient` omits sender-marked `transient` notifications (ADR-0100): history omits
+-- them,
+-- popup does not.
 function util.group_notifications(feed, applications, opts)
     opts = opts or {}
     local groups, by_key = {}, {}
@@ -367,11 +334,10 @@ function util.group_notifications(feed, applications, opts)
     return groups
 end
 
--- The history's groups with a heading before each run of them: "urgent", "today", "yesterday",
--- "earlier" (`NotificationService.qml`'s `bucketOrder`). One flat array, because a `list` draws one
--- array and a heading is an item in it; `kind = "header"` is how the item function tells the two
--- apart, and a heading's key cannot collide with a group's since no desktop id holds a colon.
--- `now` is `oblisk.system.time`, and "today" starts at the local midnight before it.
+-- History groups with `NotificationService.qml`'s `bucketOrder`: "urgent", "today", "yesterday",
+-- "earlier". Flatten for `list`; headers are `kind = "header"`, and colon keys cannot collide with
+-- desktop ids, which contain no colon. `now` is `oblisk.system.time`; today starts at local
+-- midnight.
 function util.notification_sections(groups, now)
     local today = os.date("*t", now)
     local today_start = os.time({ year = today.year, month = today.month, day = today.day, hour = 0 })
@@ -405,8 +371,7 @@ function util.notification_sections(groups, now)
     return sections
 end
 
--- A notification's arrival as a clock reading, "Wed 14:32", for the history, where "3h" is less
--- useful than when. `%a` rather than a date: the sections above already say which day.
+-- History arrival as "Wed 14:32"; `%a` is enough because sections already name the day.
 function util.absolute_time(timestamp)
     return os.date("%a %H:%M", timestamp or 0)
 end

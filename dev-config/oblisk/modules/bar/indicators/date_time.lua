@@ -1,13 +1,11 @@
--- Mirrors DateTimeDisplay.qml, which is one control holding the notification state and the clock
--- rather than two sitting beside each other.
+-- Mirrors DateTimeDisplay.qml: one control holds the notification state and clock.
 --
--- The date and the time are one string, not two cells. `%a %d %b  %H:%M` reads as a clock; a dim
--- date cell next to a large time cell reads as two modules that happen to be adjacent, which is
--- what this drew before. The mirror's own format is `TimeService.format("datetime")`.
+-- Date and time are one string, `%a %d %b  %H:%M`, rather than adjacent cells. A dim date cell next
+-- to a large time cell read as two modules, which this drew before. The mirror uses
+-- `TimeService.format("datetime")`.
 --
--- Seconds are gone with them. A clock that ticks every second is a re-resolve every second for a
--- digit nobody reads on a bar, and § 4.2's `system.time` pushes at whatever cadence it pushes at
--- either way.
+-- Seconds are omitted. A per-second clock re-resolves for a digit nobody reads; § 4.2's
+-- `system.time` still pushes at its own cadence.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")

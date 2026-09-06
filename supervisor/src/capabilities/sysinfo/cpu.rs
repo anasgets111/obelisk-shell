@@ -1,18 +1,17 @@
-//! `cpu_percent` sourcing: `/proc/stat`'s aggregate `cpu` line (ADR-0035).
+//! `cpu_percent` comes from `/proc/stat`'s aggregate `cpu` line (ADR-0035).
 
-/// One `/proc/stat` aggregate-line sample: enough to compute a busy percentage against a
-/// later sample, not every individual field (ADR-0035's `busy = total - (idle+iowait)`).
+/// Aggregate `/proc/stat` sample for `busy = total - (idle+iowait)` (ADR-0035); later samples
+/// produce the percentage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSample {
-    /// Sum of every field on the line (`user+nice+system+idle+iowait+irq+softirq+steal+guest+guest_nice`).
+    /// Sum of every field (`user+nice+system+idle+iowait+irq+softirq+steal+guest+guest_nice`).
     pub total: u64,
-    /// `idle + iowait` -- the two fields that count as "not busy" (ADR-0035).
+    /// `idle + iowait`, the two "not busy" fields (ADR-0035).
     pub idle_total: u64,
 }
 
-/// Parses `/proc/stat`'s aggregate `cpu` line (the first line; `cpuN` per-core lines are
-/// rejected). Tolerant of fewer than the full 10 fields (older kernels), as long as at least
-/// `user nice system idle` (4) are present, matching `/proc/stat`'s documented minimum.
+/// Parses the first aggregate `/proc/stat` `cpu` line; rejects `cpuN` lines. Accepts older kernels
+/// with fewer than 10 fields if the documented minimum `user nice system idle` (4) is present.
 pub fn parse_stat_line(line: &str) -> Option<CpuSample> {
     let mut fields = line.split_whitespace();
     if fields.next()? != "cpu" {
@@ -27,9 +26,8 @@ pub fn parse_stat_line(line: &str) -> Option<CpuSample> {
     Some(CpuSample { total, idle_total })
 }
 
-/// The busy-percentage delta between two samples (ADR-0035: `busy = total -
-/// (idle+iowait)`, `percent = 100 * busy_delta / total_delta`). `0` if no time elapsed
-/// (`total_delta == 0`) rather than dividing by zero.
+/// Busy delta percentage (ADR-0035): `busy = total - (idle+iowait)`, `percent = 100 *
+/// busy_delta / total_delta`. Returns `0` when `total_delta == 0`.
 pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
     let total_delta = current.total.saturating_sub(prev.total);
     if total_delta == 0 {
@@ -40,8 +38,8 @@ pub fn delta_percent(prev: &CpuSample, current: &CpuSample) -> u8 {
     ((100 * busy_delta) / total_delta) as u8
 }
 
-/// Reads and parses `{proc_root}/stat`'s aggregate `cpu` line. `proc_root` is a parameter,
-/// never hardcoded `/proc`, so a test can point it at a tempdir.
+/// Reads `{proc_root}/stat`'s aggregate `cpu` line. `proc_root` is injected so tests can use a
+/// tempdir instead of hardcoded `/proc`.
 pub fn read_sample(proc_root: &std::path::Path) -> std::io::Result<CpuSample> {
     let content = std::fs::read_to_string(proc_root.join("stat"))?;
     let line = content.lines().next().unwrap_or("");
@@ -68,7 +66,7 @@ mod tests {
     fn delta_percent_computes_the_busy_fraction_between_two_samples() {
         let prev = super::CpuSample { total: 1000, idle_total: 800 };
         let current = super::CpuSample { total: 2000, idle_total: 1000 };
-        // total_delta=1000, idle_delta=200, busy_delta=800 -> 80% busy.
+        // total_delta=1000, idle_delta=200, busy_delta=800 -> 80%.
         assert_eq!(super::delta_percent(&prev, &current), 80);
     }
 

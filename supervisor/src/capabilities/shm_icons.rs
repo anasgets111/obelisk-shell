@@ -1,14 +1,10 @@
-//! Shared icon-spooling helpers for `dbus::tray` and `dbus::notifications`: both spool
-//! bounds-checked PNG bytes to `$XDG_RUNTIME_DIR/oblisk/{subdir}/...` and shared a byte-for-byte
-//! identical `PngEncodeError` plus the "make the dir, write the file, hand back the path"
-//! shape. Only the subdirectory name and the pixel-source-to-PNG-bytes step differ, so those
-//! stay local to each controller; this module holds only the shared PNG-error type and the
-//! directory/write mechanics.
+//! Shared PNG spooling for `dbus::tray` and `dbus::notifications`: both spool bounds-checked PNG
+//! bytes to `$XDG_RUNTIME_DIR/oblisk/{subdir}/...`; the error type and directory/write mechanics
+//! are identical, while subdirectory and pixel encoding stay local.
 
 use std::path::PathBuf;
 
-/// PNG encoding failure -- wraps the `png` crate's own error type. Shared because both
-/// controllers' encoders hit the same `png::Encoder`/`png::Writer` API.
+/// PNG encoding failure wrapping the `png` crate error used by both controllers.
 #[derive(Debug)]
 pub enum PngEncodeError {
     Png(png::EncodingError),
@@ -24,34 +20,29 @@ impl std::fmt::Display for PngEncodeError {
 
 impl std::error::Error for PngEncodeError {}
 
-/// `$XDG_RUNTIME_DIR/oblisk/{subdir}` (ADR-0142; was `/dev/shm/oblisk-$UID` under ADR-0031).
+/// `$XDG_RUNTIME_DIR/oblisk/{subdir}` (ADR-0142; previously `/dev/shm/oblisk-$UID` under ADR-0031).
 ///
-/// Not `/dev/shm`: it is mode 1777, so any other local user can create `oblisk-$UID` before this
-/// process does. A symlink there aims [`sweep`]'s startup delete at a directory of their choosing
-/// and makes [`write_png`] follow the link. The runtime directory is 0700 and owned by us, which
-/// is the property the `$UID` suffix was reaching for. Same tmpfs either way.
+/// Not `/dev/shm`: mode 1777 lets another user create `oblisk-$UID` first, redirecting [`sweep`]'s
+/// delete and [`write_png`] through a symlink. The owned 0700 runtime directory provides the
+/// intended isolation on the same tmpfs.
 ///
-/// The fallback is the path systemd would have set, not `/dev/shm`: a spool that silently reverts
-/// to a world-writable directory when one variable is missing is the hole, not the repair. If it
-/// does not exist, [`write_png`] fails and the item draws without an icon.
+/// Fallback to systemd's path, not `/dev/shm`; silently reverting to a world-writable directory is
+/// the hole. If the runtime directory does not exist, [`write_png`] fails and the item has no icon.
 pub fn icon_dir(subdir: &str) -> PathBuf {
     spool_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), subdir)
 }
 
-/// [`icon_dir`] with the environment passed in, so the fallback is testable without a test that
-/// mutates process-wide state to prove it.
+/// [`icon_dir`] with an explicit environment, so fallback tests need not mutate process-wide state.
 fn spool_dir(runtime: Option<&std::ffi::OsStr>, subdir: &str) -> PathBuf {
     let runtime =
         runtime.map_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::Uid::current())), PathBuf::from);
     runtime.join("oblisk").join(subdir)
 }
 
-/// Deletes one spooled PNG, best-effort.
+/// Best-effort deletion of one spooled PNG.
 ///
-/// `path` must be one this module wrote, which is checked rather than trusted: this deletes a file
-/// from a path that travelled through a `TrayItem` and back, and the check costs a prefix compare.
-/// A failure is silent because every caller is already tearing something down and there is nothing
-/// useful to do about a file that is already gone.
+/// Checks that `path` is one this module wrote before deleting it. The path traveled through a
+/// `TrayItem` and back, so the prefix check is a trust boundary. Failure is silent during teardown.
 pub fn remove_png(subdir: &str, path: &str) {
     if !std::path::Path::new(path).starts_with(icon_dir(subdir)) {
         return;
@@ -59,17 +50,14 @@ pub fn remove_png(subdir: &str, path: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Empties `subdir` of the files a previous run left behind.
+/// Removes files a previous run left in `subdir`.
 ///
-/// Safe only at startup, and only because a fresh Supervisor owns nothing in there yet: its registry
-/// is empty and every item re-registers from scratch, spooling again. The runtime directory
-/// outlives the process, so without this every icon a killed run spooled stays resident until the
-/// session ends -- files from the previous day were still sitting there when this was written.
+/// Safe only at startup: the fresh Supervisor registry is empty and every item re-registers and
+/// respools. The runtime directory outlives the process, so killed runs otherwise leave icons until
+/// session end; files from the previous day were still present when this was written.
 ///
-/// ponytail: two Supervisors at once and the second sweeps the first's live files, which shows as a
-/// tray of blank icons until something makes each item re-spool. Two shells is a debugging accident
-/// rather than a mode, and the alternative is a lockfile or an mtime cutoff to avoid a leak measured
-/// in kilobytes.
+/// ponytail: a second Supervisor sweeps the first's live files, showing blank icons until respool.
+/// Upgrade with a lockfile or mtime cutoff if two shells become a mode, avoiding a kilobyte leak.
 pub fn sweep(subdir: &str) {
     let dir = icon_dir(subdir);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -82,9 +70,8 @@ pub fn sweep(subdir: &str) {
     }
 }
 
-/// Writes already-encoded `png_bytes` to `$XDG_RUNTIME_DIR/oblisk/{subdir}/{filename}`, creating the
-/// directory tree if missing. Same path overwritten in place on every call -- no cache-busting
-/// (ADR-0031, carried forward for notifications by ADR-0033).
+/// Writes encoded `png_bytes` to `$XDG_RUNTIME_DIR/oblisk/{subdir}/{filename}`, creating missing
+/// directories. Overwrites the same path without cache-busting (ADR-0031, ADR-0033).
 pub fn write_png(subdir: &str, filename: &str, png_bytes: &[u8]) -> std::io::Result<String> {
     let dir = icon_dir(subdir);
     std::fs::create_dir_all(&dir)?;

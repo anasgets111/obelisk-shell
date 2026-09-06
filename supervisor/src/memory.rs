@@ -1,31 +1,28 @@
-//! Memory measurement harness (ADR-0043 decision 1): reads `/proc/[pid]/smaps_rollup` for PSS/USS
-//! and `/proc/[pid]/fdinfo/*` for DRM (GPU) residency, one log line per sample. It answers "where
-//! is the memory" and evicts nothing of the shell's own. Three numbers, per the ADR's three
-//! items: total PSS across the supervisor and every live renderer (item 1, vs. the 50
-//! MiB-per-monitor budget), per-renderer USS (item 2), and GPU residency from DRM fdinfo, never
-//! folded into PSS (not in any `smaps` number under a real driver).
+//! Memory measurement harness (ADR-0043 decision 1): `/proc/[pid]/smaps_rollup` supplies PSS/USS;
+//! `/proc/[pid]/fdinfo/*` supplies DRM residency. It reports, never evicts shell state: total PSS
+//! for supervisor plus live renderers (item 1, against the 50 MiB-per-monitor budget), per-renderer
+//! USS (item 2), and GPU residency, never folded into PSS because real drivers omit it from
+//! `smaps`.
 //!
-//! [`return_free_pages_to_the_kernel`] is the one thing here that acts rather than reports, and it
-//! is the allocator's pages it hands back, never the shell's own state.
+//! [`return_free_pages_to_the_kernel`] only returns allocator pages, never shell state.
 
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
-/// `OBLISK_MEMORY_SAMPLE_SECS`: seconds between periodic samples, or unset/`0` to disable the
-/// timer. Named here so `main.rs`'s call site and this module agree on the string.
+/// `OBLISK_MEMORY_SAMPLE_SECS`: seconds between samples; unset/`0` disables the timer. Named here
+/// so `main.rs` and this module share the string.
 pub(crate) const SAMPLE_SECS_ENV: &str = "OBLISK_MEMORY_SAMPLE_SECS";
 
-/// One process's `smaps_rollup`, in KiB (`/proc`'s native unit; converted to MiB only in
-/// [`report_line`]).
+/// One process's `smaps_rollup`, in KiB, `/proc`'s native unit. [`report_line`] converts to MiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rollup {
     pub(crate) pss: u64,
     pub(crate) uss: u64,
 }
 
-/// One DRM client's memory, from a single `/proc/[pid]/fdinfo/[fd]` file. `pdev`+`client_id` is
-/// the dedupe key [`fold_drm_clients`] needs: several fds of one process share a `drm-client-id`.
+/// One DRM client's memory from `/proc/[pid]/fdinfo/[fd]`. `pdev`+`client_id` dedupes fds sharing a
+/// `drm-client-id` in [`fold_drm_clients`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DrmClient {
     pub(crate) pdev: String,
@@ -34,7 +31,7 @@ pub(crate) struct DrmClient {
     pub(crate) shared: u64,
 }
 
-/// A process's GPU footprint after dedupe; `clients` is the deduped count, not the fd count.
+/// A process's deduped GPU footprint; `clients` counts clients, not fds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Gpu {
     pub(crate) resident: u64,
@@ -42,27 +39,25 @@ pub(crate) struct Gpu {
     pub(crate) clients: usize,
 }
 
-/// One process's whole picture: PSS/USS from `smaps_rollup`, GPU residency from `fdinfo`.
+/// One process's PSS/USS from `smaps_rollup` and GPU residency from `fdinfo`.
 #[derive(Debug)]
 pub(crate) struct ProcessMemory {
     pub(crate) rollup: Rollup,
     pub(crate) gpu: Gpu,
 }
 
-/// A full sample: the supervisor plus every renderer that answered, keyed by generation id. A
-/// renderer already exited by read time is simply absent, not an error (see [`sample`]).
+/// Supervisor plus every renderer that answered, keyed by generation. A renderer already exited
+/// at read time is absent, not an error (see [`sample`]).
 #[derive(Debug)]
 pub(crate) struct Sample {
     pub(crate) supervisor: ProcessMemory,
     pub(crate) renderers: Vec<(u32, ProcessMemory)>,
 }
 
-/// Parses `smaps_rollup` text into PSS and USS, `None` if `Pss:` is missing (a truncated rollup
-/// is not a zero-byte process; reporting zero would be worse than nothing). The key matches
-/// exactly against text before the first `:`, not by prefix: `Pss_Dirty:`, `Pss_Anon:`,
-/// `Pss_File:`, `Pss_Shmem:` and `SwapPss:` all start with "Pss" and a prefix match would wrongly
-/// catch them (ADR-0043 decision 1 item 1). USS is `Private_Clean + Private_Dirty` (decision 1
-/// item 2): pages nothing else maps.
+/// Parses `smaps_rollup` into PSS and USS. Missing `Pss:` yields `None`: a truncated rollup is not
+/// a zero-byte process. Match the key before the first `:` exactly; `Pss_Dirty`, `Pss_Anon`,
+/// `Pss_File`, `Pss_Shmem`, and `SwapPss` would fool a prefix match (ADR-0043 decision 1 item 1).
+/// USS is `Private_Clean + Private_Dirty` (decision 1 item 2), pages nothing else maps.
 pub(crate) fn parse_rollup(text: &str) -> Option<Rollup> {
     let mut pss = None;
     let mut private_clean = 0u64;
@@ -80,46 +75,42 @@ pub(crate) fn parse_rollup(text: &str) -> Option<Rollup> {
     Some(Rollup { pss: pss?, uss: private_clean + private_dirty })
 }
 
-/// Hands glibc's already-free pages back to the kernel, across every arena.
+/// Hands glibc's already-free pages back to the kernel across every arena.
 ///
-/// Freeing does not shrink the process. glibc keeps freed chunks on its own free lists, and the
-/// per-thread arena a `spawn_blocking` job allocated in is never trimmed on its own, so a job that
-/// allocates a lot once raises the supervisor's floor for the rest of the session. The update
-/// check is that job: `libalpm` parses the whole sync database, tens of MiB of small allocations
-/// that are all dead a moment later. Measured before this existed: 31 MiB before the first check,
-/// 84 MiB the moment it finished, still 84 MiB minutes later -- ADR-0043's whole 50 MiB-per-monitor
-/// budget, spent on work that had already ended.
+/// Freeing does not shrink the process: glibc keeps chunks on free lists, and a `spawn_blocking`
+/// arena is not trimmed on its own. `libalpm`'s update check parses the sync database and leaves
+/// tens of MiB of dead allocations. Before this existed, memory was 31 MiB before the check, 84
+/// MiB on completion, and still 84 MiB minutes later, consuming ADR-0043's 50 MiB-per-monitor
+/// budget after the work ended.
 ///
-/// For a job on that scale and never in a loop: it walks every arena's free lists and takes each
-/// arena's lock to do it, so it belongs at the end of the blocking job itself, not on a timer.
+/// Use for a job of that scale, never in a loop: it walks every arena's free lists and locks each
+/// arena, so it belongs at the blocking job's end, not on a timer.
 pub(crate) fn return_free_pages_to_the_kernel() {
-    // SAFETY: a plain FFI call with one integer. `malloc_trim` takes the arena locks itself, is
-    // safe from any thread at any time, and only `madvise`s pages the allocator already holds free.
+    // SAFETY: plain one-integer FFI. `malloc_trim` locks arenas itself, is thread-safe, and only
+    // `madvise`s pages the allocator already holds free.
     unsafe {
         libc::malloc_trim(0);
     }
 }
 
-/// `smaps_rollup`'s value column is always `<number> kB` (the kernel's long-standing, if
-/// misleadingly named, KiB convention here). Unlike DRM fdinfo below, no competing unit to misread.
+/// `smaps_rollup` values are `<number> kB`, the kernel's long-standing name for KiB. Unlike DRM
+/// fdinfo, no competing unit exists here.
 fn parse_rollup_kib(value: &str) -> Option<u64> {
     value.split_whitespace().next()?.parse().ok()
 }
 
-/// Parses one `/proc/[pid]/fdinfo/[fd]` file into a [`DrmClient`], `None` without a `drm-driver:`
-/// line. Fields are `key:` TAB `value`; the trailing `:` is stripped after splitting on the tab,
-/// since `drm-pdev`'s value (`0000:00:02.0`) itself contains colons. Resident memory sums
-/// `drm-resident-<region>:` fields (regions are disjoint: `system0` and `stolen-system0` here);
-/// with none present, falls back to `drm-memory-<region>:` instead, never both, or new-field
-/// drivers would double count. Shared memory sums `drm-shared-<region>:` the same way;
-/// `drm-total-*`, `drm-active-*`, `drm-purgeable-*` and `drm-engine-*` (nanoseconds) are ignored.
+/// Parses `/proc/[pid]/fdinfo/[fd]` into [`DrmClient`], or `None` without `drm-driver:`. Fields
+/// are `key:` TAB `value`; strip `:` after splitting because `drm-pdev` values such as
+/// `0000:00:02.0` contain colons. Sum `drm-resident-<region>:` fields, falling back to
+/// `drm-memory-<region>:` only when none exist. Never add both, or new-field drivers double count.
+/// Sum `drm-shared-<region>:` likewise; ignore `drm-total-*`, `drm-active-*`, `drm-purgeable-*`,
+/// and `drm-engine-*` nanoseconds.
 pub(crate) fn parse_drm_client(text: &str) -> Option<DrmClient> {
     let mut has_driver = false;
     let mut pdev = None;
     let mut client_id = None;
-    // saw_resident_key tracks whether the modern naming appeared at all, separate from resident's
-    // value: folded together, a refused unparseable value would look like a field never reported
-    // and silently fall back to a legacy number; a genuine zero must not fall back either.
+    // Track modern naming separately from its value: an unparseable value must not look absent and
+    // fall back to a legacy number; a genuine zero must not fall back either.
     let mut saw_resident_key = false;
     let mut resident: u64 = 0;
     let mut shared: u64 = 0;
@@ -152,9 +143,9 @@ pub(crate) fn parse_drm_client(text: &str) -> Option<DrmClient> {
     Some(DrmClient { pdev: pdev?, client_id: client_id?, resident, shared })
 }
 
-/// A `drm-resident-<region>`/`drm-shared-<region>`/`drm-memory-<region>` value: `279968 KiB`, or a
-/// bare `0` (real fdinfo prints zero unitless, everything else with a unit). A bare nonzero number
-/// or non-KiB unit is refused, not guessed: misreading MiB as KiB would under-report by 1024x.
+/// A `drm-resident-<region>`, `drm-shared-<region>`, or `drm-memory-<region>` value: `279968 KiB`
+/// or bare `0` (real fdinfo prints zero unitless). Refuse bare nonzero and non-KiB units rather
+/// than guess; reading MiB as KiB under-reports by 1024x.
 fn parse_drm_kib(value: &str) -> Option<u64> {
     if value == "0" {
         return Some(0);
@@ -168,9 +159,9 @@ fn parse_drm_kib(value: &str) -> Option<u64> {
     number.parse().ok()
 }
 
-/// Dedupes DRM clients by `(pdev, client_id)` before summing: one client can hold many fds
-/// reporting the same id (confirmed live: three fds of one process report `drm-client-id: 4` with
-/// identical byte counts), so summing every fd would triple-count. Keeps the first fd seen.
+/// Dedupes by `(pdev, client_id)` before summing. One client can hold many fds with the same id
+/// (live: three fds reported `drm-client-id: 4` with identical bytes), so summing triples counts.
+/// Keeps the first fd seen.
 pub(crate) fn fold_drm_clients(clients: impl IntoIterator<Item = DrmClient>) -> Gpu {
     let mut kept: HashMap<(String, u64), DrmClient> = HashMap::new();
     for client in clients {
@@ -181,18 +172,17 @@ pub(crate) fn fold_drm_clients(clients: impl IntoIterator<Item = DrmClient>) -> 
     Gpu { resident, shared, clients: kept.len() }
 }
 
-/// Parses [`SAMPLE_SECS_ENV`]'s already-read value into a sampling interval. `None` (unset), an
-/// unparseable string, and `"0"` all mean the periodic sampler is off, one case for the caller.
+/// Parses [`SAMPLE_SECS_ENV`]. `None` (unset), an invalid string, and `"0"` all disable periodic
+/// sampling, one case for the caller.
 pub(crate) fn interval_from_env(value: Option<&str>) -> Option<Duration> {
     let secs: u64 = value?.parse().ok()?;
     if secs == 0 { None } else { Some(Duration::from_secs(secs)) }
 }
 
-/// The one log line a sample produces: `total pss` is the supervisor's PSS plus every renderer's
-/// PSS (ADR-0043 decision 1 item 1, vs. the 50 MiB-per-monitor budget); GPU residency is per
-/// renderer only, never added in (not in any `smaps` number). One `; generation N ...` clause per
-/// renderer, in `sample`'s order. The DRM client count is the only evidence [`fold_drm_clients`]
-/// deduped rather than summed: a count of 1 next to a plausible number is a measurement, not luck.
+/// One log line per sample. `total pss` sums supervisor and renderer PSS (ADR-0043 decision 1
+/// item 1, against 50 MiB per monitor); GPU stays per renderer because `smaps` omits it. Emit one
+/// `; generation N ...` clause in sample order. DRM client count shows [`fold_drm_clients`]
+/// deduped rather than summed: `1` beside a plausible number is measured, not luck.
 pub(crate) fn report_line(label: &str, sample: &Sample) -> String {
     let total_pss: u64 =
         sample.supervisor.rollup.pss + sample.renderers.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
@@ -218,8 +208,8 @@ fn mib(kib: u64) -> f64 {
     kib as f64 / 1024.0
 }
 
-/// Reads one process's `smaps_rollup` and every readable `fdinfo` under `/proc/<who>` (`who` is a
-/// pid or `"self"`). A missing/malformed rollup errors; no DRM fds is a correctly zeroed [`Gpu`].
+/// Reads `smaps_rollup` and readable `fdinfo` under `/proc/<who>` (`who` is a pid or `"self"`). A
+/// missing/malformed rollup errors; no DRM fds is a zeroed [`Gpu`].
 fn read_process_memory(who: &str) -> io::Result<ProcessMemory> {
     let rollup_text = std::fs::read_to_string(format!("/proc/{who}/smaps_rollup"))?;
     let rollup = parse_rollup(&rollup_text).ok_or_else(|| {
@@ -228,9 +218,8 @@ fn read_process_memory(who: &str) -> io::Result<ProcessMemory> {
     Ok(ProcessMemory { rollup, gpu: read_gpu(who) })
 }
 
-/// Sums DRM residency across every fd in `/proc/<who>/fdinfo`. A missing `fdinfo` directory and an
-/// fd that vanishes between `read_dir` and its `read` (fds close constantly; normal) both fold to
-/// "no DRM memory found" rather than propagating.
+/// Sums DRM residency across `/proc/<who>/fdinfo`. A missing directory or fd vanishing between
+/// `read_dir` and `read` (normal, as fds close constantly) means no DRM memory, not an error.
 fn read_gpu(who: &str) -> Gpu {
     let Ok(entries) = std::fs::read_dir(format!("/proc/{who}/fdinfo")) else {
         return fold_drm_clients(std::iter::empty());
@@ -241,14 +230,14 @@ fn read_gpu(who: &str) -> Gpu {
     fold_drm_clients(clients)
 }
 
-/// Reads one renderer's memory by pid, as opposed to the supervisor's own via `/proc/self`.
+/// Reads one renderer by pid, unlike the supervisor's `/proc/self` read.
 fn read_process(pid: u32) -> io::Result<ProcessMemory> {
     read_process_memory(&pid.to_string())
 }
 
-/// Reads a full sample: the supervisor's own numbers via `/proc/self`, then every renderer in
-/// `renderer_pids` (`(generation_id, pid)` pairs, in order). A pid already exited (ordinary during
-/// a PBA handoff or crash) is logged and skipped; only the supervisor's read is fatal.
+/// Reads `/proc/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A pid
+/// already exited during an ordinary PBA handoff or crash is logged and skipped; only the
+/// supervisor read is fatal.
 pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
     let supervisor = read_process_memory("self")?;
     let mut renderers = Vec::with_capacity(renderer_pids.len());
@@ -263,11 +252,10 @@ pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
     Ok(Sample { supervisor, renderers })
 }
 
-/// Builds the steady-state sampler from the environment, or `None` to leave it off (ADR-0043's
-/// sampling amendment). Opt-in: `smaps_rollup` is readable from outside any time, so an always-on
-/// timer adds nothing but a log line; the handoff sample stays unconditional since nobody outside
-/// can catch a swap-only window. The first tick is one period out, not immediate (a just-spawned
-/// Renderer isn't steady yet); `Skip` because a sampler that fell behind wants the current reading.
+/// Builds the opt-in steady-state sampler (ADR-0043 amendment), or `None`. `smaps_rollup` is
+/// always externally readable, so an always-on timer adds only a log line; the handoff sample is
+/// unconditional because no outside observer can catch a swap-only window. First tick is one
+/// period out because a new Renderer is not steady; `Skip` keeps a late sampler current.
 pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
     let period = interval_from_env(std::env::var(SAMPLE_SECS_ENV).ok().as_deref())?;
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -275,10 +263,9 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
     Some(interval)
 }
 
-/// Reads and logs one memory sample across the Supervisor and the Renderers named by `renderers`
-/// (ADR-0043 decision 1). Two callers in `main.rs`: the steady-state timer (single authoritative
-/// generation) and the PBA arm (both generations, during the window two are alive). A `Child`
-/// whose `id()` is `None` has already been reaped and is dropped, not reported as zero.
+/// Reads and logs one sample across Supervisor and `renderers` (ADR-0043 decision 1). `main.rs`
+/// calls it from the steady-state timer (one authoritative generation) and PBA (both during the
+/// two-generation window). A reaped `Child` with `id() == None` is dropped, not reported as zero.
 pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)]) {
     let pids: Vec<(u32, u32)> =
         renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
@@ -288,9 +275,9 @@ pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)
     }
 }
 
-/// The steady-state sampler's `select!` arm: never resolves when off (an `Option<Interval>` can't
-/// be `.tick()`ed directly inside `select!`, and a disabled sampler must not resolve or it'd spin
-/// the loop). Both `Interval::tick` and `pending` are cancel-safe, as `select!` requires.
+/// `select!` arm for the steady-state sampler. Off means never resolve: `Option<Interval>` cannot
+/// be ticked directly, and resolving would spin the loop. `Interval::tick` and `pending` are both
+/// cancel-safe as `select!` requires.
 pub(crate) async fn tick_sampler(interval: &mut Option<tokio::time::Interval>) -> Option<tokio::time::Instant> {
     match interval {
         Some(interval) => Some(interval.tick().await),
@@ -304,8 +291,8 @@ mod tests {
 
     // ---- parse_rollup ----
 
-    /// Real `smaps_rollup` output from this machine. Pss: 208 kB; Private_Clean: 48 kB;
-    /// Private_Dirty: 108 kB -> pss 208, uss 156.
+    /// Real machine output: Pss 208 kB, Private_Clean 48 kB, Private_Dirty 108 kB, hence
+    /// pss 208 and uss 156.
     const ROLLUP_FIXTURE: &str = "\
 56431addf000-7fffc2d7a000 ---p 00000000 00:00 0                          [rollup]
 Rss:                3932 kB
@@ -339,7 +326,7 @@ Locked:                0 kB
 
     #[test]
     fn parse_rollup_does_not_let_pss_dirty_or_other_pss_prefixed_lines_masquerade_as_pss() {
-        // A prefix match on "Pss" would find Pss_Dirty: 108 kB here and report 108, not None.
+        // Prefix matching "Pss" would find `Pss_Dirty: 108 kB` and report 108 instead of `None`.
         let text = "Pss_Dirty:           108 kB\nPss_Anon:            108 kB\nPrivate_Clean:        48 kB\n";
         assert_eq!(parse_rollup(text), None);
     }
@@ -355,10 +342,9 @@ Locked:                0 kB
 
     // ---- parse_drm_client ----
 
-    /// Real `fdinfo` output from this machine's i915 GPU. `drm-resident-system0` and
-    /// `drm-resident-stolen-system0` sum to 279968; that they equal `drm-total-system0` here is a
-    /// coincidence of a fully-resident buffer, not evidence `drm-total-*` was read -- see the
-    /// dedicated total-is-not-summed test below.
+    /// Real i915 output. `drm-resident-system0` plus `drm-resident-stolen-system0` is 279968, equal
+    /// to `drm-total-system0` only because the buffer is fully resident, not because `drm-total-*`
+    /// was read. See the total-is-not-summed test.
     const DRM_FIXTURE: &str = "pos:\t0\n\
 flags:\t02104002\n\
 mnt_id:\t357\n\
@@ -420,8 +406,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn parse_drm_client_never_adds_the_resident_and_memory_style_fields_together() {
-        // A driver could report both naming styles in the same file; resident, when present,
-        // wins outright rather than being added to the fallback.
+        // If both naming styles appear, resident wins instead of adding the fallback.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t1000 KiB\ndrm-memory-system0:\t9999 KiB\n";
         assert_eq!(
             parse_drm_client(text),
@@ -431,7 +416,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn parse_drm_client_treats_a_bare_zero_resident_value_as_present_not_missing() {
-        // If a bare "0" failed to parse, this would fall back to drm-memory-system0's 99999.
+        // If bare `0` failed to parse, this would fall back to `drm-memory-system0`'s 99999.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t0\ndrm-memory-system0:\t99999 KiB\n";
         assert_eq!(
             parse_drm_client(text),
@@ -439,8 +424,8 @@ drm-engine-video-enhance:\t0 ns\n";
         );
     }
 
-    /// The fallback is selected by the modern key being absent, never by its value failing to
-    /// parse -- answering with a stale legacy number would report a wrong number, not no number.
+    /// Select fallback only when the modern key is absent, not when its value fails to parse; a
+    /// stale legacy number is wrong, not absent.
     #[test]
     fn an_unparseable_resident_value_does_not_fall_back_to_the_legacy_field() {
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t50 MiB\ndrm-memory-system0:\t99999 KiB\n";
@@ -452,7 +437,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn parse_drm_client_ignores_a_field_reported_in_a_unit_other_than_kib() {
-        // Misreading "50 MiB" as 50 KiB would under-report by 1024x; dropped instead.
+        // Reading `50 MiB` as 50 KiB under-reports by 1024x; drop it instead.
         let text = "drm-driver:\ti915\ndrm-pdev:\t0000:00:02.0\ndrm-client-id:\t4\ndrm-resident-system0:\t50 MiB\ndrm-resident-other:\t1000 KiB\n";
         assert_eq!(
             parse_drm_client(text),
@@ -464,8 +449,8 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn fold_drm_clients_dedupes_by_pdev_and_client_id_so_one_process_is_not_triple_counted() {
-        // Three separate fds of one process, as observed live on this machine: each reports
-        // drm-client-id: 4 on the same pdev with identical byte counts.
+        // Three live fds from one process each report `drm-client-id: 4` on the same pdev with
+        // identical byte counts.
         let one_fd = || DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 279968, shared: 192368 };
         let gpu = fold_drm_clients([one_fd(), one_fd(), one_fd()]);
         assert_eq!(gpu, Gpu { resident: 279968, shared: 192368, clients: 1 });
@@ -546,8 +531,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
     #[test]
     fn report_line_total_pss_excludes_gpu_and_uss() {
-        // ADR-0043 decision 1: total pss is a PSS sum, not a PSS+USS sum -- USS is reported
-        // per renderer only.
+        // ADR-0043 decision 1: total PSS is a PSS sum, not PSS+USS; USS is per renderer only.
         let sample = Sample {
             supervisor: ProcessMemory {
                 rollup: Rollup { pss: 1024, uss: 999_999 },

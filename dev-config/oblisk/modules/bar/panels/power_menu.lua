@@ -1,19 +1,17 @@
--- Mirrors Bar/Panels/PowerMenu.qml, and replaces the `menu N` click counter that used to sit on
--- the bar. That button existed to prove Phase 21's input path and nothing else: it counted its own
--- clicks, opened the settings window and the popup at once, and had no counterpart in any real bar.
+-- Mirrors Bar/Panels/PowerMenu.qml and replaces the `menu N` click counter. That button only proved
+-- Phase 21's input path: it counted clicks and opened settings plus the popup.
 --
--- Quickshell's PowerMenu is a pill on the bar: log out, restart and power off, each behind a
--- ten-second countdown that a second click skips and a right click or the cancel slot stops. The
--- pill is `power_button` below, built the same way the mirror does it: `PowerManagementService`
--- shells out to `systemctl` and to the compositor, and `process.run` is that.
+-- The bar pill, `power_button` below, offers log out, restart, and power off behind ten-second
+-- countdowns. A second click skips; right-click or cancel stops. `process.run` shells out to
+-- `systemctl` and the compositor, as `PowerManagementService` does.
 --
--- The panel under it has no counterpart in the mirror. Lock, sleep and settings are its rows and
--- brightness its slider; settings has no other door, and lock and sleep lose nothing and so need
--- no countdown. Sleep is the mirror service's `suspend()`, which its menu never shows.
+-- The panel adds lock, sleep, settings, and a brightness slider. Settings has no other door; lock
+-- and
+-- sleep lose nothing, so need no countdown. Sleep is the mirror service's `suspend()`, absent
+-- there.
 --
--- The countdown is a deadline in `oblisk.system.time`, not a timer: `system` pushes once a second,
--- so "seconds left" is a `computed` off it and the commit is one `on_change` (ADR-0115) watching
--- the clock pass the deadline.
+-- Countdown is a deadline in `oblisk.system.time`, not a timer. `system` pushes once a second;
+-- seconds-left is a `computed`, and one `on_change` commits past the deadline (ADR-0115).
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -26,11 +24,11 @@ local ui_state = require("lib.ui_state")
 
 local KIND = "power"
 
--- The mirror's `initialCountdown`.
+-- Mirror `initialCountdown`.
 local COUNTDOWN = 10
 
--- Which session action is counting down, `""` for none, and the `oblisk.system.time` it fires at.
--- Two `state()`s rather than one table: a table is not a signal type.
+-- Pending action (`""` for none) and its `oblisk.system.time` deadline. Two `state()`s because a
+-- table is not a signal type.
 local pending = state("power_pending", "")
 local deadline = state("power_deadline", 0)
 
@@ -46,7 +44,7 @@ local function detached(cmd, args)
     process.run(cmd, args, function() end, function() end)
 end
 
--- The mirror's `actions`, in its order. `logout` is `CompositorImpl.exitSession` for niri.
+-- Mirror `actions`, in order. `logout` is niri's `CompositorImpl.exitSession`.
 local ACTIONS = {
     { key = "logout", title = "log out", icon = icons.logout, run = function()
         detached("niri", { "msg", "action", "quit", "--skip-confirmation" })
@@ -85,9 +83,8 @@ oblisk.system:on_change(function(s)
     end
 end)
 
--- Wraps rather than clamping, and it stops at `BRIGHTNESS_STEP` rather than 0. A control that can
--- black the panel out with one stray click is a control nobody clicks twice, and
--- `brightness:set(0)` on an `intel_backlight` does exactly that.
+-- Wraps rather than clamps, stopping at `BRIGHTNESS_STEP` instead of 0. `brightness:set(0)` blacks
+-- an `intel_backlight` panel, so a control that can do that gets no second click.
 local BRIGHTNESS_STEP = 10
 
 local function step_brightness(delta)
@@ -104,27 +101,25 @@ local function step_brightness(delta)
     oblisk.brightness:invoke("set", stepped)
 end
 
--- The mirror's `ExpandingPill`: one circle on the bar, the power off, that widens on hover into
--- three -- log out, restart, power off -- and narrows back when the pointer leaves. `hover` on the
--- row holding the three, not on each circle, since a hover region answers containment and a
--- pointer crossing the gap between two circles never leaves the row. That is what the mirror's
--- collapse timer exists to paper over, and what `workspace_strip.lua` now builds on too.
--- No width animation; the engine has none, and the volume pill snaps open the same way.
+-- Mirror `ExpandingPill`: power-off circle expands on hover to log out/restart/power off. Put
+-- `hover` on the containing row so gaps do not leave it, as `workspace_strip.lua` does. That is
+-- what the mirror's collapse timer exists to paper over. No width animation; the engine has none,
+-- so the volume pill snaps too.
 --
--- While an action counts down the pill holds itself open and the three circles change roles, the
--- mirror's three slots: the chosen action keeps its glyph under an accent ring, the circle next to
--- it shows the seconds left over a fill that grows as they pass, and the third is a cancel. A left
--- click on the chosen action runs it now, a click on the cancel or a right click anywhere stops it.
+-- During a countdown the pill stays open: the chosen action keeps its glyph under an accent ring,
+-- the next slot shows seconds over a growing fill, and the third cancels. Left-click the chosen
+-- action to run it;
+-- click cancel or right-click anywhere to stop.
 --
--- A right click while nothing counts opens the panel below, which the mirror does not have: lock,
--- sleep, settings and brightness live there, and settings has no other door.
+-- Right-click with no countdown opens the panel below, which adds lock, sleep, settings, and
+-- brightness; settings has no other door.
 local SLOT_COUNT = #ACTIONS
 local pill_hovered = hover("power-pill")
 local expanded = computed({ pill_hovered, counting }, function(is_hovered, any)
     return is_hovered or any
 end)
 
--- Which circle carries the countdown: the last, unless the last is the chosen action.
+-- Countdown circle: the last slot unless it is the chosen action.
 local function countdown_index(key)
     if key == ACTIONS[SLOT_COUNT].key then
         return SLOT_COUNT - 1
@@ -160,7 +155,7 @@ local function slot(index)
         align_v = "Center",
         hover = slot_hovered,
         radius = theme.item_radius,
-        -- The fill below is a plain bar cut by the circle's own arc, `FillBar.qml` under a clip.
+        -- Plain fill bar cut by the circle's arc, `FillBar.qml` under a clip.
         clip = "Rounded",
         background = ground,
         border_width = theme.border_width,
@@ -174,8 +169,7 @@ local function slot(index)
             return open or index == SLOT_COUNT
         end),
         children = {
-            -- The mirror's `FillBar` on the countdown slot: the seconds gone, as a ground that grows
-            -- from the left under the number.
+            -- Mirror `FillBar`: seconds elapsed as a ground growing from the left under the number.
             rect {
                 width = computed({ role, seconds_left }, function(what, left)
                     if what ~= "countdown" then
@@ -254,8 +248,8 @@ local body = {
         title = "lock session",
         color = theme.MAUVE,
         on_activate = function()
-            -- Straight to the capability, no confirmation and no countdown. Quickshell's ten-second
-            -- countdown guards actions that lose unsaved work; locking loses nothing.
+            -- Direct capability call, with no confirmation or countdown. Quickshell's ten-second
+            -- countdown protects unsaved work; locking loses nothing.
             oblisk.lock:invoke("lock")
         end,
     },
@@ -277,14 +271,11 @@ local body = {
         end,
     },
     section_header("brightness"),
-    -- The bar has no brightness module -- Quickshell's does not either -- so § 3.2's one command
-    -- with an argument in it is driven from here (Phase 25 item 2). Two buttons rather than one
-    -- reading left-up/right-down, because a control that means something different on each mouse
-    -- button is one nobody can guess at.
+    -- No brightness module, matching Quickshell, so § 3.2's one argument-taking command is driven
+    -- here (Phase 25 item 2). Two buttons are clearer than left-up/right-down semantics.
     --
-    -- One row, not three. The level draws as a bar between its own two buttons, which is what
-    -- `Slider.qml` is in the reference config and what `components/meter.lua` already draws for the
-    -- battery and the volume. There is no drag: a press carries a rect and a button name, and
+    -- One row, not three. The level is a bar between two buttons, like reference `Slider.qml` and
+    -- `components/meter.lua` for battery/volume. No drag: a press supplies a rect and button name;
     -- nothing tracks motion into a value.
     row {
         width = "Fill",

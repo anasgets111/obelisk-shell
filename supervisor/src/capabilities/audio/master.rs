@@ -1,18 +1,16 @@
-//! Master output volume/mute (§ 2.4), computed from the default sink's `SPA_PARAM_Props` pod,
-//! plus the metadata lookup that decides which sink is "the default" one.
+//! Master output volume/mute (§ 2.4) from the default sink's `SPA_PARAM_Props` pod and the
+//! metadata lookup that selects that sink.
 //!
-//! Master volume is not a node property: it's absent from `info().props()`, arriving only via a
-//! `param` event after `Node::subscribe_params(&[ParamType::Props])`. Verified live on sink 59:
-//! `SPA_PROP_volume` is 65539, `SPA_PROP_mute` 65540, `SPA_PROP_channelVolumes` 65544, ids from
-//! `libspa-sys`'s bindgen output (`props.h`'s enum ordering gives wrong numbers here). `libspa`
-//! has no typed wrapper for them, so parsing matches raw `spa_sys::SPA_PROP_*` constants.
+//! It is absent from `info().props()`: after `Node::subscribe_params(&[ParamType::Props])`, it
+//! arrives only in `param`. Live sink 59 reported `SPA_PROP_volume` 65539, `SPA_PROP_mute` 65540,
+//! and `SPA_PROP_channelVolumes` 65544. `libspa-sys` bindgen gets these from `props.h`'s wrong
+//! enum ordering, and `libspa` has no typed wrapper, so parsing uses raw `spa_sys` constants.
 //!
-//! **linear vs cubic**: the scalar `SPA_PROP_volume` stayed `1.0` with the sink at 30%, but
-//! `SPA_PROP_channelVolumes` was `[0.027004944, 0.027004944]`, what `wpctl`/`pactl`/WirePlumber
-//! actually show (`0.30`, and `0.3^3 = 0.027` to five decimals). So `channelVolumes` is the cube
-//! of "the volume"; `wpctl set-mute` confirmed `SPA_PROP_mute` flips independently (§ 2.4's
-//! independent fields), and [`master_volume_from_props`] takes the max channel (stereo isn't
-//! guaranteed equal) and cube-roots it, instead of scalar `volume` or raw `channelVolumes`.
+//! **Linear vs cubic:** at 30%, scalar `SPA_PROP_volume` stayed `1.0`, while
+//! `SPA_PROP_channelVolumes` was `[0.027004944, 0.027004944]` (`0.3^3 = 0.027`; `wpctl`/`pactl`
+//! show `0.30`). Live `wpctl set-mute` confirmed `SPA_PROP_mute` flips independently (§ 2.4). We
+//! max and cube-root the channels, rather than using scalar `volume` or raw `channelVolumes`,
+//! because stereo channels may differ.
 
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Property, Value, ValueArray};
@@ -27,31 +25,28 @@ pub struct MasterVolume {
 }
 
 impl Default for MasterVolume {
-    /// Only ever observed before the default sink's first `Props` param event has arrived.
-    /// ponytail: it arrived on the next main-loop iteration in this codebase's live probe, so
-    /// this is a startup value. Upgrade path if `Props` never fires: an explicit "not yet known".
+    /// Startup value before the default sink's first `Props` event. ponytail: a live probe saw
+    /// that event on the next main-loop iteration; if it stops arriving, add an explicit
+    /// "not yet known" state.
     fn default() -> Self {
         Self { volume: 0.0, muted: false }
     }
 }
 
-/// The `SPA_PROP_mute`/`SPA_PROP_channelVolumes` values `mixer.rs` pulls out of one sink node's
-/// `Props` param pod: everything [`master_volume_from_props`] needs, already stripped of the
-/// pod/`Value` machinery so it stays testable without constructing a real pod.
+/// The `SPA_PROP_mute`/`SPA_PROP_channelVolumes` values `mixer.rs` pulls from a sink `Props` pod,
+/// stripped of pod machinery so [`master_volume_from_props`] stays testable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSinkProps {
     pub mute: bool,
     pub channel_volumes: Vec<f32>,
 }
 
-/// Pulls [`RawSinkProps`] out of a sink's `Props` param, already deserialized into `libspa`'s
-/// generic [`Value`] by `mixer.rs` (always `Value::Object` here, checked live). A sink
-/// advertises two separate `Props` objects, not one, back to back on every subscription and
-/// mixer change (confirmed live): `index=0` carries the mixer keys this reads, `index=1`
-/// unrelated ALSA settings (`device`, `deviceName`, `cardName`, a nested `params` struct) with
-/// none of them. Treating a missing `channelVolumes` key as empty was a real bug: `index=1`
-/// overwrote the tracked volume with a zeroed `MasterVolume` right after `index=0` set it. So
-/// `channelVolumes`'s presence is now the signal for a real update; its absence returns `None`.
+/// Pulls [`RawSinkProps`] from `libspa`'s generic [`Value`] (always an object here, checked live).
+/// Sinks emit two `Props` objects back to back on every subscription and mixer change (confirmed
+/// live): `index=0` has mixer keys; `index=1` has unrelated ALSA `device`/`deviceName`/`cardName`/
+/// `params`. A real bug treated the latter's missing
+/// `channelVolumes` as empty and overwrote the value just set by `index=0`; absence now returns
+/// `None`.
 pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
     let Value::Object(object) = value else { return None };
 
@@ -71,33 +66,27 @@ pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
     Some(RawSinkProps { mute, channel_volumes: channel_volumes? })
 }
 
-/// Converts one sink's raw `Props` values into the `MasterVolume` § 2.4 wants: the cube root of
-/// the loudest channel, max not first because a stereo pair isn't guaranteed equal (see the
-/// module doc for why cube root). An empty `channel_volumes` reports `0.0` instead of panicking.
+/// Converts raw `Props` to § 2.4's value: the cube root of the loudest channel. Empty channels
+/// report `0.0` instead of panicking.
 pub fn master_volume_from_props(props: &RawSinkProps) -> MasterVolume {
     let peak_linear = props.channel_volumes.iter().copied().fold(0.0_f32, f32::max);
     MasterVolume { volume: peak_linear.cbrt(), muted: props.mute }
 }
 
-/// Parses a PipeWire metadata `default.audio.sink`/`default.audio.source` property value, raw
-/// JSON of the shape `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}`, into the device's
-/// `node.name` (one function for both keys: a live `pw-metadata` dump confirmed they share this
-/// shape). `None` for anything else; callers treat that as "no default known yet".
+/// Parses either `default.audio.sink` or `default.audio.source`, whose live `pw-metadata` shape is
+/// `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}`, into `node.name`. `None` means no
+/// default is known yet.
 pub fn parse_default_device_name(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     value.get("name")?.as_str().map(str::to_string)
 }
 
-/// Which tracked device node id is the default right now, given the name PipeWire's metadata
-/// reports (if any) and the `node_id -> node.name` map of `Audio/Sink` (or `Audio/Source`) nodes
-/// `mixer.rs` has seen `global` events for. Matches by name, since the metadata key names a
-/// device by `node.name`, not registry id. Public and device-kind-agnostic since § 2.4's
-/// `sinks`/`sources` arrays landed: both need the same "which of these is active" answer.
+/// Resolves the metadata name against tracked `Audio/Sink` or `Audio/Source` `node.name` values,
+/// not registry ids, for § 2.4's `sinks`/`sources` active flag.
 ///
-/// ponytail: `default_name` can name a sink not yet tracked, at startup (metadata and the
-/// sink's own `global` event have no ordering guarantee) or on removal (no fresh
-/// `default.audio.sink` update with the node removal). Both fall back to the lowest tracked
-/// sink id, correct only with one sink; upgrade path: track the previous resolved id.
+/// ponytail: startup metadata and `global` events have no ordering guarantee, and removal may
+/// have no fresh `default.audio.sink` update. An untracked name falls back to the lowest id,
+/// correct only with one sink; upgrade path: track the previous resolved id.
 pub fn resolve_default_device<'a>(
     default_name: Option<&str>,
     names: impl Iterator<Item = (u32, &'a str)>,
@@ -115,10 +104,9 @@ pub fn resolve_default_device<'a>(
     matched.or(lowest)
 }
 
-/// Combines [`resolve_default_device`] and the tracked per-sink [`RawSinkProps`] into the value
-/// `mixer.rs` publishes: [`MasterVolume::default`] if no sink is resolved, or its `Props` haven't
-/// arrived (the two maps update from separate PipeWire events). `mixer.rs` keeps the whole
-/// [`RawSinkProps`], not the derived [`MasterVolume`], because the write path needs channel count.
+/// Combines default-name resolution with tracked [`RawSinkProps`]. Returns
+/// [`MasterVolume::default`] when resolution or `Props` is still missing; the maps update from
+/// separate PipeWire events. The raw props stay tracked because writes need channel count.
 pub fn compute_master<'a>(
     default_name: Option<&str>,
     names: impl Iterator<Item = (u32, &'a str)>,
@@ -130,34 +118,31 @@ pub fn compute_master<'a>(
         .unwrap_or_default()
 }
 
-/// The inverse of [`master_volume_from_props`]'s cube root, spread across `channels` channels.
-/// PipeWire stores `channelVolumes` cubed, so a linear `0.3` is written as `0.027`; skipping this
-/// writes 30% as 67%, the mistake the read direction already made once (ADR-0053). `linear` is
-/// clamped to `[0.0, 1.0]` here (§ 3.2 states the range; this output leaves the process), and
-/// every channel gets the same value, since § 2.4 has one volume per device, flattening any
-/// uneven balance a user had set.
+/// Inverse of [`master_volume_from_props`]'s cube root, spread across `channels`. PipeWire stores
+/// `channelVolumes` cubed, so skipping this wrote 30% as 67%, the read mistake (ADR-0053).
+/// Clamps `linear` to `[0.0, 1.0]` (§ 3.2). § 2.4 has one volume per device, so every channel gets
+/// the same value, flattening balance.
 pub fn cubed_channel_volumes(linear: f32, channels: usize) -> Option<Vec<f32>> {
     if channels == 0 {
-        // An empty channelVolumes array is a Props object PipeWire accepts and ignores, so a
-        // set_volume would report success and change nothing. Refusing lets the caller say so.
+        // PipeWire accepts and ignores an empty channelVolumes array, so set_volume would report
+        // success without changing anything. Refuse it so the caller can report failure.
         return None;
     }
     let clamped = linear.clamp(0.0, 1.0);
     Some(vec![clamped * clamped * clamped; channels])
 }
 
-/// Builds the `SPA_PARAM_Props` object `Node::set_param` takes, carrying only the changed field:
-/// a partial object applies as a partial update (confirmed live: `pw-cli set-param <stream>
-/// Props '{ mute: true }'` muted the stream, left volume alone). Sending both loses a write,
-/// since neither updates optimistically: observed live, `set_app_volume(id, 0.42)` then
-/// `set_app_muted(id, true)` in the same tick sent the second object with the pre-first volume.
+/// Builds the partial `SPA_PARAM_Props` object accepted by `Node::set_param`. Live
+/// `pw-cli set-param <stream> Props '{ mute: true }'` left volume alone; sending both fields loses
+/// a same-tick write because state is not optimistic (`set_app_volume(0.42)` then mute sent the
+/// pre-write volume).
 pub fn props_object(channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
     props_object_with_id(spa_sys::SPA_PARAM_Props, channel_volumes, muted)
 }
 
-/// The same object under a caller-chosen param id. A `Props` nested inside a `Route` carries
-/// `SPA_PARAM_Route` as its id, not `SPA_PARAM_Props` (confirmed live via `pw-cli enum-params
-/// <device> Route`); building it with the standalone id is a pod PipeWire accepts and ignores.
+/// The same object under a caller-chosen id. `Props` nested in a `Route` must use
+/// `SPA_PARAM_Route`, not `SPA_PARAM_Props`; PipeWire accepts the standalone id and ignores it
+/// (confirmed with `pw-cli enum-params <device> Route`).
 fn props_object_with_id(id: u32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
     let mut properties = Vec::new();
     if let Some(muted) = muted {
@@ -172,19 +157,17 @@ fn props_object_with_id(id: u32, channel_volumes: Option<Vec<f32>>, muted: Optio
     Value::Object(Object { type_: spa_sys::SPA_TYPE_OBJECT_Props, id, properties })
 }
 
-/// Serializes [`props_object`]'s output into raw pod bytes `Pod::from_bytes` reads back.
-/// Separate from `props_object` so the object shape stays unit-testable without a serializer,
-/// and so `mixer.rs` holds the bytes alive as long as the `&Pod` borrowed from them is in use.
+/// Serializes [`props_object`]'s output into bytes for `Pod::from_bytes`; callers keep those
+/// bytes alive while the borrowed `&Pod` is in use.
 pub fn serialize_props(object: &Value) -> Option<Vec<u8>> {
     let (cursor, _) = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), object).ok()?;
     Some(cursor.into_inner())
 }
 
-/// Builds the `SPA_PARAM_Route` object a hardware sink's volume is actually written through
-/// (see `mixer::write_master`). `index` names the card's route to write; `profile_device` is the
-/// `card.profile.device` the sink reports, matched by a `Route`'s `device` field. `save: true`
-/// matches every other mixer's write and survives a re-plug; volume/mute ride in a nested
-/// `Props`, the shape a live `pw-cli enum-params <device> Route` shows.
+/// Builds the `SPA_PARAM_Route` object for a hardware sink. `index` selects the card route and
+/// `profile_device` matches the sink's `card.profile.device` to `Route.device`. `save: true`
+/// matches other mixer writes and survives re-plug; volume/mute ride in nested `Props` (the live
+/// `pw-cli enum-params <device> Route` shape).
 pub fn route_object(index: i32, profile_device: i32, channel_volumes: Option<Vec<f32>>, muted: Option<bool>) -> Value {
     Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamRoute,
@@ -201,11 +184,9 @@ pub fn route_object(index: i32, profile_device: i32, channel_volumes: Option<Vec
     })
 }
 
-/// Pulls `(card.profile.device, route index)` out of one `Route` object a device published: the
-/// whole reason devices are tracked, since a card advertises several routes and only this param
-/// says which index is active for a port, and a write to the wrong index goes nowhere. `None`
-/// for an object missing either field, skipping `EnumRoute`-shaped entries and anything under a
-/// different param rather than misreading them.
+/// Pulls `(card.profile.device, route index)` from a published `Route`. Cards advertise several
+/// routes, and the wrong index writes nowhere. `None` skips objects missing either field, including
+/// `EnumRoute`-shaped or otherwise unrelated params.
 pub fn extract_route_target(value: &Value) -> Option<(i32, i32)> {
     let Value::Object(object) = value else { return None };
     let mut index = None;
@@ -226,15 +207,10 @@ mod tests {
 
     use super::*;
 
-    /// Adapts a plain `id -> node.name` fixture map into the iterator both functions take.
     fn names(map: &HashMap<u32, String>) -> impl Iterator<Item = (u32, &str)> {
         map.iter().map(|(&id, name)| (id, name.as_str()))
     }
 
-    // ---- extract_sink_props ----
-
-    /// The shape observed live for the default sink's `Props` param, trimmed to just the three
-    /// keys this module reads.
     fn sample_props_object() -> Value {
         Value::Object(pipewire::spa::pod::Object {
             type_: 262146,
@@ -312,8 +288,6 @@ mod tests {
         );
     }
 
-    // ---- master_volume_from_props ----
-
     #[test]
     fn master_volume_from_props_cube_roots_the_loudest_channel() {
         // The exact live value: wpctl showed 30%, channelVolumes carried 0.3^3 (float rounding).
@@ -341,8 +315,6 @@ mod tests {
         assert_eq!(master_volume_from_props(&props).volume, 0.0);
     }
 
-    // ---- parse_default_device_name ----
-
     #[test]
     fn parse_default_device_name_reads_the_real_pw_metadata_shape() {
         let json = r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#;
@@ -358,8 +330,6 @@ mod tests {
     fn parse_default_device_name_rejects_a_missing_name_key() {
         assert_eq!(parse_default_device_name("{}"), None);
     }
-
-    // ---- resolve_default_device ----
 
     #[test]
     fn resolve_default_device_matches_by_name() {
@@ -390,8 +360,6 @@ mod tests {
         assert_eq!(resolve_default_device(None, names(&HashMap::new())), None);
     }
 
-    // ---- cubed_channel_volumes ----
-
     #[test]
     fn cubed_channel_volumes_is_the_exact_inverse_of_the_read_direction() {
         let volumes = cubed_channel_volumes(0.3, 2).expect("two channels is not zero");
@@ -415,8 +383,6 @@ mod tests {
         assert_eq!(cubed_channel_volumes(0.5, 0), None);
     }
 
-    // ---- route_object / extract_route_target ----
-
     #[test]
     fn a_route_object_round_trips_back_to_the_target_it_names() {
         let object = route_object(2, 7, Some(vec![0.027, 0.027]), Some(false));
@@ -425,7 +391,7 @@ mod tests {
 
     #[test]
     fn a_props_object_carries_only_the_field_the_caller_is_changing() {
-        // Sending both would lose a write -- see props_object's own doc comment.
+        // Sending both loses a write; see props_object's doc comment.
         let Value::Object(volume_only) = props_object(Some(vec![0.5]), None) else {
             panic!("props_object must build an object")
         };
@@ -478,12 +444,9 @@ mod tests {
         assert_eq!(extract_route_target(&Value::Bool(true)), None);
     }
 
-    // ---- serialize_props ----
-
     #[test]
     fn a_serialized_props_object_reads_back_as_the_same_values() {
-        // The write path hands these bytes to C through Pod::from_bytes. A serializer/
-        // deserializer disagreement means a write accepted and silently ignored.
+        // The write path hands these bytes to C; disagreement would make an accepted write no-op.
         let bytes = serialize_props(&props_object(Some(vec![0.027, 0.027]), Some(true)))
             .expect("a Props object must serialize");
         let (_, value) = pipewire::spa::pod::deserialize::PodDeserializer::deserialize_from::<Value>(&bytes)
@@ -492,8 +455,6 @@ mod tests {
         assert!(extracted.mute);
         assert_eq!(extracted.channel_volumes, vec![0.027, 0.027]);
     }
-
-    // ---- compute_master ----
 
     #[test]
     fn compute_master_combines_resolution_and_lookup() {

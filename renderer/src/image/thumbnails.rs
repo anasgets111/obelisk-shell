@@ -1,34 +1,28 @@
-//! The freedesktop thumbnail cache, read and written (ADR-0122). A thumbnail of `file:///a/b.jpg`
-//! lives at `$XDG_CACHE_HOME/thumbnails/<size>/<md5 of that URI>.png`, sized to `normal` (128),
-//! `large` (256), `x-large` (512) or `xx-large` (1024) on its longest edge, and carries the
-//! source's URI and mtime in `tEXt` chunks so a stale one can be told from a current one. Nautilus,
-//! Thunar and every GTK file chooser keep the same cache, which is the point: a folder the file
-//! manager has shown once opens in the picker with no decode at all, and a folder the picker
-//! decoded shows in the file manager likewise.
+//! The freedesktop thumbnail cache, read and written (ADR-0122). `file:///a/b.jpg` maps to
+//! `$XDG_CACHE_HOME/thumbnails/<size>/<md5 of URI>.png`, with longest edge `normal` (128), `large`
+//! (256), `x-large` (512), or `xx-large` (1024), plus source URI and mtime in `tEXt`. Nautilus,
+//! Thunar, GTK file choosers, and this picker share it, so either side can open an already-seen
+//! folder without decoding again.
 //!
-//! What is implemented of the spec: the directory layout, the URI hashing, `Thumb::URI` and
-//! `Thumb::MTime` on write and the mtime check on read, the temp-file-and-rename write with the
-//! `0600` and `0700` modes the spec asks for. Not implemented: the `fail/` directory (a file that
-//! does not decode is remembered as `Slot::Failed` for this generation instead), `Thumb::Size`, and
-//! the shared-repository (`/usr/share/thumbnails`) lookup.
+//! Implemented: layout, URI hashing, `Thumb::URI`/`Thumb::MTime` write and mtime read check,
+//! temp-file-and-rename with `0600` files and `0700` dirs. Not implemented: `fail/` (a decode miss
+//! is `Slot::Failed` for this generation), `Thumb::Size`, or `/usr/share/thumbnails` lookup.
 
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 
-/// The spec's sizes, smallest first, as (directory name, longest edge).
+/// Spec sizes, smallest first, as (directory name, longest edge).
 const SIZES: [(&str, u32); 4] = [("normal", 128), ("large", 256), ("x-large", 512), ("xx-large", 1024)];
 
-/// The smallest spec size whose longest edge covers `box_px`'s longer one, or `None` for a box
-/// larger than any thumbnail, which is a wallpaper and not a tile.
+/// Smallest spec size covering `box_px`'s longer edge, or `None` for a wallpaper-sized box.
 pub fn size_for(box_px: (u32, u32)) -> Option<(&'static str, u32)> {
     let longest = box_px.0.max(box_px.1);
     SIZES.iter().copied().find(|(_, px)| *px >= longest)
 }
 
-/// `$XDG_CACHE_HOME`, else `$HOME/.cache`, else nothing: with no cache directory there is no
-/// thumbnail to read or write and every decode is a full one.
+/// `$XDG_CACHE_HOME`, then `$HOME/.cache`, else nothing. Without it every decode is full.
 pub fn cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(xdg));
@@ -36,10 +30,9 @@ pub fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").filter(|value| !value.is_empty()).map(|home| PathBuf::from(home).join(".cache"))
 }
 
-/// `file://` plus the path percent-encoded the way GLib's `g_filename_to_uri` does it, since that
-/// is what hashed the thumbnails already in the cache: alphanumerics, `-_.!~*'()` and the path
-/// characters `/:@&=+$,` pass, everything else (a space, `#`, `%`, `?`, any byte over 127) is
-/// `%XX` in upper case. Bytes, not chars, on purpose: a name in UTF-8 is hashed by its bytes.
+/// `file://` plus GLib `g_filename_to_uri` escaping, matching existing thumbnail hashes:
+/// alphanumerics, `-_.!~*'()` and `/:@&=+$,` pass; spaces, `#`, `%`, `?`, and bytes over 127 become
+/// uppercase `%XX`. Escape bytes, not chars, so UTF-8 names hash by their bytes.
 pub fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut uri = String::from("file://");
@@ -54,7 +47,7 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// The path a thumbnail of `uri` lives at under `cache_root`, for the `dir` size.
+/// The `dir`-size thumbnail path for `uri` under `cache_root`.
 pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
     let digest = Md5::digest(uri.as_bytes());
     let mut name = String::with_capacity(36);
@@ -65,8 +58,7 @@ pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
     cache_root.join("thumbnails").join(dir).join(name)
 }
 
-/// One source file's thumbnail slot for one spec size: where it is, what it must say about the
-/// source to be current, and how big it should be.
+/// One source file's slot: path, freshness metadata, and longest edge.
 pub struct Slot {
     path: PathBuf,
     uri: String,
@@ -86,10 +78,9 @@ impl Slot {
         Some(Slot { path: thumbnail_path(cache_root, dir, &uri), uri, mtime_secs, px })
     }
 
-    /// The thumbnail's pixels, straight RGBA8, if one exists and its `Thumb::MTime` is the
-    /// source's. A thumbnail with no `Thumb::MTime` at all is not trusted, per the spec. The text
-    /// chunks are read with the `png` crate and the pixels with the `image` crate, one open each;
-    /// a 256px PNG is small enough that the second read is not worth a second decoder.
+    /// Straight RGBA8 pixels if `Thumb::MTime` matches the source. Missing mtime is untrusted per
+    /// spec. `png` reads text and `image` reads pixels, one open each; a 256px PNG is too small to
+    /// justify a second decoder.
     pub fn read_valid(&self) -> Option<(Vec<u8>, u32, u32)> {
         let file = std::fs::File::open(&self.path).ok()?;
         let reader = png::Decoder::new(BufReader::new(file)).read_info().ok()?;
@@ -98,8 +89,8 @@ impl Slot {
         if mtime.text.trim().parse::<i64>().ok()? != self.mtime_secs {
             return None;
         }
-        // A `Thumb::URI` that names another file is a hash collision or a copied cache; either
-        // way not this file's thumbnail. One that is absent is let through: the mtime matched.
+        // Another `Thumb::URI` means a hash collision or copied cache. Missing URI is allowed when
+        // mtime matches.
         if text.iter().any(|chunk| chunk.keyword == "Thumb::URI" && chunk.text != self.uri) {
             return None;
         }
@@ -109,9 +100,8 @@ impl Slot {
         Ok::<_, ()>((decoded.into_raw(), width, height)).ok()
     }
 
-    /// Writes `rgba` (`width` by `height`, straight alpha) as this slot's thumbnail, the spec's
-    /// way: the directory made `0700`, the file written `0600` under a temporary name beside its
-    /// final one and renamed into place, so a reader never sees half a PNG.
+    /// Writes straight-alpha `rgba` as the spec requires: `0700` dir, `0600` temp beside the final
+    /// file, then rename, so readers never see a partial PNG.
     pub fn write(&self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let dir = self.path.parent().ok_or_else(|| io::Error::other("thumbnail path has no parent"))?;
@@ -191,7 +181,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(slot.read_valid(), Some((pixels.clone(), 2, 1)));
 
-        // The source is rewritten with a later mtime: the thumbnail is stale and refused.
+        // A later source mtime makes the thumbnail stale.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         ::image::RgbaImage::from_pixel(4, 2, ::image::Rgba([1, 2, 3, 255])).save(&source).unwrap();
         let later = Slot::for_file(&cache, &source, (100, 100)).unwrap();
@@ -208,7 +198,7 @@ mod tests {
         let cache = dir.path().join("cache");
         let slot = Slot::for_file(&cache, &source, (100, 100)).unwrap();
         slot.write(&[9, 8, 7, 255], 1, 1).unwrap();
-        // Same bytes and mtime, another name: put the file where the other's thumbnail would be.
+        // Same bytes and mtime, another name: copy it to the other's thumbnail path.
         let other_slot = Slot::for_file(&cache, &other, (100, 100)).unwrap();
         std::fs::create_dir_all(other_slot.path().parent().unwrap()).unwrap();
         std::fs::copy(slot.path(), other_slot.path()).unwrap();

@@ -1,16 +1,8 @@
-//! The resolve pass and the retained-scene transaction (`CONTEXT.md`'s "Retained scene" entries).
-//!
-//! Three steps. [`prepare`] walks the fresh tree in declaration order, resolving and parsing each
-//! node's properties once, matching it to the retained node it continues
-//! (`pair_children_by_id_then_position`: an `id` pairs only against the same `id`, scoped to its
-//! parent; id-less children pair by position, ADR-0023's original rule, amended by ADR-0045), and
-//! retiring removed subtrees child-first (`CONTEXT.md`, Lease). [`solve`] hands the tree to taffy;
-//! [`finish`] reads the solved geometry back out.
-//!
-//! The layout math is taffy's (ADR-0077 replaced this module's hand-written stacking solver,
-//! ADR-0023). Still this module's own: node identity, the lease, the depth cap, once-per-pass
-//! resolution, the scroll writeback, and text elision. [`taffy_style`] is the seam, the only place
-//! that knows what a `row` or a `Fill` means.
+//! Resolve/reconcile transaction for the retained scene. [`prepare`] resolves and parses in
+//! declaration order, matches ids within each parent (id-less children remain positional), and
+//! retires removed subtrees child-first. [`solve`] delegates layout to taffy; [`finish`] reads
+//! geometry back and performs scroll writeback and text elision. The seam that defines `row` and
+//! `Fill` is [`taffy_style`] (ADR-0077).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -30,28 +22,18 @@ pub struct LogicalSize {
     pub height: f32,
 }
 
-/// The recursion bound for [`prepare`]: at most this many node levels are admitted, the next
-/// refused, the same "at most N levels" boundary `lua::signal`'s `MAX_SIGNAL_NESTING_DEPTH` uses.
-/// Catches both a literal cyclic tree (`r.children = { r }`) and a computed `children` signal that
-/// manufactures fresh depth on every read, since both recurse through this same function. Sized
-/// *together with* `MAX_SIGNAL_NESTING_DEPTH`, because a node level's `children` resolution can
-/// nest signals, compounding the two recursions.
+/// [`prepare`] admits 64 levels and refuses the next, matching
+/// `lua::signal::MAX_SIGNAL_NESTING_DEPTH`'s boundary. This catches literal cycles and
+/// depth-generating `children` signals; the two limits are sized together because each node can
+/// nest signal evaluation.
 ///
-/// Measured end to end on a thread shrunk until the compound worst case (a tree at this cap, every
-/// level carrying a 31-deep `computed` chain on `margin`) aborts the process, counting every
-/// frame including mlua's and a refusal's error-formatting frames run at full depth. On the
-/// tightest stack this runs on, a 2 MiB debug test thread (production runs the Lua VM on the
-/// 8 MiB process main thread, since `wayland::run` is called from `main`):
-///
-/// - about 590 KiB for a 64-level tree with no signals, near enough 8,960 B per level;
-/// - about 1,040 KiB with a 31-deep signal nest on every level, costing about 450 KiB once rather
-///   than per level since it pops before the walk descends.
-///
-/// 64 levels peak at roughly half of 2 MiB, a 1.97x margin, unchanged by the solver swap
-/// (ADR-0077) which *lowered* this: the hand-written pass needed about 1,400 KiB for the same
-/// worst case, a 1.44x margin. A real `shell.lua` is 10 to 15 levels deep, 4x headroom under the
-/// cap. `MAX_SIGNAL_NESTING_DEPTH` keeps its 32, since it also bounds dependency chains, the shape
-/// a real config is likeliest to grow.
+/// Measured end to end on a 2 MiB debug thread with a 31-deep `computed` chain on every level; the
+/// compound worst case reaches the abort boundary and counts all frames, including Lua and
+/// refusal error-formatting frames. A 64-level tree without signals uses 590 KiB, about 8,960
+/// B/level; 1,040 KiB with signals, the extra 450 KiB
+/// paid once as the chain unwinds. The 64-level case is a 1.97x margin, versus 1,400 KiB/1.44x for
+/// the old hand-written solver (ADR-0077). Production uses an 8 MiB main thread; real configs are
+/// 10-15 levels deep. Signal nesting remains 32 for dependency chains.
 const MAX_TREE_DEPTH: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,31 +49,18 @@ impl NodeId {
     }
 }
 
-/// Every geometry property one node's layout reads, parsed exactly once per pass.
-///
-/// The `Signal` behind `margin` is read once per node per pass; parsing the resolved value once is
-/// the second half of that guarantee, since a resolved `Value::Table` with an `__index` still
-/// answers every `Table::get` afresh. Measured on the hand-written pass this replaced: 16 `__index`
-/// invocations for one child's margin in one apply, and a row that measured itself 18 wide then
-/// placed its 10-wide child spanning 16..26, eight pixels outside the parent it had just been sized
-/// to fit, no `Signal` involved. The solver reads this struct once too (ADR-0077): [`taffy_style`]
-/// is the only thing that touches it.
-///
-/// Parsed by the *parent*, in its child loop, since it needs a child's `margin` before it can
-/// compute the budget it recurses with. `Scene::apply_one_instance` does it for a surface root,
-/// which has no parent. Every field is parsed for every kind, including ones that kind ignores
-/// (`spacing` on a `text`, `align_h` on a `row`'s child where only `align_v` is read): a malformed
-/// property is heard about while applying rather than the day a config changes kind and starts
-/// reading it, the trade ADR-0068 already made for resolution.
+/// Geometry parsed once per node/pass. A resolved table's `__index` still runs on each access, so
+/// this is separate from reading a `Signal`: the old pass made 16 `__index` calls for one child's
+/// margin, measured a row at 18 wide, then placed its 10-wide child at 16..26. The parent parses a
+/// child before recursing because it needs the margin and size for the solver (ADR-0077); ignored
+/// fields are still validated so a later kind change cannot hide a malformed property (ADR-0068).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LayoutStyle {
     margin: EdgeInsets,
     padding: EdgeInsets,
     width_mode: SizeMode,
     height_mode: SizeMode,
-    /// Ceilings on the two modes above, so a `Content` node can grow with its children up to here
-    /// and hand the rest to its `scroll`. The mirror's `Math.min(contentHeight, cap)`, as one
-    /// property per axis.
+    /// Ceilings for `Content` growth; overflow goes to `scroll`.
     max_width: Option<f32>,
     max_height: Option<f32>,
     align_h: Align,
@@ -132,16 +101,14 @@ impl LayoutStyle {
     }
 }
 
-/// The public, ID-less output of one node's resolution: geometry, this node's parsed paint
-/// properties, and a passthrough of the raw property map for readers that want a Lua value
-/// (`hover`, `on_close`, `on_dismiss`, and the surface-role specs
-/// `wayland::surface::apply_resolved_state` re-derives at configure cadence). Reused by
-/// `Scene::surface` and `overlay_input_regions`.
+/// Public, ID-bearing output of resolution: geometry, parsed paint, and the resolved property map
+/// retained for `hover`, callbacks, and surface specs (`wayland::surface::apply_resolved_state`
+/// re-derives those at configure cadence). Used by `Scene::surface` and `overlay_input_regions`.
 ///
-/// `properties` holds **resolved** values, never a `Signal` handle: `node::resolve_properties` ran
-/// over this node's raw map exactly once, at the top of the pass, so this tree is a snapshot a
-/// later reader can take a value from without resolving anything itself. Structural keys are the
-/// exception, copied through raw by `node::is_structural_property`, whose parsers reject `Signal`.
+/// `resolve_properties` ran over this node's raw map exactly once, so this snapshot lets later
+/// readers take values without resolving anything. `properties` holds resolved values, never a
+/// `Signal` handle. Structural keys are copied raw by `node::is_structural_property`, whose parsers
+/// reject signals.
 ///
 /// ponytail: absent and nil are one state here (`node::resolve_properties` omits a key whose
 /// signal resolved to `Value::Nil`, ADR-0044 decision 1's amendment), so a paint-only property
@@ -171,20 +138,14 @@ pub struct ResolvedNode {
     pub children: Vec<ResolvedNode>,
 }
 
-/// One retained node: `ResolvedNode`'s geometry plus the `NodeId` identity that lets the next
-/// `Scene::apply` decide whether to reuse it or retire it. `properties` is resolved, same reason
-/// and exception as [`ResolvedNode`]'s, which is where it comes from.
-///
-/// `Clone` exists solely for `Scene::apply`'s rollback snapshot; nothing else here duplicates a
-/// retained subtree.
+/// Retained geometry, properties, paint, and `NodeId` for the next reconcile. `Clone` exists only
+/// for `Scene::apply`'s rollback snapshot.
 #[derive(Clone)]
 struct RetainedNode {
     id: NodeId,
     kind: String,
     rect: LogicalRect,
-    /// This node's geometry, parsed once for the pass that produced it. `visible` and `opacity`
-    /// live in here too, which is why they are no longer separate fields: they were parsed in the
-    /// same place and read by the same passes.
+    /// Geometry for the pass that produced this node, including `visible` and `opacity`.
     style: LayoutStyle,
     properties: HashMap<String, Value>,
     paint: Option<PaintStyle>,
@@ -206,26 +167,15 @@ impl RetainedNode {
     }
 }
 
-/// The persistent node tree for one generation (`CONTEXT.md`, Retained scene), keyed per
-/// **surface instance** by that instance's `"{id}@{output}"` id (`CONTEXT.md`, Surface instance;
-/// `layout::instance`). Instance-keyed, not declared-id-keyed: a surface targeting `monitor =
-/// "All"` gets one `zwlr_layer_surface_v1` per output at a different size, so a laptop panel and a
-/// 4K external need two resolved trees; one tree per declared surface can't serve both, since
-/// whichever output resolved last would decide the geometry the other painted.
-///
-/// This *refines* ADR-0045 decision 1 rather than replacing it: the surface `id` is still the
-/// reconcile identity (`apply` finds a fresh `VirtualNode` by `node::parse_surface_id` as before),
-/// and the key adds the output half, stable for an instance's whole life. Everything below a
-/// surface's root reconciles through `pair_children_by_id_then_position`: an optional,
-/// per-parent-scoped `id` pairs only against the same `id`, id-less children falling
-/// back to ADR-0023's original positional rule, amended by ADR-0045.
+/// Persistent trees keyed by surface instance (`"{id}@{output}"`), not declared id. A panel on
+/// `monitor = "All"` needs separate trees for a laptop and 4K output because their geometry
+/// differs. Surface `id` remains reconcile identity; the output suffix distinguishes instances
+/// (ADR-0045). Descendants use per-parent id matching, with positional fallback for id-less nodes.
 #[derive(Default)]
 pub struct Scene {
     surfaces: HashMap<String, RetainedNode>,
-    /// Removed subtrees, held in child-first order until [`Scene::release`] finalizes the drop
-    /// (`CONTEXT.md`, Lease). Nothing calls `release` in production yet (see ADR-0023). `Vec`, not
-    /// a `HashMap`, so insertion order (child-first) stays observable, for a future consumer and
-    /// for this module's own tests.
+    /// Removed subtrees in child-first order until [`Scene::release`] finalizes the drop
+    /// (`CONTEXT.md`, Lease). `Vec` preserves that order; production has no release caller yet.
     retiring: Vec<(NodeId, RetainedNode)>,
     next_id: u64,
 }
@@ -241,8 +191,7 @@ impl Scene {
         id
     }
 
-    /// The unguarded spelling of [`Self::apply_admitting`], test-only so production has one way to
-    /// apply a scene, which `crate::socket`'s lock veto depends on.
+    /// Test-only unguarded apply; production uses the admitting path that the lock veto depends on.
     #[cfg(test)]
     pub fn apply(
         &mut self,
@@ -254,28 +203,18 @@ impl Scene {
         self.apply_admitting(fresh_surfaces, instances, shaping, lua, |_| Ok(()))
     }
 
-    /// Reconciles one retained tree per entry in `instances` into the retained scene, each keyed
-    /// by its `instance_id` and resolved against that instance's own `available` size.
+    /// Reconciles one retained tree per mapped instance against `fresh_surfaces`, using each
+    /// instance's `available` size. Missing declared instances are skipped for unplugged outputs;
+    /// an instance naming no declaration is an `InvalidProperty`. Retained instances absent from
+    /// this cycle stay for topology handling, not in-place apply.
     ///
-    /// `fresh_surfaces` is what the config *declared*; `instances` is what the compositor is
-    /// actually mapping (`layout::instance::expand_instances`). A declared surface with no
-    /// instance (`monitor` naming an unplugged display) resolves not at all; an instance naming a
-    /// surface `fresh_surfaces` lacks is a caller bug, raising [`LayoutError::InvalidProperty`]
-    /// rather than being skipped. An instance id present in the retained scene but absent from
-    /// `instances` this cycle is left untouched, a `surface` disappearing entirely being a topology
-    /// change (`CONTEXT.md`) for a generation swap, not this in-place apply.
+    /// `admit` vetoes the finished apply after all instances, asking whether the whole resolved
+    /// lock tree remains authenticatable; it rolls back on error. The snapshot restores exactly the
+    /// pre-call state because a failing getter may already have changed `next_id`, `retiring`, or
+    /// the trees (`CONTEXT.md`, Rollback; `socket.rs::handle_reevaluate`).
     ///
-    /// `admit` vetoes the *finished* apply, once every instance reconciles, for invariants
-    /// (`crate::socket`'s lock guard asking whether the whole resolved lock tree is still
-    /// authenticatable) that only exist once the tree does; its `Err` rolls back like the walk's.
-    /// Rollback is to exactly the pre-call state (`CONTEXT.md`, Rollback; `socket.rs`'s
-    /// `handle_reevaluate` assumes this): a Signal getter can fail partway through mutating
-    /// `self.next_id`/`self.retiring`/`fresh_surfaces`, so snapshotting all three up front and
-    /// restoring wholesale on error holds the invariant.
-    ///
-    /// ponytail: unconditional, so every apply deep-clones the tree whether or not anything fails
-    /// (the dirty flag limits this to once per capability push). Structural clone (`mlua::Value`
-    /// refcount bumps): O(nodes), not O(Lua heap).
+    /// ponytail: every apply deep-clones the tree, even on success; the dirty flag limits this to
+    /// capability-push cadence. The structural clone is O(nodes), not O(Lua heap).
     pub fn apply_admitting(
         &mut self,
         fresh_surfaces: &[VirtualNode],
@@ -288,19 +227,14 @@ impl Scene {
         let retiring_snapshot_len = self.retiring.len();
         let surfaces_snapshot = self.surfaces.clone();
 
-        // One budget for the whole pass, not one per getter call, entered out here rather than
-        // inside the walk: the instruction hook stays installed across the gaps between signal
-        // evaluations, where a resolved table's `__index` would otherwise run unhooked, and the
-        // deadline spans every node so a tree of individually-legal 5ms getters cannot add up to
-        // an unbounded pass.
+        // One budget for the whole pass: the hook covers gaps where a resolved table's `__index`
+        // runs, and individually legal 5ms getters cannot add up without a pass deadline.
         let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
             Ok(budget) => budget,
             Err(err) => return Err(node::invalid("layout", err.to_string())),
         };
-        // Every exit reports a blown budget as a blown budget: whatever error the walk raised is
-        // a symptom of it, since the hook interrupts whichever `Table::get` or getter happened to
-        // be running. Without this the failure surfaces as an `InvalidProperty` naming an
-        // arbitrary property that is not itself wrong.
+        // A hook interruption can look like an arbitrary `InvalidProperty`; report the pass budget
+        // instead whenever the deadline was exceeded.
         let blame_the_budget =
             |outcome: LayoutError| if budget.exceeded() { LayoutError::PassBudgetExceeded } else { outcome };
 
@@ -318,8 +252,7 @@ impl Scene {
             self.retiring.truncate(retiring_snapshot_len);
             return Err(blame_the_budget(err));
         }
-        // A pass that ran over but never tripped the hook (config Lua can catch the hook's error
-        // with `pcall`; it cannot catch this) still fails, and rolls back like any other failure.
+        // Lua can catch the hook error with `pcall`; the final deadline check cannot be caught.
         if budget.exceeded() {
             self.surfaces = surfaces_snapshot;
             self.next_id = next_id_snapshot;
@@ -338,8 +271,7 @@ impl Scene {
         shaping: &ShapingHandle,
         lua: &Lua,
     ) -> Result<(), LayoutError> {
-        // Matched by the declared `id`, keyed by the instance id: ADR-0045 decision 1's
-        // reconcile identity, resolved per output (see this type's doc comment).
+        // Match the declared id, then key the retained tree by instance id (ADR-0045 decision 1).
         let mut fresh = None;
         for candidate in fresh_surfaces {
             if node::parse_surface_id(&candidate.properties)? == instance.declared_id {
@@ -360,33 +292,22 @@ impl Scene {
         let key = instance.instance_id.clone();
         let available = instance.available;
         let existing = self.surfaces.remove(&key);
-        // The root's one resolve for this pass, gated by the same admissibility check its children
-        // get in the loop below: resolution runs Lua, so a node the walk will refuse must not run
-        // any first. Every node below this one is resolved by its own parent, in the child loop
-        // that needs its `margin` before it can recurse.
+        // Check admissibility before resolution runs Lua. Children get the same check in the loop
+        // that parses their margin before recursing.
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
         let properties = build_child_for_output(properties, &fresh.kind, &instance.output)?;
-        // The root's one parse for this pass. Every other node's is done by its parent's child
-        // loop; a surface root has no parent, so this is where the once-per-node-per-pass parse
-        // guarantee runs out of frames one level up.
+        // The root has no parent, so its once-per-node parse happens here; children parse in the
+        // parent's loop.
         let style = LayoutStyle::parse(&properties)?;
-        // **An unsized `window` or `lock` root is its surface.** A `panel` root sizes itself from
-        // § 6's `width`/`height`; § 6 gives a `window` neither, since a toplevel's size is the
-        // compositor's, arriving as an `xdg_toplevel` configure `set_instance_size` already turned
-        // into this `available`. Without this the root fell to `parse_size_mode`'s `Content`
-        // default, handing its children a budget of zero, so `child = column { width = "Fill" }`
-        // resolved to nothing and the toplevel mapped a fully transparent buffer. Measured against
-        // niri, which configured the window at its 1920x1168 tile and had a 0x0 tree painted into
-        // it.
-        //
-        // § 6's `lock` is the same case and worse: it has no `width` or `height` at all
-        // (`layout::node::lock_spec` refuses both), so it always fell to `Content` and filled the
-        // whole output with a transparent buffer over a locked session, the black screen with no
-        // password field ADR-0052 decision 3 refuses the lock to avoid. Only the `Content` default
-        // is overridden, per axis: a `window` writing a `width` writes a property § 6 doesn't
-        // define, and honouring it is right. A `lock` can't reach that branch, already rejected by
-        // the spec parser.
+        // An unsized `window` or `lock` root is its configured surface. `available` is the
+        // compositor's `xdg_toplevel` configure size, already converted by `set_instance_size`.
+        // A window's `Content`
+        // default used to give children a zero budget, so `child = column { width = "Fill" }`
+        // painted a 0x0 tree into niri's configured 1920x1168 tile. A lock has no width/height
+        // (`lock_spec` refuses both), so the same default produced a transparent buffer over a
+        // locked session, the passwordless black screen ADR-0052 decision 3 rejects. Override only
+        // the `Content` axes; a window's explicitly supplied fields remain honoured.
         let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
             (
                 (style.width_mode == SizeMode::Content).then_some(available.width),
@@ -396,21 +317,16 @@ impl Scene {
             (None, None)
         };
 
-        // One tree per instance, built and dropped inside this call. Nothing carries across a
-        // pass except the `NodeId` on the retained tree; taffy's own node ids are an
-        // implementation detail of the solve. So `apply_admitting`'s rollback has nothing extra
-        // to undo: a failed walk drops the tree on the way out.
+        // Taffy trees are per-instance and per-pass; only retained `NodeId`s cross the call, so a
+        // failed walk drops the temporary tree without extra rollback state.
         let mut tree: taffy::TaffyTree<Measure> = taffy::TaffyTree::new();
-        // The geometry this engine computes is fractional (`layout::text::snap` is what turns it
-        // into pixels, per surface scale, at paint time), and taffy rounds layouts to whole numbers
-        // unless told not to.
+        // Geometry stays fractional until `layout::text::snap` applies the surface scale at paint.
+        // Taffy otherwise rounds layouts to whole numbers.
         tree.disable_rounding();
         let prepared = prepare(self, &mut tree, existing, &fresh.kind, properties, style, None, lua, 0)?;
 
-        // The root's own size, patched on after the walk: it is the one node whose `Fill` and
-        // `Percent` cannot mean what they mean anywhere else, since there is no parent to take a
-        // share or percentage of, so both resolve against the room the surface was configured at.
-        // Every node below it takes its size from the solver.
+        // Patch the root after the walk: its `Fill`/`Percent` resolve against configured room
+        // because it has no parent; descendants take size from the solver.
         let mut root_style = tree.style(prepared.taffy).map_err(taffy_failed)?.clone();
         root_style.size = taffy::Size {
             width: match forced.0.or_else(|| resolve_non_content(style.width_mode, available.width)) {
@@ -492,11 +408,8 @@ impl Scene {
     }
 }
 
-/// All four § 6 roles are here per ADR-0040 decision 1. Every one is a surface container: a
-/// role for a `wl_surface`, a `child` tree inside it, and no layout model of their own beyond the
-/// stacking model ADR-0023 already gives `panel`. `lock` is admitted the same way
-/// (ADR-0052 decision 2): this admits a *node kind* into the walk, and a lock screen's tree
-/// has to be walked whether or not the compositor has handed out a surface to paint it into.
+/// Admits all four § 6 surface roles as containers with one `child` tree, including a lock tree
+/// before the compositor has handed out a surface (ADR-0040 decision 1, ADR-0052 decision 2).
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
         "panel" | "window" | "popup" | "lock" | "rect" | "row" | "column" | "text" | "icon" | "image" | "button"
@@ -505,74 +418,41 @@ fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     }
 }
 
-/// Everything a node has to pass before *anything* reads its properties: a supported kind, and a
-/// level within [`MAX_TREE_DEPTH`]. Called at each site about to run `node::resolve_properties`
-/// over a node's raw map (`Scene::apply_one_instance` for a surface root, [`prepare`]'s child loop
-/// for every node below one), and again at the top of [`prepare`], keeping [`children_of`]'s
-/// `unreachable!` arm unreachable for any caller. A function rather than two lines inline because
-/// resolution calls back into Lua (ADR-0044 decision 1), so running it before these checks executes
-/// a rejected node's `Signal` getters on its behalf. Measured: a self-generating `children`
-/// signal's body ran 64 times against a 64-level cap, because the parent at the last admitted level
-/// resolved the child's whole property map before recursing into the check that refused it. Worse
-/// for kind: an unsupported-kind node's every property getter ran, arbitrary Lua side effects for a
-/// node never admitted.
-///
-/// `depth` is the level being checked, so a parent at `depth` checks its children at `depth + 1`,
-/// the number the recursive call is handed.
+/// Checks kind and depth before any `resolve_properties` call. Resolution runs Lua (ADR-0044), so
+/// checking afterward once ran a self-generating `children` getter 64 times against the 64-level
+/// cap, and ran every getter on unsupported kinds before refusing them. Children are checked at
+/// `depth + 1`.
 fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
     ensure_supported_kind(kind)?;
-    // A cyclic or infinitely-generating tree returns a LayoutError at MAX_TREE_DEPTH's own stack
-    // depth, not further down (see MAX_TREE_DEPTH's doc comment for the measured stack cost).
-    //
-    // `>=`, not `>`: `depth` counts levels already entered, root at 0, so this admits levels
-    // 0..MAX_TREE_DEPTH-1, exactly MAX_TREE_DEPTH of them, matching the constant and the error
-    // message. `>` admitted MAX_TREE_DEPTH + 1 levels while claiming MAX_TREE_DEPTH, disagreeing
-    // with the signal cap's `>= MAX_SIGNAL_NESTING_DEPTH` about what "maximum depth" means. The
-    // reported `depth` is 1-based (the level being refused), so "maximum depth of 64 levels ...
-    // got at least 65" reads as the truth.
+    // `>=` admits levels 0..63, exactly 64. `>` would admit 65 while claiming 64 and disagree with
+    // `MAX_SIGNAL_NESTING_DEPTH`; the reported depth is the 1-based refused level.
     if depth >= MAX_TREE_DEPTH {
         return Err(LayoutError::TreeTooDeep { kind: kind.to_string(), depth: depth + 1, max: MAX_TREE_DEPTH });
     }
     Ok(())
 }
 
-/// Dispatches to the right raw property (`child` for the four surface roles, `children` for the
-/// container kinds, none for leaves). Only called after [`ensure_supported_kind`] already
-/// validated `node.kind`, so the fallback arm is unreachable, not a silent default. `window`,
-/// `popup` and `lock` share `panel`'s arm: § 6 gives each role exactly one `child`, since a
-/// surface holds one root visual node and the four roles differ only in which protocol assigns
-/// it. § 6's `lock` is shortest: `child` is one of only two properties a `lock` has,
-/// `layout::node::lock_spec` taking the other.
-///
-/// `textfield` (`oblisk-idl-api-specs.md` § 5.2 item 8) is a leaf like `text`/`icon`, never taking
-/// `children`. Its own properties (`mask_character`, `secure_submit`, `on_change`, `on_submit`)
-/// ride along unvalidated in `RetainedNode.properties`, same as `button`'s `on_click`.
-/// `secure_submit` is read off the scene graph by `renderer/src/wayland/mod.rs`'s keyboard path:
-/// the buffer and focus target live on `App`, since ADR-0005 says a masked field's bytes never
-/// become an `mlua::Value`.
+/// Selects `child`, `children`, generated list children, or no children. Surface roles share one
+/// `child`; `textfield` is a leaf (§ 5.2 item 8). Its callbacks and secure-submit fields remain in
+/// `RetainedNode.properties`; the keyboard path reads the latter from the scene while the secret
+/// buffer stays on `App` (ADR-0005).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
         "panel" | "window" | "popup" | "lock" => {
             Ok(node::parse_single_child(properties, "child")?.into_iter().collect())
         }
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
-        // ADR-0045 decision 3: a `list`'s children don't exist as a literal Lua table, they're
-        // generated from `source`, one per element, which is why this is its own parser rather
-        // than a `parse_children` variant.
+        // ADR-0045 decision 3: list children are generated from `source`, not a literal table.
         "list" => node::parse_list_children(properties),
         "text" | "icon" | "image" | "textfield" => Ok(Vec::new()),
         other => unreachable!("ensure_supported_kind already rejected `{other}`"),
     }
 }
 
-/// `child = function(output)` on a `panel` or `lock` (ADR-0121): the one place a node tree can
-/// depend on which output its surface instance is on. Called here, per instance and per pass,
-/// with the instance's output name, and the node table it returns takes `child`'s place before
-/// the walk begins, so everything below sees an ordinary child. Per pass rather than once, on
-/// `list.itemfn`'s terms: the function is the config's, and a `state("wallpaper_" .. output)`
-/// inside it is registry-stable by name, so the retained tree reconciles as it would under a
-/// literal child. A `window` or `popup` has one instance wherever the compositor puts it and no
-/// output name to hand over, so a function there is refused rather than called with `""`.
+/// `child = function(output)` on a `panel`/`lock` (ADR-0121) runs per instance and pass, with the
+/// output name, before the ordinary child walk. Per-pass calls preserve registry-stable state such
+/// as `state("wallpaper_" .. output)`. `window`/`popup` have no output name, so function children
+/// are refused rather than called with `""`.
 fn build_child_for_output(
     mut properties: HashMap<String, Value>,
     kind: &str,
@@ -595,8 +475,7 @@ fn build_child_for_output(
         Value::Table(_) => {
             properties.insert("child".to_string(), built);
         }
-        // The function declining to draw on this output: the surface maps empty, as it would with
-        // no `child` at all.
+        // A nil result maps this output empty, like an absent `child`.
         Value::Nil => {
             properties.remove("child");
         }
@@ -610,10 +489,8 @@ fn build_child_for_output(
     Ok(properties)
 }
 
-/// A surface root's own size, and nothing else's. Every node below one gets its size from the
-/// solver, but the root is the one node whose `Fill` and `Percent` have no parent to mean anything
-/// against, so both resolve against the room the surface was configured at. `Content` stays
-/// unresolved (`None`) until children are known, which is the solver's `auto`.
+/// Resolves only a surface root's `Fill`/`Percent` against available room. `Content` stays `auto`
+/// until children are known; descendants use the solver.
 fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
     match mode {
         SizeMode::Content => None,
@@ -623,28 +500,12 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
     }
 }
 
-/// Pairs `fresh_children` against `old_children` (ADR-0045 decisions 1-2) by partitioning both
-/// sides into identified and unidentified subsequences: an `id` means "this is the same node, and
-/// *only* the same node", in both directions.
-///
-/// - a fresh child **with** an `id`: matches only a retained child carrying it. A miss is new and
-///   must not fall through to the positional pool, or it would inherit the NodeId and whole
-///   retained subtree of an unrelated node, which a paint stage keying GPU resources on NodeId
-///   can't survive;
-/// - a fresh child **without** an `id`: matches only a retained child without one, positionally
-///   among themselves (ADR-0023's positional rule on a smaller set), keeping adding or removing an
-///   `id` an honest change of identity rather than a silent preservation;
-/// - every retained child claimed by neither rule is retired child-first (`CONTEXT.md`, Lease):
-///   id-less shrinkage or an `id` that vanished from the fresh tree (decision 2's last sentence).
-///
-/// Returns one `Option<RetainedNode>` per `fresh_children` entry, in order, so the caller's own
-/// kind-match check can still reject a same-id or positionally-matched pair whose kind changed.
-///
-/// Linear in child count: ids are parsed once per side, and the id match goes through a
-/// `HashMap<&str, usize>` built once per parent rather than a scan per fresh child. Matters because
-/// nothing bounds sibling count (`for i = 1, 10000 do c[i] = rect { id = "n" .. i } end` is legal
-/// config), and this runs on the Wayland dispatch thread at capability-push cadence (ADR-0044
-/// decision 2's dirty flag), not once per config edit.
+/// Pairs children by identity (ADR-0045 decisions 1-2): an `id` matches only the same `id`, while
+/// id-less children match positionally among other id-less children. An id miss is new, never a
+/// positional fallback, so it cannot inherit an unrelated `NodeId`/subtree. Unclaimed retained
+/// nodes retire child-first. The linear match uses one `HashMap<&str, usize>` per parent; sibling
+/// count is unbounded (`1..10000` is legal Lua), and this runs on the Wayland dispatch thread at
+/// capability-push cadence (ADR-0044 decision 2).
 fn pair_children_by_id_then_position(
     scene: &mut Scene,
     fresh_children: &[VirtualNode],
@@ -653,9 +514,8 @@ fn pair_children_by_id_then_position(
     let fresh_ids: Vec<Option<String>> =
         fresh_children.iter().map(|c| node::parse_node_id(&c.properties)).collect::<Result<_, _>>()?;
 
-    // Decision 1: a duplicate id among siblings is a LayoutError, not silent last-one-wins.
-    // Checked before touching `old_children` at all, so a bad config never partially retires
-    // anything before this fails.
+    // Decision 1: reject duplicate sibling ids before touching `old_children`, so failure retires
+    // nothing.
     let mut seen: HashSet<&str> = HashSet::with_capacity(fresh_ids.len());
     for id in fresh_ids.iter().flatten() {
         if !seen.insert(id.as_str()) {
@@ -666,10 +526,8 @@ fn pair_children_by_id_then_position(
         }
     }
 
-    // Each retained child's id, parsed once per parent rather than once per comparison. A
-    // retained child's id can't hold a Signal or duplicate a sibling's, both rejected in the pass
-    // that first made this node retained, so `.ok().flatten()` collapsing "no id" and "already
-    // validated" together is safe here.
+    // Retained ids were already validated and cannot hold signals, so `.ok().flatten()` safely
+    // treats absent and validated-no-id alike.
     let old_ids: Vec<Option<String>> =
         old_children.iter().map(|c| node::parse_node_id(&c.properties).ok().flatten()).collect();
     let mut old_slots: Vec<Option<RetainedNode>> = old_children.into_iter().map(Some).collect();
@@ -681,8 +539,7 @@ fn pair_children_by_id_then_position(
         }
     }
 
-    // Step 1: the identified subsequence. A miss stays `None` and is *not* refilled below: an id
-    // that matched nothing is a new node, not an unclaimed slot.
+    // Identified subsequence: a miss stays `None`, not a positional slot.
     let mut matched: Vec<Option<RetainedNode>> = Vec::with_capacity(fresh_children.len());
     for fresh_id in &fresh_ids {
         let claimed = fresh_id
@@ -692,10 +549,7 @@ fn pair_children_by_id_then_position(
         matched.push(claimed);
     }
 
-    // Step 2: the unidentified subsequence on both sides, zipped in order (ADR-0023's positional
-    // rule, restricted to children that never claimed an identity). Identified retained children
-    // are excluded by construction, so a leftover identified node can never be handed to an
-    // anonymous fresh child.
+    // Id-less subsequences zip in order (ADR-0023); identified retained children are excluded.
     let mut unidentified_old = old_ids.iter().enumerate().filter(|(_, id)| id.is_none()).map(|(index, _)| index);
     for (slot, fresh_id) in matched.iter_mut().zip(&fresh_ids) {
         if fresh_id.is_none()
@@ -705,8 +559,7 @@ fn pair_children_by_id_then_position(
         }
     }
 
-    // Whatever neither rule claimed: id-less shrinkage, or a retained child whose id vanished from
-    // the fresh tree. Both retire through the same child-first path, in the order they sat in.
+    // Unclaimed nodes, including vanished ids, retire child-first in their old order.
     for slot in &mut old_slots {
         if let Some(leftover) = slot.take() {
             scene.retire_child_first(leftover);
@@ -716,17 +569,14 @@ fn pair_children_by_id_then_position(
     Ok(matched)
 }
 
-/// The axis a parent lays its children out along. Absent for a stacking parent (`rect`, `button`
-/// and the four surface roles), whose children each get the whole content box on both axes, so
-/// have no remainder to share: measured, and correct as it stands.
+/// The parent's flow axis. Stacking parents have none; each child gets the whole content box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainAxis {
     Horizontal,
     Vertical,
 }
 
-/// Which axis `kind` flows along, reading a `list`'s `direction` through [`flow_kind`] so a
-/// horizontal `list` shares a row's rules rather than a column's.
+/// Which axis `kind` flows along; a `list` borrows its `direction` from [`flow_kind`].
 fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
     Ok(match flow_kind(kind, properties)? {
         "row" => Some(MainAxis::Horizontal),
@@ -735,19 +585,10 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
     })
 }
 
-/// What the solver cannot work out from a style alone: a leaf sized by its own content.
-///
-/// Every other kind takes the size its `width`/`height` ask for, or the size its children add up
-/// to; taffy does both. These two do not. Parsed in [`prepare`] rather than in the measure
-/// callback below, since a callback returns a `Size<f32>` with nowhere to put a [`LayoutError`],
-/// and `icon`'s `size` is a property like any other that can be malformed.
+/// Leaf sizes taffy cannot derive from style alone. Parsed in [`prepare`] so malformed icon sizes
+/// can return [`LayoutError`]; the measure callback returns only `Size<f32>`.
 enum Measure {
-    /// A `text` node's shaped extent, against the wrap width taffy offers.
-    ///
-    /// `wrap` and `max_lines` ride along because they change the extent, not just the paint: an
-    /// unwrapped run is one line however long, and a capped one is at most `max_lines` tall no
-    /// matter how many the shaper found. Measuring either wrong gives a box that disagrees with
-    /// what `Scene::finish` will put in it.
+    /// Shaped extent; `wrap` and `max_lines` change geometry, not only paint.
     Text { content: String, runs: Vec<StyleRun>, font_size: f32, wrap: node::Wrap, max_lines: Option<usize> },
     /// § 5.1's `icon` `size`, the same number on both axes.
     Square(f32),
@@ -772,10 +613,8 @@ struct PreparedNode {
     frozen: Vec<RetainedNode>,
 }
 
-/// `Content` is the one mode with no answer until the children are known, which is exactly
-/// taffy's `auto`. `Fill` is `auto` too, and gets its meaning from the `flex_grow` or the stretch
-/// [`taffy_style`] pairs it with: what "fill" means depends on what the parent is doing, and the
-/// size property cannot say it on its own.
+/// `Content` and `Fill` map to taffy's `auto`; `Fill` gets its meaning from parent flow and
+/// [`taffy_style`]'s grow/stretch rules.
 fn taffy_dimension(mode: SizeMode) -> taffy::Dimension {
     match mode {
         SizeMode::Content | SizeMode::Fill => taffy::Dimension::auto(),
@@ -784,7 +623,7 @@ fn taffy_dimension(mode: SizeMode) -> taffy::Dimension {
     }
 }
 
-/// `Align` as the alignment of one item inside the slot its parent gives it.
+/// `Align` as an item's alignment inside its parent slot.
 fn item_align(align: Align) -> taffy::AlignSelf {
     match align {
         Align::Start => taffy::AlignItems::START,
@@ -794,11 +633,8 @@ fn item_align(align: Align) -> taffy::AlignSelf {
     }
 }
 
-/// `Align` as a flow container's packing of its children along the axis it flows in.
-///
-/// `Stretch` is not a packing and never was: the hand-written pass ran its main-axis cursor from
-/// the same place for `Start` and for `Stretch`, so `Stretch` on a row's own `align_h` has always
-/// read as `Start`. Kept, rather than quietly promoted to a distribution taffy could express.
+/// `Align` as a flow container's packing. `Stretch` remains `Start`: the old pass kept the same
+/// main-axis cursor for both, and promoting it to a taffy distribution would change behavior.
 fn main_align(align: Align) -> taffy::JustifyContent {
     match align {
         Align::Start | Align::Stretch => taffy::JustifyContent::START,
@@ -807,45 +643,29 @@ fn main_align(align: Align) -> taffy::JustifyContent {
     }
 }
 
-/// One node's taffy style: the container half (how it lays its own children out) and the item
-/// half (how its parent lays *it* out), one value because that is how taffy's `Style` is shaped.
-///
-/// `parent_axis` is the axis this node's parent flows along, `None` when the parent stacks
-/// (ADR-0023) or this is a surface root. It decides which of this node's two `Fill`s is a share
-/// of a remainder and which is the whole slot: filling a row's main axis splits what the siblings
-/// leave, filling anything else takes all of it.
+/// One node's taffy style, combining its container and item roles. `parent_axis` decides whether a
+/// `Fill` shares a flow remainder or takes the whole slot; `None` means stacking or surface root.
 fn taffy_style(
     kind: &str,
     properties: &HashMap<String, Value>,
     style: &LayoutStyle,
     parent_axis: Option<MainAxis>,
 ) -> Result<taffy::Style, LayoutError> {
-    // An invisible node leaves the layout entirely: no size, no position, and no `spacing` gap on
-    // either side of it. The first two narrow what the hand-written pass did, which resolved a
-    // hidden subtree's geometry in full and declined to place it; nothing outside this module ever
-    // read it, since `paint`, `hit` and `overlay_input_regions` all filter on `visible` first. The
-    // gap was always specified, and still holds.
+    // Invisible nodes get no size, position, or spacing gap. The old pass resolved their geometry
+    // before declining to place them; all readers already filter on `visible`.
     if !style.visible {
         return Ok(taffy::Style { display: taffy::Display::None, ..taffy::Style::DEFAULT });
     }
 
     let mut out = taffy::Style {
-        // This engine has no shrink concept, so two taffy defaults are turned off. `flex_shrink`: a
-        // fixed child keeps the width it asked for even when siblings already overflow the parent
-        // (`fixed_children_that_already_overflow_collapse_a_fill_sibling_to_nothing` pins it).
-        // `min_size`: taffy's automatic minimum would floor a `Fill` item at its own content
-        // instead of letting it collapse to zero, like the hand-written pass's budgets did.
-        //
-        // Zero on the axis the parent flows along and on both axes of a stacking cell, `auto` on a
-        // flex item's cross axis. CSS gives the cross axis no automatic minimum, so `auto` there
-        // is already zero -- and writing the zero out trips a bug in taffy 0.14's flexbox: when a
-        // container measures its children it adds *its own* margin to each child's minimum
-        // cross size (`constants.margin` where `child.margin` was meant, in
-        // `determine_flex_base_size` and `determine_container_main_size`). `Some(0) + margin` is
-        // a floor of the margin's size, `None + margin` is nothing. The panel card is a column with
-        // a left margin of most of the screen, and its body text was being measured 1521px wide
-        // and one line tall, then drawn 378px wide and two lines tall, so every card came out a
-        // line short (`a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`).
+        // No shrink: fixed children keep their stated size, even when siblings overflow. Disable
+        // taffy's automatic minimum so a `Fill` item can collapse to zero as in the old pass.
+        // On a flex cross axis, leave `min_size` as `auto`: taffy 0.14 otherwise adds the
+        // container's margin to each child's minimum (`constants.margin` instead of `child.margin`
+        // in `determine_flex_base_size`/`determine_container_main_size`). `Some(0) + margin` floors
+        // it; `None + margin` does not. The bug measured a panel body at 1521px wide/one line,
+        // then drew it 378px wide/two lines, making every card a line short
+        // (`a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`).
         flex_shrink: 0.0,
         min_size: match parent_axis {
             Some(MainAxis::Horizontal) => {
@@ -879,7 +699,7 @@ fn taffy_style(
         ..taffy::Style::DEFAULT
     };
 
-    // The container half.
+    // Container half.
     match main_axis_of(kind, properties)? {
         Some(axis) => {
             out.display = taffy::Display::Flex;
@@ -887,49 +707,36 @@ fn taffy_style(
                 MainAxis::Horizontal => taffy::FlexDirection::Row,
                 MainAxis::Vertical => taffy::FlexDirection::Column,
             };
-            // A flow container's own `align_h`/`align_v` packs its children along the axis it
-            // flows in. The other axis is each child's own business and is read off the child.
+            // A flow container packs along its own axis; children control the other axis.
             out.justify_content = Some(main_align(match axis {
                 MainAxis::Horizontal => style.align_h,
                 MainAxis::Vertical => style.align_v,
             }));
-            // `spacing`, between adjacent children only, which is what a flex gap is. Set on both
-            // axes because a single flex line only ever spends the one it flows along.
+            // Adjacent-child spacing is a flex gap; set both axes because there is one flex line.
             out.gap = taffy::Size { width: length(style.spacing), height: length(style.spacing) };
         }
-        // The stacking model (ADR-0023) is a grid of exactly one cell holding every child: they
-        // overlap, each aligned independently on both axes within the full content box, and the
-        // container's `Content` size is their bounding union, exactly what a single auto-sized
-        // grid track does, hence `Display::Grid` rather than an invented third mode. The cell is
-        // implicit: the children pin themselves to line 1 on both axes below.
+        // ADR-0023's stacking model is one auto-sized grid cell: children overlap and align
+        // independently, while `Content` is their bounding union.
         None => out.display = taffy::Display::Grid,
     }
 
-    // The item half. `Fill` on an axis this node's parent does not flow along means "the whole
-    // slot", and it outranks the alignment the config wrote: the hand-written pass sized such a
-    // child to the full slot first, then aligned it inside a box already filled, so the alignment
-    // could never move it. Stretching says the same thing to taffy in one property.
+    // Item half. `Fill` off the parent's flow axis means the whole slot and outranks alignment,
+    // matching the old pass's fill-then-align order.
     let fills_h = style.width_mode == SizeMode::Fill && parent_axis != Some(MainAxis::Horizontal);
     let fills_v = style.height_mode == SizeMode::Fill && parent_axis != Some(MainAxis::Vertical);
     let align_h = if fills_h { taffy::AlignItems::STRETCH } else { item_align(style.align_h) };
     let align_v = if fills_v { taffy::AlignItems::STRETCH } else { item_align(style.align_v) };
 
-    // Which of the two alignments the parent actually applies, per axis. A flex item's main axis is
-    // packed by the container's `justify_content`, so the item's own alignment there is not its to
-    // state; a grid item in the stacking cell states both.
+    // Flex parents govern the main axis with `justify_content`; grid items state both axes.
     let (governed_h, governed_v) = match parent_axis {
         Some(MainAxis::Horizontal) => (None, Some(align_v)),
         Some(MainAxis::Vertical) => (Some(align_h), None),
         None => (Some(align_h), Some(align_v)),
     };
 
-    // The one place this mapping is not plain CSS. `align-self: stretch` applies only to an `auto`
-    // cross size, so a child writing both `height = 5` and `align_v = "Stretch"` would keep its 5,
-    // but the hand-written pass overrode the resolved size outright, so this engine has always let
-    // the stretch win (`row_child_stretch_alignment_fills_the_cross_axis` pins it). Blanking the
-    // size tells taffy the same thing: kept rather than corrected, since answering "should a stated
-    // size outrank a stated stretch" silently inside this solver swap is how a shell that laid out
-    // correctly yesterday stops doing so today.
+    // Taffy's `align-self: stretch` applies only to an `auto` cross size, so `height = 5` would
+    // normally win. The old pass overrode the size, and this engine keeps stretch precedence
+    // (`row_child_stretch_alignment_fills_the_cross_axis`); blank the size to make taffy do that.
     if governed_h == Some(taffy::AlignItems::STRETCH) {
         out.size.width = taffy::Dimension::auto();
     }
@@ -938,10 +745,9 @@ fn taffy_style(
     }
 
     match parent_axis {
-        // A flex item: the parent packs it on the main axis, so only the cross alignment is its
-        // own, and `Fill` on the main axis is a share of the remainder. A zero basis makes the
-        // share the whole remainder rather than the remainder on top of a content-sized start,
-        // pinned by `two_fill_siblings_split_the_remainder_equally`.
+        // Flex item: parent packs the main axis; cross alignment is local. A zero basis makes
+        // main-axis `Fill` share the whole remainder
+        // (`two_fill_siblings_split_the_remainder_equally`).
         Some(MainAxis::Horizontal) => {
             out.align_self = Some(align_v);
             if style.width_mode == SizeMode::Fill {
@@ -956,8 +762,7 @@ fn taffy_style(
                 out.flex_basis = taffy::Dimension::length(0.0);
             }
         }
-        // A grid item in the one shared cell. Both alignments are its own, which is the stacking
-        // model's "each child positioned per its own `align_h`/`align_v`, independently".
+        // Grid item in the shared cell; both alignments are local.
         None => {
             out.justify_self = Some(align_h);
             out.align_self = Some(align_v);
@@ -1449,10 +1254,9 @@ fn fit_text_to_box(paint: &mut Option<PaintStyle>, content_width: f32, shaping: 
 
 /// A `text`'s content being rebuilt to fit its box, with its styled runs following it (ADR-0104).
 ///
-/// Every rewrite this file makes -- lines joined with `\n`, a remainder collapsed onto one line, an
-/// ellipsis -- used to be string surgery on `content` alone. A run is a byte range into that string,
-/// so the surgery has to move the ranges too, and this is the one place that knows both: it
-/// appends slices of the *source* and re-bases whichever runs overlap each slice onto the output.
+/// Every rewrite here (joined lines, flattened remainder, ellipsis) used to edit `content` alone.
+/// Runs are byte ranges into that string, so this is the one place that appends source slices and
+/// re-bases the runs overlapping each slice.
 struct Fitted<'s> {
     source: &'s str,
     source_runs: &'s [StyleRun],
@@ -1615,7 +1419,7 @@ fn elide_cut(
         candidate.push_ellipsis(cut);
         measured_width(&candidate.text, &candidate.runs, font_size, shaping) <= width
     };
-    // Largest index into `cuts` whose prefix plus an ellipsis still fits. Zero is always admissible.
+    // Largest index whose prefix plus an ellipsis fits; zero is always admissible.
     let (mut low, mut high) = (0usize, cuts.len() - 1);
     while low < high {
         // Rounded up, so `mid` is always above `low` and the loop cannot stall; `high` is only ever
@@ -1637,14 +1441,15 @@ fn elide_cut(
 ///
 /// A visible node claims its whole box when it is *solid*: it paints something (a box with a
 /// background or a border, or any text, icon, image or field), or it is a `button` with a pointer
-/// handler (`on_click`, `on_drag`, `on_wheel`), which is invisible by design and still has to be
-/// pressable (the panel host's click-outside catcher). A transparent container claims nothing of its own and is walked into,
-/// so a full-surface `column` holding two cards yields the two cards. Everything not claimed is
-/// click-through, and under focus-follows-mouse it is also focus-through: this is why the popup's
-/// empty space below its cards no longer takes the keyboard.
+/// handler (`on_click`, `on_drag`, `on_wheel`), which is invisible by design but still pressable
+/// (the panel host's click-outside catcher). Transparent containers claim nothing and are walked
+/// into, so a full-surface `column` holding two cards yields the cards. Everything else is
+/// click-through and, under focus-follows-mouse, focus-through; the popup's empty space below its
+/// cards therefore takes neither clicks nor keyboard focus.
 ///
-/// Applies to any surface whose visible content is smaller than the surface itself: an empty region
-/// (clicks pass through) with nothing visible, a no-op for a tightly-sized bar whose child fills it.
+/// Applies to any surface whose visible content is smaller than the surface itself: empty space
+/// (clicks pass through) with nothing visible, a no-op for a tightly-sized bar whose child fills
+/// it.
 pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
     let mut regions = Vec::new();
     for child in &surface_root.children {
@@ -2614,12 +2419,12 @@ pub(super) mod tests {
 
     /// A wheel must not be able to write a capability snapshot. `scroll_handle` refuses every kind
     /// but its own, so binding the wrong signal scrolls nothing instead.
-    /// Alignment and scrolling can never both be in play, and this pins why rather than trusting it.
+    /// Alignment and scrolling cannot both be in play; this pins why rather than trusting it.
     ///
     /// `spare` is `(content - total).max(0)` and the scroll limit is `(total - content).max(0)`, so
     /// one is zero whenever the other is not. Content that underfills its box aligns and cannot
-    /// scroll; content that overflows scrolls and has no spare to align with. A `Center` column with
-    /// a scroll offset set is therefore still centred, not centred-then-shifted.
+    /// scroll; overflowing content has no spare to align with. A `Center` column with a scroll
+    /// offset is therefore still centred, not centred-then-shifted.
     #[test]
     fn alignment_and_scrolling_are_mutually_exclusive_by_construction() {
         let (_lua, ys, used) = scrolled(

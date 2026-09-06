@@ -1,43 +1,47 @@
-//! PipeWire-backed audio state; § 2.4's master volume/mute added per ADR-0053 decision 3.
-//! `mixer` tracks the registry and every list § 2.4 names; `master`
-//! holds the pure parsing/resolution logic `mixer` wires PipeWire events through.
+//! PipeWire-backed audio state. `mixer` tracks § 2.4's registry lists; `master` holds the pure
+//! parsing/resolution logic (ADR-0053 decision 3).
 //!
-//! § 3.2's audio write actions live here too, in [`dispatch`], plus the three source-side ones
-//! (`set_source_volume`, `set_source_muted`, `toggle_source_mute`) that filled the hole § 3.2 had
-//! noted beside `set_muted`. See that function's own doc comment for the two still not built.
+//! § 3.2 write actions dispatch here, including source-side volume/mute actions that filled the
+//! gap beside `set_muted`; see [`dispatch`] for the two still unbuilt actions.
 //!
-//! BlueZ codec control (§6) is later work and belongs to `bluetooth` rather than here.
+//! BlueZ codec control (§6) belongs to later `bluetooth` work.
 
 pub mod master;
 pub mod mixer;
 
 use mixer::{AudioCommand, AudioCommandSender};
 
-/// Every action `oblisk.audio:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.audio:invoke(...)`; matching this enum keeps dispatch exhaustive.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioAction {
+    /// Set master output volume; `vol` is a number and is clamped to `[0.0, 1.0]`.
     SetVolume,
+    /// Set master output mute to the boolean argument.
     SetMuted,
+    /// Toggle master output mute.
     ToggleMute,
+    /// Make the tracked output device with this PipeWire registry id the default.
     SetDefaultSink,
+    /// Make the tracked input device with this PipeWire registry id the default.
     SetDefaultSource,
+    /// Set default input volume; `vol` is a number and is clamped to `[0.0, 1.0]`.
     SetSourceVolume,
+    /// Set default input mute to the boolean argument.
     SetSourceMuted,
+    /// Toggle default input mute.
     ToggleSourceMute,
+    /// Set the per-app stream volume by PipeWire registry id; `vol` is clamped to `[0.0, 1.0]`.
     SetAppVolume,
+    /// Set the per-app stream mute by PipeWire registry id.
     SetAppMuted,
 }
 
-/// `oblisk.audio`'s action dispatch (ADR-0037). Unlike every other capability's adapter, this one
-/// has no controller to call: each action becomes an [`AudioCommand`] on the channel into the
-/// PipeWire thread, and nothing here awaits a result.
+/// Unlike every other capability's adapter, this has no controller to call. It dispatches each
+/// action as an [`AudioCommand`] on the PipeWire thread (ADR-0037); no result is awaited here.
 ///
-/// § 3.2 lists two more audio actions this does not implement: `play_sound(sound)` and
-/// `set_event_sounds_enabled(en)` need a sound player, an event-sound theme, and a place to
-/// store the toggle, none of which exist anywhere in this codebase. Named here so their absence
-/// is a decision rather than a gap in the match.
+/// § 3.2 also lists `play_sound(sound)` and `set_event_sounds_enabled(en)`. They need a sound
+/// player, event-sound theme, and toggle storage, none of which exists, so they remain absent.
 pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<AudioAction>(params) else { return };
@@ -69,14 +73,12 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
     }
 }
 
-/// `[vol]`. Shape check only: § 3.2's `[0.0, 1.0]` range is clamped once, in
-/// `master::cubed_channel_volumes`.
+/// Parses `[vol]`; § 3.2's `[0.0, 1.0]` range is clamped in `master::cubed_channel_volumes`.
 fn parse_volume_arg(arguments: &[serde_json::Value]) -> Option<f32> {
     Some(arguments.first()?.as_f64()? as f32)
 }
 
-/// `[id]`. A PipeWire registry id, so it must fit a `u32`: a larger number is rejected here
-/// rather than truncated into an id naming a different node.
+/// Parses `[id]` as a `u32`; larger values are rejected rather than truncated into another node id.
 fn parse_id_arg(arguments: &[serde_json::Value]) -> Option<u32> {
     u32::try_from(arguments.first()?.as_u64()?).ok()
 }
@@ -98,7 +100,7 @@ mod tests {
     #[test]
     fn parse_volume_arg_reads_a_float_and_an_integer_alike() {
         assert_eq!(parse_volume_arg(&[serde_json::json!(0.3)]), Some(0.3));
-        // Lua has one number type, so a config writing 1 rather than 1.0 is common, not odd.
+        // Lua has one number type, so configs commonly write 1 rather than 1.0.
         assert_eq!(parse_volume_arg(&[serde_json::json!(1)]), Some(1.0));
     }
 

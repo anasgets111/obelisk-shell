@@ -1,19 +1,16 @@
 //! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.3,
 //! `docs/oblisk-supervisor-services-dbus.md` § 10, ADR-0026).
 //!
-//! `process.run(cmd, args, out_cb, exit_cb)` executes on the Wayland dispatch thread, inside a Lua
-//! evaluation, with no socket in scope, so it can't write the outbound `"process"`/`"run"`
-//! `CommandEnvelope` directly. [`ProcessRegistry`] instead queues it onto the same
-//! `mpsc::UnboundedSender<RendererFrame>` every other outbound frame goes to, which the socket
-//! thread's `pump` drains and writes (ADR-0039).
+//! `process.run(cmd, args, out_cb, exit_cb)` runs on the Wayland dispatch thread during Lua
+//! evaluation, with no socket in scope. [`ProcessRegistry`] queues the outbound `"process"`/`"run"`
+//! envelope on the shared `mpsc::UnboundedSender<RendererFrame>` drained by the socket thread's
+//! `pump` (ADR-0039).
 //!
-//! `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: [`ProcessRegistry`] is confined to the one Wayland
-//! dispatch thread, alongside the Lua VM whose closures drive it.
+//! `Rc<RefCell<_>>` is correct because the registry and Lua closures stay on that thread.
 //!
-//! Callback calling convention, not pinned down by the spec docs, decided here (ADR-0026):
-//! `out_cb(line, stream)` with `stream` the Lua string `"stdout"`/`"stderr"` (the
-//! wire type stays a real `shared::ProcessStream` enum; Lua has no enums). `exit_cb(code)` with
-//! `code` an integer or `nil`, `Option<i32>`'s own natural `IntoLua` mapping.
+//! Callback convention, unspecified by the docs, is fixed here (ADR-0026):
+//! `out_cb(line, stream)` uses Lua strings `"stdout"`/`"stderr"` while the wire keeps
+//! `shared::ProcessStream`; `exit_cb(code)` receives an integer or `nil` via `Option<i32>`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,16 +20,14 @@ use mlua::{Function, Lua, UserData, UserDataMethods};
 use shared::{CommandEnvelope, CommandParams, ProcessStream, RendererFrame};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// One `process.run` call's registered Lua callbacks, kept until its matching
-/// `SupervisorFrame::ProcessExited` arrives.
+/// One `process.run` callback pair, retained until matching `SupervisorFrame::ProcessExited`.
 struct PendingProcess {
     out_cb: Function,
     exit_cb: Function,
 }
 
-/// Registers `process.run`'s pending callbacks, assigns each call's `CommandEnvelope.id`
-/// (ADR-0026: the Renderer assigns it, not the Supervisor, so `process.run` can return a
-/// `ProcessHandle` synchronously), and queues outbound `"process"` commands.
+/// Retains callbacks, assigns `CommandEnvelope.id` in the Renderer (ADR-0026), and queues
+/// outbound `"process"` commands. Renderer assignment permits synchronous `ProcessHandle` return.
 #[derive(Clone)]
 pub struct ProcessRegistry(Rc<RefCell<Inner>>);
 
@@ -59,9 +54,8 @@ fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::
 }
 
 impl ProcessRegistry {
-    /// `generation_id` is this Renderer's own generation id (`OBLISK_GENERATION_ID`), stamped
-    /// into every outbound `CommandEnvelope`. `outbound_tx` is the Renderer's one outbound frame
-    /// channel, drained by the socket thread's `pump`.
+    /// `OBLISK_GENERATION_ID`, stamped into every envelope; `outbound_tx` is the frame channel
+    /// drained by the socket thread's `pump`.
     pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
         ProcessRegistry(Rc::new(RefCell::new(Inner {
             generation_id,
@@ -99,9 +93,8 @@ impl ProcessRegistry {
         self.send(process_command(generation_id, "kill", Vec::new(), id));
     }
 
-    /// `SupervisorFrame::ProcessOutput` dispatch: invokes `id`'s registered `out_cb`. A
-    /// stale/unknown `id` (a frame for a since-forgotten generation, or a wire desync) is
-    /// silently ignored.
+    /// Dispatches `SupervisorFrame::ProcessOutput` to `id`'s `out_cb`. Stale/unknown ids, including
+    /// forgotten generations or wire desyncs, are ignored.
     pub fn dispatch_output(&self, id: u64, stream: ProcessStream, line: String) {
         let out_cb = self.0.borrow().pending.get(&id).map(|p| p.out_cb.clone());
         let Some(out_cb) = out_cb else { return };
@@ -110,8 +103,8 @@ impl ProcessRegistry {
         }
     }
 
-    /// `SupervisorFrame::ProcessExited` dispatch: invokes `id`'s registered `exit_cb` and forgets
-    /// the id, the callback pair's last use (ADR-0026).
+    /// Dispatches `SupervisorFrame::ProcessExited`, invokes `exit_cb`, then forgets the id
+    /// (ADR-0026).
     pub fn dispatch_exit(&self, id: u64, code: Option<i32>) {
         let exit_cb = self.0.borrow_mut().pending.remove(&id).map(|p| p.exit_cb);
         let Some(exit_cb) = exit_cb else { return };
@@ -128,7 +121,7 @@ fn stream_name(stream: ProcessStream) -> &'static str {
     }
 }
 
-/// The opaque `ProcessHandle` userdata § 3.3 hands back to Lua.
+/// Opaque § 3.3 userdata returned to Lua.
 pub struct ProcessHandle {
     id: u64,
     registry: ProcessRegistry,
@@ -143,8 +136,8 @@ impl UserData for ProcessHandle {
     }
 }
 
-/// Registers the `process` global table with `process.run(cmd, args, out_cb, exit_cb)`. `mlua`'s
-/// own argument type-checking on this closure's signature is § 3.2's validation in full.
+/// Registers `process.run(cmd, args, out_cb, exit_cb)`; mlua's closure signature supplies § 3.2
+/// argument validation.
 pub fn register(lua: &Lua, registry: ProcessRegistry) -> mlua::Result<()> {
     let table = lua.create_table()?;
     table.set(
@@ -233,14 +226,12 @@ mod tests {
     fn process_run_rejects_a_non_string_cmd() {
         let (lua, _registry, _rx) = lua_with_process(0);
 
-        // A table, not a number: mlua's `String` extraction coerces `42` to `"42"`, but a table
-        // has no such coercion and must still be rejected.
+        // `String` extraction coerces `42` to `"42"`; a table has no such coercion and must reject.
         let err = lua.load(r#"process.run({}, {}, function() end, function() end)"#).exec().unwrap_err();
         assert!(err.to_string().contains("string"), "expected a type error mentioning string, got: {err}");
     }
 
-    /// Reads a probe global back out after a callback pushed into it: callbacks have no other
-    /// observable side channel.
+    /// Reads the global a callback updated; callbacks have no other observable side channel.
     fn probe_table(lua: &Lua) -> mlua::Table {
         lua.load("probe = probe or {}; return probe").eval().unwrap()
     }

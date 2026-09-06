@@ -1,10 +1,8 @@
--- Mirrors BluetoothIndicator.qml: three glyphs for off, on and connected, with the glyph itself
--- going accent-coloured while something is connected. The device name it used to spell out is in
--- the tooltip and the panel.
+-- Mirrors BluetoothIndicator.qml: off, on and connected glyphs, with connected accented. Device
+-- names belong in the tooltip and panel.
 --
--- The accent is on the foreground rather than the ground, which is the mirror's own split: a ground
--- change means "this wants your attention", a foreground change means "this is doing something".
--- Bluetooth being connected is the second kind.
+-- Accent the foreground, not the ground. The mirror uses the ground for "wants attention" and the
+-- foreground for "doing something"; Bluetooth connected is the latter.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")

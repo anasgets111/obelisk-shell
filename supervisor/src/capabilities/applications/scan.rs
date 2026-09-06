@@ -6,64 +6,56 @@ use std::path::{Path, PathBuf};
 
 use super::entry::{desktop_file_id, flag, parse_group, tokenize_exec};
 
-/// How deep a walk goes under an applications directory. The specification allows
-/// subdirectories and real trees use one level (`kde4/`), so this is slack rather than a limit
-/// anyone reaches. It exists to bound a symlink loop without the cost of canonicalizing every
-/// directory the way `watcher.rs` has to.
+/// Walk depth under an applications directory. Subdirectories are allowed and real trees use one
+/// level (`kde4/`); the cap bounds symlink loops without canonicalizing every directory as
+/// `watcher.rs` does.
 const MAX_DEPTH: usize = 4;
 
-/// One application as the config sees it (ADR-0061). Deliberately the display half only:
-/// the argv never crosses into Lua, because `applications:launch(id)` is what runs it and a
-/// config that could rewrite a command line before it ran would be a config that could be made
-/// to run something else.
+/// One application as config sees it (ADR-0061). Display data only: argv stays private because
+/// `applications:launch(id)` runs it, and exposing it would let config rewrite the command.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct AppSummary {
-    /// The desktop file id (`org.telegram.desktop`), and `launch`'s one argument.
+    /// Desktop file id (`org.telegram.desktop`), and `launch`'s argument.
     pub id: String,
-    /// The unlocalized `Name=`. `Name[xx]` is deliberately not read (ADR-0061), so this is English
-    /// on a localized system.
+    /// Unlocalized `Name=`. `Name[xx]` is not read (ADR-0061), so this is English on a localized
+    /// system.
     pub name: String,
-    /// The `Icon=` key as written: a theme name, or an absolute path. `icon { name = ... }`
-    /// takes either, which is exactly what ADR-0054 decision 2 built it for. `None` for an
-    /// entry with no `Icon=` at all, so a config can tell "no icon" from an icon that failed to
-    /// resolve.
+    /// `Icon=` as written, either a theme name or absolute path; `icon { name = ... }` accepts
+    /// both (ADR-0054 decision 2). `None` means no `Icon=` key, distinct from failed resolution.
     pub icon: Option<String>,
-    /// The unlocalized `Comment=`: the one-line description a launcher draws under the name and
-    /// matches a search against, `"Web Browser"` under `Firefox` (ADR-0112). `None` for an entry
-    /// with none, which is common, so a config hides the line rather than drawing an empty one.
-    /// Localized the way `name` is not, and for the same reason.
+    /// Unlocalized `Comment=`, the one-line description/search text under the name, e.g.
+    /// `"Web Browser"` under `Firefox` (ADR-0112). `None` means no key, so config can hide it;
+    /// unlike `name`, this field is localized.
     pub comment: Option<String>,
 }
 
-/// What `launch` needs and Lua never sees.
+/// What `launch` needs but Lua never sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchTarget {
     pub command: String,
     pub args: Vec<String>,
-    /// `Terminal=true`: the entry is a console program and needs an emulator wrapped around it.
+    /// `Terminal=true`: wrap this console program in an emulator.
     pub terminal: bool,
 }
 
-/// Everything one scan produces.
+/// One scan's result.
 #[derive(Debug, Default)]
 pub struct ScanResult {
-    /// Sorted by display name, because a launcher shows this in order and sorting it in Lua
-    /// would re-sort it on every reload for a result that never changes between scans.
+    /// Entries sorted by display name. Sorting in Lua would repeat work on every reload.
     pub entries: Vec<AppSummary>,
-    /// `app_id` to entry, for a caller holding a window's `app_id` rather than a desktop file id
-    /// (`workspaces.active_client.class`, a tray item with no icon of its own).
+    /// `app_id` to entry, for callers holding `workspaces.active_client.class` or a tray item
+    /// with no icon of its own rather than a desktop id.
     pub by_app_id: BTreeMap<String, AppSummary>,
     pub launch: HashMap<String, LaunchTarget>,
 }
 
-/// The applications directories, in precedence order, per the XDG base directory specification.
+/// Applications directories in XDG precedence order.
 ///
-/// Both defaults are applied here rather than assumed present: `XDG_DATA_HOME` and
-/// `XDG_DATA_DIRS` are unset on a plain login shell far more often than not, and a scan that
-/// skipped the default `/usr/share` when they were would find nothing at all on a normal system.
+/// Applies both defaults: plain login shells often unset `XDG_DATA_HOME` and `XDG_DATA_DIRS`, and
+/// skipping `/usr/share` in that case finds nothing on a normal system.
 ///
-/// Injected rather than read from the environment inside, the shape `SystemController::new`
-/// already uses, so the precedence is testable without touching the process environment.
+/// Injected, like `SystemController::new`, so precedence is testable without changing the process
+/// environment.
 pub fn application_dirs(data_home: Option<PathBuf>, data_dirs: Option<String>, home: &Path) -> Vec<PathBuf> {
     let home_dir = data_home.unwrap_or_else(|| home.join(".local/share"));
     let dirs = data_dirs.filter(|value| !value.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
@@ -73,26 +65,21 @@ pub fn application_dirs(data_home: Option<PathBuf>, data_dirs: Option<String>, h
         .collect()
 }
 
-/// Scans `dirs` in order, first occurrence of a desktop file id winning.
+/// Scans `dirs` in order; the first occurrence of each desktop id wins.
 ///
-/// First-wins is the specification's rule and it is why the user's own
-/// `~/.local/share/applications` comes first in [`application_dirs`]: overriding a system entry
-/// by dropping a file with the same name into the home directory is how a user changes an
-/// application's name, icon or command, and a last-wins scan would silently ignore every one of
-/// those overrides.
+/// First-wins is the specification's rule, so `~/.local/share/applications` comes first: a same-
+/// named home file overrides a system name, icon, or command. Last-wins would ignore the override.
 pub fn scan(dirs: &[PathBuf]) -> ScanResult {
     let mut seen: HashSet<String> = HashSet::new();
     let mut entries: Vec<AppSummary> = Vec::new();
     let mut launch: HashMap<String, LaunchTarget> = HashMap::new();
-    // Kept beside the summary only until the map is built, since `StartupWMClass` is a matching
-    // key rather than anything the config reads.
+    // Keep beside the summary until the map is built; `StartupWMClass` is only a matching key.
     let mut wm_classes: Vec<(String, Option<String>)> = Vec::new();
 
     for dir in dirs {
         let mut files = Vec::new();
         collect_desktop_files(dir, 0, &mut files);
-        // Directory order is whatever the filesystem hands back, so a tree with two files
-        // resolving to one id would otherwise pick a different winner run to run.
+        // Filesystem directory order is unspecified; sort so duplicate ids have a stable winner.
         files.sort();
         for path in files {
             let Some(id) = desktop_file_id(&path, dir) else {
@@ -107,8 +94,7 @@ pub fn scan(dirs: &[PathBuf]) -> ScanResult {
             let Some(group) = parse_group(&contents) else {
                 continue; // no `[Desktop Entry]` group at all.
             };
-            // `Type` defaults to nothing rather than to `Application`: the specification requires
-            // the key, and a `Link` or `Directory` entry is not something a launcher can run.
+            // `Type` has no `Application` default; a `Link` or `Directory` is not launchable.
             if group.get("Type").map(String::as_str) != Some("Application") {
                 continue;
             }
@@ -137,23 +123,19 @@ pub fn scan(dirs: &[PathBuf]) -> ScanResult {
     ScanResult { entries, by_app_id, launch }
 }
 
-/// Every way an `app_id` is allowed to find an entry, strongest first.
+/// Ways an `app_id` finds an entry, strongest first.
 ///
-/// Two passes rather than one, and that is the whole point of the function: a weak key belonging
-/// to one entry must never beat a strong key belonging to another. Inserting entry by entry would
-/// make the answer depend on scan order, so that `org.gnome.Nautilus` could resolve to whichever
-/// application happened to be read first rather than to the one whose filename actually says so.
+/// Two passes keep a weak key from one entry from beating a strong key from another. Entry-by-entry
+/// insertion would make `org.gnome.Nautilus` depend on scan order instead of its filename.
 ///
-/// The last-segment rule is what makes this useful against a real compositor: niri reports
-/// Nautilus as `org.gnome.Nautilus` and Files ships `org.gnome.Nautilus.desktop`, which the exact
-/// pass already catches, but plenty of applications report a bare `nautilus` against a reverse-DNS
-/// filename and nothing shorter would match those.
+/// The last-segment rule covers bare ids: niri reports Nautilus as `org.gnome.Nautilus`, and
+/// Files ships that exact filename, but many apps report `nautilus` against a reverse-DNS name.
 fn build_app_id_map(entries: &[AppSummary], wm_classes: &[(String, Option<String>)]) -> BTreeMap<String, AppSummary> {
     let by_id: HashMap<&str, &AppSummary> = entries.iter().map(|entry| (entry.id.as_str(), entry)).collect();
     let mut map: BTreeMap<String, AppSummary> = BTreeMap::new();
 
-    // Pass 1, exact: `StartupWMClass` is the key the specification added for exactly this
-    // question, so it outranks the filename even though the filename usually agrees.
+    // Pass 1, exact: `StartupWMClass` is the specification's key for this question, so it outranks
+    // the filename even when they usually agree.
     for (id, wm_class) in wm_classes {
         let Some(entry) = by_id.get(id.as_str()) else { continue };
         if let Some(class) = wm_class.as_deref().filter(|class| !class.is_empty()) {
@@ -164,8 +146,7 @@ fn build_app_id_map(entries: &[AppSummary], wm_classes: &[(String, Option<String
         map.entry(entry.id.clone()).or_insert_with(|| entry.clone());
     }
 
-    // Pass 2, case-folded and shortened. Every key here is a guess, which is why none of them may
-    // displace anything above.
+    // Pass 2, case-folded and shortened. These are guesses and cannot displace exact keys.
     for (id, wm_class) in wm_classes {
         let Some(entry) = by_id.get(id.as_str()) else { continue };
         if let Some(class) = wm_class.as_deref().filter(|class| !class.is_empty()) {
@@ -181,8 +162,8 @@ fn build_app_id_map(entries: &[AppSummary], wm_classes: &[(String, Option<String
     map
 }
 
-/// Every `.desktop` file under `dir`, depth-capped. A directory that does not exist contributes
-/// nothing: most systems have no `/usr/local/share/applications`, and that is not an error.
+/// Every depth-capped `.desktop` file under `dir`. A missing directory contributes nothing; most
+/// systems lack `/usr/local/share/applications`.
 fn collect_desktop_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH {
         return;
@@ -190,9 +171,8 @@ fn collect_desktop_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(read) = std::fs::read_dir(dir) else { return };
     for entry in read.flatten() {
         let path = entry.path();
-        // `metadata` rather than `file_type`, following a symlink: a packaged application
-        // directory routinely symlinks entries in from elsewhere (Flatpak's exports do), and
-        // `file_type` calls those symlinks rather than files and would skip every one.
+        // Use `metadata` so symlinked entries are followed; packaged application trees such as
+        // Flatpak exports commonly link entries from elsewhere.
         let Ok(meta) = path.metadata() else { continue };
         if meta.is_dir() {
             collect_desktop_files(&path, depth + 1, out);
@@ -217,9 +197,8 @@ mod tests {
         format!("[Desktop Entry]\nType=Application\nName={name}\nExec=/usr/bin/{name}\n{extra}")
     }
 
-    /// Both XDG defaults are the point: a plain login shell has neither variable set, and a scan
-    /// that skipped `/usr/share` when `XDG_DATA_DIRS` was unset would find nothing on a normal
-    /// system.
+    /// Both XDG defaults matter: a plain login shell may set neither, and skipping `/usr/share`
+    /// when `XDG_DATA_DIRS` is unset finds nothing on a normal system.
     #[test]
     fn application_dirs_applies_both_xdg_defaults_when_the_environment_is_bare() {
         let dirs = application_dirs(None, None, Path::new("/home/someone"));
@@ -259,9 +238,8 @@ mod tests {
         );
     }
 
-    /// The user's own copy of an entry replaces the system one entirely, which is how a user
-    /// renames an application or changes its command. A last-wins scan would ignore every such
-    /// override.
+    /// A user's copy replaces the system entry, allowing a renamed app or changed command;
+    /// last-wins would ignore it.
     #[test]
     fn scan_lets_an_earlier_directory_win_the_same_desktop_file_id() {
         let home = tempfile::tempdir().unwrap();
@@ -332,8 +310,8 @@ mod tests {
         assert_eq!(map.get("org.gnome.Nautilus").map(|e| e.name.as_str()), Some("Files"));
     }
 
-    /// The reverse-DNS filename with a bare `app_id` is the common real mismatch: a toplevel
-    /// reports `nautilus` where the file is named `org.gnome.Nautilus.desktop`.
+    /// Common mismatch: a toplevel reports `nautilus` while the file is
+    /// `org.gnome.Nautilus.desktop`.
     #[test]
     fn an_app_id_matching_only_the_last_segment_of_a_reverse_dns_id_still_finds_its_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -354,13 +332,12 @@ mod tests {
         assert_eq!(map.get("TelegramDesktop").map(|e| e.name.as_str()), Some("Telegram"));
     }
 
-    /// The two-pass property, and the reason the map is not built entry by entry: one entry's
-    /// case-folded guess must never displace another entry's exact filename. Built in one pass,
-    /// the winner would depend on which file the scan happened to read first.
+    /// Two passes prevent one entry's case-folded guess from displacing another's exact filename;
+    /// one pass would make the winner depend on read order.
     #[test]
     fn an_exact_id_beats_another_entrys_case_folded_wm_class() {
         let dir = tempfile::tempdir().unwrap();
-        // Sorts first, so a single-pass build would let it claim "zed" before the real one is read.
+        // Sort first; a single pass could let a guess claim "zed" before the real entry.
         write_entry(dir.path(), "aaa.desktop", &application("Impostor", "StartupWMClass=Zed\n"));
         write_entry(dir.path(), "zed.desktop", &application("Zed Editor", ""));
 

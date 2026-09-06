@@ -1,35 +1,28 @@
--- Mirrors `Modules/Global/AppLauncher.qml`: a search box over a list of applications, typed into
--- the moment it opens, walked with the arrow keys, launched with Enter.
+-- Mirrors `AppLauncher.qml`: autofocus search, arrow navigation, Enter launch.
 --
--- ## The engine pieces this leans on (ADR-0112)
+-- ## Engine pieces (ADR-0112)
 --
--- The field is a plain `textfield` with `autofocus = true`, so the keyboard lands in it as the
--- surface maps and it opens empty every time. `on_change` filters, `on_navigate` moves the
--- selection and asks the list's scroll signal to `reveal` the row it moved to, `on_submit` launches
--- what is selected, `on_cancel` (Escape) closes. `oblisk toggle launcher_open` from a compositor
--- keybind is the other way in, which is why `launcher_open` is a named `state` and not a local.
+-- A plain `textfield` with `autofocus = true` gets the keyboard on map and opens empty. `on_change`
+-- filters, `on_navigate` moves selection and calls the list scroll signal's `reveal`, `on_submit`
+-- launches, and `on_cancel` closes. A compositor keybind can also toggle `launcher_open`, so it is
+-- named `state`, not local.
 --
--- ## A layer surface, not a `window`
+-- ## Layer surface, not `window`
 --
--- This was an `xdg_toplevel`, which niri tiles: it opened in the layout beside the other windows,
--- at whatever size the column had, and took focus by the compositor's window rules. The mirror's
--- `OModal` is a scrim over the whole screen with a card in the middle, and a screen-sized `panel`
--- with `keyboard_interactivity` bound to `launcher_open` is that: it takes the keyboard on map and
--- gives it back on unmap, the catcher under the card closes on a click outside, and the card sits
--- where a modal sits rather than where the tiling put it.
+-- The old `xdg_toplevel` was tiled by niri beside other windows at the column's size. The mirror's
+-- `OModal` is a screen scrim and centred card; a screen-sized `panel` bound to `launcher_open`
+-- takes the keyboard on map, returns it on unmap, and closes through its outside catcher.
 --
--- ## What the selection is
+-- ## Selection
 --
--- `selected_id` holds what a key or a hover last chose: an application id, `WEB` for the row that
--- opens a search, or nothing. `effective_selected` turns that into the row the ring is on -- the
--- choice where it is still showing, the first row otherwise -- once, for the whole list, so a
--- row's own `selected` is one `map` over one signal. That is what keeps three hundred rows inside
--- the graph's 5ms budget. Hovering a row selects it, as the mirror's `hoverSelectionArmed` does,
--- so the mouse and the arrow keys move the same ring.
+-- `selected_id` stores the last key/hover choice: app id, `WEB`, or empty. `effective_selected`
+-- keeps that row if visible, else the first row, computed once for the list so each row maps one
+-- signal. This keeps three hundred rows within the 5ms graph budget. Hover selection matches the
+-- mirror's `hoverSelectionArmed`, so mouse and arrows move the same ring.
 --
--- Not carried over: the calculator and currency rows. Both end in "Enter to copy", and this engine
--- has no clipboard yet; a result that can be read but not taken is half a feature. The web row
--- stays, since `applications:open_url` is already there to finish it.
+-- Dropped calculator and currency rows: both end in "Enter to copy", but the engine lacks a
+-- clipboard.
+-- Keep the web row because `applications:open_url` completes it.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -40,13 +33,12 @@ local panel_empty_state = require("components.panel_empty_state")
 local SCROLL = scroll("launcher_list")
 local MAX_RESULTS = 200
 local PAGE = 8
--- The id the web row goes by in `selected_id`. Not a desktop file id: those never start with a
--- space, which is the whole of what makes this one safe.
+-- Web-row id in `selected_id`, not a desktop-file id; desktop-file ids never start with a space.
 local WEB = " web"
 
 local query = state("launcher_query", "")
 local selected_id = state("launcher_selected", "")
--- Plain locals, not state: what the field held a keystroke ago, for Escape's two stages below.
+-- Plain locals, not state: the previous field text for Escape's two stages.
 local typed = ""
 local emptied_a_query = false
 
@@ -56,10 +48,9 @@ end
 
 -- ## Matching
 --
--- Not fzf, and not trying to be: a prefix of the name beats a word inside it beats a substring
--- beats the comment, letters in order anywhere is the fallback, and ties go to the shorter name.
--- That is the order a person expects "fi" to give -- Firefox, then Files, then Profile Editor --
--- and it is ten lines rather than a scoring library.
+-- Not fzf: name prefix beats word, substring, then comment; ordered letters are the fallback, with
+-- shorter names breaking ties. "fi" therefore gives Firefox, Files, Profile Editor. Ten lines beat
+-- a scoring library.
 local function subsequence(haystack, needle)
     local position = 1
     for i = 1, #needle do
@@ -126,11 +117,10 @@ end
 
 local results = computed({ oblisk.applications, query }, filter)
 
--- ## The web row
+-- ## Web row
 --
--- `WebProvider.qml`'s two shapes: something that reads as a hostname opens as a link, anything else
--- becomes a search. Shown for a URL always, and otherwise only when no application matched, so it
--- never sits above a real result.
+-- `WebProvider.qml`: hostname-shaped input opens as a link; other input searches. Show for a URL
+-- always, otherwise only when no application matches.
 local function looks_like_url(text)
     return text:match("^https?://[^%s]+$") ~= nil or text:match("^[%w%-]+%.[%w%-%.]+[%w]/?[^%s]*$") ~= nil
 end
@@ -153,10 +143,9 @@ local web_shown = computed({ trimmed, results }, function(text, found)
     return text ~= "" and (looks_like_url(text) or #found == 0)
 end)
 
--- What the ring is on: `selected_id` where it names a row that is showing, else the first row. The
--- fallback is what the launcher opens on, before any key has chosen, and what a hover-selected
--- row's disappearance falls back to when the next keystroke narrows the list past it. One
--- `computed` for the whole list; each row then asks one question of it.
+-- Ring `selected_id` when its row shows, else the first row. That is the launch target before input
+-- and after filtering removes the hovered row. One `computed` serves the list; each row asks it
+-- once.
 local effective_selected = computed({ selected_id, results, web_shown }, function(id, found, web)
     local first = web and WEB or (found and found[1] and found[1].id) or ""
     if id == "" then
@@ -175,8 +164,9 @@ end)
 
 -- ## Selection
 --
--- The rows in the order the arrow keys walk them: the web row first when it is showing, then the
--- results. Read at the moment a key arrives, never inside a `computed`.
+-- Arrow-key order: visible web row first, then results. Read it when the key arrives, never inside
+-- a
+-- `computed`.
 local function rows_now()
     local text = trimmed:get()
     local found = results:get() or {}
@@ -210,7 +200,7 @@ local function move(delta)
     end
     local next_index = math.max(1, math.min(current + delta, #ids))
     selected_id:set(ids[next_index])
-    -- The list's own index: the web row sits above the list, so it is not counted.
+        -- List index excludes the web row above it.
     local in_list = next_index - (ids[1] == WEB and 1 or 0)
     if in_list >= 1 then
         SCROLL:reveal(in_list)
@@ -262,10 +252,9 @@ local function row_shell(id, slot, children, opts)
         border_color = selected:map(function(on)
             return on and theme.ACCENT or "#00000000"
         end),
-        -- The mirror arms hover-selection on pointer motion so a list scrolling under a still
-        -- pointer, or opening under one, does not steal the ring from the keyboard. `on_hover`
-        -- fires only for a pointer that moved (ADR-0112 amendment), so the same holds here with no
-        -- arming flag: a row that slides under a parked mouse reads hovered and fires nothing.
+        -- The mirror arms hover selection only on pointer motion, so scrolling under a parked
+        -- pointer, or opening under one, cannot steal the keyboard ring. `on_hover` has the same
+        -- rule (ADR-0112 amendment), so no arming flag.
         on_hover = function(inside)
             if inside then
                 selected_id:set(id)
@@ -301,8 +290,8 @@ local function app_row(app)
         lines[#lines + 1] = cell(app.comment, theme.TEXT_OFF, theme.font.xs, { width = "Fill" })
     end
     return row_shell(app.id, "launcher-app-" .. app.id, {
-        -- `Utils.resolveIconSource(..., "application-x-executable")`: an entry with no `Icon=`
-        -- still gets a picture, and the generic one says what it is.
+        -- `Utils.resolveIconSource(..., "application-x-executable")`: entries without `Icon=` still
+        -- get a generic picture.
         icon { name = app.icon or "application-x-executable", size = theme.launcher_icon, align_v = "Center" },
         column { width = "Fill", align_v = "Center", children = lines },
     })
@@ -335,11 +324,10 @@ local app_list = list {
     end,
 }
 
--- ## The search box
+-- ## Search box
 --
--- `OInput` at `size: "xl"`: a glass field with a hairline, taller than any control on the bar, the
--- one thing on the card that is not a row. The engine draws the field's text and caret; the ground
--- and the ring are this `rect`, since a `textfield` paints no box of its own.
+-- `OInput` at `size: "xl"`: a glass, hairlined field taller than bar controls. The engine paints
+-- text/caret; this `rect` paints its ground and ring because `textfield` has no box.
 local search = rect {
     width = "Fill",
     height = theme.control.xl,
@@ -357,18 +345,16 @@ local search = rect {
             font_size = theme.font.lg,
             foreground = theme.FG,
             on_change = function(text)
-                -- Escape empties the field before `on_cancel` runs, so this is where "was there
-                -- text" is remembered for it. The `autofocus` arm on open also lands here with
-                -- `""`, which is what resets the selection and the scroll every time it opens.
+                -- Escape empties the field before `on_cancel`; remember whether text existed here.
+                -- Opening with autofocus also sends `""`, resetting selection and scroll.
                 emptied_a_query = text == "" and typed ~= ""
                 typed = text
                 query:set(text)
                 select_first()
             end,
             on_submit = activate,
-            -- `handleSearchKey`'s two-stage Escape: with text, clear it and stay; empty, close. The
-            -- engine has already cleared the field and let go of the keyboard by now; staying is
-            -- free because `autofocus` takes it straight back.
+            -- `handleSearchKey`'s two-stage Escape: text clears and stays; empty closes. The engine
+            -- already cleared the field and released the keyboard; autofocus takes it back.
             on_cancel = function()
                 if emptied_a_query then
                     emptied_a_query = false
@@ -399,9 +385,8 @@ local no_apps = panel_empty_state("no applications found", computed({ oblisk.app
     return text == "" and #entries_of(apps) == 0
 end))
 
--- Centred in the space under the bar, `OModal`'s `anchors.centerIn: parent`. The surface is the
--- screen minus what the bar reserved, so its own height is what to centre in; `screens[1]` on the
--- same terms as `modules/shell/panel_host.lua`'s clamp.
+-- Centered below the bar, `OModal`'s `anchors.centerIn: parent`. The surface excludes the bar's
+-- reservation, so center in its own height; `screens[1]` follows `panel_host.lua`'s clamp.
 local card_margin = oblisk.screens:map(function(screens)
     local screen = screens and screens[1]
     if not (screen and screen.width and screen.height) then
@@ -423,8 +408,9 @@ return panel {
     width = "Fill",
     height = "Fill",
     visible = ui_state.launcher_open,
-    -- Exclusive, and only while open: the field must be typable with no click, and a surface that
-    -- is not on screen must not hold anything.
+    -- Exclusive only while open: the field must be typable without a click, and an off-screen
+    -- surface
+    -- must hold nothing.
     keyboard_interactivity = ui_state.launcher_open:map(function(open)
         return open and "Exclusive" or "None"
     end),
@@ -432,8 +418,9 @@ return panel {
         width = "Fill",
         height = "Fill",
         children = {
-            -- The scrim, and the click-outside catcher in one: `hit::descend` stops at the card
-            -- above it, so only a click beside the card lands here.
+            -- Scrim and outside catcher in one. `hit::descend` stops at the card, so only clicks
+            -- beside
+            -- it land here.
             button {
                 width = "Fill",
                 height = "Fill",

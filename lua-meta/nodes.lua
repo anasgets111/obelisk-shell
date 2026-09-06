@@ -1,46 +1,37 @@
 ---@meta
--- The eight geometric nodes (`oblisk-idl-api-specs.md` § 5.2) and the properties every one of them
--- shares (§ 5.1).
+-- The eight geometric nodes (`oblisk-idl-api-specs.md` § 5.2) and their shared properties (§ 5.1).
 --
--- HAND-WRITTEN. `just stubs` does not touch this file. Of the five in `lua-meta`, only `oblisk.lua`
--- is generated, because a capability payload is a real `Serialize` struct to derive from. A node's
--- schema is 29 scattered `properties.get("...")` calls across `renderer/src/layout/node/`, so it is
--- control flow rather than data and there is nothing to derive from.
+-- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `oblisk.lua` is
+-- generated: capability payloads are `Serialize` structs, while a node's schema is 29 scattered
+-- `properties.get("...")` calls in `renderer/src/layout/node/`, so it is not derivable data.
 --
--- Two things keep it honest instead. `renderer/src/lua/nodes.rs`'s `meta_stub_tests` matches the
--- constructor roster and every kind's `---@field` names against `accepted_properties`, so a
--- property added to the engine and forgotten here fails the build. `just types` runs the language
--- server over `dev-config` with these declarations, so a *type* that is wrong shows up as a
--- diagnostic on working config code (ADR-0081).
+-- `renderer/src/lua/nodes.rs`'s `meta_stub_tests` matches constructors and each kind's `---@field`
+-- names against `accepted_properties`; a property added to the engine but omitted here fails the
+-- build. `just types` runs the language server over `dev-config` against these declarations, so a
+-- wrong type here surfaces as a diagnostic on working config code (ADR-0081).
 --
--- The `---@param props` and `---@return Node` on each constructor carry no prose on purpose. The
--- type is the whole content of the sentence, and twelve copies of "the properties above" is noise.
+-- Constructor `---@param props`/`---@return Node` lines stay bare: the type is the sentence, and
+-- twelve copies of "the properties above" add nothing.
 --
--- Every property here accepts a signal in place of a literal, and every union spells it out as
--- `Bound`. The engine resolves the handle once per pass (`node::resolve_properties`) and then
--- applies that property's normal rules to the result, so `radius = someSignal` is as ordinary as
--- `radius = 8`.
+-- Every property accepts a signal in place of a literal, spelled `Bound` in each union. The engine
+-- resolves it once per pass (`node::resolve_properties`), then applies the property's normal rules;
+-- `radius = someSignal` is as ordinary as `radius = 8`.
 --
--- The unions used to name `Signal` only on the properties a config reaches for most, on the theory
--- that spelling it everywhere would drown the useful types. That was wrong in a way worth writing
--- down: `lua-meta` is what the language server reads, so a union that omits it is not a readable
--- simplification, it is a red squiggle under working config code. Measured against
--- `lua-language-server --check`, 21 properties refused a binding the engine takes.
+-- Unions once named `Signal` only on common properties to avoid clutter. That made 21 engine-valid
+-- bindings fail under `lua-language-server --check`, because `lua-meta` is what the language server
+-- reads.
 --
--- They then spelled it `Signal`, and that was wrong in the opposite direction, which cost more.
--- A `---@class` accepts any table-shaped value in a union, so `string|Signal` on `text.content`
--- accepted every payload table in the IDL -- a notification's `body` span array included, which
--- reached the engine and froze the shell on its last good scene. `Bound` is `userdata`, the one
--- spelling that refuses a table, and it is what a signal actually is at runtime. See
--- `signals.lua`'s [`Signal`] for the measurements.
+-- Replacing those unions with `Signal` was worse: `---@class` accepts any table-shaped union
+-- member, so `string|Signal` on `text.content` admitted every IDL payload table, including a
+-- notification's `body` span array, which reached the engine and froze the shell on its last good
+-- scene. `Bound` is `userdata`, which rejects tables and matches the runtime signal; see
+-- `signals.lua`'s [`Signal`].
 --
--- Two kinds of exception, and both are properties the engine really does refuse. `id`, `hover`,
--- `scroll` and a `panel`'s `layer`/`anchor`/`monitor`/`namespace` are structural: `resolve_properties`
--- passes them through raw, because they are identities rather than values and an identity does not
--- resolve. `hover` and `scroll` still take a handle, so they are `Bound`; the rest name no binding
--- at all and that is correct. The `on_*`/`itemfn`/`key` callbacks name none either, for a duller
--- reason: a signal there resolves to whatever it holds and is then refused for not being a
--- function, so declaring the union would be true and useless.
+-- Structural exceptions are `id`, `hover`, `scroll`, and a panel's `layer`/`anchor`/`monitor`/
+-- `namespace`: `resolve_properties` passes them raw because identities do not resolve. `hover` and
+-- `scroll` still take handles, so they are `Bound`; the other structural fields do not. Callbacks
+-- (`on_*`/`itemfn`/`key`) also omit the union: a signal resolves to its value, then is refused as
+-- non-function, making the declared union true but useless.
 
 ---@alias Node table A node table, as one of the constructors below returns it.
 ---@alias Align "Start"|"Center"|"End"|"Stretch"
@@ -66,9 +57,9 @@
 ---@field cursor? Cursor|Bound The shape the pointer takes over this node. Omitted means the node decides by what it is: a `button` with an `on_click` and a link's own words are `"pointer"`, a `textfield` is `"text"`, everything else is the arrow. Set it for the exceptions: `"default"` on a control that is off, `"grab"` on a handle, `"not-allowed"` on something refused. The innermost node under the pointer that says anything wins, so a `cursor` on a card still yields to a link in its body (ADR-0107).
 ---@field on_hover? fun(hovered: boolean) Fires once when the pointer moves into this node's box and once when it leaves, not per motion event -- and only for a pointer that moved: a surface mapping under a resting pointer, or a list scrolling a new row under one, updates `hover(name)` but fires nothing, since the user did not cross anything (ADR-0112). Requires a `hover` slot on the same node and is refused without one: that signal is what remembers whether the node was hovered last pass, so it is also what tells one node's crossings from another's. Read `hover_rect(name)` for where the crossing happened. This is the only way to *do* something on hover -- `hover(name)` alone changes what is drawn, and a `computed` may not have side effects.
 
----The fill and the border, taken by every kind that paints as a box: `rect`, `row`, `column`,
----`button`, and all four surface roles. `row` and `column` have no paint properties of their own
----beyond a `rect`'s, and a surface root paints exactly like one.
+---The fill and border shared by box-painting nodes (`rect`, `row`, `column`, `button`) and all four
+---surface roles. `row` and `column` add no paint properties beyond `rect`'s; a surface root paints
+---the same way.
 ---@class BoxBase
 ---@field background? Color|Bound Omitted means no fill at all, which differs from `#00000000`: the first draws nothing, the second draws a transparent rectangle.
 ---@field radius? integer|Bound Corner rounding, default `0`.
@@ -89,11 +80,10 @@
 ---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.
 ---@field scroll? Bound The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
----One stretch of a `text`'s content with its own look (ADR-0104). The shape of a notification body
----span (`NotificationSpan`) minus `kind` and `href`, so a body's text spans can be handed over as
----they arrive; an image span has no `text` and is refused -- leave it out. `bold` and `italic` draw
----in the declared family's own bold and italic faces when fontconfig finds them, and in the regular
----face when it does not.
+---One `text` content stretch with its own look (ADR-0104), shaped like `NotificationSpan` minus
+---`kind` and `href`; body text spans pass through as received. An image span has no `text` and is
+---refused, so leave it out.
+---`bold` and `italic` use the family's own faces when fontconfig finds them, else regular.
 ---@class TextRun
 ---@field text string The run's text. An empty run is skipped.
 ---@field bold? boolean
@@ -138,21 +128,20 @@
 ---@field scroll? Bound The signal `scroll(name)` returned. Makes this a viewport its children move inside.
 
 ---@class TextfieldProps: NodeBase
----Two field kinds behind one node (ADR-0092). Declaring `secure_submit` makes it masked: its
----keystrokes go into a native buffer and out to a capability, and no Lua value ever holds them
----(ADR-0005). Declaring `on_change`/`on_submit` instead makes it plain: every edit is handed
----straight to the callback. A field declaring both stays masked, and one declaring neither is
----never focused, since nothing could read what was typed into it.
+---Two field kinds share this node (ADR-0092). `secure_submit` makes it masked: keystrokes stay in a
+---native buffer and go to a capability; no Lua value holds them (ADR-0005). `on_change`/`on_submit`
+---make it plain, handing every edit straight to the callback. Both declarations remain masked; neither means never
+---focus it, since nothing could read its input.
 ---
----Both read `wl_keyboard` directly rather than `zwp_text_input_v3`, so neither composes CJK or
----dead keys: text-input-v3 produces nothing at all unless a compositor-side input method is
----running, which would make a reply box that silently swallows every keystroke on a bare session.
+---Both read `wl_keyboard`, not `zwp_text_input_v3`, so neither composes CJK or dead keys.
+---Text-input-v3 produces nothing without a compositor-side input method, silently swallowing a
+---bare-session reply.
 ---
----A press is what focuses a plain field, so its surface must be able to take the keyboard when
----one is open -- see `keyboard_interactivity` on `panel`. The text typed into it stays for as long
----as the node exists (ADR-0108): the keyboard leaving the surface, or a press elsewhere on it,
----stops the keys and hides the caret but keeps the draft, and a press back into the same field
----resumes. Only Escape (with `on_cancel`), a submit, or the node going away empties it.
+---A press focuses a plain field; its surface needs `panel.keyboard_interactivity`.
+---Its draft lasts
+---as long as the node (ADR-0108): keyboard exit or another press stops input and hides the caret,
+---but keeps the draft; pressing the field again resumes. Only Escape with `on_cancel`, submit, or
+---node removal clears it.
 ---@field placeholder? string|Bound Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string. A focused plain field shows a caret instead, so that "empty" and "empty and typing into it" do not look alike.
 ---@field mask_character? string|Bound Capped at 1 byte. Hides typed input.
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).

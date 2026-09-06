@@ -1,32 +1,26 @@
--- Mirrors SysTray.qml: the registered `StatusNotifierItem`s laid out horizontally, each item its
--- own borderless button carrying that application's own icon.
+-- Mirrors SysTray.qml: registered `StatusNotifierItem`s laid out horizontally as borderless buttons
+-- carrying their applications' icons.
 --
--- Themed icons here, not glyphs, and that split is the point of `components/icon_button.lua`'s
--- note: a tray item ships its own artwork and nobody gets to recolour it. Everything else on this
--- bar is a glyph precisely because this config chooses those and does not choose these.
+-- Use themed icons, not glyphs: tray items ship their own artwork and cannot be recoloured, as
+-- `components/icon_button.lua` notes. The rest of this bar chooses its glyphs explicitly.
 --
--- One carve-out, and it is not really one: `foreground` on an `icon` is what CSS `color` is, the
--- value a `currentColor` fill resolves to (ADR-0072). A symbolic icon is *defined* as taking the
--- panel's colour, and Breeze bakes its own light-theme grey into the file expecting the toolkit to
--- rewrite it. Telegram's tray icon drew near-black on this bar until it did. A full-colour app
--- icon names no `currentColor` and ignores this, so it goes on every item unconditionally.
+-- `icon.foreground` is CSS `color`, the value `currentColor` resolves to (ADR-0072). Symbolic icons
+-- are defined to take the panel colour; Breeze bakes light-theme grey into the file for the toolkit
+-- to rewrite. Telegram drew near-black until this was set. Full-colour icons have no `currentColor`
+-- and ignore it, so apply it to every item.
 --
--- No ground, and absent when the tray is empty. It was a glass pill of a fixed 135px, which on a
--- session that registers nothing is an empty box sitting on the bar looking like a control that
--- failed to load, and on a session that registers two is a box with a lot of nothing to the right
--- of them. The fixed 150px that replaced it kept the second half of that: a `list` sizes to its
--- content when `width` is omitted, so stating one is a floor as well as a ceiling, and two tray
--- items sat in 110px of empty bar. The width is computed from the item count now, capped.
+-- No ground, and hidden when empty. A fixed 135px pill looked like a failed control with no items;
+-- fixed 150px left two items in 110px of empty bar because a `list` without `width` sizes to
+-- content,
+-- so a fixed width is both floor and ceiling. Compute width from item count, capped.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
 local SCROLL = scroll("sys_tray")
 
--- `Passive` means the item has nothing to say and the spec expects a bar to hide it, which is how
--- an application whose tray icon you turned off stops haunting the panel. A presentation call, so
--- it lives here rather than in the backend: `status` reaches Lua and some bars legitimately show
--- Passive items dimmed instead.
+-- Hide `Passive`: the spec treats it as no presentation, so disabling an application's tray icon
+-- removes it. This is presentation policy in Lua; other bars may dim Passive items.
 local function items_of(t)
     local out = {}
     for _, item in ipairs((t and t.items) or {}) do
@@ -37,9 +31,8 @@ local function items_of(t)
     return out
 end
 
--- `NeedsAttention` swaps in the item's own attention artwork when it ships some. Telegram does not
--- (it rewrites `icon_name` to `-attention-symbolic` itself), which is exactly why this falls back
--- to the base pair rather than drawing nothing.
+-- `NeedsAttention` uses supplied attention artwork. Telegram instead rewrites `icon_name` to
+-- `-attention-symbolic`, so fallback to the base pair rather than drawing nothing.
 local function artwork(item)
     if item.status == "NeedsAttention" and (item.attention_icon_name or item.attention_icon_path) then
         return item.attention_icon_name or item.attention_icon_path
@@ -47,21 +40,20 @@ local function artwork(item)
     return item.icon_name or item.icon_path
 end
 
--- The ceiling, not the width. A session that registers a dozen items scrolls rather than taking
--- the whole zone (ADR-0069). The mirror has no cap because a QML `RowLayout` shrinks its
--- children; a `row` here does not.
+-- The ceiling, not the width: a dozen items scroll instead of taking the zone (ADR-0069). The
+-- mirror
+-- has no cap because QML `RowLayout` shrinks children; this `row` does not.
 local TRAY_WIDTH = theme.s(150, 110)
 
--- Content-sized up to that ceiling, which § 5.1 has no `max_width` for. `width` takes a signal and
--- a signal resolves before the property is parsed (ADR-0044), so the item count can state the
--- number the engine would otherwise have measured -- the same trick `components/meter.lua` uses to
--- get a progress bar out of a `"NN%"` string.
+-- Content-sized up to the ceiling; § 5.1 has no `max_width`. `width` accepts a signal resolved
+-- before
+-- the property is parsed (ADR-0044), so item count supplies the width, like `components/meter.lua`
+-- turns `"NN%"` into a progress bar.
 --
--- ponytail: this re-derives the row's own measurement in Lua, and only `itemfn`'s icon branch is
--- `icon.md` wide. An item that registered no artwork falls back to two glyphs at `font.sm`, which
--- shape to something else, so a tray holding one of those is off by the difference. The upgrade
--- path is a `max_width` on § 5.1: the engine already knows every child's real width and this
--- guesses at it.
+-- ponytail: Lua re-derives row measurement. The icon branch is `icon.md`, but no-artwork fallback
+-- uses two `font.sm` glyphs, so a tray containing one is off by that difference. Upgrade path:
+-- § 5.1
+-- `max_width`, letting the engine use real child widths.
 local ITEM_WIDTH = theme.icon.md + theme.spacing.xs
 
 local function tray_width(count)
@@ -86,10 +78,9 @@ return list {
         if art then
             return icon { name = art, size = theme.icon.md, align_v = "Center", foreground = theme.FG }
         end
-        -- No artwork registered, which happens, and is what the faint smudge between the
-        -- bluetooth circle and the clock was: two 9px letters at `DIM` next to a row of 22px
-        -- glyphs reads as a rendering fault rather than as a fallback. Same weight as the icons
-        -- it stands in for.
+        -- No artwork happens. Two 9px `DIM` letters beside 22px glyphs looked like a rendering
+        -- fault
+        -- between Bluetooth and the clock, so match the icon weight.
         return cell((item.name or item.id or "?"):sub(1, 2), theme.FG, theme.font.sm, { align_v = "Center" })
     end,
     key = function(item)

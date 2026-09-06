@@ -7,14 +7,11 @@ local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local section_header = require("components.section_header")
 
--- A real `xdg_toplevel`, opened from `power_menu.lua`'s settings row and, since `panel_header`
--- joined this file, closable from inside itself too. The compositor places and sizes this, not the
--- config: § 6 gives a `window` no `monitor`, no `anchor` and no size, so `niri msg windows` is
--- where you check that the title and app_id arrived.
+-- A real `xdg_toplevel`, opened by `power_menu.lua` and closable through its `panel_header`. § 6
+-- gives a `window` no monitor, anchor, or size; inspect placement with `niri msg windows`.
 --
--- What is left here is the readouts with no indicator of their own. The bluetooth section moved to
--- `panels/bluetooth_panel.lua` when that panel gained an indicator to open it, which is the split
--- Quickshell draws too: a control belongs behind the thing it controls.
+-- This holds readouts without indicators. Bluetooth moved to `panels/bluetooth_panel.lua` when it
+-- gained its own opener, matching Quickshell's control-behind-what-it-controls split.
 return window {
     id = "settings",
     title = "Oblisk settings",
@@ -22,8 +19,8 @@ return window {
     min_size = { width = 320, height = 240 },
     max_size = { width = 1280, height = 800 },
     visible = ui_state.settings_open,
-    -- `panel_card`'s own defaults are the popup shape (10px radius): this is an opaque toplevel
-    -- with no edge to round against, so `radius = 0` overrides it.
+    -- `panel_card` defaults to a 10px popup radius; this opaque toplevel has no edge to round
+    -- against, so `radius = 0`.
     child = panel_card({
         panel_header {
             title = "oblisk settings",

@@ -1,19 +1,16 @@
 //! Idle capability (`oblisk.idle`, docs/oblisk-supervisor-services-dbus.md §7; ADR-0032).
-//! Splits transport -- `ext_idle_notifier_v1` on the Supervisor's own dedicated Wayland
-//! connection for notify, `org.freedesktop.login1.Manager.Inhibit` on the existing system-bus
-//! connection for inhibit -- but shares one controller and one generation-scoped cleanup hook.
+//! Notify uses the Supervisor's dedicated `ext_idle_notifier_v1` Wayland connection; inhibit uses
+//! `org.freedesktop.login1.Manager.Inhibit` on the existing system bus. They share one controller
+//! and generation-scoped cleanup.
 //!
-//! Notify degrades to inert (silent no-op, logged once) if the protocol isn't advertised, the
-//! dedicated connection fails, or setup exceeds [`IDLE_NOTIFY_SETUP_TIMEOUT`]; setup runs as a
-//! background task from [`IdleController::new`], which returns immediately, so a hung
-//! compositor can never delay boot. Inhibit has no equivalent degrade path -- it rides the
-//! Supervisor's already-required system-bus connection, so its only failure mode is a
-//! per-request `Inhibit` call failing (see [`IdleController::inhibit`]).
+//! Notify becomes inert (silent no-op, logged once) if the protocol is absent, its connection
+//! fails, or setup exceeds [`IDLE_NOTIFY_SETUP_TIMEOUT`]. Background setup lets
+//! [`IdleController::new`] return before a hung compositor. Inhibit rides the required system
+//! bus, so only its per-request `Inhibit` call can fail (see [`IdleController::inhibit`]).
 //!
-//! The real decision logic lives in pure, unit-testable seams -- [`register_threshold_entry`]/
-//! [`cleanup_generation_thresholds`] for notify fan-out, [`apply_inhibit`]/
-//! [`apply_release_inhibit`]/[`cleanup_generation_inhibit`] for the inhibit refcount -- wrapped
-//! by thin async/Wayland-touching methods on [`IdleController`].
+//! Pure seams hold the decisions: [`register_threshold_entry`]/[`cleanup_generation_thresholds`]
+//! for notify and [`apply_inhibit`]/[`apply_release_inhibit`]/[`cleanup_generation_inhibit`] for
+//! refcounts. [`IdleController`] wraps them with async/Wayland operations.
 
 pub mod controller;
 pub mod gate;
@@ -24,8 +21,8 @@ pub mod state;
 pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
 pub use state::IdleState;
 
-/// Every action `oblisk.idle:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.idle:invoke(...)`; exhaustive dispatch keeps variants and arms in
+/// sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleAction {
@@ -34,9 +31,8 @@ pub enum IdleAction {
     ReleaseInhibit,
 }
 
-/// `oblisk.idle`'s action dispatch (ADR-0037): owns the action match, argument parse, and
-/// write-action spawn for every `idle` `CommandEnvelope`. Every action carries the
-/// registering generation's own id (ADR-0032/ADR-0006).
+/// `oblisk.idle` action dispatch (ADR-0037): matches, parses, and spawns every `idle`
+/// `CommandEnvelope`; each action carries its registering generation id (ADR-0032/ADR-0006).
 pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let generation_id = params.generation_id;

@@ -1,30 +1,24 @@
-//! The inhibit gate for `oblisk.idle` (ADR-0139): what a held logind idle inhibitor does to the
-//! threshold events this Supervisor forwards.
+//! The `oblisk.idle` inhibit gate (ADR-0139): how a held logind inhibitor affects threshold events.
 //!
-//! Oblisk is the idle daemon on this machine. `IdleAction=ignore` in `logind.conf` is the usual
-//! configuration for a session that runs its own, so nothing but this shell acts on idleness, and
-//! that makes honouring an inhibitor this shell's job rather than logind's.
+//! Oblisk is the idle daemon here. With `IdleAction=ignore` in `logind.conf`, this shell alone acts
+//! on idleness, so it must honor inhibitors rather than logind.
 //!
-//! ADR-0032 gave `oblisk.idle` a write half (`inhibit`/`release_inhibit`) and no read half, which
-//! left the capability holding an inhibitor it then ignored: a config could ask logind not to let
-//! the session idle and still get the `on_idle` that dims the screen. `systemd-inhibit
-//! --what=idle mpv film.mkv` from any other application had the same problem from the outside.
+//! ADR-0032 gave `oblisk.idle` `inhibit`/`release_inhibit` writes but no read half. A config could
+//! ask logind to prevent idle and still receive `on_idle`; external `systemd-inhibit
+//! --what=idle mpv film.mkv` had the same problem.
 //!
-//! The gate closes both at once. `Manager.BlockInhibited` is a colon-separated list of what is
-//! currently blocked, with change notification, so one property watch answers "is anything holding
-//! an idle inhibitor" for every holder including this shell's own. While it names `idle`, no
-//! threshold event is forwarded, and `idle:inhibit(reason)` becomes the mechanism it always read
-//! like rather than a flag set and then ignored.
+//! The gate closes both. `Manager.BlockInhibited` is a change-notified, colon-separated list, so
+//! one property watch answers whether any holder, including this shell, blocks idle. While it
+//! names `idle`, threshold events stop and `idle:inhibit(reason)` has its expected effect.
 //!
-//! Wayland surface inhibitors are a separate mechanism and need nothing here: ADR-0032 picked
-//! `get_idle_notification` over `get_input_idle_notification`, and the compositor already withholds
-//! `idled` for those. This is the logind half of the same idea.
+//! Wayland surface inhibitors need nothing here: ADR-0032 uses `get_idle_notification` rather than
+//! `get_input_idle_notification`, and the compositor already withholds `idled` for them.
 
 use std::collections::HashSet;
 
-/// `Manager.BlockInhibited`'s `what` field, split. A colon-separated list, e.g.
-/// `"handle-power-key"` or `"idle:sleep"`, and `"idle"` has to match a whole entry: a substring
-/// test would read `"handle-lid-switch"` as an idle block on a machine with a different set.
+/// `Manager.BlockInhibited`'s colon-separated `what` entries, e.g. `"handle-power-key"` or
+/// `"idle:sleep"`. Match `"idle"` as a whole entry; substring matching would misread
+/// `"handle-lid-switch"`.
 pub(crate) fn blocks_idle(block_inhibited: &str) -> bool {
     block_inhibited.split(':').any(|what| what == "idle")
 }
@@ -34,17 +28,15 @@ pub(crate) fn blocks_idle(block_inhibited: &str) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct IdleGate {
     blocked: bool,
-    /// Every `(generation_id, threshold_sec)` an `Idled` was forwarded for and no `Resumed` has
-    /// been forwarded for yet.
+    /// Every `(generation_id, threshold_sec)` with a forwarded `Idled` and no `Resumed` yet.
     idled: HashSet<(u32, u64)>,
 }
 
 impl IdleGate {
     /// One raw threshold event. `None` drops it.
     ///
-    /// A `Resumed` is dropped under a block along with the `Idled`s: if the pair was open when the
-    /// inhibitor arrived, [`Self::set_blocked`] already closed it, and if it was not, this
-    /// `Resumed` answers nothing.
+    /// Drops `Resumed` under a block. If the pair was open when the inhibitor arrived,
+    /// [`Self::set_blocked`] already closed it; otherwise it answers nothing.
     pub(crate) fn observe(&mut self, event: shared::IdleEvent) -> Option<shared::IdleEvent> {
         if self.blocked {
             return None;
@@ -61,23 +53,19 @@ impl IdleGate {
         Some(event)
     }
 
-    /// A change in what logind reports as blocked. `None` when this is the same answer as last
-    /// time, which is most calls: `BlockInhibited` changes whenever *anything* is inhibited, and
-    /// almost none of it is idle. `Some` carries the `Resumed` events now owed, so a config that
-    /// dimmed the screen at 30 seconds gets its undim when a film starts -- which is the whole
-    /// reason the `idled` set is tracked rather than a bare flag.
+    /// A change in logind's idle-block answer. `None` means unchanged; `BlockInhibited` changes
+    /// for every inhibitor, most unrelated to idle. `Some` carries owed `Resumed` events, so a
+    /// config dimmed at 30 seconds undims when a film starts; hence the tracked `idled` set.
     ///
-    /// The gate starts unblocked, so the first observation of an unblocked system is `None` and
-    /// logs nothing. An inhibitor already held at startup is a real change and does log.
+    /// Starts unblocked: an unblocked first observation is `None` and logs nothing; an inhibitor
+    /// already held at startup is a real change and logs.
     ///
-    /// Nothing is replayed on release. If the seat is still idle when the inhibitor goes away, the
-    /// compositor has already sent its `idled` and will not send it again, so the screen stays
-    /// awake until the next idle period.
+    /// Release replays nothing. If the seat is still idle, the compositor already sent `idled` and
+    /// will not send it again, so the screen stays awake until the next idle period.
     ///
-    /// ponytail: that is the safe direction to fail and it is still wrong. The fix is asking the
-    /// compositor for the seat's current idleness on release, which `ext-idle-notifier-v1` has no
-    /// call for -- it would mean tearing down every notification and re-creating it, and the
-    /// re-created ones fire from zero rather than from when the user actually stopped.
+    /// ponytail: Still wrong, but safe. The fix is querying current seat idleness on release;
+    /// `ext-idle-notifier-v1` has no such call. Recreating every notification would fire from zero,
+    /// not from when the user stopped.
     pub(crate) fn set_blocked(&mut self, blocked: bool) -> Option<Vec<shared::IdleEvent>> {
         if blocked == self.blocked {
             return None;
@@ -95,8 +83,7 @@ impl IdleGate {
                 state: shared::IdleState::Resumed,
             })
             .collect();
-        // A `HashSet`'s drain order is arbitrary and these reach Lua callbacks; sorted so a
-        // config's undim runs in the same order twice.
+        // HashSet drain order is arbitrary; sort before Lua callbacks for repeatable undims.
         owed.sort_by_key(|event| (event.generation_id, event.threshold_sec));
         Some(owed)
     }
@@ -121,8 +108,8 @@ mod tests {
         assert!(!blocks_idle("shutdown:sleep"));
     }
 
-    /// The startup case: nothing is inhibited, the gate already thinks so, and the watcher must
-    /// not announce a release that never happened.
+    /// Startup with no inhibitor: the gate already agrees, so do not announce a nonexistent
+    /// release.
     #[test]
     fn observing_an_unblocked_system_at_startup_is_not_a_change() {
         assert_eq!(IdleGate::default().set_blocked(false), None);
@@ -143,8 +130,8 @@ mod tests {
         assert_eq!(gate.observe(event(1, 30, IdleState::Resumed)), None);
     }
 
-    /// The point of tracking the set: a config that dimmed at 30s must get its undim when a film
-    /// takes an inhibitor, not be left dimmed until the user touches the keyboard.
+    /// A config dimmed at 30s must get its undim when a film takes an inhibitor, not wait for
+    /// input.
     #[test]
     fn an_arriving_inhibitor_takes_back_every_idle_it_had_announced() {
         let mut gate = IdleGate::default();
@@ -172,8 +159,8 @@ mod tests {
         assert_eq!(gate.set_blocked(true), Some(Vec::new()));
     }
 
-    /// `BlockInhibited` changes whenever anything at all is inhibited, most of it unrelated to
-    /// idle, so the same answer twice must not re-announce a resume.
+    /// `BlockInhibited` changes for unrelated inhibitors too; the same idle answer must not
+    /// re-announce a resume.
     #[test]
     fn repeating_the_same_block_state_owes_nothing() {
         let mut gate = IdleGate::default();

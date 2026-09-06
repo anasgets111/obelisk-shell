@@ -2,9 +2,8 @@ use std::ffi::c_void;
 
 use khronos_egl as egl;
 
-/// The attributes of a candidate EGL frame buffer configuration, as reported by
-/// `eglGetConfigAttrib`. Kept separate from `egl::Config` so `satisfies_requirements`
-/// stays a pure function testable without a live EGL display.
+/// `eglGetConfigAttrib`'s candidate fields, kept separate from `egl::Config` so
+/// `satisfies_requirements` stays pure and testable without a live EGL display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigAttribs {
     pub surface_type: egl::Int,
@@ -15,12 +14,10 @@ pub struct ConfigAttribs {
     pub alpha_size: egl::Int,
 }
 
-/// A config must back an on-screen window surface, render GLES3, and give exactly
-/// 8-bit-per-channel ARGB.
+/// Requires an on-screen window surface, GLES3, and exactly 8-bit-per-channel ARGB.
 ///
-/// `eglChooseConfig` is supposed to only return matches, but its attribute lists are bitmask
-/// supersets and driver behavior around exact-vs-minimum component sizes is inconsistent enough
-/// to be worth re-validating directly rather than trusting the first candidate returned.
+/// `eglChooseConfig` promises matches but returns bitmask supersets. Drivers disagree on exact
+/// versus minimum component sizes, so revalidate every candidate instead of trusting the first.
 pub fn satisfies_requirements(attrs: ConfigAttribs) -> bool {
     attrs.surface_type & egl::WINDOW_BIT != 0
         && attrs.renderable_type & egl::OPENGL_ES3_BIT != 0
@@ -30,8 +27,8 @@ pub fn satisfies_requirements(attrs: ConfigAttribs) -> bool {
         && attrs.alpha_size == 8
 }
 
-/// Live EGL state shared by every static surface: one display connection, one config,
-/// one GLES3 context. Surfaces are created per `wl_surface` against this shared context.
+/// Shared by every static surface: one display, config, and GLES3 context; one EGL surface per
+/// `wl_surface`.
 pub struct EglState {
     pub instance: egl::Instance<egl::Static>,
     pub display: egl::Display,
@@ -39,14 +36,13 @@ pub struct EglState {
     pub context: egl::Context,
 }
 
-/// Initializes EGL against the Wayland display and picks the first config that
-/// genuinely satisfies [`satisfies_requirements`], not just the first one
-/// `eglChooseConfig` hands back.
+/// Initializes EGL against Wayland and picks the first candidate that satisfies
+/// [`satisfies_requirements`], not merely the first returned by `eglChooseConfig`.
 pub fn init(wl_display_ptr: *mut c_void) -> Result<EglState, String> {
     let instance = egl::Instance::new(egl::Static);
 
-    // SAFETY: wl_display_ptr comes from Connection::backend().display_ptr(), a live
-    // wl_display for the whole lifetime of this process's Wayland connection.
+    // SAFETY: `wl_display_ptr` comes from `Connection::backend().display_ptr()` and stays live
+    // for this process's Wayland connection.
     let display = unsafe { instance.get_display(wl_display_ptr) }
         .ok_or("eglGetDisplay returned no display for the Wayland connection")?;
 
@@ -131,7 +127,6 @@ mod tests {
 
     #[test]
     fn accepts_config_with_extra_bits_set() {
-        // Supporting ES2 as well as ES3, and pbuffer as well as window, still satisfies the mask.
         let mut attrs = full_match();
         attrs.surface_type |= egl::PBUFFER_BIT;
         attrs.renderable_type |= egl::OPENGL_ES2_BIT;

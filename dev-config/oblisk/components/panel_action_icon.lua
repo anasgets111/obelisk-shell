@@ -1,11 +1,10 @@
--- A row's own small control, `Components/PanelActionIcon.qml`: a glyph with no ground of its own,
--- tinted by what it does -- red to disconnect or forget -- that only grows a ground under the
--- pointer. Quieter than a `components/icon_button.lua` on purpose: a list of six rows each carrying
--- two of these would otherwise read as eighteen buttons, and the row is the thing to look at.
+-- A row's small control, matching `Components/PanelActionIcon.qml`: tinted by what it does, red to
+-- disconnect or forget, with no ground until hover. It stays quieter than
+-- `components/icon_button.lua`; two per six-row list must not read as eighteen buttons.
 local theme = require("config.theme")
 local icon_button = require("components.icon_button")
 
--- Fully transparent, so the ring `icon_button` would otherwise draw is off too (`border = false`).
+-- Fully transparent; `border = false` also disables `icon_button`'s ring.
 local CLEAR = "#00000000"
 
 ---@param glyph string
@@ -13,8 +12,8 @@ local CLEAR = "#00000000"
 ---@param opts { slot: string, tint?: Color, visible?: boolean|Bound }
 return function(glyph, on_activate, opts)
     local tint = opts.tint or theme.FG
-    -- The same registry entry `icon_button` will ask for under this slot (ADR-0062 decision 2), so
-    -- the glyph brightens on the hover the button already tracks.
+    -- `icon_button` asks for the same registry entry under this slot (ADR-0062 decision 2), so the
+    -- glyph brightens with the button's hover.
     local hovered = hover(opts.slot)
     return icon_button(glyph, on_activate, {
         slot = opts.slot,

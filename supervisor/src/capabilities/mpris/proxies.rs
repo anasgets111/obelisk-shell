@@ -1,11 +1,8 @@
-//! Hand-written proxies for `org.mpris.MediaPlayer2`/`org.mpris.MediaPlayer2.Player` (no
-//! maintained zbus proxy crate for MPRIS). Split from `dbus::mpris` -- see `dbus/mpris/mod.rs`
-//! for the module-level doc.
+//! Hand-written proxies for `org.mpris.MediaPlayer2`/`Player`; no maintained zbus MPRIS crate.
+//! Split from `dbus::mpris`; see `dbus/mpris/mod.rs`.
 //!
-//! Every real MPRIS player lives at the fixed object path `/org/mpris/MediaPlayer2` (the
-//! freedesktop spec doesn't allow otherwise), but the bus name (`destination`) varies per player
-//! -- so these declare `default_path` only, never `default_service`, and every binder below takes
-//! the bus name explicitly.
+//! Every player uses fixed `/org/mpris/MediaPlayer2` (the freedesktop spec disallows otherwise),
+//! while `destination` varies. Declare `default_path` only; binders take the bus name explicitly.
 
 use std::collections::HashMap;
 
@@ -15,8 +12,8 @@ use zbus::zvariant::{ObjectPath, OwnedValue};
 pub(super) trait MprisRoot {
     #[zbus(property, name = "Identity")]
     fn identity(&self) -> zbus::Result<String>;
-    /// Optional in the real spec: several players publish no `.desktop` file name at all, so this
-    /// erroring is an answer rather than a failure (ADR-0137).
+    /// Optional in the spec; several players publish no `.desktop` name, so absence is an answer
+    /// rather than a failure (ADR-0137).
     #[zbus(property, name = "DesktopEntry")]
     fn desktop_entry(&self) -> zbus::Result<String>;
 }
@@ -33,13 +30,12 @@ pub(super) trait MprisPlayer {
     fn next(&self) -> zbus::Result<()>;
     #[zbus(name = "Previous")]
     fn previous(&self) -> zbus::Result<()>;
-    /// Relative seek, microseconds -- also `mpris:trackid`'s fallback when no trackid is cached
-    /// (ADR-0036).
+    /// Relative seek in microseconds; also the `mpris:trackid` fallback when uncached (ADR-0036).
     #[zbus(name = "Seek")]
     fn seek(&self, offset_us: i64) -> zbus::Result<()>;
-    /// Absolute seek. `track_id` must be the *currently playing* track's `mpris:trackid` per
-    /// the real freedesktop spec (a no-op otherwise) -- ADR-0036 notes this isn't reliably
-    /// enforced by every real player, so the cache feeding this is kept fresh regardless.
+    /// Absolute seek. Per freedesktop, `track_id` must be the currently playing track's
+    /// `mpris:trackid` or the call is a no-op. Real players do not enforce this reliably, so the
+    /// cache stays fresh (ADR-0036).
     #[zbus(name = "SetPosition")]
     fn set_position(&self, track_id: ObjectPath<'_>, position_us: i64) -> zbus::Result<()>;
 
@@ -47,12 +43,10 @@ pub(super) trait MprisPlayer {
     fn playback_status(&self) -> zbus::Result<String>;
     #[zbus(property, name = "Metadata")]
     fn metadata(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
-    /// The real freedesktop spec excludes `Position` from `PropertiesChanged` (it changes too
-    /// often). zbus's proxy macro caches a `#[zbus(property)]` getter's value and only
-    /// refreshes it on that property's own change signal, so without `emits_changed_signal =
-    /// "false"` here this always returns whatever was cached on the first read -- confirmed
-    /// live via `busctl` showing a real player's `Position` genuinely advancing while this
-    /// stayed at a stale `0`.
+    /// Freedesktop excludes `Position` from `PropertiesChanged` because it changes too often.
+    /// zbus otherwise caches this getter until that absent signal; live `busctl` showed a player
+    /// advancing while the getter stayed at stale `0`. Disable caching with
+    /// `emits_changed_signal = "false"`.
     #[zbus(property(emits_changed_signal = "false"), name = "Position")]
     fn position(&self) -> zbus::Result<i64>;
     #[zbus(property, name = "CanControl")]
@@ -68,9 +62,8 @@ pub(super) trait MprisPlayer {
     #[zbus(property, name = "CanGoPrevious")]
     fn can_go_previous(&self) -> zbus::Result<bool>;
 
-    /// The real freedesktop spec excludes `Position` from `PropertiesChanged`; a discontinuous
-    /// jump is signaled here instead. `player.rs`'s forwarder task waits on this for
-    /// position-only changes, alongside `PlaybackStatus`/`Metadata`'s own change streams.
+    /// Freedesktop excludes `Position` from `PropertiesChanged`; this signal marks discontinuous
+    /// jumps. `player.rs` waits on it for position-only changes beside `PlaybackStatus`/`Metadata`.
     #[zbus(signal, name = "Seeked")]
     fn seeked(&self, position_us: i64) -> zbus::Result<()>;
 }

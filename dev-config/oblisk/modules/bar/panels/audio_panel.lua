@@ -1,16 +1,13 @@
--- Mirrors AudioPanel.qml: a masthead, one card for the output and one for the microphone, each a
--- name, a percentage, a mute button and a slider, with a device picker folded under it when there
--- is more than one device to pick; then the application mixer, one slider per stream.
+-- Mirrors AudioPanel.qml: masthead, output/microphone cards with pickers, then one slider per
+-- application stream.
 --
--- The sliders are `components/slider.lua`, on `button`'s `on_drag`/`on_wheel` (ADR-0116). The
--- device pickers and the mixer fold open on a click, `PanelRow.expandable`, held in three `state()`
--- signals here; the mirror closes both pickers when the panel closes and this does not, since a
--- picker left open across a close is a picker the user opened.
+-- Sliders use `components/slider.lua` and `button`'s `on_drag`/`on_wheel` (ADR-0116). Device
+-- pickers and the mixer fold open on a click, using `PanelRow.expandable` backed by three
+-- `state()` signals.
+-- Unlike the mirror, closing the panel does not close a picker the user left open.
 --
--- Not carried over: the mirror's 150% headroom with a marker at 100% (`set_volume` clamps to
--- `[0.0, 1.0]`, § 3.2), and the per-stream application icon resolved through a desktop-entry
--- lookup, which this does through `oblisk.applications` where the process name is an `app_id` and
--- falls back to a note glyph where it is not.
+-- Dropped: 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`, § 3.2). Stream
+-- icons use `oblisk.applications` and `app_id`, falling back to a note glyph.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -44,9 +41,8 @@ local function active_device(devices)
     return nil
 end
 
--- `AudioService.deviceIconFor`: PipeWire's `device.icon-name` says what kind of thing a device is,
--- and a headset row should look like one. The hint is a theme icon name, so the words in it are
--- what is matched; a device with no hint gets the picker's default.
+-- `AudioService.deviceIconFor`: match words in PipeWire's `device.icon-name`; no hint gets the
+-- picker's default.
 local function device_glyph(device, default)
     local hint = (device and device.icon) or ""
     if hint:find("headset") or hint:find("hands%-free") then
@@ -59,7 +55,7 @@ local function device_glyph(device, default)
     return default
 end
 
--- `AudioService.normalizeDeviceName`: the ALSA description carries words a person does not need.
+-- `AudioService.normalizeDeviceName`: remove redundant ALSA description words.
 local function device_name(device)
     if device == nil then
         return nil
@@ -73,8 +69,8 @@ local function device_name(device)
     return name ~= "" and name or device.name
 end
 
--- The mirror's `AudioControl`: a card holding a title row (glyph, title over the device name, the
--- percentage, a mute button), a slider, and whatever the caller folds under it.
+-- Mirror `AudioControl`: title/device row, percentage, mute button, slider, and caller-supplied
+-- rows.
 ---@class AudioControlOpts
 ---@field name string The slider's state name.
 ---@field title string
@@ -158,8 +154,8 @@ local function audio_control(opts)
     })
 end
 
--- The mirror's `DevicePicker`: a "choose device" row that folds open into one row per device, the
--- active one ringed and ticked. Shown only with something to choose between.
+-- Mirror `DevicePicker`: a "choose device" row expands to one row per device, with the active one
+-- ringed and ticked. Show it only when there is a choice.
 local function device_picker(opts)
     local devices = oblisk.audio:map(function(a)
         return (a and opts.list(a)) or {}
@@ -208,8 +204,8 @@ local function device_picker(opts)
     }
 end
 
--- One mixer stream, the mirror's `StreamItem`: the application's icon and name, its percentage,
--- a mute glyph, and a thinner slider under them.
+-- One mixer stream, the mirror's `StreamItem`: app icon/name, percentage, mute glyph, and thin
+-- slider.
 local function stream_row(app)
     local name = app.name or app.process_name or "unknown"
     local entry = util.app_entry(oblisk.applications:get(), app.process_name or app.name)
@@ -328,8 +324,7 @@ local body = {
             },
         },
     },
-    -- The mirror's `MixerSection`: one row that says how many applications are playing, folding
-    -- open into a slider per stream, capped at a few rows and scrolling past that.
+    -- `MixerSection`: application count, expanding to one slider per stream, capped and scrollable.
     panel_card({
         panel_row {
             slot = "audio-mixer",

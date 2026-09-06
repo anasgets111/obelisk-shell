@@ -1,23 +1,18 @@
 //! Media players (`oblisk.mpris`, docs/oblisk-supervisor-services-dbus.md §3;
 //! docs/oblisk-idl-api-specs.md §2.8; ADR-0036).
 //!
-//! Supervisor-owned session-bus MPRIS player discovery and zero-polling progress-sync state,
-//! so `mpris.players` survives a Renderer crash/reload the same way idle/lock authority does
-//! (ADR-0010). Position is captured once with a monotonic timestamp rather than polled; a
-//! progress bar interpolates the elapsed time client-side. Seeking reads a live position over
-//! D-Bus on demand instead of tracking one continuously. Hand-written `#[zbus::proxy]` traits
-//! (`proxies.rs` -- no maintained zbus proxy crate for MPRIS), a `HashMap<bus_name, entry>`
-//! dynamic registry hydrated live and kept live via one forwarder task per tracked player
-//! (`player.rs`), a `*Controller` struct owning that registry plus write-action dispatch
-//! (`controller.rs`), and pure parsing/comparison helpers unit-testable without a live D-Bus
-//! connection (`metadata.rs`).
+//! Supervisor-owned session-bus MPRIS discovery and zero-polling progress state, so `mpris.players`
+//! survives Renderer crash/reload like idle/lock authority (ADR-0010). Capture position once with
+//! a monotonic timestamp and interpolate elapsed time client-side; read live position only when
+//! seeking. Hand-written proxies (`proxies.rs`), a live `HashMap<bus_name, entry>` registry with
+//! one forwarder per player (`player.rs`), controller dispatch (`controller.rs`), and pure
+//! parsing/comparison helpers in `metadata.rs`, unit-testable without a live D-Bus connection,
+//! make the boundaries explicit.
 //!
-//! MPRIS players never register with anything -- discovery is active (`watcher.rs`):
-//! `ListNames` scanned once at startup, then `NameOwnerChanged` watched for the
-//! `org.mpris.MediaPlayer2.` prefix going forward for both arrival and departure. This shape,
-//! and every other real design decision in this module (`playerctld` exclusion, album-art
-//! trust-checking, track-identity caching, `SetPosition`'s `TrackId` fallback), is grounded
-//! in ADR-0036.
+//! Players never register; discovery is active (`watcher.rs`): scan `ListNames` once, then watch
+//! `NameOwnerChanged` for `org.mpris.MediaPlayer2.` arrivals and departures. ADR-0036 also fixes
+//! `playerctld` exclusion, album-art trust checks, track-identity caching, and `SetPosition`'s
+//! `TrackId` fallback.
 
 pub mod controller;
 pub mod metadata;
@@ -27,8 +22,8 @@ pub mod watcher;
 
 pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args, parse_seek_relative_args};
 
-/// Every action `oblisk.mpris:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.mpris:invoke(...)`; exhaustive dispatch keeps variants and arms in
+/// sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MprisAction {
@@ -37,9 +32,8 @@ pub enum MprisAction {
     SeekRelative,
 }
 
-/// `oblisk.mpris`'s action dispatch (ADR-0037): owns the action match, argument parse, and
-/// write-action spawn for every `mpris` `CommandEnvelope`. Write actions are `tokio::spawn`ed
-/// rather than awaited inline (ADR-0036/ADR-0029).
+/// `oblisk.mpris` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
+/// action (ADR-0036/ADR-0029).
 pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<MprisAction>(params) else { return };

@@ -1,8 +1,7 @@
 //! `oblisk.updates` capability: package update checking and installation (ADR-0034).
 //!
-//! Separated into a schedule component and a backend abstraction (ADR-0134).
-//! `backend.rs` defines the backend trait; `pacman/` implements it for Arch Linux.
-//! Separate from `oblisk.sysinfo` scheduler with no shared code (ADR-0034).
+//! Separates scheduling from the backend abstraction (ADR-0134): `backend.rs` defines the trait and
+//! `pacman/` implements it for Arch. The scheduler is independent of `oblisk.sysinfo` (ADR-0034).
 
 pub mod backend;
 pub mod controller;
@@ -10,8 +9,7 @@ pub mod pacman;
 
 pub use controller::{UpdatesController, UpdatesSignal, parse_configure_args};
 
-/// Every action `oblisk.updates:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.updates:invoke(...)`; `dispatch` keeps the table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatesAction {
@@ -20,9 +18,8 @@ pub enum UpdatesAction {
     Install,
 }
 
-/// `oblisk.updates` action dispatch (ADR-0037): `check` and `configure` are synchronous,
-/// sending scheduler channel requests (ADR-0034). `install` runs a package manager child
-/// and is spawned asynchronously.
+/// `oblisk.updates` dispatch (ADR-0037): `check`/`configure` send scheduler requests synchronously
+/// (ADR-0034); `install` spawns the package-manager child.
 pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<UpdatesAction>(params) else { return };

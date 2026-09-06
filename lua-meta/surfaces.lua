@@ -1,21 +1,19 @@
 ---@meta
--- The four surface roles (`oblisk-idl-api-specs.md` § 6, ADR-0040). A `wl_surface` is inert until a
--- protocol assigns it a role; these are the four this shell exposes, one constructor each. What
--- `shell.lua` returns is the whole surface set, evaluated fresh on every reload (ADR-0038).
+-- The four surface roles (`oblisk-idl-api-specs.md` § 6, ADR-0040); a `wl_surface` stays inert.
+-- Protocol assigns its role. This shell has one constructor per role. `shell.lua` returns the set,
+-- freshly evaluated on every reload (ADR-0038).
 --
--- HAND-WRITTEN, on the same terms as `nodes.lua`: see that file's header for what generates,
--- what does not, and what checks this one. The constructors' `---@param props`/`---@return Node`
--- are deliberately bare there too.
+-- HAND-WRITTEN, on `nodes.lua`'s terms. Its header covers generation and checks; constructor
+-- `---@param props`/`---@return Node` lines are bare there too.
 --
--- `id`, `layer`, `anchor` and `monitor` reject a `Signal`, unlike every other property in the IDL.
--- They are read once per evaluation to decide whether a reload is an in-place update or a full
--- generation swap (ADR-0001), and a value that moved afterwards would strand that decision.
+-- `id`, `layer`, `anchor`, and `monitor` reject `Signal`, unlike the rest. Read them once per
+-- evaluation to choose in-place reload or full generation swap (ADR-0001); a later change would
+-- strand that decision.
 
 ---@alias Rect { x: number, y: number, width: number, height: number }
 ---@alias PopupAnchor "Top"|"Bottom"|"Left"|"Right"|"TopLeft"|"TopRight"|"BottomLeft"|"BottomRight"|"Center"
 
----A surface root takes every `NodeBase` property a `rect` does and paints like one, on top of its
----own § 6 topology.
+---A surface root uses `rect`'s `NodeBase` properties, paints like one, and keeps its § 6 topology.
 ---@class PanelProps: NodeBase, BoxBase
 ---@field id string Unique. A surface targeting several outputs is one Wayland surface per output, addressed as `"{id}@{output}"`.
 ---@field layer "Background"|"Bottom"|"Top"|"Overlay" Required, no default: a typo'd layer that quietly stacked a bar on `Background` would be worse than an error.
@@ -67,14 +65,13 @@ function panel(props) end
 ---@return Node
 function window(props) end
 
----An `xdg_popup`, rooted under its parent surface. Dropdown, context menu, tooltip. Costs nothing
----until shown: a popup with `visible = false` creates no Wayland object (ADR-0049).
+---An `xdg_popup` under its parent surface. Dropdown, context menu, or tooltip. Hidden popups create
+---no Wayland object until shown (`visible = false`, ADR-0049).
 ---@param props PopupProps
 ---@return Node
 function popup(props) end
 
----An `ext_session_lock_surface_v1`. Gets keyboard focus from the protocol rather than from
----`keyboard_interactivity`.
+---An `ext_session_lock_surface_v1`; focus comes from the protocol, not `keyboard_interactivity`.
 ---@param props LockProps
 ---@return Node
 function lock(props) end

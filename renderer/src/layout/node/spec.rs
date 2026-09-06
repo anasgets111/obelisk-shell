@@ -1,9 +1,5 @@
-//! The surface-spec envelope: [`LockSpec`] (§ 6), the [`SurfaceSpec`] enum every surface role
-//! resolves to and its [`SurfaceFingerprint`] (swap-detection key), the generic child-list parsers
-//! (`parse_single_child`/`parse_children`/`parse_list_children`), and the masked
-//! [`SecureSubmitTarget`] (§ 5.2 item 8). `parse_children`/`parse_list_children` are where a
-//! node's `kind` decides how its `children`/`itemfn` property is walked, carrying the `HashSet`
-//! dedup check for a `list`'s keys.
+//! Surface specs, swap fingerprints, child-list parsers, and masked `SecureSubmitTarget` (§ 5.2
+//! item 8). List generation also owns duplicate-key rejection.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,38 +9,23 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 
 use super::*;
 
-/// § 6's `lock`: `id` and `child` are its whole property list (ADR-0052 decision 2). `child`
-/// is not a field here for the same reason it is not one on the other three roles:
-/// `layout::scene::children_of` walks it into the retained tree, and a spec carries what Wayland
-/// needs told, not what layout reads. Stays a struct rather than `SurfaceSpec::Lock(String)`:
-/// [`lock_spec`] hangs § 6's four refusals off it, which a bare `String` variant could not.
-///
-/// **No `LockTopology`, for a stronger reason than [`PopupSpec`] has:** a lock surface has *no*
-/// protocol field a config could set. `ext_session_lock_surface_v1` has one request,
-/// `ack_configure`, and its size arrives in the configure, never asked for. Nothing exists to
-/// diff beyond the declaration's existence, which [`SurfaceFingerprint::Lock`] holds.
+/// § 6's `lock` has only `id` and `child` (ADR-0052 decision 2). `child` is walked into the
+/// retained tree, so the spec carries no layout field. It stays a struct rather than
+/// `SurfaceSpec::Lock(String)`, giving [`lock_spec`] a place to attach § 6's four refusals. There
+/// is no `LockTopology`: the protocol
+/// exposes only `ack_configure`, with size supplied by configure, so only declaration existence is
+/// fingerprinted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockSpec {
     pub id: String,
 }
 
-/// § 6's parser: refuses the properties a `lock` does not have, then reads the one it does.
-///
-/// Refusing rather than ignoring is the real decision. `visible = false` implies the config
-/// decides when the lock is up, but the compositor creates and destroys lock surfaces itself, at
-/// `locked` and `unlock_and_destroy`; obeying it mid-session would tear down a surface it still
-/// shows, which ADR-0042 says makes it "fall back to rendering a solid color". The error lands in
-/// `rescue`'s `error_log` (§ 2.10, ADR-0046) at evaluation time instead, while a human is reading
-/// and the session is not locked.
-///
-/// `monitor`, `anchor`, `width` and `height` get the same treatment for a weaker reason: each is
-/// inert rather than dangerous (geometry is entirely the compositor's configure, expanding per
-/// output because the protocol says so, not a `monitor`, per ADR-0052 decision 2), but a silent
-/// no-op is still worse than a reported one. The refusals run before `id` is read, so a `lock`
-/// missing both leads with the problem about the role, not the merely missing `id`.
-/// [`is_deferred_signal`] is never consulted either: a refusal tests the *key*, so a `Signal`
-/// under it is refused like a literal, since § 6 leaves `lock` no movable property for
-/// ADR-0049's second amendment to apply to.
+/// Refuses unsupported § 6 properties before reading `id`. Ignoring `visible` could tear down a
+/// compositor-owned lock at `locked`/`unlock_and_destroy`, causing ADR-0042's solid-color fallback;
+/// the error reaches `rescue`'s `error_log` (§ 2.10, ADR-0046) while unlocked. `monitor`, `anchor`,
+/// `width`, and `height` are inert because configure owns geometry and lock surfaces cover every
+/// output (ADR-0052 decision 2), but silent no-ops are still errors. A `Signal` under a refused key
+/// is refused too; `is_deferred_signal` does not apply to a lock.
 pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, LayoutError> {
     for property in ["visible", "monitor", "anchor", "width", "height"] {
         if properties.contains_key(property) {
@@ -60,12 +41,8 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
     Ok(LockSpec { id: parse_surface_id(properties)? })
 }
 
-/// One declared top-level surface, parsed by whichever § 6 role its `kind` names (ADR-0040
-/// decision 1). `crate::socket`'s `surface_specs` builds one per evaluated node; later stages
-/// read this roster, `expand_instances` turning it into surface instances and `create_surfaces`
-/// binding them. One enum rather than three parallel lists: declaration *order* is part of the
-/// swap fingerprint (see [`SurfaceFingerprint`]), which three lists would lose, and it keeps a
-/// surface's role one `match` away instead of a lookup in whichever list holds it.
+/// One declared top-level surface, parsed by its § 6 role (ADR-0040 decision 1). Declaration order
+/// remains in the roster and swap fingerprint, so one enum preserves it across roles.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceSpec {
     Panel(PanelSpec),
@@ -75,8 +52,7 @@ pub enum SurfaceSpec {
 }
 
 impl SurfaceSpec {
-    /// The `id` this surface was declared with, whatever its role: what
-    /// `layout::scene::Scene`'s apply matches a `SurfaceInstance` back to its `VirtualNode` by.
+    /// The declared id used to match a `SurfaceInstance` back to its `VirtualNode`.
     pub fn declared_id(&self) -> &str {
         match self {
             SurfaceSpec::Panel(spec) => &spec.topology.id,
@@ -86,7 +62,6 @@ impl SurfaceSpec {
         }
     }
 
-    /// This declaration's share of the swap fingerprint.
     pub fn fingerprint(&self) -> SurfaceFingerprint {
         match self {
             SurfaceSpec::Panel(spec) => SurfaceFingerprint::Panel(spec.topology.clone()),
@@ -97,24 +72,10 @@ impl SurfaceSpec {
     }
 }
 
-/// One declared surface's share of the topology `crate::socket`'s `handle_reevaluate` diffs to
-/// choose a generation swap over an in-place reload (ADR-0001, `CONTEXT.md`'s Topology change).
-/// Order-sensitive equality on `Vec<SurfaceFingerprint>` is that diff.
-///
-/// The protocol decides how much each role contributes. A `panel` carries all five of
-/// [`SurfaceTopology`]'s fields because `get_layer_surface` fixes every one at creation. A
-/// `window`, `popup` and `lock` carry only their `id`: everything else is a request on a live
-/// object (`set_title`, `set_app_id`, the two size hints, see [`WindowSpec`]'s "no
-/// `WindowTopology`" note) or rebuilt per open (`xdg_positioner`, ADR-0049 decision 1), so none of
-/// it can strand a live object the way a changed `namespace` would; a `lock` lands on the same
-/// one field because § 6 gives it only `id` and `child` to begin with.
-///
-/// The three `id` arms still catch ADR-0049 decision 3: adding or removing a declaration is a
-/// topology change for every role, even one whose Wayland object comes and goes inside a
-/// generation. Deleting a `lock` mid-session is the sharpest case: ADR-0042's rule queues that
-/// swap until unlock, so a live lock screen cannot lose its tree underneath it (ADR-0052,
-/// Consequences). The role itself is part of the fingerprint too: rewriting `panel { id = "x" }`
-/// as `window { id = "x" }` changes the variant, a different Wayland object and so a swap.
+/// Fields `crate::socket::handle_reevaluate` compares for generation swaps (ADR-0001). A `panel`
+/// carries all five creation-time topology fields; `window`, `popup`, and `lock` carry only `id`
+/// because their other fields update live or rebuild per open. Adding/removing any role still
+/// changes topology (ADR-0049 decision 3); lock removal queues the swap until unlock (ADR-0042).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceFingerprint {
     Panel(SurfaceTopology),
@@ -123,8 +84,7 @@ pub enum SurfaceFingerprint {
     Lock(String),
 }
 
-/// A single-node property (`panel.child`), converted from its raw table via
-/// `lua::nodes::deserialize_lua_table`, not re-implemented here.
+/// A single-node property converted with `deserialize_lua_table`.
 pub fn parse_single_child(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -139,7 +99,7 @@ pub fn parse_single_child(
     Ok(Some(node))
 }
 
-/// An array-of-nodes property (`rect`/`row`/`column`/`button.children`).
+/// An array-of-nodes `children` property.
 pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     let Some(value) = properties.get("children") else {
         return Ok(Vec::new());
@@ -156,27 +116,16 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     Ok(children)
 }
 
-/// A `list` node's children (`oblisk-idl-api-specs.md` § 5.2 item 7, ADR-0045 decision 3).
-/// Parallels [`parse_children`] for `rect`/`row`/`column`/`button`, but a `list`'s children are
-/// never a literal Lua table: they are generated here, once per element of `source`, by calling
-/// `itemfn(element)` and deserializing the node table it returns. `source` arrives already
-/// resolved: `resolve_properties` treats it like any other non-structural property, so a `Signal`
-/// there was read exactly once before this runs.
+/// A `list`'s children (§ 5.2 item 7, ADR-0045 decision 3) are generated once per resolved
+/// `source` item; it arrives already resolved, so a `Signal` there was read exactly once before
+/// `itemfn` runs. Without `key`, reconciliation is positional. With it, `key(element)`
+/// is called on the source value, not the built node, and overwrites that node's `id`; duplicate
+/// keys fail here before `pair_children_by_id_then_position` sees them.
 ///
-/// Without `key`, a generated child gets no `id`, so `pair_children_by_id_then_position` matches
-/// list items by position, the rule an id-less literal child already gets and exactly what
-/// decision 3 specifies. With `key`, `key(element)` (called on the source element, never on the
-/// node `itemfn` built) becomes that child's `id`, overwriting whatever `itemfn`'s own table
-/// carried: identity belongs to the list, so an inner `id` could let two items collide. Duplicate
-/// keys are rejected here, before any `id` reaches `pair_children_by_id_then_position`, so a list
-/// author gets a message naming `key`, the property they actually wrote.
-///
-/// ponytail: `key` makes reconciliation cheap, not evaluation. `itemfn` still runs for every
-/// element on every resolve, so a 30-item tray builds 30 fresh nodes and throws 29 away each
-/// pass, at ADR-0044 decision 2's per-poll-turn cadence (§ 5.2 calls `list` a "fast-reconciling
-/// virtual repeater"). The fix, computing keys first and skipping `itemfn` for unchanged ones,
-/// is not built because `children_of` hands this only the fresh node's properties, never the
-/// retained side.
+/// ponytail: `key` speeds reconciliation, not evaluation. A 30-item tray still runs `itemfn` 30
+/// times and discards 29 fresh nodes on ADR-0044 decision 2's per-poll-turn capability-push
+/// cadence. § 5.2 calls `list` a "fast-reconciling virtual repeater"; skipping unchanged items
+/// needs retained-side data, which `children_of` does not provide.
 pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     let source_value = properties.get("source").ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
     let Value::Table(source) = source_value else {
@@ -223,7 +172,7 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
             if !seen_keys.insert(key_text.clone()) {
                 return Err(invalid("key", format!("duplicate key `{key_text}` among list items")));
             }
-            // The key wins over any `id` itemfn's node already carried; see this fn's doc comment.
+            // List identity wins over any `id` the item function supplied.
             node.properties.insert("id".to_string(), Value::String(key_str));
         }
 
@@ -232,27 +181,20 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
     Ok(children)
 }
 
-/// `textfield.secure_submit` (§ 5.2 item 8): the `{ capability, action }` pair a masked field's
-/// committed buffer is addressed to once it submits, instead of reaching Lua (ADR-0005,
-/// ADR-0027). Submit is Enter on `wl_keyboard`, read natively in `renderer/src/wayland/mod.rs`,
-/// not through the `zwp_text_input_v3` bridge (see that file's `secure_key_action` for why a
-/// password must not travel through an input method). This pair is the routing key on a
-/// `RendererFrame::SecureSubmit` envelope (ADR-0050 decision 4), so both fields are required.
+/// `textfield.secure_submit` (§ 5.2 item 8) routes a masked field's committed buffer without Lua
+/// (ADR-0005, ADR-0027). Enter is read from `wl_keyboard` in `renderer/src/wayland/mod.rs`, not
+/// `zwp_text_input_v3`; the pair keys `RendererFrame::SecureSubmit` (ADR-0050 decision 4). See
+/// `secure_key_action` for why a password must bypass the input-method bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureSubmitTarget {
     pub capability: String,
     pub action: String,
 }
 
-/// `Ok(None)` when absent: `secure_submit` is optional even on a masked field (§ 5.2 item 8: an
-/// unread mask is just unreadable from Lua). Not in [`is_structural_property`]'s carve-out, so a
-/// signal-bound value arrives already resolved: nothing reconciles a node by its `secure_submit`,
-/// so there is no structural decision here for a live-changing signal to undermine.
-///
-/// `capability`/`action` are refused non-UTF-8 rather than converted lossily, the same call
-/// [`parse_node_id`] makes: this pair addresses a secret to a Supervisor capability, and a lossy
-/// conversion could collapse two distinct byte strings onto one name, routing a password to a
-/// capability nobody registered.
+/// `secure_submit` is optional (§ 5.2 item 8) because an unread mask is unreadable from Lua, and it
+/// is non-structural, so signal-bound values arrive
+/// resolved. `capability`/`action` reject non-UTF-8 rather than collapsing distinct bytes onto one
+/// Supervisor capability name, as [`parse_node_id`] does.
 pub fn parse_secure_submit(properties: &HashMap<String, Value>) -> Result<Option<SecureSubmitTarget>, LayoutError> {
     let Some(value) = properties.get("secure_submit") else {
         return Ok(None);

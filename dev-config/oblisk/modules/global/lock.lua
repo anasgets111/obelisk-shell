@@ -4,24 +4,18 @@ local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- § 6 routes authentication through a `textfield` with `secure_submit`, and that pair is what
--- keeps the password out of this VM entirely: with both `mask_character` and `secure_submit` set,
--- keystrokes go into a native buffer on the Renderer's Wayland thread and leave as a
--- `("lock", "authenticate")` envelope, never as a Lua value (§ 5.2 item 8, ADR-0005/ADR-0027). So
--- there is deliberately no `on_change`/`on_submit` here: one would be the exact hole the design
--- exists to close.
+-- § 6 routes authentication through a `textfield` with `secure_submit`. With `mask_character` too,
+-- keystrokes stay in a native buffer on the Renderer's Wayland thread and leave as a
+-- `("lock", "authenticate")` envelope, never a Lua value (§ 5.2 item 8, ADR-0005/ADR-0027). No
+-- `on_change`/`on_submit`: either callback would reopen the closed path.
 --
--- It is the only `secure_submit` field on this surface, and that is load-bearing: the engine
--- focuses a surface's sole `secure_submit` field the moment the compositor gives that surface
--- keyboard focus, so this is typable with no click. A second such field would put the lock screen
--- back to needing a mouse, because with two destinations the engine refuses to guess.
+-- It is the surface's only `secure_submit` field. The engine focuses the sole field on compositor
+-- keyboard focus, so no click is needed; with two fields it refuses to guess and needs a mouse.
 --
--- `mask_character` is drawn, one glyph per keystroke, so typing is visible. It was not always:
--- this field reserved 28px and swallowed keystrokes showing nothing, and typing a password blind
--- is worse than it sounds. `pam_unix` answers a wrong password with a two second delay and
--- `pam_faillock` locks the account after three, so an invisible typo looked exactly like a slow
--- unlock and three of them cost ten minutes. `lock_status` below still reports what the
--- capability says; this reports what you typed.
+-- `mask_character` draws one glyph per keystroke. The old field reserved 28px and showed nothing;
+-- blind typing made `pam_unix`'s two-second wrong-password delay indistinguishable from a slow
+-- unlock, and `pam_faillock` locked the account after three, costing ten minutes. `lock_status`
+-- reports capability state; this reports what was typed.
 local password_field = textfield {
     width = "Fill",
     height = theme.control.md,
@@ -30,11 +24,11 @@ local password_field = textfield {
     secure_submit = { capability = "lock", action = "authenticate" },
 }
 
--- Off `oblisk.lock` rather than off `rescue`, and the split is ADR-0052 decision 4: with the lock
--- surfaces mapped the compositor shows only these, so the bar's `rescue_cell` is unreachable and the
--- capability's own state is the only channel left. `attempts` is printed because a config cannot
--- rebuild it: capability state is sampled at layout time (ADR-0044), so two identical failures in a
--- row are one unchanged `error` string and a counter written here would miss the second.
+-- Read from `oblisk.lock`, not `rescue`, per ADR-0052 decision 4: while lock surfaces are mapped
+-- the
+-- bar's `rescue_cell` is unreachable. Print `attempts` because capability state is sampled at
+-- layout
+-- time (ADR-0044); identical consecutive `error` strings would otherwise hide the second failure.
 local lock_status = cell(util.label(oblisk.lock, function(l)
     if l.error == nil or l.error == "" then
         return l.active and "type your password, then Enter" or "locking..."
@@ -42,22 +36,19 @@ local lock_status = cell(util.label(oblisk.lock, function(l)
     return string.format("%s (%d)", l.error, l.attempts or 0)
 end), theme.RED)
 
--- The lock screen gets the clock too, because every lock screen has one and because it is the
--- cheapest possible proof that `system` keeps pushing while the session is locked.
+-- Include the clock, both because lock screens have one and because it proves `system` still pushes
+-- while locked.
 local lock_clock = cell(util.label(oblisk.system, function(s)
     return os.date("%H:%M", s.time)
 end), theme.FG, theme.font.hero)
 
--- Declared, not open. § 6 gives a `lock` an `id` and a `child` and nothing else: no `visible`,
--- no `monitor`, no size, because the compositor decides when these surfaces exist and the
--- protocol requires one on every output while they do. Returning this costs one retained node
--- and zero Wayland objects until `oblisk.lock:invoke("lock")` is clicked, the same
--- declaration/lifetime split ADR-0049 made for `window` and `popup`.
+-- Declared, not open. § 6 gives `lock` only `id` and `child`: the compositor creates one per output
+-- while locked, with no `visible`, monitor, or size. This retains one node and zero Wayland objects
+-- until `oblisk.lock:invoke("lock")`, the declaration/lifetime split of ADR-0049.
 return lock {
     id = "lock_screen",
     child = column {
-        -- Opaque and full-bleed: this is what covers the session, so a `Content`-sized child
-        -- would leave the desktop showing through everything it did not paint.
+        -- Opaque and full-bleed: a `Content`-sized child would leave unpainted desktop visible.
         width = "Fill",
         height = "Fill",
         background = "#11111bff",

@@ -1,12 +1,12 @@
 //! Polkit authentication agent registration handshake.
 //!
-//! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()` is the real
-//! D-Bus method (verified against polkit's source and introspection XML), not `RegisterAgent`;
-//! the call-out uses `zbus_polkit`'s `Authority` proxy and `Subject` type directly, skipping
+//! `RegisterAuthenticationAgent(subject: (sa{sv}), locale: s, object_path: s) -> ()` is the
+//! verified D-Bus method, checked against polkit's source and introspection XML, not
+//! `RegisterAgent`. Use `zbus_polkit`'s `Authority` proxy and `Subject` directly, avoiding
 //! hand-derived zvariant types (ADR-0013).
 //!
-//! `org.freedesktop.PolicyKit1.AuthenticationAgent`, the agent side, has no maintained crate, so
-//! `AuthenticationAgent` below is hand-written against the verified signature:
+//! No maintained crate covers `org.freedesktop.PolicyKit1.AuthenticationAgent`, so the hand-written
+//! interface below uses the verified signature:
 //! `BeginAuthentication(action_id: s, message: s, icon_name: s, details: a{ss}, cookie: s,
 //! identities: a(sa{sv})) -> ()` and `CancelAuthentication(cookie: s) -> ()`.
 
@@ -18,43 +18,39 @@ use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 pub use zbus_polkit::policykit1::{AuthorityProxy, Subject};
 
-/// The one error the agent side of the protocol returns. polkit's docs: "If the user dismisses
-/// the authentication dialog, the authentication agent should return the
-/// org.freedesktop.PolicyKit1.Error.Cancelled error."
+/// Agent-side protocol error. Dismissing the dialog returns
+/// `org.freedesktop.PolicyKit1.Error.Cancelled`.
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.freedesktop.PolicyKit1.Error")]
 pub enum AgentError {
     Cancelled,
 }
 
-/// What polkitd asked of the agent, forwarded to `main.rs`'s loop, which owns the answer.
+/// polkitd request forwarded to `main.rs`, which owns the answer.
 ///
-/// `Begin` carries the reply: the docs say the agent "should not return until after authentication
-/// is complete", and polkitd reads an early return as a finished, failed authentication -- so
-/// `begin_authentication` below awaits this sender's answer and only then returns to the bus.
-/// Dropping the sender without answering cancels.
+/// `Begin` carries the reply. polkitd treats an early return as failed authentication, so
+/// `begin_authentication` awaits the answer before returning to the bus. Dropping the sender
+/// cancels.
 pub enum AgentRequest {
     Begin { call: BeginAuthenticationCall, reply: oneshot::Sender<Result<(), AgentError>> },
     Cancel { cookie: String },
 }
 
-/// Object path this agent is exported at on our own unique connection name. Any path under
-/// our control is valid: the spec's `object_path` argument is caller-chosen, not fixed.
+/// Export path on our unique connection. Any path we control is valid; the spec leaves it to the
+/// caller.
 pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/PolicyKit1/AuthenticationAgent";
 
-/// Builds the `unix-session` `Subject` for the session this process is running in.
+/// Builds the `unix-session` `Subject` for this process's session.
 ///
-/// ponytail: resolves the session id from `$XDG_SESSION_ID`, not the general-purpose route
-/// (asking logind's `Manager.GetSessionByPID` for this pid). The logind round-trip is the
-/// upgrade path once pam_systemd doesn't set it, or once a logind client exists here for
-/// another reason (ADR-0010 covers Wayland idle/lock, not logind sessions).
+/// ponytail: reads `$XDG_SESSION_ID`, not logind's `Manager.GetSessionByPID`. Upgrade to that
+/// round trip if pam_systemd stops setting it or a logind client arrives here (ADR-0010 covers
+/// Wayland idle/lock, not logind sessions).
 pub fn current_session_subject() -> Result<Subject, std::env::VarError> {
     Ok(session_subject(std::env::var("XDG_SESSION_ID")?))
 }
 
-/// The `Subject` half of [`current_session_subject`], split off the `$XDG_SESSION_ID` read so a
-/// test can check the shape without setting the variable. `set_var` races every other thread in
-/// the test binary that reads the environment, which is why Rust 2024 made it `unsafe`.
+/// `Subject` construction split from `$XDG_SESSION_ID` lookup so tests avoid `set_var`, which
+/// races every environment reader in the test binary and is `unsafe` in Rust 2024.
 fn session_subject(session_id: String) -> Subject {
     let mut subject_details = HashMap::new();
     subject_details.insert(
@@ -64,10 +60,9 @@ fn session_subject(session_id: String) -> Subject {
     Subject { subject_kind: "unix-session".to_string(), subject_details }
 }
 
-/// One `BeginAuthentication` call as polkitd sent it, parsed off the wire.
+/// One wire-parsed `BeginAuthentication` call from polkitd.
 ///
-/// `Eq` is deliberately not derived: `identities`' `OwnedValue` can hold a
-/// `zvariant::Value::F64`, and `f64` only implements `PartialEq`, not `Eq`.
+/// No `Eq`: `identities` can contain `zvariant::Value::F64`, and `f64` is only `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeginAuthenticationCall {
     pub action_id: String,
@@ -78,14 +73,12 @@ pub struct BeginAuthenticationCall {
     pub identities: Vec<(String, HashMap<String, OwnedValue>)>,
 }
 
-/// The uid to authenticate as and to report back via `AuthenticationAgentResponse2`, parsed
-/// from `BeginAuthentication`'s `identities` list: a `unix-user` identity carries its uid
-/// under the `"uid"` key, typed `uint32`.
+/// uid for `AuthenticationAgentResponse2`, parsed from `BeginAuthentication`'s `identities`: a
+/// `unix-user` identity stores `uint32` under `"uid"`.
 ///
-/// ponytail: takes the *first* `unix-user` identity, not all of them. polkitd can list several
-/// (e.g. every member of `wheel`), and picking one is normally a user-facing choice this
-/// codebase has no picker for. First-match is correct until one exists; see the upgrade path at
-/// ADR-0028.
+/// ponytail: takes the *first* `unix-user`, not all. polkitd may list several (for example every
+/// `wheel` member), but this codebase has no picker. First-match stands until one exists; upgrade
+/// path: ADR-0028.
 pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)]) -> Option<u32> {
     identities
         .iter()
@@ -94,13 +87,11 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
         .and_then(|v| u32::try_from(v.clone()).ok())
 }
 
-/// `org.freedesktop.PolicyKit1.AuthenticationAgent`, the interface polkitd calls back into once
-/// this process registers via [`register_agent`].
+/// `org.freedesktop.PolicyKit1.AuthenticationAgent`, called by polkitd after [`register_agent`].
 ///
-/// Only forwards: the challenge becomes `oblisk.polkit`'s state, polkit's setuid helper runs PAM
-/// once a `secure_submit("polkit", "authenticate")` frame arrives, and `main.rs` ends this method's
-/// held reply when the helper has answered (ADR-0114). zbus dispatches each call on its own task, so a
-/// `CancelAuthentication` is delivered while a `BeginAuthentication` is still waiting.
+/// Forwards only. The challenge becomes `oblisk.polkit` state; the setuid helper runs PAM after
+/// `secure_submit("polkit", "authenticate")`, and `main.rs` releases the held reply when it answers
+/// (ADR-0114). zbus uses one task per call, so cancel can arrive while begin waits.
 pub struct AuthenticationAgent {
     requests: UnboundedSender<AgentRequest>,
 }
@@ -135,14 +126,14 @@ impl AuthenticationAgent {
     }
 }
 
-/// The authentication agent, held unregistered until a config reads `oblisk.polkit` or declares a
-/// `secure_submit` that names it (ADR-0070 decisions 5 and 6, ADR-0114).
+/// Authentication agent, unregistered until config reads `oblisk.polkit` or names it in
+/// `secure_submit` (ADR-0070 decisions 5 and 6, ADR-0114).
 ///
-/// A registration failure is logged, not propagated with `?`, since "An authentication agent
-/// already exists for the given subject" is normal elsewhere and must not stop the shell.
+/// Log registration failures rather than propagating them: another agent for the subject is normal
+/// elsewhere and must not stop the shell.
 pub struct PolkitAgent {
-    /// Taken by the first [`Self::register`] call, so a second is a no-op rather than a second
-    /// `RegisterAuthenticationAgent` for the same subject.
+    /// Taken by the first [`Self::register`], making later calls no-ops instead of duplicate wire
+    /// registrations.
     agent: Option<AuthenticationAgent>,
 }
 
@@ -151,8 +142,7 @@ impl PolkitAgent {
         PolkitAgent { agent: Some(AuthenticationAgent::new(requests)) }
     }
 
-    /// Registers with polkitd, once. Every failure logs and leaves this process without an agent,
-    /// which costs it the challenges it would have been asked to answer and nothing else.
+    /// Registers once. Failures log and disable this process's agent, costing only its challenges.
     pub async fn register(&mut self, connection: &zbus::Connection) {
         match current_session_subject() {
             Ok(subject) => self.register_for(connection, &subject).await,
@@ -160,17 +150,15 @@ impl PolkitAgent {
                 eprintln!(
                     "polkit: $XDG_SESSION_ID names no session to register an agent for; agent disabled for this run: {err}"
                 );
-                // Dropped rather than left for a later call to retry: `$XDG_SESSION_ID` will not
-                // appear mid-run, so a second attempt would fail the same way.
+                // Do not retry: `$XDG_SESSION_ID` will not appear mid-run.
                 self.agent = None;
             }
         }
     }
 
-    /// [`Self::register`] once the subject is known, holding the take-once rule.
-    ///
-    /// Split off so tests can drive this path twice without `set_var`: `setenv` rewrites the
-    /// process-wide `environ` block, racing any concurrent `getenv` regardless of which variable.
+    /// [`Self::register`] once the subject is known, preserving the take-once rule. Separate so
+    /// tests can call it twice without `set_var`, whose process-wide `environ` rewrite races any
+    /// concurrent `getenv`.
     async fn register_for(&mut self, connection: &zbus::Connection, subject: &Subject) {
         let Some(agent) = self.agent.take() else {
             return;
@@ -184,9 +172,8 @@ impl PolkitAgent {
     }
 }
 
-/// Registers `agent` as the polkit authentication agent for `subject`/`locale`. Exports
-/// `agent` on `connection`'s object server *before* calling `RegisterAuthenticationAgent`, so
-/// a callback arriving right after registration succeeds always finds a live object.
+/// Exports `agent` before calling `RegisterAuthenticationAgent`, so an immediate callback finds a
+/// live object.
 pub async fn register_agent(
     connection: &zbus::Connection,
     agent: AuthenticationAgent,
@@ -205,9 +192,7 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
 
-    /// A stand-in for polkitd's own `org.freedesktop.PolicyKit1.Authority` object, exported
-    /// on the peer end of a p2p connection so `register_agent`'s real wire call can be
-    /// exercised without a live system bus.
+    /// Stand-in Authority on the p2p peer, exercising the real wire call without a system bus.
     struct MockAuthority {
         calls: mpsc::UnboundedSender<(Subject, String, String)>,
     }
@@ -219,9 +204,9 @@ mod tests {
         }
     }
 
-    /// A connected pair of p2p zbus connections, no bus daemon involved. Mirrors zbus's own
-    /// `tests/e2e.rs` (`iface_and_proxy_unix_p2p`) -- crucially, building both ends concurrently
-    /// via `try_join!`: the SASL handshake needs both peers reading and writing at once.
+    /// Connected p2p zbus pair, with no daemon. Build both ends via `try_join!`: SASL needs both
+    /// peers reading and writing concurrently. Mirrors zbus `tests/e2e.rs`'s
+    /// `iface_and_proxy_unix_p2p`.
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
         let guid = zbus::Guid::generate();
@@ -266,8 +251,8 @@ mod tests {
         assert_eq!(object_path, AGENT_OBJECT_PATH);
     }
 
-    /// Registering twice would ask polkitd for a second agent on one subject. The second call is
-    /// reachable because every generation sends its own starts (ADR-0070 decision 3).
+    /// A second registration would ask polkitd for another agent on one subject. Every generation
+    /// sends its own starts, so it is reachable (ADR-0070 decision 3).
     #[tokio::test]
     async fn registering_twice_makes_only_one_wire_call() {
         let (authority_side, agent_side) = p2p_pair().await;
@@ -288,11 +273,8 @@ mod tests {
         assert!(calls_rx.try_recv().is_err(), "the second register must be a no-op");
     }
 
-    /// Was `current_session_subject_reads_xdg_session_id`, which set `$XDG_SESSION_ID` and read it
-    /// back through [`current_session_subject`]. Its safety comment claimed no other test in the
-    /// binary touched that variable; `registering_twice_makes_only_one_wire_call` sets it to `c1`,
-    /// and the harness runs both on parallel threads, so the read-back saw `c1` whenever it lost.
-    /// Testing [`session_subject`] instead keeps the assertion and needs no environment at all.
+    /// Replaces the old env-mutating test: parallel tests could set `$XDG_SESSION_ID` to `c1`, so
+    /// read-back raced. Testing [`session_subject`] keeps the assertion without environment state.
     #[test]
     fn a_session_id_becomes_a_unix_session_subject() {
         let subject = session_subject("test-session-42".to_string());

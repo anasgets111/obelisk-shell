@@ -1,21 +1,16 @@
-//! Test helpers shared by more than one capability.
+//! Test helpers shared across capabilities.
 //!
-//! A capability that needs a fixture only it uses keeps it at home: `notifications` has its own
-//! `test_support` for building a body span, and that is the right place for it. This file is for
-//! the ones a second caller turned up for, which so far is exactly [`p2p_pair`], used by `tray`
-//! and by `mpris`. It moved here rather than growing a second copy or being reached into across
-//! capabilities.
+//! Capability-specific fixtures stay local; `notifications` builds its body span in its own
+//! `test_support`. This file currently holds [`p2p_pair`], shared by `tray` and `mpris`, rather
+//! than duplicating or reaching across modules.
 
 use tokio::net::UnixStream;
 
-/// A connected pair of p2p zbus connections, no bus daemon involved, with one addition: the server
-/// side gets a short `method_timeout`. `tray::registry::register_item`'s real code path calls out
-/// from this side to a peer that registers no object server handler for some calls, and with
-/// zbus's default timeout each would hang until it lapses instead of erroring quickly, several
-/// sequentially.
+/// Connected p2p zbus connections without a bus daemon. The server has a short `method_timeout`:
+/// `tray::registry::register_item` calls a peer with no handlers, and zbus's default timeout would
+/// let several sequential calls hang.
 ///
-/// Binding a proxy makes no call at all, so a test that only needs a `Proxy` to exist can use this
-/// and never provide a peer that answers.
+/// Binding a proxy makes no call, so tests needing only a `Proxy` need no answering peer.
 pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
     let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
     let guid = zbus::Guid::generate();

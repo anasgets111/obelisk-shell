@@ -83,8 +83,7 @@ pub(super) trait AgentManager1 {
     fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
-/// Small convenience wrappers around each proxy's own macro-generated `builder()`, purely to
-/// keep every per-path `.path(path)?.build().await` call site one line instead of three.
+/// Wrap each macro-generated `builder()` so per-path binding stays one line.
 pub(super) async fn bind_adapter(
     connection: &zbus::Connection,
     path: OwnedObjectPath,
@@ -112,9 +111,8 @@ pub(super) async fn bind_object_manager(
     zbus::fdo::ObjectManagerProxy::builder(connection).destination("org.bluez")?.path("/")?.build().await
 }
 
-/// Subscribes to `object_manager`'s `InterfacesAdded`/`InterfacesRemoved` signals, returning
-/// both streams already-live, so a caller can subscribe before hydrating via
-/// `GetManagedObjects()` without missing anything that changes in between.
+/// Returns live `InterfacesAdded`/`InterfacesRemoved` streams before `GetManagedObjects()`
+/// hydration, so changes between subscription and hydration are not missed.
 pub(super) async fn subscribe_object_manager(
     object_manager: &zbus::fdo::ObjectManagerProxy<'static>,
 ) -> zbus::Result<(zbus::fdo::InterfacesAddedStream, zbus::fdo::InterfacesRemovedStream)> {

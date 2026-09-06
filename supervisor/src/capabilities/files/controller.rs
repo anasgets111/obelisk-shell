@@ -1,5 +1,4 @@
-//! [`FilesController`]: the `oblisk.files` state owner, one listing task per watched folder
-//! (ADR-0120).
+//! [`FilesController`] owns `oblisk.files`, with one listing task per watched folder (ADR-0120).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -11,47 +10,41 @@ use inotify::{EventMask, Inotify, WatchMask};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-/// How long after the last inotify event a folder is re-listed. A copy of forty wallpapers is
-/// forty `CREATE`/`CLOSE_WRITE` pairs in a burst, and one listing at the end is the point.
+/// Relist 200ms after the last event. Forty wallpapers produce forty `CREATE`/`CLOSE_WRITE` pairs;
+/// one listing after the burst is the point.
 const RELIST_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// `oblisk.files`'s payload (ADR-0120): every watched folder, keyed by the path `watch` was
-/// given, so a config reads back `oblisk.files.folders[folder]` with the string it wrote.
+/// `oblisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
+/// `oblisk.files.folders[folder]` reads back with the string the config wrote.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct FilesState {
-    /// One entry per `files:watch(path)` still in force, keyed by that path with trailing slashes
-    /// stripped. Absent until the first `watch`, so a config draws nothing rather than an empty
-    /// list for a folder it never asked about.
+    /// One entry per active `files:watch(path)`, keyed by `path` with trailing slashes stripped.
+    /// Absent until watched, so an unrequested folder is not an empty list.
     pub folders: BTreeMap<String, Folder>,
 }
 
-/// One watched folder as the config sees it.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct Folder {
-    /// `false` between `watch` and the first listing landing, which is the "loading" a picker
-    /// draws a spinner for. `true` afterwards, even when `entries` is empty or `error` is set.
+    /// `false` until the first listing lands, for a picker's loading spinner. `true` thereafter,
+    /// even when `entries` is empty or `error` is set.
     pub ready: bool,
-    /// The plain files directly inside the folder, hidden ones (a leading dot) skipped, filtered
-    /// to the extensions `watch` named, sorted by name case-insensitively. Not recursive: a
-    /// subfolder is not listed and nothing inside it is. Replaced wholesale on every change
-    /// inotify reports, debounced, so a copy in progress lands as one update.
+    /// Plain files directly inside the folder, skipping dotfiles, filtered to `watch`'s extensions
+    /// and sorted case-insensitively. Not recursive. Replaced wholesale after each debounced
+    /// inotify burst, so a copy in progress lands as one update.
     pub entries: Vec<FileEntry>,
-    /// Why the last listing produced nothing, in words fit to draw (`"No such file or
-    /// directory"`), or absent when it succeeded. Set alongside `ready = true`, so a picker tells a
-    /// missing folder from an empty one.
+    /// A drawable listing error such as `"No such file or directory"`, or absent on success. Set
+    /// with `ready = true`, distinguishing a missing folder from an empty one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// One file in a watched folder.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema)]
 pub struct FileEntry {
-    /// The file name alone, `sunrise.jpg`, for drawing and for matching a search against.
+    /// File name alone, such as `sunrise.jpg`, for drawing and search.
     pub name: String,
-    /// The absolute path, what `image { source = ... }` takes and what a config stores.
+    /// Absolute path for `image { source = ... }` and config storage.
     pub path: String,
-    /// Unix epoch seconds of the last modification, for a "newest first" sort. `0` when the
-    /// filesystem does not say.
+    /// Last-modification Unix seconds for newest-first sorting; `0` when unavailable.
     pub modified: i64,
 }
 
@@ -60,15 +53,13 @@ pub enum FilesSignal {
     Changed,
 }
 
-/// One folder's watch: the task that lists it and follows inotify, aborted on `unwatch`, and the
-/// extensions it was asked for, so a repeat `watch` with the same filter is a no-op.
+/// A folder's listing task and filter. `unwatch` aborts the task; repeating the same filter is a
+/// no-op.
 struct Watch {
     task: JoinHandle<()>,
     extensions: Vec<String>,
 }
 
-/// `Clone` so `main.rs`'s dispatch arm can hand a cheap `Arc`-backed copy around, the same shape
-/// `ApplicationsController` has.
 #[derive(Clone)]
 pub struct FilesController {
     state: Arc<Mutex<FilesState>>,
@@ -77,8 +68,7 @@ pub struct FilesController {
 }
 
 impl FilesController {
-    /// Builds the controller with nothing watched. There is no folder to list until a config
-    /// names one, so unlike `applications` there is no startup scan.
+    /// Builds with nothing watched. A config names folders on demand, so there is no startup scan.
     pub fn new(events: UnboundedSender<FilesSignal>) -> Self {
         FilesController {
             state: Arc::new(Mutex::new(FilesState::default())),
@@ -91,10 +81,9 @@ impl FilesController {
         self.state.lock().expect("files state mutex poisoned").clone()
     }
 
-    /// Starts following `path`, or re-pushes the current listing when it is already followed with
-    /// the same `extensions`: a generation swap re-evaluates the config, which calls `watch` again,
-    /// and the new generation's first read is served from the snapshot either way. A different
-    /// filter replaces the watch, since the listing it holds was made under the old one.
+    /// Starts following `path`, or re-pushes the current listing for the same `extensions`. A
+    /// generation swap calls `watch` again and reads this snapshot; a different filter replaces
+    /// the watch because its listing used the old filter.
     pub fn watch(&self, path: &str, extensions: Vec<String>) {
         let key = folder_key(path);
         {
@@ -123,7 +112,7 @@ impl FilesController {
         let _ = self.events.send(FilesSignal::Changed);
     }
 
-    /// Stops following `path` and drops it from the payload. A path never watched is a no-op.
+    /// Stops following `path` and removes it from the payload; an unwatched path is a no-op.
     pub fn unwatch(&self, path: &str) {
         let key = folder_key(path);
         let removed = self.watches.lock().expect("files watches mutex poisoned").remove(&key);
@@ -134,16 +123,15 @@ impl FilesController {
     }
 }
 
-/// The payload key for a folder: the path with trailing slashes stripped, so `/walls/` and
-/// `/walls` are one watch. `/` itself stays `/`.
+/// Strips trailing slashes for payload keys, making `/walls/` and `/walls` one watch while keeping
+/// `/` as `/`.
 pub fn folder_key(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
 }
 
-/// Whether `name` passes the `extensions` filter: any file when the list is empty, else a file
-/// whose extension, case-folded, is in it. A file with no extension never matches a non-empty
-/// list.
+/// An empty filter matches every file; otherwise the case-folded extension must be listed. A
+/// file without an extension never matches a non-empty filter.
 pub fn matches_extension(name: &str, extensions: &[String]) -> bool {
     if extensions.is_empty() {
         return true;
@@ -155,8 +143,8 @@ pub fn matches_extension(name: &str, extensions: &[String]) -> bool {
     extensions.contains(&ext)
 }
 
-/// One listing of `dir` on [`Folder::entries`]'s terms. Blocking: `read_dir` plus one `stat` per
-/// entry, so the caller runs it under `spawn_blocking`.
+/// Lists `dir` for [`Folder::entries`]. Blocking: `read_dir` plus one `stat` per entry, so callers
+/// use `spawn_blocking`.
 pub fn list_folder(dir: &Path, extensions: &[String]) -> std::io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -166,7 +154,7 @@ pub fn list_folder(dir: &Path, extensions: &[String]) -> std::io::Result<Vec<Fil
         if name.starts_with('.') || !matches_extension(name, extensions) {
             continue;
         }
-        // `metadata`, not `file_type`, so a symlink to a file lists as the file.
+        // `metadata`, not `file_type`, includes symlinks to files.
         let Ok(metadata) = entry.path().metadata() else { continue };
         if !metadata.is_file() {
             continue;
@@ -182,7 +170,6 @@ pub fn list_folder(dir: &Path, extensions: &[String]) -> std::io::Result<Vec<Fil
     Ok(entries)
 }
 
-/// Lists `dir` once, stores the result under `key`, and pushes when it differs from what is held.
 async fn relist(
     dir: &Path,
     key: &str,
@@ -201,7 +188,7 @@ async fn relist(
     let changed = {
         let mut guard = state.lock().expect("files state mutex poisoned");
         match guard.folders.get(key) {
-            // Unwatched while the listing ran: nothing to store.
+            // The folder was unwatched while listing ran.
             None => return,
             Some(current) if *current == folder => false,
             Some(_) => {
@@ -215,9 +202,8 @@ async fn relist(
     }
 }
 
-/// The events that change a listing: an entry appearing, finishing a write, or going away.
-/// `MODIFY` is left out since a copy in progress fires it per chunk and `CLOSE_WRITE` marks the
-/// end; `DELETE_SELF`/`MOVE_SELF` catch the folder itself going.
+/// Listing events: entries appearing, finishing writes, or going away. Exclude `MODIFY`, which a
+/// copy emits per chunk; `CLOSE_WRITE` marks its end. `DELETE_SELF`/`MOVE_SELF` catch folder loss.
 fn watch_mask() -> WatchMask {
     WatchMask::CREATE
         | WatchMask::MOVED_TO
@@ -228,10 +214,9 @@ fn watch_mask() -> WatchMask {
         | WatchMask::MOVE_SELF
 }
 
-/// One folder's whole life under a watch: list it, then re-list after every settled burst of
-/// inotify events until the task is aborted or the folder is gone. A folder that cannot be
-/// watched (missing, unreadable) is listed once, which records the error, and left there: the
-/// upgrade is watching the parent for it to appear, which nothing has asked for.
+/// Lists a folder, then relists after each settled inotify burst until abort or folder loss. A
+/// missing/unreadable folder is listed once to record the error and left there. ponytail: watching
+/// the parent for it to appear is the upgrade path, but no caller asks for it.
 async fn follow_folder(
     dir: PathBuf,
     key: String,
@@ -259,7 +244,7 @@ async fn follow_folder(
                 match event {
                     Some(Ok(event)) => {
                         if event.mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF | EventMask::IGNORED) {
-                            // The folder itself went: one last listing records the error.
+                            // Record the folder's disappearance in one last listing.
                             relist(&dir, &key, &extensions, &state, &events).await;
                             return;
                         }
@@ -339,7 +324,7 @@ mod tests {
         let first = controller.snapshot();
         assert_eq!(first.folders[&key], Folder::default(), "not ready until the listing lands");
 
-        // The first push is the `watch` itself; the second is the listing landing.
+        // First push is `watch`; second is the listing landing.
         rx.recv().await.unwrap();
         rx.recv().await.unwrap();
         let listed = controller.snapshot();

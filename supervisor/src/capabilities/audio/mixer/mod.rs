@@ -1,52 +1,34 @@
-//! PipeWire registry listener for per-app audio streams.
+//! PipeWire registry listener for audio streams and master/source devices.
 //!
-//! A stream node's owning process pid is `application.process.id` (`PW_KEY_APP_PROCESS_ID`),
-//! set on the stream node's own properties -- not `sec.pid`/`node.client-id` (not real
-//! `pipewire-rs` keys) and not `pipewire.sec.pid` (set on the Client object, but for a stream
-//! routed through `pipewire-pulse` that's `pipewire-pulse`'s own pid, not the application's).
-//! Matches `/proc/{pid}/comm` for the real app in every case checked. See ADR-0016.
+//! A stream's owning pid is its `application.process.id` (`PW_KEY_APP_PROCESS_ID`), not
+//! `sec.pid`/`node.client-id` (not real `pipewire-rs` keys) or `pipewire.sec.pid` (the
+//! `pipewire-pulse` Client pid, not the routed application's). It matches `/proc/{pid}/comm` in
+//! every checked case (ADR-0016).
 //!
-//! `media.class == "Stream/Output/Audio"` identifies a playback stream, verified against real
-//! `pw-dump` output.
+//! `media.class == "Stream/Output/Audio"` identifies playback streams (verified in `pw-dump`).
 //!
-//! `registry::on_global` checks `media.class` at registry `global` time and always binds a matching
-//! node, without also requiring `application.process.id` yet: a `pipewire-pulse`-routed
-//! stream's `global` event fires before `pipewire-pulse` pushes
-//! `application.process.id`/`application.name` onto the node, so filtering on the full parse at
-//! `global` time misses every such stream. The pid arrives moments later through the bound
-//! node's own `info` event, which `state::build_app_stream` runs against.
+//! `on_global` filters only `media.class` and binds immediately. A `pipewire-pulse` stream's
+//! `global` event precedes its `application.process.id`/`application.name`; filtering on the full
+//! parse misses every such stream. The pid arrives moments later in `info`, parsed by
+//! `state::build_app_stream`.
 //!
-//! `info` fires on any change PipeWire tracks for the node, not just a props change -- state
-//! transitions (RUNNING <-> IDLE/SUSPENDED), params, and ports changes all trigger it too.
-//! `NodeInfoRef::props()` returns `Some(&DictRef)` on every `info` call, but PipeWire's C
-//! marshaller only fills real entries into that dict when `change_mask` includes
-//! `PW_NODE_CHANGE_MASK_PROPS`; any other kind of `info` event carries a non-null but empty
-//! dict. So the node listener checks `NodeInfoRef::change_mask()` for `NodeChangeMask::PROPS`
-//! before running `state::build_app_stream`, leaving a non-PROPS event's tracked entry untouched
-//! rather than misreading it as the stream disappearing.
+//! `info` also fires for RUNNING/IDLE/SUSPENDED, params, and ports. `props()` is `Some` every time,
+//! but PipeWire's C marshaller fills it only when `change_mask` has `PW_NODE_CHANGE_MASK_PROPS`;
+//! other events carry a non-null empty dict. The listener gates `build_app_stream` on
+//! `NodeChangeMask::PROPS` so those events do not look like a vanished stream.
 //!
-//! The very first `info` call after `registry.bind()` is guaranteed to carry
-//! `NodeChangeMask::PROPS`: upstream PipeWire's `global_bind` (`impl-node.c`) unconditionally
-//! sets `change_mask = PW_NODE_CHANGE_MASK_ALL` before any other event can reach a freshly
-//! bound resource, and `protocol-native.c`'s marshaller only nulls the props dict when the
-//! PROPS bit is unset, so `ALL` always carries a real dict. Later `info` calls go through
-//! `emit_info_changed` instead, which forwards only the bits that actually changed. Confirmed
-//! live too: `pw-mon` attached before starting `paplay` showed the node's first `added:` block
-//! already carrying a full `properties:` section, with no earlier emptier `info` event.
+//! The first `info` after `registry.bind()` is guaranteed to have PROPS: upstream `global_bind`
+//! (`impl-node.c`) sets `change_mask = PW_NODE_CHANGE_MASK_ALL`, and `protocol-native.c` only
+//! nulls the dict when PROPS is unset. Later `emit_info_changed` events forward changed bits only.
+//! Live `pw-mon` confirmed the first `paplay` `added:` block already had full `properties:`.
 //!
-//! ponytail: the `media.class` filter runs once, at `global` time. A node whose `media.class`
-//! starts as something else and only later changes to `Stream/Output/Audio` won't be picked up
-//! -- real clients set `media.class` once at creation and don't mutate it. If that stops being
-//! true, the fix is binding every `ObjectType::Node` unconditionally and filtering inside the
-//! `info` callback instead.
+//! ponytail: filtering runs once at `global`; a later class change is missed. Real clients set it
+//! at creation. Upgrade path: bind every `ObjectType::Node` and filter in `info` if that changes.
 //!
-//! Master output volume/mute (§ 2.4, ADR-0053 decision 3) is a second, mostly independent
-//! tracking job on the same registry listener: `Audio/Sink` nodes' `SPA_PARAM_Props` param (via
-//! `param` events, not `info`) and the `default` `Metadata` object's `default.audio.sink` key
-//! (which names the master sink by `node.name`). `Audio/Source` nodes are tracked the same way
-//! for `source_volume`/`source_muted`, off `default.audio.source`. This file only wires the PipeWire event
-//! plumbing; [`super::master`] holds the pure parsing and resolution logic, including the linear/cubic
-//! volume conversion.
+//! Master/source tracking (§ 2.4, ADR-0053 decision 3) is a second, mostly independent tracking
+//! job on the same registry listener. It reads `Audio/Sink`/`Audio/Source` `Props` in `param`
+//! events and resolves them through `default.audio.sink`/`source` metadata names.
+//! This file wires events; [`super::master`] owns parsing, resolution, and linear/cubic conversion.
 
 mod registry;
 mod state;
@@ -54,7 +36,6 @@ mod write;
 
 pub use registry::{AudioCommandSender, command_channel, run};
 pub use state::{AudioCommand, CaptureApp, PrivacySources, VideoSourceApp};
-// `main.rs` names this on `ensure_mixer_thread`'s sender parameter, which is what the lazy start
-// (ADR-0070) cost: the channel outlives the thread's construction, so its item type can no
-// longer be inferred from `run`'s own signature at the one call site.
+// `main.rs` names this on `ensure_mixer_thread`'s sender: lazy start (ADR-0070) leaves the
+// channel alive beyond thread construction, so `run` no longer supplies the item type.
 pub use state::AudioState;

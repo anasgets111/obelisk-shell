@@ -1,9 +1,6 @@
-//! `xdg_shell`'s two client-picked roles: `window` (`xdg_toplevel`, § 6) and `popup`
-//! (`xdg_popup`, § 6): positioner construction, size negotiation, and the click-outside/dismiss
-//! latch ADR-0049 and ADR-0051 describe.
-//!
-//! Creation, in-place spec updates, and each role's configure/close/dismiss callbacks live here;
-//! bind/paint/(un)map machinery shared with every other role stays in `surface`.
+//! `xdg_shell`'s client-picked `window` (`xdg_toplevel`) and `popup` (`xdg_popup`) roles (§ 6),
+//! including positioners, size negotiation, and the ADR-0049/0051 dismissal latch. Shared
+//! bind/paint/(un)map logic is in `surface`.
 
 use super::*;
 use crate::wayland::surface::MapState;
@@ -11,26 +8,21 @@ use crate::wayland::surface::PopupParent;
 use crate::wayland::surface::PopupRefusal;
 use crate::wayland::surface::TrackedRole;
 
-/// What one resolution of a `popup`'s `visible` does, given whether its `xdg_popup` exists and
-/// whether ADR-0051 decision 2's latch is set (§ 5.1's `visible`, ADR-0049 decision 2).
+/// One `popup` visibility decision from object existence and the ADR-0051 latch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PopupAction {
     Create,
     Destroy,
     Nothing,
 }
-/// Decision 2's latch as a pure state machine: a mistake here is a livelock, not a missing window.
-/// Read only; the caller clears it on the same `visible = false` this returns `Destroy` or
-/// `Nothing` for. `dismissed_at` is [`App::pointer_input_count`] at dismissal, `pointer_input`
-/// that counter now, and the latch holds only while no pointer input arrived since (ADR-0051's
-/// first amendment): the `visible = false` edge alone is unobservable here and would make it
-/// permanent.
+/// ADR-0051 decision 2's pure latch machine for § 5.1's `visible`. `dismissed_at` is the pointer
+/// count at dismissal;
+/// it holds while that count is unchanged (first amendment), since the `visible = false` edge is
+/// otherwise unobservable and a bool would latch forever. The caller clears it on that edge.
 ///
-/// - `visible = true`, no object, dismissed with the counter unmoved: **nothing** (decision 2;
-///   otherwise the next re-resolve recreates the popup for the same click-outside, forever).
-/// - `visible = true`, no object, dismissed but the counter moved: **create**, a fresh click.
-/// - `visible = false`, no object: **nothing**; the caller still clears the latch.
-/// - `visible = true`, object exists: **nothing**; runs for every surface on every capability push.
+/// `visible=true` with no object creates unless the count is latched; a moved count permits a fresh
+/// click. `visible=false` destroys an object and otherwise does nothing. An existing object stays,
+/// and this no-op runs for every surface on every capability push.
 fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64>, pointer_input: u64) -> PopupAction {
     let latched = dismissed_at == Some(pointer_input);
     match (visible, exists) {
@@ -39,13 +31,10 @@ fn popup_visibility_action(visible: bool, exists: bool, dismissed_at: Option<u64
         _ => PopupAction::Nothing,
     }
 }
-/// Which tracked surface a popup roots under (ADR-0051 decision 1), as an index into the same
-/// iterator's order. § 6's `parent` names a declared `id`, not one surface: `monitor = "All"`
-/// expands a `panel` per output (ADR-0038 decision 3), so `parent = "bar"` on a two-monitor
-/// session names two surfaces and `get_popup` takes exactly one. The tie-break is the click that
-/// armed the grab, a field on [`ArmedSerial`]. ponytail: with nothing armed (e.g. a `grab = false`
-/// popup opened by a D-Bus notification), falls back to the first instance of the named parent.
-/// Upgrade path: a `monitor` property on `popup`, taking a third argument here.
+/// Parent instance for a popup (ADR-0051 decision 1). A declared id can expand to one panel per
+/// output (ADR-0038 decision 3), so use the arming click's instance. ponytail: without an armed
+/// click, such as a `grab = false` D-Bus popup, use the first parent instance. Upgrade: add popup
+/// `monitor` and a third selector argument.
 fn parent_instance_index<'a>(
     instance_ids: impl Iterator<Item = &'a str>,
     parent: &str,
@@ -63,13 +52,10 @@ fn parent_instance_index<'a>(
     }
     first
 }
-/// The size one `xdg_popup` configure asks for, as a buffer size. `width`/`height` are the
-/// compositor's answer, taken as given: it may have slid, flipped or resized the popup to keep it
-/// on screen (§ 6's `constraint_adjustment`). A non-positive axis falls back to the positioner's
-/// requested size, guarding against SCTK, not the compositor: `PopupInner` seeds its pending
-/// dimensions at `-1` and reports whatever it holds when `xdg_surface.configure` arrives, so one
-/// arriving first hands this `-1`, which crashes `WlEglSurface::new`. At least 1 on both axes for
-/// the same reason ([`toplevel_size_for`]).
+/// Popup buffer size. Positive configure axes are authoritative because the compositor may slide,
+/// flip, or resize for § 6 constraints. Non-positive axes use the requested size: SCTK's
+/// `PopupInner` starts pending dimensions at `-1`, which would crash `WlEglSurface::new`; clamp to
+/// at least 1.
 fn popup_size_for(configured: (i32, i32), spec: &PopupSpec) -> (u32, u32) {
     let axis = |configured: i32, requested: f32| -> u32 {
         if configured > 0 {
@@ -79,9 +65,7 @@ fn popup_size_for(configured: (i32, i32), spec: &PopupSpec) -> (u32, u32) {
     };
     (axis(configured.0, spec.width), axis(configured.1, spec.height))
 }
-/// § 6's `anchor` as `xdg_positioner`'s own enum. `Center` is § 6's name for the protocol's
-/// `none`: with no edge specified, the XML puts the anchor point "in the center of the anchor
-/// rectangle".
+/// § 6 `anchor` to `xdg_positioner`; `Center` is protocol `none`, centered in the anchor rectangle.
 fn positioner_anchor(anchor: PopupAnchor) -> xdg_positioner::Anchor {
     match anchor {
         PopupAnchor::Center => xdg_positioner::Anchor::None,
@@ -95,9 +79,8 @@ fn positioner_anchor(anchor: PopupAnchor) -> xdg_positioner::Anchor {
         PopupAnchor::BottomRight => xdg_positioner::Anchor::BottomRight,
     }
 }
-/// § 6's `gravity`, which shares `anchor`'s value set but gets a second protocol enum with
-/// identical members. `none` again for `Center`: a gravity of `none` centers the surface "over
-/// the anchor point on any axis that had no gravity specified".
+/// § 6 `gravity` to its separate but identical protocol enum; `Center` again maps to `none`,
+/// which centers the surface over the anchor point on axes without specified gravity.
 fn positioner_gravity(gravity: PopupAnchor) -> xdg_positioner::Gravity {
     match gravity {
         PopupAnchor::Center => xdg_positioner::Gravity::None,
@@ -111,9 +94,8 @@ fn positioner_gravity(gravity: PopupAnchor) -> xdg_positioner::Gravity {
         PopupAnchor::BottomRight => xdg_positioner::Gravity::BottomRight,
     }
 }
-/// § 6's `constraint_adjustment` as the protocol's bitmask. [`ConstraintAdjustment`] is six
-/// independent booleans, not the array a config writes: the request takes a mask and the
-/// compositor fixes precedence, so the array's order was never carrying anything.
+/// Six independent § 6 `constraint_adjustment` booleans to the protocol bitmask; precedence is
+/// compositor-defined, so config array order carries no meaning.
 fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::ConstraintAdjustment {
     let mut bits = xdg_positioner::ConstraintAdjustment::None;
     bits.set(xdg_positioner::ConstraintAdjustment::SlideX, adjustment.slide_x);
@@ -124,14 +106,9 @@ fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::Co
     bits.set(xdg_positioner::ConstraintAdjustment::ResizeY, adjustment.resize_y);
     bits
 }
-/// Sends one [`PopupSpec`]'s whole § 6 positioner state in one place, so [`App::show_popup`]
-/// reads as the protocol order it is (positioner, surface, popup, root, grab, commit), not six
-/// requests inline. Every field is sent, including ones equal to the protocol default: the
-/// positioner is built fresh per open, so there is no live object to diff against. Rounded, not
-/// truncated, to `i32`: these are logical pixels a `button`'s resolved rect handed the config
-/// through `on_click` (ADR-0050 decision 3), so `x = 996.6` belongs one pixel right of `996`. The
-/// two sizes clamp to at least 1, catching only a positive value that rounds to zero:
-/// `node::parse_popup_extent`/`parse_anchor_rect` already refuse a zero outright.
+/// Sends all § 6 positioner fields in protocol order. Each open builds a fresh positioner, so no
+/// diff exists. Logical pixels round to `i32` (`x=996.6` becomes 997) because the anchor came from
+/// `on_click` (ADR-0050 decision 3); sizes clamp to 1 after parsers reject zero.
 fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
     let round = |n: f32| n.round() as i32;
     positioner.set_size(round(spec.width).max(1), round(spec.height).max(1));
@@ -146,22 +123,16 @@ fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
     positioner.set_constraint_adjustment(positioner_constraint(spec.constraint_adjustment));
     positioner.set_offset(round(spec.offset.x), round(spec.offset.y));
 }
-/// What a `window` takes on a configure axis the compositor left to it, when the config declared
-/// no `min_size` to take instead. ponytail: a constant. Ceiling: with no `min_size`, opens at this
-/// size on a compositor leaving the first configure at zero. Upgrade path: § 6 gaining an
-/// advisory initial size, or sizing `Content` via the solver ADR-0077 introduced.
+/// Fallback for a compositor-selected window axis without `min_size`. ponytail: fixed 640x480;
+/// with no min size, that is the opening size when the first configure leaves an axis zero.
+/// Upgrade: § 6 advisory initial size or solver-backed `Content` sizing (ADR-0077).
 const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
-/// The size a toplevel's buffer takes for one `xdg_toplevel` configure. A `Some` axis is the
-/// compositor's, taken as given: `xdg_toplevel::configure`'s wording makes a maximized or
-/// fullscreen size binding, and a tiling compositor sizes every window this way, so on niri this
-/// is the only branch that ever runs. A `None` axis is "the client picks" ("If this value is
-/// None, you may set the size of the window as you wish"), the ordinary first configure on a
-/// floating compositor: picks `min_size` for that axis, falls back to
-/// [`UNCONFIGURED_WINDOW_SIZE`], then clamps by `max_size`. § 6's
-/// "advisory" caveat governs the compositor's own use of these numbers, not a licence to ignore a
-/// value someone chose. A zero `max_size` axis is not a maximum of zero: `set_max_size`'s own "0
-/// means no expected maximum size in the given dimension" ([`node::window_spec`]'s parser agrees).
-/// At least 1 on both axes: a `wl_egl_window` of 0 is invalid.
+/// Toplevel buffer size. `xdg_toplevel::configure` binds maximized and fullscreen sizes, so
+/// `Some` axes are authoritative; tiling compositors, including niri, always take this branch. A
+/// `None` axis means "the client picks", the ordinary first configure on a floating compositor.
+/// Choose `min_size`, then 640x480, then clamp by
+/// positive `max_size`; a zero max means unset per `set_max_size`. Clamp both axes to 1 because a
+/// zero `wl_egl_window` is invalid.
 fn toplevel_size_for(
     new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>),
     spec: &WindowSpec,
@@ -183,16 +154,10 @@ fn toplevel_size_for(
         axis(new_size.1, UNCONFIGURED_WINDOW_SIZE.1, min.height, max.height),
     )
 }
-/// The `xdg_toplevel` requests one live toplevel needs after a re-resolve changed its `window`
-/// properties (§ 6, ADR-0049's second amendment). `None` per field means "unchanged, send
-/// nothing", as `layer::SpecUpdate` does for a panel: all four are double-buffered. Every § 6
-/// protocol-facing field is here, unlike a panel: `SpecUpdate` omits
-/// [`node::SurfaceTopology`]'s five because `get_layer_surface` fixes them at creation, but a
-/// toplevel has no such set (`xdg-shell.xml` allows `set_app_id`/`set_title` after mapping, and
-/// both size hints are double-buffered too). Only `id`, the reconcile identity, is left out, since
-/// it's not a protocol field. `Option<Option<SizeHint>>` is the honest type: the outer layer is
-/// "did it move", the inner one § 6's absent-versus-present distinction, and "moved to absent"
-/// must still reach `set_min_size(None)`, the protocol's own spelling of unset.
+/// Live `xdg_toplevel` changes (§ 6, ADR-0049 amendment). All protocol fields are diffed because
+/// title/app-id and size hints remain double-buffered after mapping; `id` is only reconcile
+/// identity. `Option<Option<SizeHint>>` distinguishes unchanged from changed-to-absent, which
+/// must reach `set_min_size(None)`/`set_max_size(None)` as protocol unset.
 #[derive(Debug, Default, PartialEq)]
 struct WindowUpdate {
     title: Option<String>,
@@ -208,18 +173,14 @@ fn window_update(applied: &WindowSpec, fresh: &WindowSpec) -> WindowUpdate {
         max_size: (fresh.max_size != applied.max_size).then_some(fresh.max_size),
     }
 }
-/// A [`SizeHint`] as the two `xdg_toplevel` requests take it. `None` stays `None`, which
-/// `Window::set_min_size`/`set_max_size` send as the protocol's zero, meaning unset.
+/// A [`SizeHint`] in protocol units; `None` remains unset, sent as protocol zero.
 fn size_hint_pair(hint: Option<SizeHint>) -> Option<(u32, u32)> {
     hint.map(|hint| (hint.width.max(0.0) as u32, hint.height.max(0.0) as u32))
 }
 
 impl App {
-    /// [`App::create_surfaces`]'s `window` arm: the tracking entry always, the `xdg_toplevel` only
-    /// if this window is already shown (ADR-0049 decision 1). The entry exists either way to make
-    /// the window reachable: the poll loop's [`App::apply_resolved_surface_state`] walks
-    /// `self.surfaces`, and one with no entry never has its `visible` looked at, so it could never
-    /// open.
+    /// [`App::create_surfaces`]'s `window` arm: always track it, but create `xdg_toplevel` only
+    /// when visible (ADR-0049 decision 1). The entry lets later re-resolves observe `visible`.
     pub(super) fn create_window(
         &mut self,
         qh: &QueueHandle<App>,
@@ -242,14 +203,11 @@ impl App {
         }
     }
 
-    /// [`App::create_surfaces`]'s `popup` arm: the tracking entry always, the `xdg_popup` only if
-    /// this popup is already shown (ADR-0049 decision 1, ADR-0051 decision 1). The entry exists
-    /// for [`App::create_window`]'s reason: it makes the scene resolve the popup's tree, which
-    /// `visible` is read off. Twenty declared popups cost twenty retained nodes, zero objects. A
-    /// popup declared `visible = true` at startup with § 6's default `grab = true` is refused
-    /// by [`App::show_popup`], logged once, not treated as a startup failure: nothing has been
-    /// clicked, so there is no serial, and a dropdown that cannot be dismissed by clicking outside
-    /// it is worse than one that did not open (ADR-0049's amendment).
+    /// [`App::create_surfaces`]'s `popup` arm: always track it, but create `xdg_popup` only when
+    /// visible (ADR-0049/0051). Twenty declared popups cost twenty retained nodes and zero objects.
+    /// A startup-visible default-grab popup is refused and logged once because no click supplied a
+    /// serial; an undismissable dropdown is worse than a closed one (ADR-0049 amendment). This is
+    /// expected and does not fail startup.
     pub(super) fn create_popup(
         &mut self,
         qh: &QueueHandle<App>,
@@ -272,12 +230,9 @@ impl App {
         }
     }
 
-    /// Diffs one toplevel's freshly resolved `window` spec against the one its `xdg_toplevel` state
-    /// was last set from and sends only what moved (§ 6; see [`window_update`] for which
-    /// fields). Sends nothing while the window is not shown, but stores the spec anyway:
-    /// `visible = false` means there is no `xdg_toplevel` to send to (ADR-0049 decision 1), and
-    /// [`App::show_window`] builds the next one from exactly this stored spec, so a `title`
-    /// changed three times while closed opens with the third one.
+    /// Diff a fresh `window` spec and send changed fields (§ 6). Hidden windows have no object to
+    /// update, but retain the latest spec so a title changed three times while closed opens with
+    /// the third value (ADR-0049 decision 1).
     pub(super) fn apply_window_change(&mut self, index: usize, fresh: WindowSpec) {
         let TrackedRole::Window { window, spec: applied } = &mut self.surfaces[index].role else {
             return;
@@ -293,9 +248,8 @@ impl App {
         if let Some(app_id) = update.app_id {
             window.set_app_id(app_id);
         }
-        // Minimum before maximum, so the pair the compositor validates at the next commit is never
-        // momentarily inverted. `set_max_size` raises `invalid_size` for a maximum under the
-        // minimum, and `node::window_spec` has already refused that pairing in the fresh spec.
+        // Minimum before maximum avoids a transient inverted pair and `invalid_size`; the parser
+        // already rejects the final pairing.
         if let Some(min_size) = update.min_size {
             window.set_min_size(size_hint_pair(min_size));
         }
@@ -304,14 +258,9 @@ impl App {
         }
     }
 
-    /// [`App::apply_visibility`]'s `popup` arm (ADR-0049 decision 2, ADR-0051 decision 2). The
-    /// decision is [`popup_visibility_action`], pure and tested; this is the writes it does not
-    /// make. The latch clear is unconditional on the `visible = false` edge, not paired with
-    /// `Destroy`: a popup the compositor dismissed is already objectless, so the false edge that
-    /// reopens its path is exactly the one with nothing left to destroy. Still needed despite
-    /// ADR-0051's first amendment: it stays the ordinary case, since a config whose `on_dismiss`
-    /// writes `visible = false` reopens the path the same turn, without waiting for the pointer
-    /// count to move.
+    /// Apply [`popup_visibility_action`] (ADR-0049 decision 2, ADR-0051 decision 2). Clear the
+    /// latch on every `visible = false`, even if the object is already gone: `on_dismiss` may write
+    /// false in the same turn and must reopen without waiting for pointer input.
     pub(super) fn apply_popup_visibility(&mut self, index: usize, visible: bool) {
         let TrackedRole::Popup { popup, dismissed_at, .. } = &self.surfaces[index].role else {
             return;
@@ -331,19 +280,14 @@ impl App {
         }
     }
 
-    /// Creates this window's `xdg_toplevel` and performs the initial commit `xdg_surface` requires
-    /// (§ 6, ADR-0040 decisions 4 and 5, ADR-0049 decision 1). The sequence is layer-shell's
-    /// with a different constructor: create the surface, send the
-    /// role's state, commit unbuffered, wait for the configure (`MapState::AwaitingConfigure`,
-    /// shared verbatim with the panel path). SCTK acks `xdg_surface.configure` itself through the
-    /// wrapping `xdg_surface` (`shell/xdg/window/inner.rs`'s `Dispatch2<XdgSurface, _>`), so
-    /// nothing here acks. `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` with
+    /// Creates the toplevel and its required initial unbuffered commit (§ 6, ADR-0040 decisions
+    /// 4-5, ADR-0049 decision 1), then waits in `AwaitingConfigure`. SCTK acks configure before
+    /// the handler. `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` with
     /// `xdg_wm_base`, so `WindowDecorations::RequestServer` plus
-    /// [`Window::request_decoration_mode`] is the whole of decoration handling, no second global.
-    /// No `set_window_geometry` either: the default bounding box already fits, since this shell
-    /// draws edge to edge with no shadow to exclude and no subsurfaces. A compositor with no
-    /// xdg-shell leaves the window unbuilt, logged once per attempt, not fatal: the "keep the
-    /// shell up" principle every other failure here follows.
+    /// [`Window::request_decoration_mode`] is the whole decoration path, with no second global.
+    /// No geometry request is needed: the default bounding box fits this edge-to-edge shell, with
+    /// no shadow to exclude and no subsurfaces. Missing xdg-shell logs once per attempt and leaves
+    /// the window absent, not fatal.
     pub(super) fn show_window(&mut self, qh: &QueueHandle<App>, index: usize) {
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
             eprintln!(
@@ -359,21 +303,15 @@ impl App {
 
         let surface = self.compositor_state.create_surface(qh);
         let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, qh);
-        // Asked for explicitly too, since the two reach different objects: the constructor
-        // argument decides whether a `zxdg_toplevel_decoration_v1` exists at all, this is the
-        // `set_mode` on it. Whatever the compositor answers is accepted, and
-        // `WindowHandler::configure` logs a client-side grant and carries on undecorated.
+        // The constructor decides whether the decoration object exists; this sets its mode.
+        // Accept the compositor's answer; configure logs client-side decoration and remains bare.
         window.request_decoration_mode(Some(DecorationMode::Server));
         window.set_title(spec.title.clone());
         window.set_app_id(spec.app_id.clone());
-        // Advisory: nothing in `layout` clamps the resolved tree against them (§ 6,
-        // `WindowSpec`'s own note). They do bound the size picked on a `None` configure axis, the
-        // one place the choice is ours. See [`toplevel_size_for`].
+        // Hints do not clamp layout (§ 6), but bound the size chosen for `None` configure axes.
         window.set_min_size(size_hint_pair(spec.min_size));
         window.set_max_size(size_hint_pair(spec.max_size));
-        // The initial commit `xdg_surface` requires: "the client must perform an initial commit
-        // without any buffer attached", after which the compositor's configure makes attaching
-        // one legal.
+        // Required initial commit without a buffer; configure then permits attachment.
         window.commit();
 
         if let TrackedRole::Window { window: slot, .. } = &mut self.surfaces[index].role {
@@ -383,17 +321,12 @@ impl App {
         eprintln!("[oblisk-renderer] {} creating: visible = true", self.surfaces[index].surface_id);
     }
 
-    /// Destroys this window's `xdg_toplevel` and everything hanging off it, leaving the tracking
-    /// entry behind so a later `visible = true` can build a fresh one (ADR-0049 decision 1).
-    /// Teardown order is [`App::destroy_surface_by_id`]'s: EGL surface by hand, then the
-    /// `wl_egl_window`, then the role object. Dropping the [`Window`] handle is that last step;
-    /// SCTK's `WindowInner::drop` destroys the decoration object, then the `xdg_toplevel`, then
-    /// the `xdg_surface`, then the `wl_surface`, the order xdg-shell requires. `configured_size`
-    /// clears with the binding (inside `release_bound`): the next toplevel gets its own configure
-    /// and must not paint into a stale one.
+    /// Destroys the toplevel but keeps tracking so a later `visible = true` rebuilds it
+    /// (ADR-0049 decision 1). Clear `configured_size` with the binding; the next toplevel gets its
+    /// own configure and cannot paint into a stale one. Release EGL/`wl_egl_window` first; dropping
+    /// `Window` then destroys decoration, toplevel, xdg-surface, and wl-surface in protocol order.
     pub(super) fn hide_window(&mut self, index: usize) {
-        // Before anything of this window's own is torn down: a popup rooted under it must not
-        // outlive its `xdg_surface`. See [`App::drop_child_popups`] for the cost of skipping this.
+        // Child popups must die before their parent xdg-surface.
         self.drop_child_popups(index);
         self.release_bound(index);
         if let TrackedRole::Window { window, .. } = &mut self.surfaces[index].role {
@@ -404,24 +337,17 @@ impl App {
         eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
-    /// Creates this popup's `xdg_positioner` and `xdg_popup`, roots it under one parent instance,
-    /// takes the grab if § 6 asked for one, and performs the initial commit, in protocol order
-    /// (§ 6, ADR-0040 decision 2, ADR-0049 decisions 1-2, ADR-0051 decisions 1 and 3). Build the
-    /// positioner and set every field, since `get_popup` reads and consumes it once. Create with
-    /// [`Popup::from_surface`], not [`Popup::new`]: `new` sends the initial commit itself, fatal
-    /// for a `panel` parent whose rooting request has not been sent yet (SCTK requires configuring
-    /// such a parent, e.g. via `LayerSurface::get_popup`, before the commit, or
-    /// `invalid_popup_parent` results). The grab must be requested before the popup maps, or the
-    /// compositor raises `invalid_grab`. Then commit and wait in [`MapState::AwaitingConfigure`].
-    ///
-    /// `grab = true` with nothing armed refuses the popup rather than open it ungrabbed
-    /// (ADR-0049's amendment, ADR-0051 decision 3): undismissable is worse than unopened. A
-    /// refused grab needs no branch: it arrives as an immediate `popup_done`, § 6's normal
-    /// outcome, handled by [`PopupHandler::done`] like a click-outside. SCTK acks
-    /// `xdg_surface.configure` before calling [`PopupHandler::configure`] (`shell/xdg/popup.rs`'s
-    /// `Dispatch2<XdgSurface, _>`), so nothing here acks. The grab is the one request it does not
-    /// wrap, reached through `Popup::xdg_popup()`, the raw-object escape hatch ADR-0009
-    /// established for `wp-text-input-v3`.
+    /// Creates positioner and popup in protocol order (§ 6, ADR-0040 decision 2, ADR-0049
+    /// decisions 1-2, ADR-0051 decisions 1 and 3). `get_popup` consumes every positioner field.
+    /// Use [`Popup::from_surface`], not `Popup::new`: the latter commits before a layer parent is
+    /// rooted and causes `invalid_popup_parent`. Request grabs before mapping or get
+    /// `invalid_grab`.
+    /// SCTK's `Dispatch2<XdgSurface, _>` acks `xdg_surface.configure` before
+    /// [`PopupHandler::configure`] (`shell/xdg/popup.rs`), so nothing here acks. The grab is the
+    /// one request not wrapped by SCTK: `Popup::xdg_popup()` is the raw-object escape hatch for
+    /// `wp-text-input-v3` established by ADR-0009, and is used here only for grab.
+    /// An unarmed `grab = true` is refused, producing normal immediate `popup_done` rather than an
+    /// undismissable popup (ADR-0049 amendment, ADR-0051 decision 3).
     fn show_popup(&mut self, qh: &QueueHandle<App>, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
@@ -435,7 +361,7 @@ impl App {
         };
         let spec = spec.clone();
 
-        // Decided before anything is created, so a refusal costs no protocol objects.
+        // Refuse before creating protocol objects.
         let grab = if spec.grab {
             let Some(armed) = self.input_serial.clone() else {
                 if self.refusal_is_new(index, PopupRefusal::Unarmed) {
@@ -460,9 +386,8 @@ impl App {
             None
         };
 
-        // Consulted whether or not a grab was asked for: ADR-0051 decision 1 picks which instance
-        // of the declared parent a dropdown belongs to, and a click decides that regardless of
-        // grab.
+        // Parent selection applies with or without a grab; the arming click still decides it
+        // (ADR-0051 decision 1).
         let parent_index = parent_instance_index(
             self.surfaces.iter().map(|tracked| tracked.surface_id.as_str()),
             &spec.parent,
@@ -477,8 +402,7 @@ impl App {
             }
             return;
         };
-        // Logged with the popup: on a multi-monitor session it's the answer ADR-0051 decision 1
-        // gives, otherwise unobservable.
+        // Log the selected parent, observable mainly on multi-monitor sessions.
         let parent_id = parent_index.map_or("<none>", |parent| self.surfaces[parent].surface_id.as_str()).to_string();
 
         let positioner = match XdgPositioner::new(xdg_shell) {
@@ -503,17 +427,15 @@ impl App {
             }
         };
         if let PopupParent::Layer(layer) = &parent {
-            // Layer-shell's own rooting request, the reason `Popup::from_surface` got no parent
-            // above. Before the commit below, or `invalid_popup_parent`.
+            // Layer-shell roots the raw popup before the commit, or `invalid_popup_parent`.
             layer.get_popup(popup.xdg_popup());
         }
         if let Some((seat, armed)) = &grab {
             popup.xdg_popup().grab(seat, armed.serial);
         }
-        // The initial commit `xdg_surface` requires, and the line every step above had to precede.
+        // Required initial unbuffered commit, after all rooting/grab requests.
         popup.wl_surface().commit();
-        // `positioner` drops here, destroying the `xdg_positioner`: fine, since `get_popup` has
-        // already copied its state.
+        // `get_popup` copied the positioner, so dropping it is correct.
 
         if let TrackedRole::Popup { popup: slot, refusal_logged, .. } = &mut self.surfaces[index].role {
             *slot = Some(popup);
@@ -526,14 +448,11 @@ impl App {
         );
     }
 
-    /// Destroys this popup's `xdg_popup` and every popup nested under it, leaving the tracking
-    /// entries behind so a later `visible = true` can build fresh ones (ADR-0049 decision 1).
-    /// Children first: `xdg_popup`'s own description makes destroying a parent before its child a
-    /// protocol error, and [`App::shown_popups_under`] produces exactly that order. A nested child
-    /// is latched on the way down though it never got its own `popup_done`: the
-    /// engine took its parent away, not the compositor, but its object is gone while its `visible`
-    /// still says true, and recreating it next re-resolve would only find its parent missing. The
-    /// latch clears on its own `visible = false`, as decision 2 says.
+    /// Destroys this popup and nested popups, children first because xdg-shell rejects parent-first
+    /// teardown, leaving tracking entries so a later `visible = true` builds fresh objects. Latch
+    /// children removed with the parent even without their own `popup_done`; their object is gone
+    /// while `visible` remains true and their parent is absent. The latch clears on their
+    /// `visible = false` edge (ADR-0051 decision 2).
     fn hide_popup(&mut self, index: usize) {
         for child in self.drop_child_popups(index) {
             self.latch_popup(child);
@@ -541,16 +460,11 @@ impl App {
         self.drop_popup_object(index);
     }
 
-    /// Destroys every popup currently rooted under the surface at `index`, deepest first, and
-    /// returns them in that order. `index` itself is left alone: its own teardown is the caller's.
-    /// Every path that destroys a surface owes this call: wlroots rejects destroying an
-    /// `xdg_surface` whose popup list is non-empty, taking the connection and the whole shell down
-    /// with it. The latch is deliberately not set here, only by `hide_popup` on what this returns:
-    /// a parent going away is not a compositor dismissal, the child's `visible` never moved, so it
-    /// should reappear the moment its parent does rather than wait for pointer input (a parent
-    /// reopened by a D-Bus notification never produces any). Cost: each re-resolve while the
-    /// parent is away runs a [`App::show_popup`] that refuses at the `parent` check, plus one
-    /// throttled log line ([`PopupRefusal`]).
+    /// Returns shown descendants deepest-first and destroys their objects. Every surface teardown
+    /// needs this because wlroots rejects a parent xdg-surface with live popups. Do not latch here:
+    /// parent teardown is not compositor dismissal, and a child should return when its parent does,
+    /// including parents reopened by D-Bus without pointer input. While absent, each re-resolve
+    /// retries and emits one throttled [`PopupRefusal`].
     pub(super) fn drop_child_popups(&mut self, index: usize) -> Vec<usize> {
         let mut nested = Vec::new();
         self.shown_popups_under(index, &mut nested);
@@ -560,10 +474,8 @@ impl App {
         nested
     }
 
-    /// One popup's object teardown, with no opinion about the latch or about nesting. Teardown
-    /// order is [`App::destroy_surface_by_id`]'s, reused rather than restated: EGL surface by hand,
-    /// then the `wl_egl_window`, then the role object. Dropping the [`Popup`] handle is that
-    /// last step, since `PopupInner::drop` is what sends `xdg_popup.destroy`.
+    /// One popup object teardown, without changing its latch or nesting. Release EGL and
+    /// `wl_egl_window`, then drop [`Popup`], whose `Drop` sends `xdg_popup.destroy`.
     fn drop_popup_object(&mut self, index: usize) {
         self.release_bound(index);
         if let TrackedRole::Popup { popup, .. } = &mut self.surfaces[index].role {
@@ -574,10 +486,8 @@ impl App {
         eprintln!("[oblisk-renderer] {} destroyed", self.surfaces[index].surface_id);
     }
 
-    /// Whether this refusal's line is worth writing, recording it either way: true unless it's the
-    /// same refusal last logged for this popup (ADR-0049's amendment, [`PopupRefusal`]). A
-    /// different refusal still gets its own line: the field holds a reason, not a flag, so a
-    /// config that fixes `grab` and then trips over a hidden `parent` is not told nothing.
+    /// Whether this is a new refusal for the popup (ADR-0049 amendment). Different reasons each
+    /// log, so fixing `grab` and then hitting a hidden parent is visible.
     fn refusal_is_new(&mut self, index: usize, refusal: PopupRefusal) -> bool {
         let TrackedRole::Popup { refusal_logged, .. } = &mut self.surfaces[index].role else {
             return false;
@@ -585,11 +495,8 @@ impl App {
         refusal_logged.replace(refusal) != Some(refusal)
     }
 
-    /// Sets ADR-0051 decision 2's latch on one popup, stamped with the pointer-input count now (a
-    /// no-op on any other role, why this is a method rather than a field write at each call site).
-    /// The stamp is what the amendment turns on: the latch holds until
-    /// [`App::pointer_input_count`] moves past this value, so a dismissal followed by nothing
-    /// holds forever and one followed by a click does not.
+    /// Stamp ADR-0051 decision 2's latch with the current pointer count; it holds until that count
+    /// advances, so dismissal followed by nothing stays latched and a later click reopens.
     fn latch_popup(&mut self, index: usize) {
         let stamp = self.pointer_input_count;
         if let TrackedRole::Popup { dismissed_at, .. } = &mut self.surfaces[index].role {
@@ -597,15 +504,10 @@ impl App {
         }
     }
 
-    /// Every currently shown popup rooted under the surface at `index`, appended deepest-first,
-    /// the order [`App::hide_popup`] destroys in. Post-order over the parent tree: a grandchild is
-    /// appended before its parent, and `index` itself is never appended (the caller owns that).
-    /// Siblings come out in tracked order, fine since xdg-shell constrains a popup against its
-    /// parent, not against siblings under one parent. Cannot recurse forever, not from a depth
-    /// guard: a popup is only counted here while it holds
-    /// an object, and it cannot hold one unless its parent held one first ([`App::show_popup`]
-    /// refuses otherwise), so a `parent` cycle, including a popup naming itself, has no member
-    /// that ever opens.
+    /// Append shown descendants deepest-first, matching [`App::hide_popup`]. Siblings stay in
+    /// tracked order, which is safe because xdg-shell constrains a popup against its parent, not
+    /// against siblings under one parent. A popup can hold an object only after its parent does, so
+    /// parent cycles, including self-parenting, never open and cannot recurse through this walk.
     pub(super) fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
         let parent_id = self.surfaces[index].surface_id.clone();
         let children: Vec<usize> = (0..self.surfaces.len())
@@ -621,18 +523,12 @@ impl App {
     }
 }
 
-/// `xdg_toplevel` for the `window` role (§ 6). See `delegate_dispatch2!(App)` at the bottom of
-/// this file for why no `delegate_xdg_shell!`/`delegate_xdg_window!` call accompanies this.
+/// `xdg_toplevel` handler for `window` (§ 6).
 impl WindowHandler for App {
-    /// `xdg_toplevel::close`, a request, not a command: "The client may choose to ignore this
-    /// request", and § 6 makes that the config's call. The callback may decline by doing
-    /// nothing, leaving the window open until the config sets `visible = false`. Deliberately
-    /// destroys nothing: closing on behalf of a config that did not ask would take
-    /// the decision away from ADR-0049 decision 2 and leave the scene's `visible` saying `true`
-    /// about a window that no longer exists, which the next re-resolve would answer by creating a
-    /// second one. The Lua call has `fire_on_click`'s shape: cloned out of the resolved tree so no
-    /// borrow of `self.client` is live while Lua runs, and a raise is logged and swallowed rather
-    /// than taking down a shell that is otherwise painting.
+    /// `xdg_toplevel::close` is a request, not a command: § 6 lets config ignore it. Do not destroy
+    /// here; doing so would leave `visible=true` describing a missing window and the next resolve
+    /// would create a second one (ADR-0049 decision 2). Clone the callback before Lua; log and
+    /// swallow raises like `fire_on_click`.
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
         let Some(index) = self.index_of_surface(window.wl_surface()) else {
             return;
@@ -640,8 +536,8 @@ impl WindowHandler for App {
         let surface_id = self.surfaces[index].surface_id.clone();
         let on_close =
             self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_close") {
-                // § 6 leaves the key opaque to `layout::node`, as § 5.2 leaves `on_click`: this
-                // is the only place its type is checked.
+                // § 6 leaves this key opaque to `layout::node`, as § 5.2 leaves `on_click`; this
+                // is its only type check.
                 Some(Value::Function(on_close)) => Some(on_close.clone()),
                 _ => None,
             });
@@ -656,19 +552,9 @@ impl WindowHandler for App {
         }
     }
 
-    /// One `xdg_surface.configure`, already acked by SCTK before this runs (see
-    /// [`App::show_window`]). Everything after the size decision is `bind_and_clear`, shared
-    /// verbatim with layer-shell. `WindowConfigure` carries three things layer-shell has no
-    /// analogue for; this handles one:
-    ///
-    /// - `new_size`, whose axes are `Option` since a toplevel may be told to pick for itself
-    ///   ([`toplevel_size_for`] decides).
-    /// - `decoration_mode`, logged only on the first configure of a mapping when the compositor
-    ///   granted client-side decorations: ADR-0040 decision 4 and § 6 both refuse a client-side
-    ///   titlebar, so undecorated is the accepted outcome.
-    /// - `state` and `capabilities`, deliberately unread: § 5.2 and § 6 give a config nothing to
-    ///   bind them to. The consequence that matters, a fullscreen or maximized configure being
-    ///   binding, already reaches this shell as a `Some` axis of `new_size`.
+    /// SCTK has acked this configure. `new_size` may leave axes to the client; client-side
+    /// decoration is logged but not drawn (ADR-0040 decision 4); `state`/`capabilities` have no
+    /// config binding, while fullscreen/maximized sizes arrive as `Some` axes.
     fn configure(
         &mut self,
         _conn: &Connection,
@@ -696,22 +582,11 @@ impl WindowHandler for App {
     }
 }
 
-/// `xdg_popup` for the `popup` role (§ 6). See `delegate_dispatch2!(App)` at the bottom of this
-/// file for why no `delegate_xdg_popup!` call accompanies this.
+/// `xdg_popup` handler for `popup` (§ 6).
 impl PopupHandler for App {
-    /// One `xdg_surface.configure`, already acked by SCTK before this runs (see
-    /// [`App::show_popup`]). Everything after the size decision is `bind_and_clear`, shared
-    /// verbatim with layer-shell and the toplevel path. [`PopupConfigure`] carries two things this
-    /// deliberately does not read.
-    ///
-    /// - `position`, the popup's offset from its parent's window geometry. The compositor places
-    ///   it; the client neither needs nor may act on where it landed, and § 6 gives a config
-    ///   nothing to bind it to.
-    /// - `kind`, `Initial` on every configure this shell will ever see. The other two variants,
-    ///   `Reactive` (needs `xdg_positioner::set_reactive`, which [`configure_positioner`] does not
-    ///   send) and `Reposition` (needs `xdg_popup.reposition`), are unbuilt: a fresh popup per
-    ///   open covers a dropdown opening under different buttons, and only a moving anchor needs
-    ///   either.
+    /// SCTK has acked the configure. Ignore compositor placement because § 6 gives config no
+    /// binding for it. Only `Initial` is built; `Reactive` needs `set_reactive` and `Reposition`
+    /// needs `xdg_popup.reposition`, while a fresh popup per open handles changing anchors.
     fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup, configure: PopupConfigure) {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;
@@ -723,19 +598,12 @@ impl PopupHandler for App {
         self.bind_and_clear(index, width, height);
     }
 
-    /// `xdg_popup.popup_done`, not a request: the whole reason ADR-0040 reached for a real
-    /// `xdg_popup` instead of a second `panel`, since layer-shell has no compositor-agnostic way
-    /// to dismiss on click-outside. Three things happen in order: destroy the object, children
-    /// first ([`App::hide_popup`]); set ADR-0051 decision 2's latch so no replacement appears
-    /// unasked; then fire § 6's `on_dismiss` into a config that finds the popup already gone.
-    /// Deliberately not [`WindowHandler::request_close`]'s rule: `close` is ignorable, so that
-    /// path destroys nothing and lets the config decide. `popup_done` is not a request, the object
-    /// is already gone, so the engine must not trust the config's answer. See
-    /// [`popup_visibility_action`] for why the latch, not this callback, prevents a livelock. A
-    /// grab the compositor denied arrives here too, right after `show_popup` asked for one,
-    /// needing no branch: § 6 calls that normal (ADR-0051 decision 3). The Lua call follows
-    /// [`WindowHandler::request_close`]'s shape: cloned out of the resolved tree, raise logged and
-    /// swallowed.
+    /// `popup_done` is compositor dismissal, not a request. It is why ADR-0040 uses a real
+    /// `xdg_popup` instead of a second `panel`: layer-shell has no compositor-agnostic
+    /// click-outside dismissal. Then destroy children/object, latch ADR-0051 decision 2, and call
+    /// § 6 `on_dismiss` against the already-gone popup. A denied
+    /// grab arrives here as normal `popup_done` (ADR-0051 decision 3); clone callbacks and swallow
+    /// raises. The latch, not this callback, prevents the re-resolve livelock.
     fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;
@@ -747,14 +615,12 @@ impl PopupHandler for App {
 
         let on_dismiss =
             self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_dismiss") {
-                // § 6 leaves the key opaque too, as `on_close`'s comment in `request_close`
-                // notes.
+                // § 6 leaves this key opaque too.
                 Some(Value::Function(on_dismiss)) => Some(on_dismiss.clone()),
                 _ => None,
             });
         let Some(on_dismiss) = on_dismiss else {
-            // Not a warning: a config with no `on_dismiss` does not care why the popup closed, and
-            // the latch is what makes that safe rather than a livelock.
+            // No handler is fine; the latch still prevents a livelock.
             return;
         };
         if let Err(e) = on_dismiss.call::<()>(()) {

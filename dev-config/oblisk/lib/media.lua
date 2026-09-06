@@ -1,21 +1,14 @@
--- Whether a player is showing a video rather than playing a song.
---
--- Nothing in Rust answers this and nothing should (ADR-0137). The Supervisor publishes the two
--- facts a config cannot reach, `url` and `desktop_entry`, and stops there: the four lists below are
--- taste, they go stale on their own schedule, and the right list for one person is wrong for the
--- next. This is where the rest of this config's taste already lives.
---
--- Mirrors `MediaService.qml`'s `_isVideo`, order included, because the order is load-bearing:
---
---   1. A known video application is a video whatever it happens to be playing.
---   2. Anything that is not a browser is not a video. A music player publishing a `.mp4` URL is
---      still a music player.
---   3. A browser is judged by its URL, music sites checked *first*: `music.youtube.com/watch?v=`
---      contains `youtube.com/watch`, so checking the video list first calls every album a film.
---   4. Then the video sites, then the file extension.
---
--- `desktop_entry` before `identity`: the first is the player's `.desktop` basename and is stable,
--- the second is a display string a player may localise or decorate.
+-- Classifies whether a player shows video rather than playing a song.
+-- Rust deliberately does not answer this (ADR-0137). The Supervisor exposes only `url` and
+-- `desktop_entry`; these four preference lists live in config and may go stale independently.
+-- Mirrors `MediaService.qml`'s `_isVideo`; order is load-bearing:
+--   1. A known video application is video whatever it plays.
+--   2. A non-browser is not video; a music player publishing `.mp4` remains a music player.
+--   3. For browsers, check music sites first: `music.youtube.com/watch?v=` contains
+--      `youtube.com/watch`, so video-first would classify every album as a film.
+--   4. Then check video sites, then the extension.
+-- Prefer `desktop_entry` to `identity`: the former is the stable `.desktop` basename; the latter
+-- is a display string that may be localised or decorated.
 local media = {}
 
 local VIDEO_APPS = {
@@ -44,8 +37,7 @@ local VIDEO_EXTENSIONS = {
     mpg = true, wmv = true, flv = true,
 }
 
--- `find(..., true)` for a plain substring search: every entry above is a literal, and a `.` in
--- `youtu.be` would otherwise match any character.
+-- `find(..., true)` keeps entries literal; otherwise the `.` in `youtu.be` matches any character.
 local function matches_any(haystack, needles)
     for _, needle in ipairs(needles) do
         if haystack:find(needle, 1, true) then
@@ -55,7 +47,7 @@ local function matches_any(haystack, needles)
     return false
 end
 
---- Whether one `PlayerState` is showing a video.
+--- Video classification for one `PlayerState`.
 --- @param player table? one entry of `oblisk.mpris`'s `players`
 --- @return boolean
 function media.is_video(player)
@@ -81,9 +73,8 @@ function media.is_video(player)
     return extension ~= nil and VIDEO_EXTENSIONS[extension] == true
 end
 
---- Whether any player in one `oblisk.mpris` payload is playing a video. Pure, and it takes the
---- payload rather than reading it, so `lib/idle.lua` can call it with what an `on_change` handed
---- over instead of trusting a `computed` to be current inside a callback.
+--- Video classification from one `oblisk.mpris` payload. Pure and payload-based so `lib/idle.lua`
+--- can use the value from `on_change` instead of a possibly stale `computed` in its callback.
 --- @param m table? `oblisk.mpris`'s payload
 --- @return boolean
 function media.is_playing_video(m)

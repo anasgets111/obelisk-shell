@@ -18,29 +18,24 @@ use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category,
 };
 
-/// Holds every proxy `oblisk.bluetooth`'s write actions and state rebuilds need. `Clone`:
-/// every field is a cheap `zbus` proxy/`Arc` handle, so a clone can be moved into a
-/// `tokio::spawn`ed task for one write action without the caller losing its own handle.
+/// Proxies needed by `oblisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
+/// proxy or `Arc`, so a clone can move into a `tokio::spawn` task.
 #[derive(Clone)]
 pub struct BluetoothController {
     adapter: Option<Adapter1Proxy<'static>>,
     devices: DeviceRegistry,
-    /// `oblisk.bluetooth`'s own push state (ADR-0037), mutated only by
-    /// [`handle_signal`](Self::handle_signal). `Mutex` because the controller is `Clone`;
+    /// Push state (ADR-0037), mutated only by [`handle_signal`](Self::handle_signal). The mutex is
     /// never held across an await.
     state: Arc<Mutex<BluetoothState>>,
-    /// Clone of the signal channel's sender: lets [`clear_discovered`](Self::clear_discovered)
-    /// route its immediate clear through the same FIFO as the forwarders' real signals.
+    /// Signal sender used by [`clear_discovered`](Self::clear_discovered) to share the forwarders'
+    /// FIFO.
     events: UnboundedSender<BluetoothSignal>,
 }
 
 impl BluetoothController {
-    /// Binds `org.bluez`'s `ObjectManager`, hydrates the device registry and the first adapter
-    /// found via one `GetManagedObjects()` call (ADR-0030: "single adapter, first one found"),
-    /// spawns every signal-forwarder task this controller needs, and registers the
-    /// Just-Works-only pairing agent, all at construction time. `events` is threaded in here
-    /// rather than exposed via a getter: hydrating the device registry needs the channel,
-    /// since every hydrated device gets its own forwarder immediately.
+    /// Binds `org.bluez`'s `ObjectManager`, hydrates devices and the first adapter from one
+    /// `GetManagedObjects()` call (ADR-0030), starts signal forwarders, and registers the
+    /// Just-Works agent. `events` is passed in because hydration starts each device forwarder.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<BluetoothSignal>) -> Self {
         let object_manager = match bind_object_manager(&connection).await {
             Ok(object_manager) => Some(object_manager),
@@ -53,8 +48,7 @@ impl BluetoothController {
         let devices: DeviceRegistry = Arc::new(Mutex::new(HashMap::new()));
         let mut adapter = None;
 
-        // Subscribed before GetManagedObjects() below, not after: a device added/removed on
-        // the bus in between would otherwise be silently missed forever.
+        // Subscribe before GetManagedObjects(): a device changing between them would be missed.
         let object_manager_streams = match &object_manager {
             Some(object_manager) => match subscribe_object_manager(object_manager).await {
                 Ok(streams) => Some(streams),
@@ -107,9 +101,8 @@ impl BluetoothController {
         Self { adapter, devices, state: Arc::new(Mutex::new(BluetoothState::default())), events }
     }
 
-    /// Applies one [`BluetoothSignal`] to the controller-owned [`BluetoothState`] and returns
-    /// the updated state for the main loop's one bluetooth arm to push: no debounce, every
-    /// relevant event fully re-derives the affected part of the state from scratch.
+    /// Applies one [`BluetoothSignal`] to [`BluetoothState`] for the main loop to push. No
+    /// debounce: each relevant event fully re-derives its affected state.
     pub async fn handle_signal(&self, signal: BluetoothSignal) -> BluetoothState {
         match signal {
             BluetoothSignal::AdapterChanged => {
@@ -135,14 +128,13 @@ impl BluetoothController {
         }
     }
 
-    /// The immediate half of `bluetooth:start_discovery()`: queues
-    /// [`BluetoothSignal::DiscoveryCleared`] so `discovered_devices` clears on initiation, not
-    /// once `StartDiscovery`'s D-Bus round trip completes (ADR-0030).
+    /// Queues [`BluetoothSignal::DiscoveryCleared`] immediately when
+    /// `bluetooth:start_discovery()` begins, before `StartDiscovery`'s D-Bus round trip (ADR-0030).
     pub fn clear_discovered(&self) {
         let _ = self.events.send(BluetoothSignal::DiscoveryCleared);
     }
 
-    /// Live `Powered` read, `false` (not an error) with no adapter present.
+    /// Live `Powered` value; `false` without an adapter is not an error.
     async fn read_enabled(&self) -> bool {
         match &self.adapter {
             Some(adapter) => adapter.powered().await.unwrap_or(false),
@@ -150,7 +142,7 @@ impl BluetoothController {
         }
     }
 
-    /// Live `Discovering` read, `false` (not an error) with no adapter present.
+    /// Live `Discovering` value; `false` without an adapter is not an error.
     async fn read_discovering(&self) -> bool {
         match &self.adapter {
             Some(adapter) => adapter.discovering().await.unwrap_or(false),
@@ -158,12 +150,10 @@ impl BluetoothController {
         }
     }
 
-    /// Full, live re-derivation of both device lists from the entire tracked registry.
-    /// `connected_devices` is every entry that's both `Paired` and `Connected` (§5's "active
-    /// paired & connected accessories"); `discovered_devices` is every entry that isn't
-    /// `Paired` yet. A device whose `Paired`/`Connected` read fails is excluded from both.
-    /// `discovered_devices` is not scoped to the current discovery session -- see
-    /// `dbus/bluetooth/mod.rs`'s module doc ponytail note.
+    /// Re-derives both lists from the full registry. `connected_devices` contains entries that
+    /// are both `Paired` and `Connected` (§5); `discovered_devices` contains unpaired entries.
+    /// Failed `Paired`/`Connected` reads exclude an entry from both. Discovery is not session-
+    /// scoped; see `dbus/bluetooth/mod.rs`'s ponytail note.
     async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<DiscoveredDevice>) {
         let snapshot: Vec<(String, Device1Proxy<'static>, Option<Battery1Proxy<'static>>)> = {
             let guard = self.devices.lock().unwrap();
@@ -196,17 +186,15 @@ impl BluetoothController {
         (connected, discovered)
     }
 
-    /// Synchronous registry scan resolving `mac` to its tracked object path and bound
-    /// `Device1` proxy -- no `.await` here on purpose, so this can be called freely without
-    /// ever holding the registry's `std::sync::Mutex` across an await point.
+    /// Synchronously resolves `mac` to its tracked path and `Device1` proxy. No `.await`, so the
+    /// registry mutex is never held across an await.
     fn resolve_device(&self, mac: &str) -> Option<(OwnedObjectPath, Device1Proxy<'static>)> {
         let guard = self.devices.lock().unwrap();
         guard.iter().find(|(_, entry)| entry.mac == mac).map(|(path, entry)| (path.clone(), entry.device.clone()))
     }
 
-    /// `bluetooth:set_enabled(en)`: writes `Adapter1.Powered`. No local state flip and no
-    /// snapshot push here -- [`spawn_adapter_signal_forwarder`] observes the real property
-    /// change and `main.rs` rebuilds/pushes from that.
+    /// `bluetooth:set_enabled(en)`: writes `Adapter1.Powered`. The adapter signal forwarder
+    /// observes the real change; `main.rs` then rebuilds and pushes state.
     pub async fn set_enabled(&self, enabled: bool) {
         let Some(adapter) = &self.adapter else {
             eprintln!("bluetooth: set_enabled({enabled}) failed: {}", BluetoothActionError::NoAdapter);
@@ -217,9 +205,8 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:start_discovery()`'s D-Bus half. The `discovered_devices` clear (ADR-0030)
-    /// happens via [`clear_discovered`](Self::clear_discovered), immediately, before this is
-    /// even spawned.
+    /// D-Bus half of `bluetooth:start_discovery()`. [`clear_discovered`](Self::clear_discovered)
+    /// clears `discovered_devices` before this task is spawned (ADR-0030).
     pub async fn start_discovery(&self) {
         let Some(adapter) = &self.adapter else {
             eprintln!("bluetooth: start_discovery() failed: {}", BluetoothActionError::NoAdapter);
@@ -230,8 +217,8 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:stop_discovery()`: no local state mutation (ADR-0030: the last
-    /// `discovered_devices` snapshot stays visible).
+    /// `bluetooth:stop_discovery()`: no local mutation; the last `discovered_devices` snapshot
+    /// stays visible (ADR-0030).
     pub async fn stop_discovery(&self) {
         let Some(adapter) = &self.adapter else {
             eprintln!("bluetooth: stop_discovery() failed: {}", BluetoothActionError::NoAdapter);
@@ -242,8 +229,8 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:pair(mac)`. An unresolvable `mac` is a domain error -- logged and dropped,
-    /// never a guessed object path (ADR-0030).
+    /// `bluetooth:pair(mac)`. An unresolvable `mac` is logged and dropped, never guessed
+    /// (ADR-0030).
     pub async fn pair(&self, mac: &str) {
         match self.resolve_device(mac) {
             Some((_, device)) => {
@@ -279,9 +266,8 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:forget(mac)`: resolves `mac` to its tracked path and calls
-    /// `Adapter1.RemoveDevice(path)` on the bound adapter -- clears paired credentials from disk
-    /// (docs/oblisk-supervisor-services-dbus.md §5.1).
+    /// `bluetooth:forget(mac)`: resolves `mac` and calls `Adapter1.RemoveDevice(path)`, clearing
+    /// paired credentials from disk (docs/oblisk-supervisor-services-dbus.md §5.1).
     pub async fn forget(&self, mac: &str) {
         let Some(adapter) = &self.adapter else {
             eprintln!("bluetooth: forget({mac:?}) failed: {}", BluetoothActionError::NoAdapter);

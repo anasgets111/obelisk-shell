@@ -10,9 +10,10 @@
 use crate::layout::node::SurfaceSpec;
 use crate::layout::scene::LogicalSize;
 
-/// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the one id space
-/// Lua, the retained scene, the Wayland surface, and the PBA handshake all share (ADR-0038): the
-/// `"{id}@{output}"` convention `supervisor/src/reload.rs` already used for wallpaper, generalized.
+/// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the shared id
+/// space for Lua, the retained scene, Wayland, and the PBA handshake (ADR-0038), using the
+/// `"{id}@{output}"` convention from `supervisor/src/reload.rs`, generalising wallpaper's existing
+/// id namespace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceInstance {
     /// `"bar@DP-1"` for a `panel`; the bare declared id (`"settings"`) for a `window`, with no
@@ -128,21 +129,15 @@ pub fn is_instance_of(instance_id: &str, declared_id: &str) -> bool {
 /// EGL binding, configure history, and place on screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceReconcile {
-    /// Every instance that should exist after the change, in `fresh` order.
     pub instances: Vec<SurfaceInstance>,
     pub added: Vec<SurfaceInstance>,
-    /// `instance_id`s whose surface must be destroyed.
     pub removed: Vec<String>,
 }
 
-/// Diffs the instance set a generation is currently resolving against the one
-/// [`expand_instances`] produces from the outputs now connected.
-///
-/// A retained instance carries over from `current` **unchanged**, the one thing a plain
-/// re-expansion cannot do: `expand_instances` seeds `available` from the output's logical size,
-/// but `RendererClient::set_instance_size` has replaced it with what the compositor configured (a
-/// bar's 1920x32, not its output's 1920x1080); the re-expanded size would stick until a
-/// `configure` that never comes if the size is unchanged.
+/// Diffs the current instance set against [`expand_instances`]' output. Retained instances carry
+/// over unchanged: `set_instance_size` may have replaced the seeded output size with the
+/// compositor's configured size, such as a bar's 1920x32 on a 1920x1080 output; re-expansion
+/// would persist the wrong size until a configure that never comes.
 pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance]) -> InstanceReconcile {
     let mut instances = Vec::with_capacity(fresh.len());
     let mut added = Vec::new();

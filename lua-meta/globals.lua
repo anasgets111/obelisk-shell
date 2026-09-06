@@ -1,39 +1,31 @@
 ---@meta
--- The remaining engine globals, and the stdlib as ADR-0048 actually left it.
+-- The remaining engine globals, and the stdlib as ADR-0048 left it.
 --
--- HAND-WRITTEN. `just stubs` does not touch this file, and nothing else checks it either: unlike
--- `nodes.lua` there is no roster test behind it, because these globals are registered one at a time
--- in `renderer/src/lua/` rather than from a list. `just types` is the only thing that exercises it,
--- indirectly, by checking `dev-config` against these signatures. Edit it in the same commit as the
--- Rust that changes, or nothing will tell you.
+-- HAND-WRITTEN. `just stubs` does not touch it: unlike `nodes.lua`, globals register one at a time
+-- in `renderer/src/lua/`, so no roster test exists. `just types` checks `dev-config` against it;
+-- edit it with the Rust or drift only appears as a config diagnostic.
 --
--- The sandbox is the reason this file matters most. The config VM loads only
--- `COROUTINE | TABLE | STRING | UTF8 | MATH | PACKAGE | OS`, and then replaces `os` with a table
--- holding four calls. Without the `runtime.builtin` disables in `.luarc.json` plus the `os`
--- declaration below, the language server would offer `io.open`, `os.execute` and `debug.getinfo`,
--- none of which exist at runtime. A red squiggle beats reading a stack trace.
+-- The config VM loads only `COROUTINE | TABLE | STRING | UTF8 | MATH | PACKAGE | OS`, then replaces
+-- `os` with four calls. `.luarc.json` disables the other builtins; without that and this `os`
+-- declaration, the language server offers runtime-missing `io.open`, `os.execute`, and
+-- `debug.getinfo`.
 
----The font chain, in fallback order. Called at the top level of `shell.lua`, before anything
----measures text. Both readers fall back per glyph across the whole chain, so one declaration
----covers body text and Nerd Font private-use glyphs: the codepoint picks the face, not the node.
+---The fallback chain is read at `shell.lua`'s top level before text measurement. Both readers fall
+---back per glyph across it, so one declaration covers body text and Nerd Font private-use glyphs.
+---The codepoint picks the face, not the node. Read once, at startup: editing it re-evaluates like
+---any other change and does nothing until the shell restarts, because a chain change invalidates
+---every measurement (ADR-0043).
 ---
----Read once, at startup. Editing it re-evaluates like any other change and does nothing until the
----shell restarts, because a chain change invalidates every measurement in the shell (ADR-0043).
----
----Refused if an entry is not a string, or if the table has a hole or a named key: `#` is undefined
----on a sparse table, so a hole would silently lose the tail. A family no font matches is skipped
----with a diagnostic, so a typo costs that entry and not the chain.
+---Non-string entries, holes, and named keys are refused. `#` is undefined on sparse tables, so a
+---hole would lose the tail. An unmatched family is skipped with a diagnostic; typos cost one entry.
 ---@param chain string[] Family names in fallback order, densest first. A dense array: a hole truncates it.
 function fonts(chain) end
 
 json = {}
 
----Decodes JSON to a Lua value. Never raises, on any input.
----
----Returns `nil` plus a message on a decode error. A JSON `null` decodes to `nil` as well, since it
----goes through the same mapping every capability payload does, so a successful null and a failure
----are indistinguishable. Both mean "no data" (ADR-0057). A `null` array element leaves a hole and
----`ipairs` stops at it.
+---Decodes JSON without raising. Errors return `nil` plus a message; JSON `null` also returns `nil`
+---through the capability-payload mapping; both mean "no data" and are indistinguishable (ADR-0057).
+---A `null` array element leaves a hole, and `ipairs` stops there.
 ---@param text string The JSON document. Any input is safe, including an empty string.
 ---@return any value, string? error
 function json.decode(text) end
@@ -43,14 +35,13 @@ process = {}
 ---@class ProcessHandle
 local ProcessHandle = {}
 
----Kills the process. Safe to call after it has already exited.
+---Safe after the process has already exited.
 function ProcessHandle:kill() end
 
----Spawns a process and streams its output. Never blocks the shell.
+---Spawns a process and streams output without blocking the shell.
 ---
----`out_cb` fires once per line with the newline stripped, because the supervisor reads the child
----through `BufReader::lines()`. A pretty-printed JSON document therefore arrives in pieces, and
----only `exit_cb` knows the buffer is whole: accumulate in one, decode in the other.
+---`out_cb` fires once per newline-stripped line from `BufReader::lines()`; pretty JSON arrives in
+---pieces. Accumulate in `out_cb` and decode in `exit_cb`, the only one that knows it is complete.
 ---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
 ---@param args string[] One element per argument, already split. Passing `"a b"` is one argument containing a space.
 ---@param out_cb fun(line: string, stream: "stdout"|"stderr") Both streams reach the same callback; branch on `stream`.
@@ -59,10 +50,9 @@ function ProcessHandle:kill() end
 function process.run(cmd, args, out_cb, exit_cb) end
 
 ---@class oslib
----The four `os` calls ADR-0048 keeps, each of which reads process-local state and returns without
----a syscall that waits. Everything else in the library is gone, `os.execute` and `os.remove`
----included: the 5ms CPU cap is an instruction-count hook, and a thread parked in a syscall
----executes no instructions, so a blocking call cannot be caught and would wedge the Wayland thread.
+---The four `os` calls ADR-0048 keeps read process-local state without a waiting syscall. The rest,
+---including `os.execute` and `os.remove`, is gone: the 5ms CPU cap counts instructions; a thread
+---parked in a blocking syscall executes none, cannot be caught, and would wedge the Wayland thread.
 os = {}
 
 ---@param format? string `strftime` directives, or `"*t"` for a table. Defaults to `"%c"`. A leading `!` reads UTC.

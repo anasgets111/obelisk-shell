@@ -1,56 +1,46 @@
--- Mirrors NotificationPopup.qml: a stack of the newest cards in one corner, not one surface each.
+-- Mirrors NotificationPopup.qml: newest cards stacked in one corner on one surface.
 --
--- One surface holding a scrolling column, which is the shape ADR-0069 made possible and the one
--- this file said it was waiting for. A surface per card is the alternative and is not available:
--- a `panel` is declared, not spawned, so N of them means N declarations and a fixed ceiling anyway.
+-- One scrolling surface, enabled by ADR-0069. A `panel` is declared, not spawned, so one surface
+-- per
+-- card would mean N declarations and a fixed ceiling.
 --
--- The card itself is `components/notification_card.lua`, shared with the history panel. What is
--- here is the surface: where it sits, how tall it is allowed to get, when it takes the keyboard,
--- and the expiry hold.
+-- `components/notification_card.lua` is shared with history. This file owns placement, height,
+-- keyboard mode, and expiry hold.
 local theme = require("config.theme")
 local util = require("lib.util")
 local ui = require("lib.ui_state")
 local notification_card = require("components.notification_card")
 
--- How many cards the stack shows at once, matching `maxVisibleNotifications`. The feed carries
--- twenty (§ 2.7) and a column of twenty cards is taller than the screen; the rest are one click
--- away in the history panel, which is the half of § 2.7 this popup was never meant to be.
+-- Visible stack count matches `maxVisibleNotifications`. The feed carries twenty (§ 2.7), too many
+-- for a screen; the rest belong one click away in history.
 local MAX_CARDS = 4
 
 local SCROLL = scroll("notification_stack")
 local HOVER = hover("notification_stack_region")
 
--- The cards this surface should be showing: the newest few groups of everything live that has not
--- already had its turn as a popup, and nothing at all while any bar panel is up.
+-- Show the newest few live, unseen cards, and none while a bar panel is open.
 --
--- One signal for two properties. `visible` used to ask "is the feed non-empty" and the list asked
--- something else, which is how the surface came to map itself around an empty column; asking once
--- and reading the answer twice makes the two agree by construction.
+-- One signal drives both properties. The old `visible` and list predicates disagreed, mapping an
+-- empty column; sharing the answer keeps them consistent.
 local visible_groups = computed(
     { oblisk.notifications, ui.popup_seen, ui.panel_open, oblisk.lock, oblisk.applications },
     function(n, seen, panel_open, lock, applications)
-        -- Any panel, not only the history: the mirror's `PanelHost` suspends popups on
-        -- `onOverlayOpen` and pumps them again on close, so a card never sits beside an open
-        -- panel (both anchor top-right, and the two surfaces would overlap). Standing down is not
-        -- the same as being retired: only the history marks the feed seen (`ui.popup_seen`, on
-        -- its open and its close), so what was up when the network panel opened comes back when
-        -- it closes -- unless its countdown ran out meanwhile, since the Supervisor keeps counting
-        -- (ADR-0100), in which case it is in the history and nowhere else, as the mirror's
-        -- expire-transients step leaves it.
+        -- Any panel suspends popups, as `PanelHost` does on `onOverlayOpen`, because both anchor
+        -- top-right. Standing down is not retiring: only history marks feed entries seen
+        -- (`ui.popup_seen` on open/close), so a card returns after panel close unless its
+        -- Supervisor
+        -- countdown expires (ADR-0100), which leaves it only in history.
         --
-        -- Nothing while the session is locked either (the mirror's `_popupsBlocked`): a popup
-        -- over the lock screen is a message readable without the password. Not marked seen, so
-        -- what arrived while locked pops up on unlock -- except what expired meanwhile, since the
-        -- Supervisor's countdowns keep running and a five-second notification is `expired` long
-        -- before the unlock. Which is the right split: a critical alert waits, a chat ping does not.
+        -- Nothing while locked (`_popupsBlocked`): a popup over the lock screen is readable without
+        -- a password. Do not mark it seen, so it appears on unlock unless its Supervisor countdown
+        -- expires; a five-second chat ping may expire, while a critical alert can wait.
         if panel_open or (lock and lock.active) then
             return {}
         end
-        -- Three ways a notification has had its turn: its own timeout ran out (`expired`, set by
-        -- the Supervisor, ADR-0100); the history was opened while it was up (`ui.popup_seen`, this
-        -- config's own note, ADR-0098); or do-not-disturb is on and it is not critical, which is
-        -- the one urgency the mirror lets through DND. Each keeps it out of the stack; none takes it
-        -- out of the history.
+        -- A card leaves the stack when it expires (`expired`, Supervisor, ADR-0100), history marks
+        -- it seen (`ui.popup_seen`, ADR-0098), or DND suppresses it unless critical. None removes
+        -- it
+        -- from history.
         local dnd = n and n.dnd
         local unseen = {}
         for _, notification in ipairs((n and n.feed) or {}) do
@@ -74,40 +64,34 @@ return panel {
     anchor = { top = true, right = true },
     margin = { top = theme.bar_height + theme.spacing.md, right = theme.spacing.md },
     width = theme.notification_width,
-    -- Tall enough for the whole stack and no taller: the column sizes to its cards and the surface
-    -- has to be able to hold them. A fixed `notification_height` was right when this showed one
-    -- notification and is a clipping box now that it shows four that each grow when expanded.
+    -- Fit the whole stack, but no taller. Fixed `notification_height` suited one card; four
+    -- expandable
+    -- cards now need content height.
     height = theme.notification_stack_height,
     visible = visible_groups:map(function(shown)
         return #shown > 0
     end),
-    -- The keyboard, on demand, while the pointer is on the stack or a reply is half-typed
-    -- (ADR-0109). Bound rather than constant for the reason `modules/shell/panel_host.lua` states
-    -- at length: niri gives an `on_demand` or `exclusive` layer surface focus the moment it *maps*,
-    -- and this surface maps every time a notification arrives. A constant here would take the
-    -- keyboard away from whatever you were typing in, every time anything notified you.
+    -- On demand while the pointer is on the stack or a reply is pending (ADR-0109). Bind it because
+    -- niri focuses an `on_demand`/`exclusive` layer surface on map, and this maps per notification;
+    -- a constant would steal the keyboard on every notification.
     --
-    -- `OnDemand`, not `Exclusive` (ADR-0108). Exclusive is the lock screen's word: the keyboard
-    -- stays here whatever is clicked, and a surface this small has nowhere for a click-outside to
-    -- land. On demand, niri gives this surface the keyboard on a *click* while the mode is already
-    -- on demand -- not on the flip to it, measured -- which is why the hover is in the binding:
-    -- the pointer arrives before the click into the reply field, so the field's own click is the
-    -- one that brings the keyboard, and typing starts at once. The pending draft keeps the ask
-    -- alive after the pointer leaves, for a click-to-focus compositor that would otherwise drop the
-    -- keyboard mid-sentence; under focus-follows-mouse the keyboard has left with the pointer
-    -- anyway and comes back with it, and the field keeps its text through both.
+    -- `OnDemand`, not `Exclusive` (ADR-0108): a small surface has no outside click and must not
+    -- keep
+    -- the keyboard. Measured niri behavior focuses it on a *click* while already on demand, not on
+    -- the mode flip, so hover enters the binding before a reply-field click. A pending draft keeps
+    -- the request alive after the pointer leaves under click-to-focus; focus-follows-mouse returns
+    -- the keyboard with the pointer and preserves the field text.
     keyboard_interactivity = computed({ HOVER, ui.reply_pending }, function(hovered, pending)
         return (hovered or pending) and "OnDemand" or "None"
     end),
     child = column {
         width = "Fill",
         height = "Fill",
-        -- The pointer resting on a card stops every countdown, and leaving releases it (ADR-0094,
-        -- ADR-0095). On a card, not anywhere in this box: the input region is built from what is
-        -- drawn (ADR-0109), so the empty surface below the cards sends no pointer events at all. One region for the whole stack rather than one per card, and that
-        -- is not just economy: sibling cards are written in tree order within a single pass, so a
-        -- pointer moving from the second card to the first would fire the first's enter before the
-        -- second's leave, and the leave would release the hold the enter had just placed.
+        -- A pointer on any card stops countdowns; leaving releases the hold (ADR-0094, ADR-0095).
+        -- The region follows drawn input (ADR-0109), so empty space below sends no events. One
+        -- region
+        -- for the stack avoids sibling enter/leave ordering: entering the first before leaving the
+        -- second would otherwise release the hold just acquired.
         hover = HOVER,
         on_hover = function(hovered)
             oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)

@@ -1,21 +1,15 @@
--- The background-plus-padding-plus-radius block every dropdown and panel body turns out to be.
--- `modules/shell/panel_host.lua`'s card and `modules/bar/panels/settings.lua`'s window
--- child were the same six properties before this existed, which is exactly `components/pill.lua`'s
--- own reason for being: two call sites in agreement is a component, not a coincidence.
---
--- `opts` overrides rather than replaces: a card called with no options at all is the dropdown
--- shape (10px radius, 6px spacing), since that is the more common of the two. The settings window
--- wants `radius = 0` (an opaque toplevel has no edge to round against) and its own padding, and
--- passes both explicitly.
---
--- `margin`, `align_h`, `align_v` and `visible` are the properties here that are not a look, and all
--- are passed through for the same reason: they are facts about where the card is, not about how it
--- is drawn. The panel host places its card by hand, because a layer surface has no `anchor_rect` to
--- hang from and the offset from the indicator that opened it is an outer margin on this node (see
--- that file's `card_margin`); the polkit prompt is content-sized and centres itself in its surface
--- with the two aligns. `modules/bar/panels/update_panel.lua` shows and hides two whole cards -- the
--- package table and the log -- and hiding a card by hiding each of its children leaves its ground
--- and its padding behind, which is a rounded empty rectangle where nothing is happening.
+-- Shared background, padding, and radius for dropdowns and panel bodies.
+-- `modules/shell/panel_host.lua`
+-- and `modules/bar/panels/settings.lua` repeated the same six properties, meeting the two-call-site
+-- rule also used by `components/pill.lua`.
+-- `opts` overrides defaults. With no options, the common dropdown shape is 10px radius and 6px
+-- spacing. The opaque settings toplevel passes `radius = 0` and its own padding because it has no
+-- edge to round against.
+-- Pass through `margin`, `align_h`, `align_v`, and `visible`: they locate the card. The panel host
+-- positions it manually because a layer surface has no `anchor_rect`; its indicator offset is this
+-- node's outer `card_margin`. The content-sized polkit prompt centres with the two aligns.
+-- `modules/bar/panels/update_panel.lua` hides whole package/log cards; hiding children alone leaves
+-- their ground and padding as a rounded empty rectangle.
 local theme = require("config.theme")
 
 return function(children, opts)

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use super::backend::{Backend, InstallCommand, InstallStep, UpdateCandidate};
 
-/// Checks against a throwaway db root, installs through the real one. Both paths are injected
-/// rather than hardcoded here, which is what lets the tests point at a temp dir.
+/// Checks use a throwaway db root; installs use the real one. Injected paths let tests use a
+/// tempdir.
 pub struct PacmanBackend {
     conf_path: PathBuf,
     db_root: PathBuf,
@@ -30,18 +30,14 @@ impl Backend for PacmanBackend {
 
     fn check(&self) -> Result<Vec<UpdateCandidate>, String> {
         let candidates = check_against_a_throwaway_copy(&self.conf_path, &self.db_root);
-        // On this thread, after the `alpm` handle is dropped and before its arena is left alone
-        // for the rest of the session: `libalpm`'s parse of the sync database is the largest
-        // allocation the Supervisor makes, and none of it is live by here
-        // (`memory::return_free_pages_to_the_kernel` carries the measurement).
+        // After dropping `alpm`, return its sync-database pages before the arena sits idle for the
+        // session. It is the Supervisor's largest allocation (the memory helper measures this).
         crate::memory::return_free_pages_to_the_kernel();
         candidates
     }
 
-    /// The real, system-modifying upgrade as root, against the real `/etc/pacman.conf` and
-    /// `/var/lib/pacman`, no throwaway copy. `pkexec` rather than `sudo` because it talks to
-    /// polkit, which triggers Oblisk's own already-registered agent (`dbus::polkit`) rather
-    /// than needing a terminal to type into.
+    /// Root upgrade against real `/etc/pacman.conf` and `/var/lib/pacman`. `pkexec` triggers
+    /// Oblisk's registered polkit agent instead of requiring a terminal.
     fn install_command(&self) -> InstallCommand {
         InstallCommand {
             program: "pkexec".to_string(),
@@ -58,20 +54,16 @@ impl Backend for PacmanBackend {
     }
 }
 
-/// Points a fresh `tempfile::tempdir()` at `db_root`'s `local/` with one symlink, then syncs and
-/// checks against that throwaway db root, never the real `db_root` (ADR-0034, amended ADR-0113).
-/// Only `sync/` is written, and it is written inside the temp dir.
+/// Uses a fresh tempdir with one symlink to `db_root/local`, then syncs and checks there, never in
+/// the real db (ADR-0034, amended ADR-0113). Only tempdir `sync/` is written.
 ///
-/// A symlink and not a copy, which is what `checkupdates` itself does (`ln -s "${DBPath}/local"
-/// "$CHECKUPDATES_DB"`): `local/` is the installed-package metadata, which `syncdbs_mut().update()`
-/// only reads. The copy this replaces walked ~1,500 package directories off disk on every single
-/// check, and ADR-0034's own note says where it came from -- the throwaway prototype that proved
-/// the sync needs no `fakeroot` copied the whole tree, and the copy came along with the answer.
+/// Uses a symlink like `checkupdates` (`ln -s "${DBPath}/local" "$CHECKUPDATES_DB"`): `local/` is
+/// read-only installed metadata. The replaced copy walked ~1,500 package directories on every
+/// check; the throwaway prototype that proved no `fakeroot` was needed copied the whole tree
+/// (ADR-0034).
 ///
-/// Known limitation, now sharper than it was: with a copy, a check ran against a snapshot; with a
-/// symlink it reads the live directory, so a concurrent real install can be observed mid-write. The
-/// window is the same one `checkupdates` lives with, the result is a spurious transient
-/// `check_error`, and it self-heals on the next scheduled check.
+/// ponytail: unlike the old snapshot copy, the symlink can observe a concurrent install mid-write,
+/// causing a transient `check_error`. This matches `checkupdates` and self-heals next check.
 fn check_against_a_throwaway_copy(conf_path: &Path, db_root: &Path) -> Result<Vec<UpdateCandidate>, String> {
     let throwaway = tempfile::tempdir().map_err(|err| format!("failed to create a throwaway temp dir: {err}"))?;
     link_local_db(db_root, throwaway.path())?;
@@ -90,9 +82,8 @@ fn check_against_a_throwaway_copy(conf_path: &Path, db_root: &Path) -> Result<Ve
 /// needs the network.
 fn link_local_db(db_root: &Path, throwaway: &Path) -> Result<(), String> {
     let local_src = db_root.join("local");
-    // Checked, because `symlink` will happily point at nothing and a dangling `local/` is not an
-    // error to `alpm` -- it is an empty installed set, which reads as "every package on the
-    // mirror is an update". The copy this replaces failed loudly on a missing source; so does this.
+    // Refuse a missing source: `symlink` permits a dangling `local/`, which `alpm` reads as no
+    // installed packages and therefore every mirror package being an update.
     if !local_src.is_dir() {
         return Err(format!("{} is not a directory; cannot check updates against it", local_src.display()));
     }
@@ -116,8 +107,7 @@ mod tests {
 
     #[test]
     fn the_throwaway_db_root_reads_installed_packages_through_a_link_named_local() {
-        // The name matters as much as the read: `alpm` looks for `local/` under the db root it is
-        // given, so a link under any other name is an empty db and every package reads as new.
+        // `alpm` looks specifically for `local/`; another link name makes every package look new.
         let real = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(real.path().join("local").join("bash-5.3-1")).unwrap();
         std::fs::write(real.path().join("local").join("bash-5.3-1").join("desc"), "%NAME%\nbash\n").unwrap();
@@ -136,8 +126,7 @@ mod tests {
 
     #[test]
     fn linking_into_a_throwaway_root_that_already_holds_a_local_is_an_error_not_a_silent_reuse() {
-        // `symlink` refuses an existing destination. Surfacing that as a `check_error` beats
-        // checking against whatever was there: a reused temp dir would report stale packages.
+        // An existing destination is an error, preventing reuse of stale package metadata.
         let real = tempfile::tempdir().unwrap();
         let throwaway = tempfile::tempdir().unwrap();
         std::fs::create_dir(throwaway.path().join("local")).unwrap();

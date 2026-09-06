@@ -1,6 +1,5 @@
-//! `LiveProcesses` bookkeeping for the Lua `process.run` binding (ADR-0026): registering a
-//! freshly-spawned child, streaming stdout/stderr back as `ProcessOutput` frames, kill/exit
-//! reporting, and per-generation/shutdown-time reap sweeps.
+//! `process.run` bookkeeping (ADR-0026): child registration, stdout/stderr `ProcessOutput` frames,
+//! kill/exit reporting, and per-generation/shutdown reap sweeps.
 
 use std::collections::HashMap;
 use std::io;
@@ -12,13 +11,12 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use crate::send_frame_logged;
 use crate::socket;
 
-/// Every `process.run`-spawned child still tracked, keyed by the generation that spawned it
-/// and the `CommandEnvelope.id` the Renderer assigned it (ADR-0026). A plain local,
-/// mutated only from inside `main()`'s own `select!` arms -- not behind a mutex.
+/// Tracked `process.run` children, keyed by spawning generation and Renderer-assigned
+/// `CommandEnvelope.id` (ADR-0026). Mutated only inside `main()`'s `select!`, not behind a mutex.
 pub(crate) type LiveProcesses = HashMap<(u32, u64), Child>;
 
-/// Parses `process.run`'s `CommandEnvelope.params.arguments` -- `[cmd, args]`. `None` on any
-/// shape mismatch (a protocol desync, not a spawn failure) -- logged by the caller.
+/// Parses `process.run` arguments as `[cmd, args]`. `None` means protocol shape mismatch, not
+/// spawn failure; the caller logs it.
 pub(crate) fn process_run_args(arguments: &[serde_json::Value]) -> Option<(String, Vec<String>)> {
     let cmd = arguments.first()?.as_str()?.to_string();
     let args =
@@ -26,9 +24,8 @@ pub(crate) fn process_run_args(arguments: &[serde_json::Value]) -> Option<(Strin
     Some((cmd, args))
 }
 
-/// The `process` capability's action dispatch (ADR-0037): owns the action match, argument
-/// parse, and spawn for `process.run`/`process.kill`. `async` (unlike other capabilities'
-/// dispatchers) because `kill`'s reap must complete before its `ProcessExited` report goes out.
+/// Dispatches `process.run`/`process.kill` (ADR-0037), including parse and spawn. `async` because
+/// kill must reap before sending `ProcessExited`.
 pub(crate) async fn dispatch(
     processes: &mut LiveProcesses,
     registry: &socket::GenerationRegistry,
@@ -61,8 +58,8 @@ pub(crate) async fn dispatch(
                     "malformed process.run command from generation {generation_id}: {:?}",
                     envelope.params.arguments
                 );
-                // Lua's ProcessHandle is already waiting on `id`'s exit_cb; with no process
-                // ever spawned, this is what stops it leaking the callback pair forever.
+                // Lua's ProcessHandle already awaits `id`'s exit_cb; this prevents a callback pair
+                // leak when no process spawned.
                 send_frame_logged(
                     registry,
                     generation_id,
@@ -75,8 +72,8 @@ pub(crate) async fn dispatch(
                 send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));
             }
             KillOutcome::ReapFailed => {
-                // The registry entry is already removed and the reap failure already logged;
-                // this stops `id`'s exit_cb from leaking. `None` is honest, not synthesized.
+                // Entry is removed and failure logged; send `None` to stop `id`'s exit_cb leaking.
+                // `None` is honest, not synthesized.
                 send_frame_logged(
                     registry,
                     generation_id,
@@ -89,9 +86,8 @@ pub(crate) async fn dispatch(
     }
 }
 
-/// `("process", "run")`'s spawn step: pipes stdout/stderr (`super::spawn_group_leader_piped`),
-/// takes the piped handles off the `Child` before registering it, so `processes` can keep owning
-/// the `Child` while a separate task reads its output. Logs and returns `None` on spawn failure.
+/// Spawns `("process", "run")` with piped stdout/stderr, removes handles before registering the
+/// `Child`, leaving `processes` owning it while a task reads output. Spawn failure is `None`.
 pub(crate) fn spawn_and_register_process(
     processes: &mut LiveProcesses,
     generation_id: u32,
@@ -113,10 +109,9 @@ pub(crate) fn spawn_and_register_process(
     }
 }
 
-/// Reads `stdout`/`stderr` concurrently, line-by-line, forwarding each as
-/// `SupervisorFrame::ProcessOutput` through `registry` directly. Runs until both streams hit
-/// EOF, then reports `(generation_id, id)` on `process_done_tx` -- this task never owns the
-/// `Child`, so it can't call `wait()` for the real exit code itself.
+/// Reads stdout/stderr concurrently by line, forwarding `SupervisorFrame::ProcessOutput` through
+/// `registry`. After both EOFs, reports `(generation_id, id)` on `process_done_tx`; it does not own
+/// the `Child`, so it cannot `wait()` for the exit code.
 pub(crate) async fn stream_process_output(
     registry: &socket::GenerationRegistry,
     generation_id: u32,
@@ -141,8 +136,7 @@ pub(crate) async fn stream_process_output(
     }
 }
 
-/// One `stream_process_output` poll's outcome: sends a `ProcessOutput` frame for a real line,
-/// logs a read error, and reports whether this stream is now done (EOF or error).
+/// Handles one stream poll: sends a frame for a line, logs read errors, and reports EOF/error done.
 fn report_process_output_line(
     registry: &socket::GenerationRegistry,
     generation_id: u32,
@@ -170,19 +164,16 @@ fn report_process_output_line(
 /// What `("process", "kill")` found for `(generation_id, id)`.
 #[derive(Debug)]
 pub(crate) enum KillOutcome {
-    /// Nothing was registered under this id -- already exited and reaped via the completion
-    /// channel, or an id Lua never actually got a handle for.
+    /// No entry: already reaped via completion, or Lua never received a handle.
     NotRegistered,
-    /// The process group was reaped; report this exit code back to Lua.
+    /// Group reaped; report its exit code to Lua.
     Reaped(Option<i32>),
-    /// `reap_process_group` itself failed (already logged).
+    /// `reap_process_group` failed; already logged.
     ReapFailed,
 }
 
-/// `("process", "kill")`'s handler: removes `(generation_id, id)` and reaps its process group
-/// via `super::reap_process_group` (ADR-0018's promised real caller). The returned exit code
-/// is reused directly (usually `None`, since `SIGTERM`/`SIGKILL` are signal deaths) so a
-/// killed process's `exit_cb` fires honestly.
+/// Removes `(generation_id, id)` and reaps its group via `super::reap_process_group` (ADR-0018).
+/// Reuse the returned code, usually `None` for SIGTERM/SIGKILL deaths, so `exit_cb` is honest.
 pub(crate) async fn kill_registered_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> KillOutcome {
     let Some(mut child) = processes.remove(&(generation_id, id)) else {
         return KillOutcome::NotRegistered;
@@ -198,17 +189,15 @@ pub(crate) async fn kill_registered_process(processes: &mut LiveProcesses, gener
     }
 }
 
-/// `process_done`'s handler, fast half: `stream_process_output` reported that `(generation_id,
-/// id)`'s streams closed. Only removes the registry entry -- never awaits -- so it's safe to call
-/// directly inside `main()`'s `select!` (see [`wait_and_report_exit`] for the actual `wait()`).
+/// Fast `process_done` half: after both streams close, remove the entry without awaiting. Safe in
+/// `main()`'s `select!`; [`wait_and_report_exit`] performs the real `wait()`.
 pub(crate) fn take_exited_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> Option<Child> {
     processes.remove(&(generation_id, id))
 }
 
-/// `process_done`'s handler, slow half: waits for `child`'s real exit and reports it to Lua.
-/// Always run as a detached `tokio::spawn`ed task, never awaited inline in `main()`'s
-/// `select!` -- both piped streams closing only means the process stopped writing to them, not
-/// that it exited (a daemonizing child can redirect them onto `/dev/null` and keep running).
+/// Slow `process_done` half: waits for the real exit and reports it to Lua. Detach it, never await
+/// inline in `main()`'s `select!`: streams can close while a daemonizing child keeps running after
+/// redirecting them to `/dev/null`.
 pub(crate) async fn wait_and_report_exit(
     registry: socket::GenerationRegistry,
     generation_id: u32,
@@ -225,10 +214,9 @@ pub(crate) async fn wait_and_report_exit(
     }
 }
 
-/// Supervisor services § 10's SIGTERM-then-SIGKILL group reap, applied to every process the
-/// superseded generation's Lua spawned -- not just its own Renderer process (`CONTEXT.md`'s
-/// Generation swap). No `ProcessExited` is sent: the superseded generation's own connection is torn
-/// down in the same swap.
+/// Applies Supervisor § 10's SIGTERM/SIGKILL group reap to every process spawned by the superseded
+/// generation's Lua, not only its Renderer (`CONTEXT.md` Generation swap). Send no `ProcessExited`;
+/// that generation's connection is torn down in the same swap.
 pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {
     let stale_ids: Vec<(u32, u64)> =
         processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();
@@ -241,10 +229,9 @@ pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, ge
     }
 }
 
-/// Every still-tracked `process.run` child, regardless of which generation spawned it -- the
-/// shutdown-time counterpart to `reap_generations_processes`'s narrower per-generation sweep.
-/// Without this, a `SIGINT`/`SIGTERM`'d Supervisor left every live child orphaned: confirmed
-/// live, a boot-spawned Renderer in its own process group kept running headless forever.
+/// Reaps every tracked child at shutdown, the counterpart to the per-generation sweep. Without
+/// it, SIGINT/SIGTERM orphaned live children; a boot Renderer was confirmed to keep running
+/// headless in its own group.
 pub(crate) async fn reap_all_processes(processes: &mut LiveProcesses) {
     let ids: Vec<(u32, u64)> = processes.keys().copied().collect();
     for key in ids {

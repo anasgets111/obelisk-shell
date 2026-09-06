@@ -1,4 +1,4 @@
-//! [`ApplicationsController`]: the `oblisk.applications` state owner and its two write actions
+//! [`ApplicationsController`]: `oblisk.applications`'s state owner and two write actions
 //! (ADR-0061).
 
 use std::collections::BTreeMap;
@@ -12,21 +12,18 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 
 /// `oblisk.applications`'s payload (ADR-0061 decision 2).
 ///
-/// `by_app_id` repeats the summaries in `entries` rather than indexing into it. A Lua array
-/// index counts from one while the JSON array this serializes to counts from zero, so an index
-/// would carry an off-by-one nobody can see in the payload; repeating three small fields for a
-/// few hundred entries costs less than that trap.
+/// `by_app_id` repeats summaries instead of indexing `entries`: Lua arrays start at one while the
+/// serialized JSON array starts at zero. Repeating three small fields for a few hundred entries
+/// avoids an invisible off-by-one.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApplicationsState {
-    /// Every installed desktop entry that is visible and launchable, sorted by name. Rebuilt on
-    /// `applications:refresh()`; nothing watches the directories, so an app installed mid-session
-    /// does not appear until something asks.
+    /// Visible, launchable installed entries, sorted by name. Rebuilt by
+    /// `applications:refresh()`; directories are not watched, so mid-session installs wait for it.
     pub entries: Vec<AppSummary>,
-    /// The same entries, keyed by the `app_id` a window reports, for a caller holding
-    /// `workspaces.active_client.class` rather than a desktop file id. Keyed on exact
-    /// `StartupWMClass` and exact desktop id first, then case-folded and last-dot-segment
-    /// spellings, and an exact key is never displaced by a folded one. Miss on it before
-    /// concluding an app is not installed: the mapping is a set of heuristics, not a registry.
+    /// The same entries keyed by a window's `app_id`, for callers holding
+    /// `workspaces.active_client.class` rather than a desktop id. Exact `StartupWMClass` and
+    /// desktop id win over case-folded and last-dot-segment spellings; exact keys are never
+    /// displaced. A miss is only a heuristic miss, not proof that the app is uninstalled.
     pub by_app_id: BTreeMap<String, AppSummary>,
 }
 
@@ -42,21 +39,17 @@ pub enum OpenUrlError {
     Spawn(String),
 }
 
-/// `open_url`'s cap. Browsers accept far more; a notification body is capped at 512 bytes, so a
-/// URL that arrived through one cannot be longer than that anyway, and the cap is here for the
-/// `applications:open_url` a config might call with something it built itself.
+/// `open_url`'s 2048-byte cap. Browsers accept more; notification bodies cap URLs at 512 bytes, so
+/// body URLs cannot exceed that and config-built URLs still get this bound.
 pub const MAX_URL_BYTES: usize = 2048;
 
-/// The schemes `open_url` will hand to the desktop opener (ADR-0103): a web page and a mail
-/// address, which are what a notification body links to. Not `file:`, on the same reasoning every
-/// notification path runs through a trusted-root check -- a body is untrusted text and "open this
-/// local file" is the one thing it must not be able to say. Not the application-specific schemes
-/// (`tg:`, `spotify:`, `steam:`) either: each is a program the URL's author chooses to run.
+/// Schemes handed to the desktop opener (ADR-0103): web and mail links from notification bodies.
+/// `file:` is excluded because notification bodies are untrusted text and notification paths use
+/// trusted-root checks; application schemes (`tg:`, `spotify:`, `steam:`) choose a program.
 const OPENABLE_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
-/// Whether `url` is something `open_url` will spawn the opener on: an allowlisted scheme, no
-/// whitespace or control character anywhere (nothing legitimate carries one, and an argument
-/// holding a newline is how a log line becomes two), and under [`MAX_URL_BYTES`].
+/// Accepts only an allowlisted scheme, no whitespace/control character anywhere (nothing legitimate
+/// carries one; a newline would split a log line), and a URL under [`MAX_URL_BYTES`].
 pub fn openable_url(url: &str) -> Result<(), &'static str> {
     if url.len() > MAX_URL_BYTES {
         return Err("longer than 2048 bytes");
@@ -73,36 +66,32 @@ pub fn openable_url(url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// What `launch` could not do, so the caller can log one line naming the reason rather than a
-/// generic failure.
+/// Why `launch` failed, so the caller can log a specific reason.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LaunchError {
-    /// No entry with that desktop file id, which for a config reading `entries` means a scan has
-    /// replaced the list since it was drawn.
+    /// No entry has that desktop id; a refresh may have replaced the list since it was drawn.
     Unknown,
     /// `Terminal=true` with no `$TERMINAL` set, see [`ApplicationsController::launch`].
     NoTerminal,
     Spawn(String),
 }
 
-/// `Clone` so `main.rs`'s dispatch arm can hand a cheap `Arc`-backed copy to the blocking scan
-/// task, the same shape `UpdatesController` uses for `install`.
+/// Cheap `Arc`-backed clone for `main.rs`'s blocking scan task, like `UpdatesController::install`.
 #[derive(Clone)]
 pub struct ApplicationsController {
     state: Arc<Mutex<ApplicationsState>>,
-    /// Not part of the snapshot: an argv the config could read is an argv the config could be
-    /// tricked into rewriting before `launch` ran it (ADR-0061 decision 3).
+    /// Not in the snapshot: exposing argv would let config rewrite it before `launch` (ADR-0061
+    /// decision 3).
     launch_targets: Arc<Mutex<HashMap<String, LaunchTarget>>>,
     dirs: Arc<Vec<PathBuf>>,
     events: UnboundedSender<ApplicationsSignal>,
 }
 
-/// The argv `launch` actually spawns, given the entry and whatever `$TERMINAL` says.
+/// The argv `launch` spawns for an entry and `$TERMINAL`.
 ///
-/// Split out from [`ApplicationsController::launch`] so the `Terminal=true` rule is testable
-/// without writing to the process environment, as `system::should_emit` and
-/// `layer::exclusive_zone_for` already do. An empty `$TERMINAL` counts as unset: exporting it
-/// blank is how a shell leaves a variable it never assigned.
+/// Split from [`ApplicationsController::launch`] so `Terminal=true` is testable without mutating
+/// the environment, as `system::should_emit` and `layer::exclusive_zone_for` do. Empty
+/// `$TERMINAL` counts as unset, as with a shell-exported blank variable.
 fn command_line(terminal: Option<String>, target: LaunchTarget) -> Result<(String, Vec<String>), LaunchError> {
     if !target.terminal {
         return Ok((target.command, target.args));
@@ -114,12 +103,11 @@ fn command_line(terminal: Option<String>, target: LaunchTarget) -> Result<(Strin
 }
 
 impl ApplicationsController {
-    /// Builds the controller empty and starts the first scan in the background.
+    /// Builds an empty controller and starts the first scan in the background.
     ///
-    /// Not scanned inline: this runs inside `main`'s startup, and a few hundred `.desktop` files
-    /// read off a cold page cache is real milliseconds before the first surface is up. The
-    /// capability reads `nil` in Lua until the scan lands, same as every capability
-    /// (`shared::Capability::ALL`'s own doc comment), so this needs no extra branch.
+    /// The scan stays off `main`'s startup path: reading a few hundred `.desktop` files from a
+    /// cold page cache costs real milliseconds before the first surface. Lua reads `nil` until it
+    /// lands, as every capability does (`shared::Capability::ALL`), so no extra branch is needed.
     pub fn new(dirs: Vec<PathBuf>, events: UnboundedSender<ApplicationsSignal>) -> Self {
         let controller = ApplicationsController {
             state: Arc::new(Mutex::new(ApplicationsState::default())),
@@ -135,14 +123,14 @@ impl ApplicationsController {
         self.state.lock().expect("applications state mutex poisoned").clone()
     }
 
-    /// Rescans the applications directories off-thread, then signals `main`'s `select!` to push.
+    /// Rescans off-thread, then signals `main`'s `select!` to push.
     ///
-    /// `spawn_blocking` rather than a plain task: this is `read_dir` plus a `read_to_string` per
-    /// entry, exactly the blocking filesystem work a tokio worker thread must not do.
+    /// `spawn_blocking` is required for `read_dir` plus one `read_to_string` per entry: blocking
+    /// filesystem work must not run on a Tokio worker thread.
     ///
-    /// Pushes only on a real change. Every `StateSnapshot` marks the Renderer's scene dirty and
-    /// drives a full re-resolve and repaint (ADR-0044), so a config calling `refresh` on each
-    /// launcher open would otherwise repaint the whole shell for an identical list.
+    /// Pushes only on change. Every `StateSnapshot` dirties the Renderer and triggers a full
+    /// re-resolve/repaint (ADR-0044); launcher-open `refresh` would otherwise repaint an identical
+    /// list.
     pub fn refresh(&self) {
         let state = Arc::clone(&self.state);
         let launch_targets = Arc::clone(&self.launch_targets);
@@ -162,44 +150,35 @@ impl ApplicationsController {
         });
     }
 
-    /// Runs the application `id` names, detached.
+    /// Runs the application named by `id`, detached.
     ///
-    /// Detached is the point, and it is why this is its own action rather than the config calling
-    /// `process.run`: `process.run` pipes stdout and stderr and holds the child for its exit code
-    /// (ADR-0026), which for a launched GUI application means the Supervisor keeps two pipes
-    /// and a `Child` alive for the whole life of a program it has nothing more to say to. A
-    /// generation swap would also reap it, so opening a text editor and then editing the config
-    /// would close the editor.
+    /// This is separate from config `process.run`: that action pipes stdout/stderr and holds the
+    /// `Child` for its exit code (ADR-0026). For a GUI app that keeps two pipes and a child alive
+    /// for its whole run; a generation swap would reap it and close an editor when config reloads.
     ///
-    /// ponytail: `Terminal=true` needs an emulator and there is no specified way to find one, so
-    /// this reads `$TERMINAL` and refuses if it is unset rather than guessing. Probing `PATH` for
-    /// a list of known emulators is the upgrade, and it is left out because a guess that picks the
-    /// wrong one is worse than a refusal that says why: a user who sets `$TERMINAL` gets exactly
-    /// the terminal they asked for, and a user who does not gets a log line naming the variable.
+    /// ponytail: `Terminal=true` reads `$TERMINAL` and refuses when unset. Probing `PATH` for
+    /// known emulators is the upgrade; a set variable gets exactly that terminal, while guessing
+    /// wrong is worse than naming the missing variable.
     pub fn launch(&self, id: &str) -> Result<(), LaunchError> {
         let target = {
             let targets = self.launch_targets.lock().expect("applications launch map mutex poisoned");
             targets.get(id).cloned().ok_or(LaunchError::Unknown)?
         };
         let (command, args) = command_line(std::env::var("TERMINAL").ok(), target)?;
-        // The `Child` is dropped rather than awaited, which is what detaches it: tokio reaps an
-        // orphaned child through its own background reaper, so nothing here has to wait on a
-        // program the shell has no further relationship with.
+        // Dropping rather than awaiting detaches it; tokio's background reaper handles the orphan.
         match crate::process::spawn_group_leader(&command, &args, &[]) {
             Ok(_) => Ok(()),
             Err(err) => Err(LaunchError::Spawn(err.to_string())),
         }
     }
 
-    /// Hands `url` to `xdg-open`, detached the way [`ApplicationsController::launch`] detaches,
-    /// after [`openable_url`] has agreed to it (ADR-0103). The one way a config can open a link,
-    /// and it is here rather than in `process.run` because a URL out of a notification body is
-    /// the sender's text: what runs on it has to be the user's own default handler, chosen by the
-    /// desktop and not by a string, and the scheme has to be one the shell is willing to act on.
+    /// After [`openable_url`] accepts it (ADR-0103), hands `url` to `xdg-open` detached. A
+    /// notification body is sender text, so the desktop chooses the user's default handler and
+    /// the shell still limits which schemes may reach it; config has no other link action.
     ///
-    /// `xdg-open` rather than `gio open`: it is what every desktop ships and what the portal
-    /// falls back to, and a machine with a MIME database but no `xdg-utils` is not one this
-    /// shell has met. A missing binary is a spawn error, logged with the URL.
+    /// Uses `xdg-open`, which every desktop ships and the portal falls back to; this shell has not
+    /// met a target with a MIME database but no `xdg-utils`. A missing binary is a URL-tagged
+    /// spawn error.
     pub fn open_url(&self, url: &str) -> Result<(), OpenUrlError> {
         openable_url(url).map_err(OpenUrlError::Refused)?;
         match crate::process::spawn_group_leader("xdg-open", &[url.to_string()], &[]) {
@@ -212,8 +191,6 @@ impl ApplicationsController {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- openable_url (ADR-0103) ----
 
     #[test]
     fn a_web_or_mail_url_is_openable_whatever_the_schemes_case() {
@@ -240,7 +217,7 @@ mod tests {
         assert!(openable_url(&format!("https://example.org/{}", "a".repeat(MAX_URL_BYTES))).is_err());
     }
 
-    /// The refusal happens before anything is spawned, so a refused URL never reaches `xdg-open`.
+    /// A refused URL never reaches `xdg-open`.
     #[tokio::test]
     async fn open_url_refuses_before_spawning() {
         let (controller, _dir) = controller_over(&[("thing.desktop", &runnable("Thing", "/bin/true"))]).await;
@@ -250,9 +227,8 @@ mod tests {
         );
     }
 
-    /// Builds a controller over one temporary applications directory and waits for its opening
-    /// scan to land. `new` starts that scan in the background, so every test here would otherwise
-    /// race it and read an empty list.
+    /// Builds a controller over one temporary directory and waits for `new`'s background scan;
+    /// otherwise tests race it and read an empty list.
     async fn controller_over(entries: &[(&str, &str)]) -> (ApplicationsController, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         for (file, body) in entries {
@@ -282,8 +258,7 @@ mod tests {
         assert!(state.by_app_id.contains_key("thing"), "the id must be reachable as an app_id");
     }
 
-    /// The whole point of `launch` being its own action: the argv lives here, keyed by id, and
-    /// never travels through the config (ADR-0061 decision 3).
+    /// `launch` gets argv from this id-keyed map, never through config (ADR-0061 decision 3).
     #[tokio::test]
     async fn launch_runs_the_entrys_own_command() {
         let marker = tempfile::tempdir().unwrap();
@@ -294,7 +269,7 @@ mod tests {
 
         controller.launch("t").expect("launching a known entry must succeed");
 
-        // The child is detached, so there is no handle to await -- poll for the side effect.
+        // Detached child: poll for the side effect because there is no handle to await.
         for _ in 0..50 {
             if touched.exists() {
                 return;
@@ -315,8 +290,7 @@ mod tests {
         LaunchTarget { command: "/usr/bin/top".to_string(), args: vec!["-u".to_string()], terminal: true }
     }
 
-    /// A console program with no emulator to run it in is refused, not spawned into a session with
-    /// no terminal where it would exit instantly and look like nothing happened.
+    /// Without an emulator, refuse rather than spawn into a session where it exits immediately.
     #[test]
     fn a_terminal_entry_is_refused_when_the_environment_names_no_terminal() {
         assert_eq!(command_line(None, console_program()), Err(LaunchError::NoTerminal));
@@ -348,8 +322,8 @@ mod tests {
         assert_eq!(args, vec!["--new-tab".to_string()]);
     }
 
-    /// `refresh` must not push when nothing changed: every snapshot repaints the whole scene
-    /// (ADR-0044), and the dev config calls `refresh` each time its launcher opens.
+    /// Unchanged `refresh` must not push: every snapshot repaints the whole scene (ADR-0044), and
+    /// the dev config calls it whenever its launcher opens.
     #[tokio::test]
     async fn refreshing_an_unchanged_directory_pushes_nothing() {
         let dir = tempfile::tempdir().unwrap();

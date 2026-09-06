@@ -1,12 +1,10 @@
-//! The Rust-Lua type-marshalling boundary (`oblisk-idl-api-specs.md` § 1.1): the one place
-//! that enforces the "strict, non-coercive" rejection rules the spec's type table lists next to
-//! `f64`, `i64`/`u64`, and `String` -- `mlua` maps the Lua<->Rust *shape* automatically, but
-//! nothing stops a NaN, an out-of-range integer, or an oversized string from crossing otherwise.
-//! `signal::Signal::try_new_direct` is this boundary's first real caller (§ 1.2's
-//! `Box<Signal<T>>` line).
+//! Rust-Lua marshalling boundary (`oblisk-idl-api-specs.md` § 1.1), enforcing its strict,
+//! non-coercive rules for `f64`, `i64`/`u64`, and `String`. `mlua` maps shape but does not reject
+//! NaN, unsafe integers, or oversized strings. First caller: `signal::Signal::try_new_direct`
+//! (§ 1.2's `Box<Signal<T>>` line).
 
-/// `2^53 - 1`: the largest integer a Lua `number` (an IEEE-754 double under the hood, even when
-/// Lua's own integer subtype holds it) can represent without losing precision.
+/// `2^53 - 1`, the largest exact integer in Lua's IEEE-754-double `number`, even when its integer
+/// subtype holds it.
 const MAX_SAFE_INTEGER: i64 = (1i64 << 53) - 1;
 const MIN_SAFE_INTEGER: i64 = -MAX_SAFE_INTEGER;
 

@@ -1,6 +1,5 @@
--- Mirrors NetworkIndicator.qml: one glyph whose bars say how good the link is, opening the network
--- panel. The SSID it used to spell out lives in the tooltip and in the panel, which is where the
--- mirror keeps it too -- a bar has room for signal strength, not for a network name.
+-- Mirrors NetworkIndicator.qml: signal glyph opens the network panel. The SSID belongs in the
+-- tooltip and panel; the bar has room for strength, not a network name.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -11,7 +10,7 @@ local network_panel = require("modules.bar.panels.network_panel")
 
 local SLOT = "network"
 
--- Four buckets, matching `NetworkService.getWifiIcon`'s own tiering of a 0..100 strength.
+-- Four buckets, matching `NetworkService.getWifiIcon`'s 0..100 tiering.
 local function network_glyph(n)
     if n == nil then
         return icons.wifi_none
@@ -19,8 +18,8 @@ local function network_glyph(n)
     if n.ssid == "Ethernet" then
         return icons.ethernet
     end
-    -- A dead radio and a live one joined to nothing are different pictures, and until
-    -- `NetworkState` carried `wifi_enabled` this could only draw the second one.
+    -- A dead radio and a live one joined to nothing are different pictures. `wifi_enabled` was
+    -- added to `NetworkState` so the first can be drawn.
     if not n.networking_enabled or not n.wifi_enabled then
         return icons.wifi_off
     end
@@ -37,8 +36,8 @@ local network_module = icon_button(oblisk.network:map(network_glyph), function(r
 end, {
     slot = SLOT,
     selected = ui_state.panel_showing(network_panel.kind),
-    -- Lit for a link that carries the default route, not for a bare association: `connected` is
-    -- the question a glance at the bar is asking.
+    -- Lit for a link carrying the default route, not a bare association: `connected` answers the
+    -- question the bar asks.
     foreground = oblisk.network:map(function(n)
         return (n ~= nil and n.connected) and theme.FG or theme.TEXT_OFF
     end),

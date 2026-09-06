@@ -1,32 +1,28 @@
 //! Generates `lua-meta/oblisk.lua` from the types that actually cross the socket.
 //!
-//! The stubs were hand-written first, and wrong twice in one session: `process.run`'s callback
-//! arity, and `oblisk.notifications`'s claimed seven commands where `dispatch` has four
-//! (`low`/`normal`/`critical` are urgency arms, not actions). A hand-maintained schema copy
-//! describes what someone believed, not what runs.
+//! Hand-written stubs were wrong twice in one session: `process.run` callback arity, and
+//! `oblisk.notifications` claiming seven commands while `dispatch` has four (`low`/`normal`/
+//! `critical` are urgency arms). A copied schema describes belief, not running code.
 //!
-//! So the payload half is derived: every capability's `*State` already derives `Serialize`, and
-//! adding `JsonSchema` beside it lets a field's Rust doc comment become its LuaCATS description.
+//! Payloads are derived: each `*State` already has `Serialize`; adding `JsonSchema` makes each
+//! field's Rust doc comment its LuaCATS description.
 //!
-//! The command half is derived the same way. Each capability's actions are a
-//! `#[derive(Deserialize, JsonSchema)]` enum next to its `dispatch`, and `parse_action` at the
-//! socket boundary turns the wire string into one, so a mismatched action fails the build rather
-//! than the golden test.
+//! Commands work the same way: `#[derive(Deserialize, JsonSchema)]` action enums sit beside
+//! `dispatch`, and socket-boundary `parse_action` turns wire strings into them. Mismatches fail
+//! the build rather than the golden test.
 //!
-//! ponytail: argument types stay `...`. The upgrade is a payload enum (`Set(u32)`) carrying its
-//! parsed arguments, deleting all 19 `parse_*_args` functions, but that costs an IDL change to
-//! named arguments (docs/oblisk-idl-api-specs.md § 7), not a derive.
+//! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting all
+//! 19 `parse_*_args` functions, only with an IDL change for named arguments
+//! (docs/oblisk-idl-api-specs.md § 7).
 
 use std::collections::BTreeMap;
 
 use schemars::{Schema, schema_for};
 
-/// The one place a capability name is tied to the type it pushes and to the enum of actions it
-/// accepts. Neither mapping exists anywhere else in the tree: `push_snapshot` takes
-/// `&impl Serialize`, so the payload type is inferred at each of the 18 call sites, and an action
-/// enum is named only by its own `dispatch`. `every_capability_has_a_schema` keeps this honest
-/// against `shared::Capability::ALL`. `None` is a read-only capability, which gets the plain `invoke`
-/// it inherits from `Capability`.
+/// The sole capability-to-payload/action mapping. `push_snapshot` takes `&impl Serialize`, so
+/// payload types are inferred at 18 call sites; action enums are named only by their `dispatch`.
+/// `every_capability_has_a_schema` checks `shared::Capability::ALL`. `None` is read-only and gets
+/// the inherited plain `invoke`.
 fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     vec![
         (
@@ -125,16 +121,14 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     ]
 }
 
-/// The Lua class name for a capability's payload, e.g. `audio` -> `AudioState`. Taken from the
-/// schema's own `title`, which schemars fills in with the Rust type name, so a renamed struct
-/// renames the Lua class without a second edit here.
+/// Lua payload class name, e.g. `audio` -> `AudioState`, taken from schemars' `title` so renaming
+/// the Rust struct renames Lua without another edit.
 fn payload_class(schema: &Schema) -> String {
     schema.get("title").and_then(|t| t.as_str()).unwrap_or("table").to_string()
 }
 
-/// An action enum's variants as the wire strings a config passes to `invoke`, in declaration
-/// order. schemars renders a fieldless enum as a bare `enum` array of its `rename_all` spellings,
-/// which is exactly the list `parse_action` accepts.
+/// Action variants as declaration-ordered wire strings for `invoke`. schemars' fieldless `enum`
+/// array uses `rename_all` spellings, exactly what `parse_action` accepts.
 fn action_names(schema: &Schema) -> Vec<String> {
     let value = serde_json::to_value(schema).expect("a schema serializes");
     value
@@ -164,27 +158,23 @@ fn string_enum(fragment: &serde_json::Value) -> Option<String> {
     if names.is_empty() { None } else { Some(names.join("|")) }
 }
 
-/// The same fieldless enum, spelled the other way schemars spells it: one `oneOf` branch per
-/// variant, each a bare `const`. That is what it emits as soon as a variant carries a doc comment,
-/// and `BatteryStatus` is the first enum here whose variants needed one -- `PendingCharge` and
+/// Fieldless enum form with one `oneOf`/`const` branch per documented variant. schemars switches to
+/// it when a variant has a doc comment; `BatteryStatus` first needed it because `PendingCharge` and
 /// `PendingDischarge` do not explain themselves.
 ///
-/// Returns each variant with its own description, because losing those is most of why documenting
-/// the variants was worth doing.
+/// Returns each variant with its description; preserving those is the point of documenting them.
 fn const_enum(body: &serde_json::Value) -> Option<Vec<(&str, Option<&str>)>> {
     let branches = body.get("oneOf")?.as_array()?;
     let mut variants: Vec<(&str, Option<&str>)> = Vec::new();
     for branch in branches {
         let description = branch.get("description").and_then(|d| d.as_str());
-        // schemars splits a fieldless enum two ways in the same `oneOf`: a documented variant is
-        // its own `const` branch, and every undocumented one is pooled into a single `enum` branch.
-        // Both are strings and both belong in the alias.
+        // schemars uses a `const` branch for documented variants and pools undocumented ones in an
+        // `enum` branch; both are strings belonging in the alias.
         if let Some(name) = branch.get("const").and_then(|c| c.as_str()) {
             variants.push((name, description));
             continue;
         }
-        // Neither spelling means an object branch, so this is a tagged union and the caller
-        // renders it as a class.
+        // Neither form is an object branch, so this is a tagged union rendered as a class.
         let pooled = branch.get("enum").and_then(|e| e.as_array())?;
         for name in pooled.iter().filter_map(|v| v.as_str()) {
             variants.push((name, description));
@@ -193,12 +183,10 @@ fn const_enum(body: &serde_json::Value) -> Option<Vec<(&str, Option<&str>)>> {
     (!variants.is_empty()).then_some(variants)
 }
 
-/// A JSON Schema fragment as a LuaCATS type expression.
+/// JSON Schema fragment as a LuaCATS type expression.
 ///
-/// The five shapes that appear in these payloads, and nothing else: a `$ref` into `$defs`, an
-/// array, a `Vec`-free map (`BTreeMap<String, T>` serializes as an object with
-/// `additionalProperties`), a string enum, and a scalar. A fragment with no `type` at all is
-/// `serde_json::Value`, which is `any`.
+/// Only five payload shapes occur: `$defs` `$ref`, array, `BTreeMap<String, T>` object with
+/// `additionalProperties`, string enum, and scalar. No `type` means `serde_json::Value`, or `any`.
 fn lua_type(fragment: &serde_json::Value) -> String {
     if let Some(reference) = fragment.get("$ref").and_then(|r| r.as_str()) {
         return reference.rsplit('/').next().unwrap_or("table").to_string();
@@ -206,15 +194,15 @@ fn lua_type(fragment: &serde_json::Value) -> String {
     if let Some(union) = string_enum(fragment) {
         return union;
     }
-    // `Option<SomeStruct>` widens to `anyOf: [{$ref}, {"type": "null"}]` rather than to a `type`
-    // array, because a `$ref` has no `type` to widen. Missing this typed every optional struct
-    // field as `any`, which is how `WorkspacesState.active_client` lost its `ActiveClient`.
+    // `Option<SomeStruct>` uses `anyOf: [{$ref}, {"type": "null"}]`, not a type array: `$ref` has
+    // no type to widen. Missing this made optional structs `any`, losing `ActiveClient` from
+    // `WorkspacesState.active_client`.
     if let Some(branches) = fragment.get("anyOf").and_then(|a| a.as_array())
         && let Some(concrete) = branches.iter().find(|b| b.get("type").and_then(|t| t.as_str()) != Some("null"))
     {
         return lua_type(concrete);
     }
-    // `Option<T>` widens the type to `["T", "null"]` as well as dropping out of `required`.
+    // `Option<T>` also widens to `["T", "null"]` and removes the field from `required`.
     let type_name = match fragment.get("type") {
         Some(serde_json::Value::String(name)) => name.clone(),
         Some(serde_json::Value::Array(names)) => {
@@ -239,9 +227,8 @@ fn lua_type(fragment: &serde_json::Value) -> String {
     }
 }
 
-/// A Rust doc comment as one line of LuaCATS trailing description. Newlines collapse to spaces,
-/// because `---@field name type description` is a single-line form and a wrapped description would
-/// end the annotation early.
+/// Rust doc comment as one LuaCATS trailing description. Collapse newlines because
+/// `---@field name type description` is single-line and wrapping ends the annotation.
 fn one_line(description: Option<&serde_json::Value>) -> String {
     match description.and_then(|d| d.as_str()) {
         Some(text) => {
@@ -252,17 +239,14 @@ fn one_line(description: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Renders one object schema as a `---@class` with a `---@field` per property.
+/// Renders an object schema as `---@class` plus one `---@field` per property.
 ///
-/// `oneOf` is the tagged-enum case, and it flattens. `NotificationSpan` is
-/// `#[serde(tag = "kind")]`, so a value is one variant's fields plus a `kind` discriminating them.
-/// LuaCATS has no tagged union, and the honest Lua shape is one class carrying every variant's
-/// fields as optional, which is how a config reads it anyway: check `kind`, then use the fields
-/// that variant carries.
+/// `oneOf` tagged enums flatten. `NotificationSpan` is `#[serde(tag = "kind")]`: one variant's
+/// fields plus `kind`. LuaCATS lacks tagged unions, so emit one class with all variant fields
+/// optional; configs check `kind` before using them.
 fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
-    // A fieldless enum (`Urgency` is `low`/`normal`/`critical`) is a set of strings, not an object.
-    // Emitting it as a `---@class` gives it no fields, which types every reader of it as an empty
-    // table and silently loses the three values that are the whole point.
+    // Fieldless enums such as `Urgency` (`low`/`normal`/`critical`) are strings, not objects.
+    // A fieldless `---@class` would type readers as empty tables and lose all three values.
     if body.get("properties").is_none()
         && body.get("oneOf").is_none()
         && let Some(union) = string_enum(body)
@@ -275,8 +259,7 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
         }
         return;
     }
-    // The documented spelling of the same thing. One line per variant so each keeps its own
-    // description, which the flat `"a"|"b"` union above has nowhere to put.
+    // Documented enum form: one line per variant; the flat union has nowhere for descriptions.
     if body.get("properties").is_none()
         && let Some(variants) = const_enum(body)
     {
@@ -319,9 +302,8 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
             continue;
         };
         for (field, fragment) in properties {
-            // A flattened variant's fields are optional even where that variant requires them,
-            // because a value of another variant does not carry them at all. The discriminator is
-            // the exception: every variant has it.
+            // Flattened variant fields are optional because other variants omit them; the
+            // discriminator is the exception because every variant has it.
             let is_discriminator = fragment.get("const").is_some() || (tagged && field == "kind");
             let optional = !required.contains(&field.as_str()) || (tagged && !is_discriminator);
             let type_name = if is_discriminator && tagged {
@@ -345,15 +327,14 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
     }
 }
 
-/// The whole generated file.
+/// The generated file.
 pub fn render() -> String {
     let mut out = String::new();
     out.push_str(&GENERATED_HEADER.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
 
     let schemas = capability_schemas();
 
-    // Every `$defs` entry across every capability, deduplicated by name and sorted, so the output
-    // is stable whatever order the roster is in.
+    // Deduplicate and sort every capability's `$defs`, making output independent of roster order.
     let mut defs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (_, schema, _) in &schemas {
         let value = serde_json::to_value(schema).expect("a schema serializes");
@@ -382,13 +363,11 @@ pub fn render() -> String {
         let class = capability_class(capability);
         let payload = payload_class(schema);
         let commands = actions.as_ref().map_or_else(Vec::new, action_names);
-        // `get`/`map` are inherited from `Capability<T>` rather than restated: written out per
-        // class they would have to name their own `self`, and a `---@field` that does not bind the
-        // payload back to `Signal<T>` is an annotation that reads right and checks nothing.
+        // Inherit `get`/`map` from `Capability<T>`: repeating them would need a class-specific
+        // `self`, and an unbound `---@field` would check nothing.
         out.push_str(&format!("\n---@class {class}: Capability<{payload}>\n"));
         if commands.is_empty() {
-            // No `invoke` line at all, so calling one is `undefined-field` rather than accepted
-            // against the base class's `string`.
+            // Omit `invoke` so calls are `undefined-field`, not accepted as the base `string`.
             out.push_str(&format!("local {class} = {{}}\n"));
         } else {
             let union = commands.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join("|");
@@ -451,14 +430,13 @@ const GENERATED_HEADER: &str = r#"---@meta
 ---@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 "#;
 
-/// Methods a capability carries that no action schema can describe, appended to its generated
-/// class. Exactly one capability has any: `idle`'s three take Lua callbacks, which never cross the
-/// wire and so have no `IdleAction` variant to derive a signature from (ADR-0032, ADR-0141).
+/// Methods no action schema can describe, appended to the generated class. Only `idle` has them:
+/// three Lua callbacks never cross the wire, so no `IdleAction` signature exists (ADR-0032,
+/// ADR-0141).
 ///
-/// `---@field` lines rather than `function IdleCapability:...` definitions, because a class that
-/// emits `---@field invoke` has no `local` binding its name, so a later `function` on it attaches
-/// to nothing and every call site reads `undefined-field` -- which is exactly what the first
-/// version of this did, caught by `just types`.
+/// Use `---@field`, not `function IdleCapability:...`: a class with `---@field invoke` has no local
+/// binding for a later function, so calls read `undefined-field`. The first version did this;
+/// `just types` caught it.
 fn hand_written_methods(capability: &str) -> &'static str {
     match capability {
         "idle" => {
@@ -513,18 +491,14 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../lua-meta/oblisk.lua")
     }
 
-    /// The golden-file check. `just stubs` rewrites the file; with `UPDATE_STUBS` unset, a
-    /// difference fails.
+    /// Golden-file check. `just stubs` rewrites; without `UPDATE_STUBS`, differences fail.
     ///
-    /// This is the whole automation, and it is deliberately a test rather than a build step.
-    /// `render` reads `schemars::JsonSchema` derives on types inside this crate, so a `build.rs`
-    /// could not call it: a build script compiles and runs before the crate it belongs to exists.
-    /// Even if it could, a build that writes into the source tree breaks a read-only checkout and
-    /// dirties the working tree on every `cargo build`.
+    /// Deliberately a test, not a build step: `render` reads derives here, but `build.rs`
+    /// runs before that crate exists. Writing source during builds would break read-only checkouts
+    /// and dirty the tree on every `cargo build`.
     ///
-    /// Checked in rather than built on demand because the language server reads it directly from
-    /// the working tree, with no build step between an editor opening and a completion appearing.
-    /// A fresh clone has working stubs before anything is compiled.
+    /// Checked in because the language server reads the working tree with no build step between
+    /// editor open and completion. A fresh clone has usable stubs before compilation.
     #[test]
     fn the_generated_stub_matches_what_is_checked_in() {
         let rendered = super::render();
@@ -541,9 +515,8 @@ mod tests {
         );
     }
 
-    /// Every roster name has a payload type, and no entry here names a capability that is gone.
-    /// The stamp has to survive the round trip, or the mismatch warnings compare against `None`
-    /// forever and never fire.
+    /// Every roster name has a payload, with no removed capability. The stamp must survive the
+    /// round trip or mismatch warnings compare against `None` forever.
     #[test]
     fn the_generated_stub_stamps_a_version_that_reads_back() {
         let dir = tempfile::tempdir().unwrap();

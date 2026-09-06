@@ -1,9 +1,8 @@
-//! The `oblisk` namespace: the one Lua table every capability, `rescue`, `screens`, `version` and
-//! `config_dir` hang off (`CONTEXT.md`, **Oblisk namespace**).
+//! The `oblisk` table for capabilities, `rescue`, `screens`, `version`, and `config_dir`
+//! (`CONTEXT.md`, **Oblisk namespace**).
 //!
-//! Built once per generation, before `shell.lua` is ever evaluated. Nothing here answers a
-//! `SupervisorFrame`; it is construction, which is why it does not live beside the frame handling
-//! in `crate::socket`.
+//! Built once per generation before `shell.lua`; it answers no `SupervisorFrame`, so construction
+//! stays separate from `crate::socket` frame handling.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,35 +12,30 @@ use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
 use crate::lua::idle::IdleRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 
-/// One generation's built `oblisk` table, plus the handles its owner needs to keep writing to
-/// after construction.
+/// One generation's `oblisk` table and the handles its owner writes after construction.
 pub(crate) struct Namespace {
     pub(crate) table: mlua::Table,
-    /// One handle per `shared::Capability::ALL` name, for `StateSnapshot` pushes to hydrate.
+    /// One `StateSnapshot` hydration handle per `shared::Capability::ALL` name.
     pub(crate) capabilities: HashMap<String, CapabilityHandle>,
     pub(crate) rescue: LiveSignalHandle,
-    /// `oblisk.idle`'s registry, kept so an inbound `SupervisorFrame::IdleEvent` can find the
-    /// callbacks the config registered for that threshold.
+    /// `oblisk.idle` registry for inbound `SupervisorFrame::IdleEvent` callback dispatch.
     pub(crate) idle: IdleRegistry,
     pub(crate) screens: LiveSignalHandle,
-    /// The value `screens` currently holds, so a later output change can diff against it.
+    /// Current `screens` payload, for diffing later output changes.
     pub(crate) screens_payload: serde_json::Value,
 }
 
-/// Builds the whole `oblisk` namespace: every `shared::Capability` roster name, the two
-/// Renderer-sourced signals `rescue` and `screens`, `idle`, `version`, and `config_dir`.
+/// Builds `oblisk`: every roster name, Renderer-sourced `rescue`/`screens`, `idle`, `version`, and
+/// `config_dir`.
 ///
-/// **No roster name is on the table itself.** Every one is built here and parked in a side table
-/// that `oblisk`'s `__index` moves across on first read, which is what tells the Supervisor to
-/// construct that capability's controller (ADR-0070 decision 1). A config still reads a live
-/// signal holding `nil` before the first push rather than indexing into nil (ADR-0037); the
-/// difference is that a name the config never reads costs a `nil` and nothing else, where it used
-/// to cost a D-Bus subscription. The unrostered lazy path in `crate::socket` is unrelated: it is
-/// reached from a `StateSnapshot` rather than from here.
+/// **Roster names stay off the table.** `__index` moves each from a side table on first read and
+/// starts its controller (ADR-0070 decision 1). Before the first push, config reads a live `nil`
+/// signal
+/// (ADR-0037); an unread name costs only that `nil`, not the old D-Bus subscription. The unrelated
+/// unrostered `crate::socket` lazy path starts from `StateSnapshot`, not here.
 ///
-/// **One table, so a typo is a Lua error rather than silence.** § 6's `lock` node constructor
-/// owns the global `lock`, and a bare `lock` signal used to silently overwrite it and break every
-/// `lock { ... }` declaration (ADR-0052 decision 1).
+/// **One table, so typos raise.** § 6's `lock` constructor owns global `lock`; a bare `lock` signal
+/// once overwrote it silently and broke every `lock { ... }` declaration (ADR-0052 decision 1).
 pub(crate) fn build(
     loader: &Loader,
     dirty: &DirtyFlag,
@@ -51,10 +45,9 @@ pub(crate) fn build(
     let table = loader.create_table()?;
     let mut capabilities = HashMap::new();
     let pending = loader.create_table()?;
-    // `idle` is the one roster name whose member is not parked in `pending`: its three threshold
-    // methods take Lua callbacks that cannot cross the wire as an `:invoke`, so `lua::idle` wraps
-    // the member and that wrapper goes on the table directly (ADR-0141). The handle still lands in
-    // `capabilities`, so a `StateSnapshot` for `idle` hydrates the same signal the wrapper reads.
+    // `idle` alone bypasses `pending`: its three callbacks cannot cross the wire as `:invoke`, so
+    // `lua::idle` wraps it directly (ADR-0141). Its handle remains in `capabilities`, letting an
+    // `idle` `StateSnapshot` hydrate the signal the wrapper reads.
     let mut idle_member = None;
     for capability in shared::Capability::ALL {
         let name = capability.as_str();
@@ -72,33 +65,28 @@ pub(crate) fn build(
     table.set("idle", idle.member())?;
     loader.register_idle(idle.clone());
     let rescue = register_rescue_signal(loader, &table, dirty.clone())?;
-    // Seeded to an empty list (not `nil`) so a config looping over `oblisk.screens` iterates zero
-    // times rather than erroring, and set through `new_live`'s initial value rather than a `set` so
-    // seeding it does not mark the scene dirty before anything has ever applied.
+    // Seed with an empty list, not `nil`, so `oblisk.screens` loops zero times; pass it to
+    // `new_live` rather than `set` so initialization does not dirty an unapplied scene.
     let screens_payload = serde_json::Value::Array(Vec::new());
     let screens = register_screens_signal(loader, &table, dirty.clone(), &screens_payload)?;
     table.set("version", version_table(loader)?)?;
-    // The directory the config was loaded from, so a config can name a file it ships beside itself.
-    // A string beside `version` rather than a capability: static process information, not something
-    // that pushes. The parent of `shell.lua` rather than a second call to `shared::config_dir()`,
-    // so this cannot disagree with the file actually loaded.
+    // Parent of the loaded `shell.lua`, so config can name adjacent files without disagreeing with
+    // `shared::config_dir()`. Static string beside `version`, not a pushing capability.
     table
         .set("config_dir", shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default())?;
     loader.set_global("oblisk", table.clone())?;
     Ok(Namespace { table, capabilities, rescue, idle, screens, screens_payload })
 }
 
-/// Puts `pending`'s members behind `oblisk`'s `__index`, so reading one both hands it over and
-/// starts its controller (ADR-0070 decision 1).
+/// Puts `pending` behind `oblisk.__index`; first read installs the member and starts its controller
+/// (ADR-0070 decision 1).
 ///
-/// The member is `raw_set` onto `oblisk` on the way out, so the metamethod fires exactly once per
-/// name and the second read is an ordinary table lookup. That matters more than it looks: a
-/// `computed({ oblisk.audio }, f)` inside a `list`'s `itemfn` indexes `oblisk` once per row per
-/// layout pass.
+/// `raw_set` installs the member, so the metamethod fires once per name and later reads are
+/// ordinary lookups. This matters because `computed({ oblisk.audio }, f)` in a `list` `itemfn`
+/// indexes it once per row per layout pass.
 ///
-/// Returns `nil` for a name `pending` does not hold, which is what an ordinary table does for an
-/// absent key -- a typo like `oblisk.audioo` must stay a Lua nil-index error naming the config's
-/// line, not become an error raised from inside a metamethod.
+/// Returns `nil` for absent names, preserving ordinary-table behavior: `oblisk.audioo` must remain
+/// a Lua nil-index error naming the config line, not a metamethod error.
 fn install_capability_index(
     loader: &Loader,
     oblisk: &mlua::Table,
@@ -121,12 +109,10 @@ fn install_capability_index(
     Ok(())
 }
 
-/// `oblisk.rescue` (§ 2.10). Returns the handle so later evaluations can update it.
+/// `oblisk.rescue` (§ 2.10), returning its update handle.
 ///
-/// A bare `lua::signal::Signal` and not a [`Capability`], for the same reason
-/// [`register_screens_signal`] is: this is Renderer-sourced, has no `dispatch` on the Supervisor
-/// side and no roster entry, so an `invoke` on it could only ever be a command the Supervisor
-/// drops.
+/// Bare `lua::signal::Signal`, not [`Capability`]: Renderer-sourced, with no Supervisor dispatch or
+/// roster entry, so `invoke` would only queue a command the Supervisor drops.
 fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
     let table = rescue_table(loader, false, "")?;
     let (signal, handle) = crate::lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
@@ -134,15 +120,11 @@ fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFla
     Ok(handle)
 }
 
-/// Registers the reactive `oblisk.screens` signal (ADR-0041 decision 2), seeded with
-/// `initial`.
+/// Registers reactive `oblisk.screens` (ADR-0041 decision 2), seeded with `initial`.
 ///
-/// Deliberately outside `shared::Capability::ALL` and outside the capability map, an exception to the
-/// shape ADR-0037 established that ADR-0041 decision 2 states as such: this is sourced in the
-/// Renderer from `smithay_client_toolkit`'s `OutputState`, not pushed by the Supervisor as a
-/// `StateSnapshot`, so the roster (the Supervisor's own dispatch and push list) has nothing to say
-/// about it. It sits in the same table anyway, because § 2.15 names this `oblisk.screens` like
-/// everything else in § 2.
+/// Deliberately outside `shared::Capability::ALL` and its map: `smithay_client_toolkit`'s
+/// `OutputState` sources it in the Renderer, not the Supervisor's `StateSnapshot` roster
+/// (ADR-0037/ADR-0041 decision 2). It still lives in `oblisk` because § 2.15 names it there.
 fn register_screens_signal(
     loader: &Loader,
     oblisk: &mlua::Table,
@@ -154,16 +136,13 @@ fn register_screens_signal(
     Ok(handle)
 }
 
-/// This Renderer binary's version as `{ major, minor, patch }` integers, from Cargo's own
-/// `CARGO_PKG_VERSION_*`.
+/// Renderer version as `{ major, minor, patch }` integers from `CARGO_PKG_VERSION_*`.
 ///
-/// A plain table, not a signal: it cannot change while the process runs. Registered on the day the
-/// namespace is built rather than on the day a config needs it, since a config written before any
-/// version exists has nothing to guard on, forever.
+/// Plain table, not signal: it cannot change during the process. Register it at namespace build so
+/// configs written before first use still have a version to guard on.
 ///
-/// The Renderer's version and not the Supervisor's: they are the same number today because the
-/// workspace versions both together, but the day they diverge this is still the right one, since it
-/// is the process that hosts the VM and defines the API a config is written against.
+/// Use the Renderer's version, not the Supervisor's. They match today, but this process hosts the
+/// VM and defines the config API if workspace versions diverge.
 fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
     let table = loader.create_table()?;
     let [major, minor, patch] = version_parts();
@@ -173,19 +152,18 @@ fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
     Ok(table)
 }
 
-/// `expect` rather than a `0` fallback: a non-numeric `CARGO_PKG_VERSION_*` means the build is
-/// broken, and a version table that quietly reads `0.0.0` is worse than not booting -- a config
-/// would guard on it and take the wrong branch forever. Guarded by
-/// `socket::tests::oblisk_version_is_three_integers_a_config_can_compare`, which reaches this
-/// through [`build`] and so fails on the panic as well as on a wrong number.
+/// `expect`, not `0`: a non-numeric `CARGO_PKG_VERSION_*` is a broken build, while silent `0.0.0`
+/// makes config guards take the wrong branch forever. The socket test
+/// `oblisk_version_is_three_integers_a_config_can_compare` reaches this through [`build`] and
+/// catches panic or wrong values.
 fn version_parts() -> [u32; 3] {
     [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")].map(|part| {
         part.parse().expect("Cargo's CARGO_PKG_VERSION_* are the numeric components of an already-parsed semver")
     })
 }
 
-/// `oblisk.rescue`'s `{ is_rescue, error_log }` table. `pub(crate)` for `RendererClient::set_rescue_state`,
-/// which rebuilds it on every genuine rescue transition.
+/// `oblisk.rescue`'s `{ is_rescue, error_log }` table, rebuilt by
+/// `RendererClient::set_rescue_state` on each genuine rescue transition.
 pub(crate) fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Result<mlua::Table> {
     let table = loader.create_table()?;
     table.set("is_rescue", is_rescue)?;

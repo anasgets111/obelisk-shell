@@ -1,37 +1,28 @@
-//! One `.desktop` file, parsed (ADR-0061). The desktop entry specification's file format
-//! and its `Exec` quoting rules, hand-written rather than pulled from a crate: the whole of what
-//! this needs is one group header, seven keys and one tokenizer, and owning the semantics is
-//! worth more here than a dependency's opinion about them.
+//! One `.desktop` file, parsed (ADR-0061). The format needs one group header, seven keys and one
+//! tokenizer, so its `Exec` semantics stay here rather than in a dependency.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Every `Exec` field code the specification defines. All of them expand to something a launcher
-/// with no file, no URL and no invoking-menu-item does not have, so all of them are dropped.
+/// Every `Exec` field code. A launcher has no file, URL or invoking menu item, so all are dropped.
 ///
-/// `%i` is the interesting one: it expands to `--icon <Icon>`, which is real and which this
-/// drops anyway. An app that renders differently without it is an app whose own `Icon=` key we
-/// already read and hand to the config, so passing it again through argv would only let the two
-/// disagree.
+/// `%i` expands to `--icon <Icon>` but is dropped too. The app's `Icon=` is already read for
+/// config, and passing a second value could make argv and displayed metadata disagree.
 const FIELD_CODES: [char; 13] = ['f', 'F', 'u', 'U', 'd', 'D', 'n', 'N', 'i', 'c', 'k', 'v', 'm'];
 
-/// The `[Desktop Entry]` group's keys, as written. Values are unescaped only for `Exec`, by
-/// [`tokenize_exec`]; every other key is a display string this hands through verbatim.
+/// `[Desktop Entry]` keys as written. Only `Exec` is unescaped by [`tokenize_exec`]; other keys
+/// are display strings passed through verbatim.
 pub type Group = HashMap<String, String>;
 
 /// Reads the `[Desktop Entry]` group out of a `.desktop` file's contents.
 ///
-/// Stops at the next group header, which is not a detail: a `.desktop` file routinely carries
-/// `[Desktop Action new-window]` groups after the main one, each with its own `Name` and `Exec`.
-/// Reading the whole file into one flat map would let an action's `Exec` overwrite the
-/// application's, and the launcher would open a new window of an app that was not running.
+/// Stops at the next group header. `[Desktop Action new-window]` groups commonly follow the main
+/// group; flattening them could let an action's `Exec` replace the application's and launch a new
+/// window instead of the app.
 ///
-/// Localized keys (`Name[de]`) are skipped rather than merged, so `Name` always means the
-/// unlocalized value. ponytail: that makes the launcher read English names on a localized
-/// system. Picking the right one is `$LC_MESSAGES`/`$LANG` and a `ll_CC` then `ll` then bare
-/// lookup, about a dozen lines, and it goes in the day someone runs this in a locale that has
-/// translations. Leaving it half-done (matching `ll` but not `ll_CC`) would be worse than not
-/// matching at all, since it would silently prefer the wrong regional variant.
+/// Skips localized keys (`Name[de]`), so `Name` stays the unlocalized value, English on a
+/// localized system. ponytail: locale lookup is the upgrade, using `$LC_MESSAGES`/`$LANG` with
+/// `ll_CC`, then `ll`, then bare. A partial lookup could silently choose the wrong region.
 pub fn parse_group(contents: &str) -> Option<Group> {
     let mut group = Group::new();
     let mut inside = false;
@@ -62,38 +53,32 @@ pub fn parse_group(contents: &str) -> Option<Group> {
     inside.then_some(group)
 }
 
-/// Whether a key's value is the specification's `true`. Absent is false, which is what every
-/// boolean key here (`NoDisplay`, `Hidden`, `Terminal`) wants as its default.
+/// Whether a key is the specification's `true`; absent is false for `NoDisplay`, `Hidden`, and
+/// `Terminal`.
 pub fn flag(group: &Group, key: &str) -> bool {
     group.get(key).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-/// Splits an `Exec` value into a command and its arguments, applying the specification's quoting
-/// rules and dropping its field codes.
+/// Splits `Exec` into a command and arguments, applying its quoting rules and dropping field codes.
 ///
-/// Quoting is double-quote only, with backslash escapes inside them, exactly as the
-/// specification writes it. Single quotes are not quoting characters in a `.desktop` file even
-/// though every shell treats them as such, which is the one rule a reader coming from shell
-/// syntax gets wrong, and getting it wrong here would split `Exec=foo 'a b'` into three
-/// arguments instead of two.
+/// Quoting is double-quote only, with backslash escapes inside. Single quotes are literal here,
+/// unlike in shells; treating them as quoting would split `Exec=foo 'a b'` into three arguments.
 ///
-/// Returns `None` for an `Exec` that has no command left after the field codes come out, which
-/// is a malformed entry rather than an empty one.
+/// Returns `None` when field-code removal leaves no command, which is malformed rather than empty.
 pub fn tokenize_exec(exec: &str) -> Option<(String, Vec<String>)> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
-    // Tracks a token that exists but is empty, so `Exec=foo ""` keeps its empty argument
-    // instead of silently dropping it. A bare run of spaces has no token to flush.
+    // Tracks an existing empty token, so `Exec=foo ""` keeps its empty argument; bare spaces do
+    // not create a token to flush.
     let mut started = false;
     let mut chars = exec.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match ch {
             '\\' if quoted => {
-                // Inside quotes a backslash escapes the next character. Pushed verbatim rather
-                // than matched against the escapable set: an entry escaping something the
-                // specification does not list means the literal character either way.
+                // Inside quotes, backslash escapes the next character. Push it verbatim: escaping
+                // a non-listed character means the literal character either way.
                 if let Some(escaped) = chars.next() {
                     current.push(escaped);
                 }
@@ -123,19 +108,14 @@ pub fn tokenize_exec(exec: &str) -> Option<(String, Vec<String>)> {
     Some((command, expanded.collect()))
 }
 
-/// Removes a token's field codes and unescapes `%%`, or drops the token entirely if that leaves
-/// nothing behind.
+/// Removes field codes and unescapes `%%`; drops the token if nothing remains.
 ///
-/// An unknown `%x` is kept as written rather than dropped. The specification reserves `%` and
-/// lists the codes exhaustively, so an unknown one is a malformed entry; keeping it means the
-/// app receives a visibly wrong argument it can complain about, where dropping it would hand
-/// over a silently different command line.
+/// Keeps unknown `%x` as written. The specification lists codes exhaustively, so it is malformed;
+/// keeping it lets the app complain instead of receiving a silently changed command line.
 ///
-/// ponytail: a token that mixes a field code with other text (`--file=%f`) keeps the other text
-/// and loses only the code, leaving `--file=`. Dropping the whole token would be right for that
-/// shape and wrong for `%c` inside a longer string. Neither is common enough to have a caller
-/// worth deciding against, and the launcher passes no files, so both spellings are unreachable
-/// today.
+/// ponytail: mixed tokens such as `--file=%f` keep the other text, yielding `--file=`. Dropping
+/// the token would fit that shape but not `%c` embedded in longer text. Neither case is common,
+/// and this launcher passes no files, so both spellings are currently unreachable.
 fn expand_field_codes(token: &str) -> Option<String> {
     let mut out = String::new();
     let mut chars = token.chars().peekable();
@@ -155,17 +135,15 @@ fn expand_field_codes(token: &str) -> Option<String> {
             None => out.push('%'),
         }
     }
-    // An empty token that never held a code is a real empty argument (`Exec=foo ""`) and is
-    // kept; one that held a code is the code's own remains and is dropped.
+    // `Exec=foo ""` is a real empty argument and stays; a token emptied by a field code drops.
     if out.is_empty() && had_code { None } else { Some(out) }
 }
 
-/// The desktop file id: the path relative to the applications directory it was found under,
-/// with `/` replaced by `-` and the `.desktop` suffix removed.
+/// The path relative to its applications directory, with `/` replaced by `-` and `.desktop`
+/// removed.
 ///
-/// The subdirectory rule is the specification's and it is load-bearing for deduplication rather
-/// than cosmetic: `kde4/konsole.desktop` is the id `kde4-konsole`, distinct from a top-level
-/// `konsole.desktop`, so two different applications in one tree do not collapse into one.
+/// Subdirectories are part of the specification and preserve identity: `kde4/konsole.desktop`
+/// becomes `kde4-konsole`, distinct from top-level `konsole.desktop`.
 pub fn desktop_file_id(path: &Path, base: &Path) -> Option<String> {
     let relative = path.strip_prefix(base).ok()?;
     let text = relative.to_str()?.strip_suffix(".desktop")?;
@@ -176,9 +154,8 @@ pub fn desktop_file_id(path: &Path, base: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The trap this parser exists to avoid: `[Desktop Action ...]` groups carry their own `Name`
-    /// and `Exec`, and a flat read of the whole file lets the last one win. A launcher built on
-    /// that opens a new window of an application instead of starting it.
+    /// `[Desktop Action ...]` has its own `Name`/`Exec`; flattening the file lets the last group
+    /// win and opens an app window instead of starting the app.
     #[test]
     fn parse_group_stops_at_the_next_group_header() {
         let contents = "\
@@ -234,8 +211,8 @@ Exec=firefox --new-window
         );
     }
 
-    /// A `.desktop` file quotes with double quotes only. Treating single quotes as quoting, the
-    /// way every shell does, would split this into three arguments instead of two.
+    /// `.desktop` quoting uses double quotes only; treating single quotes like a shell would split
+    /// this into three arguments instead of two.
     #[test]
     fn tokenize_exec_quotes_with_double_quotes_and_leaves_single_quotes_literal() {
         assert_eq!(
@@ -249,9 +226,8 @@ Exec=firefox --new-window
         assert_eq!(tokenize_exec(r#"prog "a\"b""#), Some(("prog".to_string(), vec![r#"a"b"#.to_string()])));
     }
 
-    /// Every field code expands to a file, URL or menu detail a launcher does not have, so a
-    /// token that is only a field code has to disappear rather than reach argv as a literal
-    /// `%u` the target application would try to open.
+    /// Field codes need a file, URL, or menu detail this launcher has not got. A code-only token
+    /// disappears instead of reaching argv as literal `%u` for the app to open.
     #[test]
     fn tokenize_exec_drops_standalone_field_codes() {
         assert_eq!(tokenize_exec("firefox %u"), Some(("firefox".to_string(), Vec::new())));
@@ -265,8 +241,8 @@ Exec=firefox --new-window
 
     #[test]
     fn tokenize_exec_keeps_an_unknown_percent_escape_as_written() {
-        // Not a specified field code, so it is a malformed entry. Kept, so the application can
-        // complain about an argument it can see, rather than silently receiving a different one.
+        // Not a specified code, so the entry is malformed. Keep it visible to the app rather than
+        // silently changing its argument list.
         assert_eq!(tokenize_exec("prog %z"), Some(("prog".to_string(), vec!["%z".to_string()])));
     }
 

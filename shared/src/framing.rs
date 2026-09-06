@@ -1,17 +1,13 @@
-//! 4-byte big-endian length-prefixed wire framing.
-//!
-//! Generic over `AsyncRead`/`AsyncWrite` so both a real `UnixStream` and an in-memory duplex pipe
-//! drive the same code in tests -- no filesystem needed to exercise framing correctness.
+//! 4-byte big-endian length-prefixed framing. `AsyncRead`/`AsyncWrite` lets tests use an in-memory
+//! duplex pipe instead of a filesystem-backed `UnixStream`.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Ceiling on a single frame's payload length, checked against the 4-byte length prefix before
-/// any payload bytes are read, so a malformed or hostile prefix can't force an unbounded
-/// allocation (up to 4 GiB from a `u32` alone) -- this socket carries secure textfield submissions
-/// (ADR-0005).
+/// 16 MiB ceiling checked before reading payload bytes. Without it, a hostile `u32` prefix could
+/// force an allocation of up to 4 GiB; this socket carries secure textfield submissions (ADR-0005).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -24,7 +20,7 @@ pub enum FramingError {
     Decode(#[from] serde_json::Error),
 }
 
-/// Writes `payload` as one frame: a 4-byte big-endian length prefix, then the bytes.
+/// Writes a 4-byte big-endian length prefix followed by `payload`.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<(), FramingError> {
     if payload.len() > MAX_FRAME_LEN {
         return Err(FramingError::FrameTooLarge { len: payload.len() });
@@ -35,8 +31,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) 
     Ok(())
 }
 
-/// Reads one frame: a 4-byte big-endian length prefix, then exactly that many bytes. Rejects an
-/// oversized declared length before allocating the payload buffer.
+/// Reads the prefix and exactly that many bytes, rejecting an oversized length before allocation.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, FramingError> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
@@ -49,7 +44,6 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>,
     Ok(payload)
 }
 
-/// Serializes `value` as JSON and writes it as one frame.
 pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
@@ -58,7 +52,6 @@ pub async fn write_json_frame<W: AsyncWrite + Unpin, T: Serialize>(
     write_frame(writer, &payload).await
 }
 
-/// Reads one frame and deserializes its payload as JSON.
 pub async fn read_json_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: &mut R) -> Result<T, FramingError> {
     let payload = read_frame(reader).await?;
     Ok(serde_json::from_slice(&payload)?)
@@ -96,8 +89,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_rejects_an_oversized_declared_length_before_reading_any_payload() {
-        // A buffer smaller than the claimed length: if read_frame allocated first and then tried
-        // to fill it, this would hang waiting for bytes that never arrive.
+        // The buffer is smaller than the claim. Allocating first would hang waiting for bytes that
+        // never arrive.
         let (mut a, mut b) = tokio::io::duplex(8);
         let oversized_len = (MAX_FRAME_LEN as u32) + 1;
         a.write_all(&oversized_len.to_be_bytes()).await.unwrap();

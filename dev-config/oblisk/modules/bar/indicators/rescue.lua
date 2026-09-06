@@ -1,10 +1,7 @@
--- Not in the mirror, and first on the bar anyway: a config error is the one thing that must not be
--- pushed off the edge by whatever is beside it. It occupies no width unless the config has failed
--- (ADR-0046).
+-- Not in the mirror. First on the bar so a config error cannot be pushed off its edge; it occupies
+-- no width unless configuration failed (ADR-0046).
 --
--- A red warning circle rather than the words "config error", now that every other module on this
--- bar is a glyph. It is the same size as its neighbours, so a bar that has broken looks like a bar
--- with one red circle on it rather than a bar that has changed shape.
+-- A red warning circle, the same size as its glyph neighbours, keeps a failed bar's shape stable.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")

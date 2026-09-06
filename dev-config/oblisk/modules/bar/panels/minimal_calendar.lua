@@ -1,14 +1,10 @@
--- Mirrors MinimalCalendar.qml: the current month as a grid, today marked, opened by clicking the
--- clock.
+-- Mirrors MinimalCalendar.qml: current month grid with today marked, opened by the clock.
 --
--- Pure arithmetic and a grid of cells, which is why it is here rather than in the ADR backlog: it
--- needs no capability, no subprocess and no engine feature that did not already exist. It was
--- missing because nothing had built a grid yet, and a grid is a `column` of `row`s once something
--- computes the offsets.
+-- Pure arithmetic and existing nodes, so it needs no capability, subprocess, or engine feature. A
+-- grid is a `column` of `row`s once the offsets are computed.
 --
--- `os.date` and `os.time` rather than a capability. `oblisk.system.time` is the clock this reads
--- for *today*, so the highlight follows the real date, but the month layout is arithmetic over that
--- one number and belongs in the config (§ 2.x has no calendar and should not grow one).
+-- Use `os.date`/`os.time`, with `oblisk.system.time` supplying *today*. § 2.x has no calendar
+-- capability and should not grow one.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local section_header = require("components.section_header")
@@ -18,20 +14,20 @@ local COLUMNS = 7
 local ROWS = 6
 local DAY_NAMES = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" }
 
--- The day cell's side. Square, so the grid reads as a calendar rather than a table of numbers.
+-- Square day cells keep the grid calendar-like.
 local DAY_SIDE = theme.s(30, 24)
 
--- The grid for the month containing `now`, as `ROWS * COLUMNS` entries in reading order. An entry
--- is `nil` where the cell falls outside the month, which is what makes the leading and trailing
--- blanks fall out of the same loop as the days.
+-- `ROWS * COLUMNS` entries in reading order; out-of-month entries are `nil`, so leading and
+-- trailing
+-- blanks use the same loop.
 --
--- `os.time` with a normalising table is doing the real work: Lua's `os.time{ day = 0 }` is the last
--- day of the previous month and `day = 32` rolls into the next, so there is no month-length table
--- here and no leap-year branch. The C library owns that.
+-- Lua's normalizing `os.time` makes `day = 0` the previous month's last day and `day = 32` roll
+-- into
+-- the next, avoiding a month-length table and leap-year branch.
 local function month_grid(now)
     local today = os.date("*t", now)
     local first = os.date("*t", os.time({ year = today.year, month = today.month, day = 1, hour = 12 }))
-    -- `wday` is 1-based from Sunday, which is the same order `DAY_NAMES` is in.
+    -- `wday` is 1-based from Sunday, matching `DAY_NAMES`.
     local lead = first.wday - 1
     local days_in_month = os.date("*t", os.time({ year = today.year, month = today.month + 1, day = 0, hour = 12 })).day
 
@@ -49,8 +45,7 @@ end
 
 local function day_cell(entry)
     if entry.day == nil then
-        -- A blank that still occupies its column. An absent child would shift the rest of the week
-        -- left, which is the one thing a calendar grid must not do.
+        -- Keep the blank in its column; an absent child would shift the week left.
         return rect { width = DAY_SIDE, height = DAY_SIDE }
     end
     return rect {
@@ -100,15 +95,12 @@ local heading = row {
     end)(),
 }
 
--- Rebuilt whenever the clock ticks, which is once a second and is 42 cells of arithmetic. That is
--- cheap and it is also wasteful, because the grid only changes at midnight.
+-- Rebuilt on each one-second clock tick, 42 cells of arithmetic, although the grid changes only at
+-- midnight.
 --
--- ponytail: the cheap fix is not available. `:map` runs during scene resolution and must stay pure
--- (ADR-0044's rollback means resolution can rerun on the same inputs), so this cannot memoise on
--- the day and skip the rebuild -- a cache write is a side effect, and the second run would see a
--- different table than the first. Caching this wants either a `computed` whose inputs are the
--- day rather than the second, or `oblisk.system` pushing a date field beside `time`. The second is
--- the smaller change and is where this goes if it ever matters.
+-- ponytail: `:map` must stay pure during scene resolution (ADR-0044 can rerun it on the same
+-- inputs), so day memoization cannot write a cache. Upgrade to a day-based `computed` input or add
+-- a date field beside `oblisk.system.time`; the latter is smaller.
 local grid = column {
     width = "Fill",
     spacing = theme.spacing.xs,

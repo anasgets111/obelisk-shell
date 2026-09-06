@@ -1,59 +1,50 @@
-//! `SystemController`: one wall-clock-aligned ticking task feeding `oblisk.system`'s one field
-//! (docs/oblisk-idl-api-specs.md §2.11), `time`, refreshed every second.
+//! [`SystemController`] feeds `oblisk.system.time` (docs/oblisk-idl-api-specs.md §2.11) from one
+//! wall-clock-aligned task, refreshed every second.
 //!
-//! No `poll_mode`/dormant-vs-ticking split: §2.11 names no interval argument, so the task just
-//! ticks, unconditionally, from construction to shutdown, aligned to the wall-clock second
-//! boundary ([`time_until_next_second`]) so a clock reading doesn't visibly lag on screen.
+//! §2.11 has no interval argument, so it ticks unconditionally from construction to shutdown,
+//! aligning its first wake to the wall-clock second boundary ([`time_until_next_second`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11). The field name
-/// is the `StateSnapshot` payload's JSON key verbatim.
+/// `oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11), with its
+/// `StateSnapshot` JSON key unchanged.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {
-    /// Unix epoch seconds, not milliseconds -- §2.11 calls it "system time epoch" with no unit
-    /// stated. `os.date` wants seconds, so a millis reading would be silently wrong by 1000x.
+    /// Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds;
+    /// milliseconds would be wrong by 1000x.
     pub time: i64,
 }
 
-/// Wakes `main.rs`'s `select!` to push a fresh `StateSnapshot`.
+/// Wakes `main.rs`'s `select!` for a fresh `StateSnapshot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemSignal {
     Changed,
 }
 
-/// Whether a freshly-sampled epoch second is worth pushing. This filter is mandatory
-/// (ADR-0044): every `StateSnapshot` marks the Renderer's scene dirty and drives a full
-/// re-resolve and repaint, so an unconditional push would repaint the whole scene every tick
-/// even when nothing changed. Pure over the last-emitted and current second, so it's testable
-/// without a real clock. `last_emitted` is `None` only before the first tick.
+/// Whether a sampled second is worth pushing. Required by ADR-0044: every `StateSnapshot` dirties
+/// the Renderer and triggers full re-resolve/repaint, so unconditional pushes repaint unchanged
+/// scenes. Pure over last/current seconds; `last_emitted` is `None` only before the first tick.
 pub fn should_emit(last_emitted: Option<i64>, current: i64) -> bool {
     last_emitted != Some(current)
 }
 
-/// `SystemTime::now()`'s epoch, truncated to whole seconds -- §2.11's `time` field. A thin
-/// wrapper so the truncation is one pinned seam instead of two call sites that could drift.
+/// `SystemTime::now()`'s epoch truncated to whole seconds for §2.11's `time`; one pinned seam.
 pub fn epoch_seconds(now: SystemTime) -> i64 {
     now.duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs() as i64).unwrap_or(0)
 }
 
-/// How long to sleep from `elapsed_since_epoch` until the next whole-second boundary. Pure
-/// over a `Duration` rather than `SystemTime` itself, so it's testable without a real clock.
+/// Duration from `elapsed_since_epoch` to the next whole-second boundary. Pure over `Duration` for
+/// clock-free tests.
 ///
-/// ponytail: this aligns once, at task startup, and then ticks a plain steady 1-second
-/// `tokio::time::interval` -- it does not re-align on every tick or track wall-clock drift
-/// against the monotonic clock `tokio::time::Instant` is built on. The two clocks run at the
-/// same rate under normal operation (no NTP step, no suspend/resume) closely enough that a
-/// display clock does not visibly drift within any session length this shell runs for. A step
-/// (NTP slew, `settimeofday`, wake from suspend) would leave the tick boundary wherever it was
-/// before the step until the next restart. The upgrade path, if that is ever observed, is
-/// re-deriving `time_until_next_second` after every tick instead of only before the first one
-/// and rebuilding the `interval` when it disagrees with the ticker by more than a few
-/// milliseconds -- not built here because it adds a re-alignment check to a 1Hz hot loop for a
-/// clock skew this shell has no other reason to care about.
+/// ponytail: aligns once at startup, then uses a steady 1-second `tokio::time::interval` on
+/// monotonic `Instant`. It does not track wall-clock drift. With no NTP step or suspend/resume,
+/// both clocks run closely enough for this shell's sessions; a step (`settimeofday`, NTP slew,
+/// resume) leaves the old boundary until restart. Upgrade by re-deriving alignment each tick and
+/// rebuilding the interval after a discrepancy of a few milliseconds; not worth a check in this
+/// 1Hz loop until observed.
 pub fn time_until_next_second(elapsed_since_epoch: Duration) -> Duration {
     Duration::from_secs(1) - Duration::from_nanos(u64::from(elapsed_since_epoch.subsec_nanos()))
 }
@@ -63,8 +54,8 @@ pub struct SystemController {
 }
 
 impl SystemController {
-    /// `time` is seeded to the current second immediately, so an early client never sees a stale
-    /// zero, and the ticking task takes over from there.
+    /// Seeds `time` immediately, so an early client sees the current second, not stale zero; the
+    /// ticking task takes over afterward.
     pub fn new(signal_tx: UnboundedSender<SystemSignal>) -> Self {
         let now = epoch_seconds(SystemTime::now());
         let state = Arc::new(Mutex::new(SystemState { time: now }));
@@ -74,17 +65,14 @@ impl SystemController {
         Self { state }
     }
 
-    /// The current combined state -- what `main.rs`'s signal-channel `select!` arm clones and
-    /// pushes as a fresh `StateSnapshot`.
+    /// Current state for `main.rs`'s signal-channel `select!` snapshot push.
     pub fn snapshot(&self) -> SystemState {
         self.state.lock().expect("system state mutex poisoned").clone()
     }
 }
 
-/// The one ticking task. Aligns its first wakeup to the next wall-clock second boundary
-/// ([`time_until_next_second`]), then ticks a plain steady one-second `tokio::time::interval`
-/// forever. `last_emitted` starts at the second `SystemController::new` already seeded, so the
-/// first real tick doesn't double-push for a second construction already reported.
+/// Aligns its first wake to the next wall-clock second, then ticks a steady one-second interval.
+/// `last_emitted` starts at the second seeded by `new`, so the first tick does not double-push.
 async fn run_clock_task(
     state: Arc<Mutex<SystemState>>,
     signal_tx: UnboundedSender<SystemSignal>,
@@ -133,8 +121,7 @@ mod tests {
 
     #[test]
     fn epoch_seconds_is_seconds_not_milliseconds() {
-        // A millis value for "now" would be roughly 1_700_000_000_000, three orders larger --
-        // pins the magnitude so a future as_millis() typo fails loudly.
+        // Millis "now" would be roughly 1_700_000_000_000, three orders larger.
         let known = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let seconds = epoch_seconds(known);
         assert!((1_000_000_000..2_000_000_000).contains(&seconds), "plausible unix epoch seconds range, got {seconds}");
@@ -153,8 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_seeds_time_synchronously_before_any_tick_fires() {
-        // The clock task's first tick is a second away; a client connecting inside that second
-        // must read a real epoch, not a zero.
+        // The first tick is a second away; clients in that second must read real epoch, not zero.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = SystemController::new(tx);
 

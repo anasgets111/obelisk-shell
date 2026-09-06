@@ -1,8 +1,7 @@
 //! Pointer hit-testing: the chain of nodes under one point (ADR-0050 decision 1).
 //!
-//! Pure, and that is the whole reason it is a module rather than three functions inside
-//! `crate::wayland`: everything else on the pointer path needs a live `wl_pointer` and a live
-//! `wl_surface`, and this is the part that decides what a click means.
+//! Pure: unlike the rest of the pointer path, this only decides what a click means. Other
+//! pointer-path work owns live `wl_pointer` and `wl_surface` objects.
 
 use cursor_icon::CursorIcon;
 use mlua::Value;
@@ -22,10 +21,10 @@ pub struct LogicalPoint {
 
 /// Every node containing `point`, root-first and deepest-last; empty if the point misses `root`.
 ///
-/// A path, not a topmost node: the only tree anyone writes is a `button` whose child is a `text`,
-/// and the deepest node under the pointer has no `on_click`, so returning it alone would mean no
-/// button ever fires (ADR-0050 decision 1). Each caller scans the result from the deep end
-/// for the kind it wants.
+/// A path, not a topmost node: the supported tree is a `button` whose `text` child has no
+/// `on_click`; returning only the deepest node would mean no button ever fires (ADR-0050
+/// decision 1).
+/// Callers scan from the deep end for the kind they want.
 ///
 /// Three rules, all load-bearing:
 ///
@@ -39,12 +38,10 @@ pub struct LogicalPoint {
 /// - **Half-open bounds**, `rect.x <= point.x < rect.x + rect.width`. Two buttons sharing an edge
 ///   must not both claim it, and a zero-area rect must contain nothing.
 ///
-/// `ResolvedNode::rect` is parent-relative, so the absolute rect of a hit node is only recoverable
-/// from the path that reached it -- [`absolute_rect`] does that recovery, which is why the return
-/// type is the whole chain rather than a node and its depth.
+/// `ResolvedNode::rect` is parent-relative. [`absolute_rect`] recovers a hit node's absolute rect
+/// from the path, which is why the return value is the whole chain.
 ///
-/// No depth bound of its own: `layout::scene::MAX_TREE_DEPTH` refuses a tree deeper than 64 levels
-/// at resolve time.
+/// `layout::scene::MAX_TREE_DEPTH` refuses a tree deeper than 64 levels at resolve time.
 pub fn hit_path(root: &ResolvedNode, point: LogicalPoint) -> Vec<&ResolvedNode> {
     let mut path = Vec::new();
     descend(root, point, 0.0, 0.0, &mut path);
@@ -152,11 +149,8 @@ pub fn contains_node(root: &ResolvedNode, id: crate::layout::scene::NodeId) -> b
     root.id == id || root.children.iter().any(|child| contains_node(child, id))
 }
 
-/// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path.
-///
-/// Sums the parent-relative origins the walk descended through, which is the only place that sum
-/// still exists once [`hit_path`] has returned bare node references. Callers wanting an
-/// intermediate node's rect pass the prefix ending at it (`absolute_rect(&path[..=index])`).
+/// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path. It sums the
+/// parent-relative origins; pass a prefix to recover an intermediate node's rect.
 pub fn absolute_rect(path: &[&ResolvedNode]) -> Option<LogicalRect> {
     let last = path.last()?;
     Some(LogicalRect {
@@ -167,9 +161,6 @@ pub fn absolute_rect(path: &[&ResolvedNode]) -> Option<LogicalRect> {
     })
 }
 
-/// Pushes `node` and its deepest hit descendant onto `path`, returning whether it was entered at
-/// all. `origin_x`/`origin_y` is the absolute origin of `node`'s parent, the same running sum
-/// `layout::paint::run` carries.
 fn descend<'a>(
     node: &'a ResolvedNode,
     point: LogicalPoint,
@@ -194,9 +185,6 @@ fn descend<'a>(
     true
 }
 
-/// Half-open containment: the top-left edges belong to the rect, the bottom-right ones to
-/// whatever is past them. A zero-width or zero-height rect contains nothing, since the two
-/// comparisons cannot both hold.
 fn contains(rect: LogicalRect, point: LogicalPoint) -> bool {
     point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height
 }

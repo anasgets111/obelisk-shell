@@ -1,7 +1,5 @@
-//! [`KeyboardController`]: `oblisk.keyboard` write-action dispatcher and state owner.
-//!
-//! Backlight, lock state, and layout share one `Arc<Mutex<KeyboardState>>`
-//! and one signal channel (ADR-0034).
+//! [`KeyboardController`] owns `oblisk.keyboard` state and write actions. Backlight, lock state,
+//! and layout share one `Arc<Mutex<KeyboardState>>` and signal channel (ADR-0034).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,15 +14,14 @@ use super::backlight::KbdBacklightProxy;
 use super::layout::{CompositorLink, HyprlandLink, NiriLink};
 use super::locks::{read_led_on, resolve_lock_leds};
 
-/// `oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` when this machine has no
-/// keyboard-backlight hardware. `caps_lock`/`num_lock`/`scroll_lock` have no sentinel (bare
-/// `bool`) -- they default `false` and stay there, logged once, if neither evdev nor sysfs
-/// resolves. `active_layout` defaults to an empty string (IDL declares it non-nullable,
-/// ADR-0034), `active_layout_index`/`layout_count` default `0`.
+/// `oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` without keyboard-backlight
+/// hardware. Lock booleans have no sentinel: they default and remain `false` if neither evdev nor
+/// sysfs resolves. `active_layout` is the non-nullable empty-string sentinel; index and count are
+/// `0` by default (ADR-0034).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct KeyboardState {
-    /// Keyboard backlight, `0` to `100`, or `-1` on a machine with no backlight device. `-1` is an
-    /// answer, not a failure: check for it before drawing a slider.
+    /// Keyboard backlight, `0` to `100`, or `-1` without a backlight device. Check `-1` before
+    /// drawing a slider.
     pub backlight_pct: i32,
     /// Caps Lock is on.
     pub caps_lock: bool,
@@ -32,14 +29,13 @@ pub struct KeyboardState {
     pub num_lock: bool,
     /// Scroll Lock is on.
     pub scroll_lock: bool,
-    /// The layout's display name, e.g. `"English (US)"`. Empty string before the compositor has
-    /// answered once.
+    /// Layout display name, e.g. `"English (US)"`; empty before the compositor answers.
     pub active_layout: String,
-    /// The active layout's 0-based position in the configured list. What
-    /// `keyboard:invoke("switch_layout", index)` takes.
+    /// Active layout's 0-based configured-list position, passed to
+    /// `keyboard:invoke("switch_layout", index)`.
     pub active_layout_index: u32,
-    /// How many layouts are configured. `switch_layout` has nothing to switch to below `2`, so
-    /// this is the check for whether to draw a layout indicator at all.
+    /// Configured layout count. Below `2`, `switch_layout` has nothing to change and a layout
+    /// indicator need not be drawn.
     pub layout_count: u32,
 }
 
@@ -57,14 +53,13 @@ impl Default for KeyboardState {
     }
 }
 
-/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardSignal {
     Changed,
 }
 
-/// `keyboard:set_backlight(pct)`'s `arguments: [pct]`. `pct` is intentionally unclamped here
-/// -- clamping happens once, in `backlight::raw_from_percent`.
+/// `keyboard:set_backlight(pct)`'s `arguments: [pct]`; clamping happens once in
+/// `backlight::raw_from_percent`.
 pub fn parse_set_backlight_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
@@ -74,16 +69,13 @@ pub fn parse_switch_layout_args(arguments: &[serde_json::Value]) -> Option<usize
     arguments.first()?.as_u64().map(|v| v as usize)
 }
 
-/// Either a live UPower `KbdBacklight` object with its `GetMaxBrightness()` cached at
-/// construction (a keyboard's brightness step count doesn't change at runtime), or
-/// `Unavailable` if this machine's UPower doesn't expose one at all.
+/// A live UPower `KbdBacklight` with construction-time `GetMaxBrightness()` or `Unavailable` if
+/// UPower exposes none. Brightness step count does not change at runtime.
 enum Backlight {
     Live { proxy: KbdBacklightProxy<'static>, max: i32 },
     Unavailable,
 }
 
-/// `Clone` so `main.rs` can hand a cheap `Arc`-backed copy to the `tokio::spawn`ed task
-/// `keyboard:set_backlight`'s dispatch arm needs, since it makes a real D-Bus call.
 #[derive(Clone)]
 pub struct KeyboardController {
     state: Arc<Mutex<KeyboardState>>,
@@ -92,13 +84,10 @@ pub struct KeyboardController {
 }
 
 impl KeyboardController {
-    /// `system_bus` is the Supervisor's already-established `zbus::Connection::system()`;
-    /// `KbdBacklightProxy` rides it directly (ADR-0034). Returns immediately; a failed
-    /// `GetMaxBrightness()` degrades to [`Backlight::Unavailable`] rather than failing
-    /// construction. `leds_root` (real default `/sys/class/leds`) is the lock-state sysfs
-    /// fallback's root, injected for testability. Layout picks one [`CompositorLink`] via
-    /// `crate::compositor`'s env-var probe -- `None` for a session running something with no
-    /// implementor.
+    /// `system_bus` is the existing `zbus::Connection::system()` used by `KbdBacklightProxy`
+    /// (ADR-0034). A failed `GetMaxBrightness()` yields [`Backlight::Unavailable`]. `leds_root`
+    /// (default `/sys/class/leds`) is the test-injected sysfs fallback root. Layout selects one
+    /// [`CompositorLink`] via `crate::compositor`'s env probe, or `None` without an implementor.
     pub async fn new(
         system_bus: zbus::Connection,
         leds_root: &Path,
@@ -126,8 +115,7 @@ impl KeyboardController {
         Self { state, backlight: Arc::new(backlight), layout: Arc::new(layout) }
     }
 
-    /// `keyboard:set_backlight(pct)`. A silent no-op (logged once) when this machine has no
-    /// keyboard backlight.
+    /// `keyboard:set_backlight(pct)`. Logs and returns without keyboard-backlight hardware.
     pub async fn set_backlight(&self, pct: u64) {
         let Backlight::Live { proxy, max } = self.backlight.as_ref() else {
             eprintln!("keyboard: set_backlight called but this machine has no keyboard backlight; ignored");
@@ -137,13 +125,11 @@ impl KeyboardController {
         if let Err(err) = proxy.set_brightness(raw).await {
             eprintln!("keyboard: SetBrightness failed: {err}");
         }
-        // No optimistic local update: state changes flow through `BrightnessChanged`, off
-        // this call.
+        // State changes arrive through `BrightnessChanged`, not this call.
     }
 
-    /// `keyboard:switch_layout(index)`. A no-op (logged) when no supported compositor was
-    /// detected. Synchronous, not `async`: `CompositorLink::switch_layout` itself is
-    /// synchronous, fire-and-forget.
+    /// `keyboard:switch_layout(index)`. Logs and returns without a supported compositor.
+    /// Synchronous because `CompositorLink::switch_layout` is synchronous fire-and-forget.
     pub fn switch_layout(&self, index: usize) {
         match self.layout.as_ref() {
             Some(link) => link.switch_layout(index),
@@ -156,12 +142,9 @@ impl KeyboardController {
     }
 }
 
-/// Binds `KbdBacklightProxy` and resolves it to [`Backlight::Live`] or
-/// [`Backlight::Unavailable`], spawning the `BrightnessChanged` forwarder task for the `Live`
-/// case. The subscription is established before the initial `GetBrightness()` read, not after
-/// -- a `BrightnessChanged` emitted in that gap would otherwise be silently and permanently
-/// missed. A failed initial read is best-effort only: `backlight_pct` stays at its `-1` default
-/// until the first `BrightnessChanged` arrives, rather than degrading the whole capability.
+/// Binds `KbdBacklightProxy`, then returns [`Backlight::Live`] or [`Backlight::Unavailable`]. For
+/// the live case, subscribe before `GetBrightness()` or a signal in that gap is lost. A failed
+/// initial read leaves `backlight_pct` at `-1` until the next `BrightnessChanged`.
 async fn resolve_backlight(
     system_bus: &zbus::Connection,
     state: &Arc<Mutex<KeyboardState>>,
@@ -214,22 +197,19 @@ async fn resolve_backlight(
     Backlight::Live { proxy, max }
 }
 
-/// Picks the keyboard-like evdev device (the first one, in `evdev::enumerate()`'s order,
-/// whose LED capability set includes `LED_CAPSL`) and returns it still open. Not unit-tested
-/// against fake data: `evdev::enumerate()` scans real `/dev/input` device nodes, verified only
-/// by live testing on this dev machine (ADR-0034).
+/// Picks the first `evdev::enumerate()` device whose LEDs include `LED_CAPSL`, leaving it open.
+/// Not fake-data unit-tested: enumeration scans real `/dev/input` nodes and was verified live on
+/// this machine (ADR-0034).
 fn find_keyboard_led_device() -> Option<evdev::Device> {
     evdev::enumerate()
         .find(|(_, device)| device.supported_leds().is_some_and(|leds| leds.contains(evdev::LedCode::LED_CAPSL)))
         .map(|(_, device)| device)
 }
 
-/// Resolves lock-state reporting and writes the initial value into `state`. evdev is primary
-/// (ADR-0034): its `EV_LED` event stream carries every live change with no re-read needed, and
-/// the kernel queues `EV_LED` events per open fd from the moment `Device::open` succeeds, so
-/// there's no subscribe-before-read race like UPower's `BrightnessChanged`. Sysfs
-/// (`locks::resolve_lock_leds`) is a static, read-once fallback when evdev isn't accessible;
-/// neither resolving leaves all three lock fields at their `false` default, logged once.
+/// Uses evdev first (ADR-0034): `EV_LED` carries live changes, queued per open fd from
+/// `Device::open`, so it has no UPower-style subscribe-before-read race. Sysfs
+/// (`locks::resolve_lock_leds`) is a static read-once fallback; neither source leaves all locks at
+/// their logged `false` defaults.
 async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) {
     if let Some(device) = find_keyboard_led_device() {
         match device.get_led_state() {
@@ -273,12 +253,12 @@ async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, even
                         }
                     }
                 });
-                // evdev is fully live now; the sysfs fallback below only applies when it isn't.
+                // evdev is live; use sysfs only when it is not.
                 return;
             }
             Err(err) => {
-                // A device that's merely un-streamable still counts as "evdev can't be opened"
-                // -- fall through to the sysfs branch instead of leaving lock state at `false` forever.
+                // An un-streamable device still counts as evdev unavailable; use sysfs rather than
+                // leaving lock state at `false` forever.
                 eprintln!(
                     "keyboard: failed to open an EV_LED event stream; falling back to a one-time sysfs LED read for lock state: {err}"
                 );

@@ -1,15 +1,11 @@
 //! What the Supervisor knows between one loop iteration and the next.
 //!
-//! `run_supervisor`'s `select!` says which events exist and what order they run in; this says what
-//! each does. State lives here, and the channel receivers the loop `await`s stay locals in
-//! `main.rs`, each read by exactly one arm. Not a borrow-checker constraint: `tokio::select!` drops
-//! the branch futures before running the winner, so `supervisor.authoritative.child.wait()` and
-//! `&mut supervisor` compile in different branches, which the departure arm relies on. Some
-//! operations must address only the *authoritative* generation, never the frame's:
-//! `self.authoritative.generation_id` is read directly, not passed at each call site, except
-//! `hydrate` and `answer_unchanged_report`, which take it as an argument. Not testable in
-//! isolation: [`Capabilities`] needs a live system bus, so no unit test can build a `Supervisor`;
-//! [`crate::is_current_reload`], [`crate::begin_reload`], and [`push_snapshot`] stay testable.
+//! `run_supervisor`'s `select!` owns event order; this owns each operation's state. Receivers stay
+//! in `main.rs`, one per arm. `select!` drops losing futures before running the winner, allowing
+//! `child.wait()` and `&mut supervisor` in separate branches. Most operations address only the
+//! authoritative generation via `self.authoritative.generation_id`; `hydrate` and
+//! `answer_unchanged_report` are the exceptions. [`Capabilities`] needs a live bus, so only
+//! [`crate::is_current_reload`], [`crate::begin_reload`], and [`push_snapshot`] are isolated tests.
 
 use std::collections::HashMap;
 
@@ -29,20 +25,18 @@ use crate::snapshot::push_snapshot;
 use crate::socket::{self, InboundFrame};
 use crate::{PBA_TIMINGS, Shutdown, begin_reload, memory, process, reload, send_frame_logged};
 
-/// Why a generation is being asked to take a lock it did not request. The log line differs by cause
-/// though both arrive at the same state: a lock the compositor already holds with nothing of ours
-/// on it. Naming it beats a `bool` whose two sides read identically at the call site.
+/// Why a generation must take an unrequested lock. Causes differ in logs but both mean the
+/// compositor holds a lock with nothing of ours on it; a named enum beats an ambiguous `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelockReason {
-    /// ADR-0058 decision 4: the Renderer holding the lock died and a replacement was spawned.
+    /// ADR-0058 decision 4: lock-holder Renderer died; replacement spawned.
     RendererReplaced,
-    /// ADR-0060: this Supervisor started with `$XDG_RUNTIME_DIR`'s marker set, so a previous one
-    /// died while the session was locked.
+    /// ADR-0060: runtime marker was set, so a previous Supervisor died while locked.
     SupervisorRestarted,
 }
 
 impl RelockReason {
-    /// The subject noun for the outcome messages below.
+    /// Subject noun for outcome messages.
     fn subject(self) -> &'static str {
         match self {
             RelockReason::RendererReplaced => "the replacement",
@@ -50,7 +44,7 @@ impl RelockReason {
         }
     }
 
-    /// Why the lock is going out unasked, for the request-in-flight log line.
+    /// Why the lock is being retaken, for the in-flight log.
     fn because(self) -> &'static str {
         match self {
             RelockReason::RendererReplaced => "the Renderer that held it died",
@@ -59,59 +53,57 @@ impl RelockReason {
     }
 }
 
-/// Everything the Supervisor loop carries between iterations.
+/// Supervisor loop state.
 pub(crate) struct Supervisor {
-    /// Every live Renderer connection, keyed by generation id.
+    /// Live Renderer connections by generation.
     pub(crate) registry: socket::GenerationRegistry,
-    /// The generation whose frames count and whose id every outbound frame below is addressed to.
+    /// Generation whose frames count and receive outbound frames.
     pub(crate) authoritative: Authoritative,
-    /// Every capability's controller and sender (ADR-0076).
+    /// Capability controllers and senders (ADR-0076).
     pub(crate) capabilities: Capabilities,
-    /// The lock capability, built here rather than in `Capabilities` (ADR-0052).
+    /// Lock capability, built here rather than in `Capabilities` (ADR-0052).
     pub(crate) lock: LockController,
-    /// Kept alive for the whole run so the channel never closes; each outcome carries the
-    /// acquisition it answers for (see `lock::accepts_outcome`).
+    /// Kept alive so the channel stays open; outcomes carry their acquisition
+    /// (`lock::accepts_outcome`).
     pub(crate) pam_outcome_tx: tokio::sync::mpsc::UnboundedSender<(u64, shared::PamOutcome)>,
-    /// The polkit challenge on screen, built here like `lock` (ADR-0114).
+    /// Onscreen polkit challenge, built here like `lock` (ADR-0114).
     polkit: PolkitController,
-    /// The polkit sibling of `pam_outcome_tx`, tagged with the challenge's cookie.
+    /// Polkit counterpart to `pam_outcome_tx`, tagged by challenge cookie.
     polkit_outcome_tx: tokio::sync::mpsc::UnboundedSender<(String, shared::PamOutcome)>,
 
-    /// `$XDG_RUNTIME_DIR`'s "the session is locked" marker, which outlives this process (ADR-0060).
+    /// Persistent `$XDG_RUNTIME_DIR` locked marker (ADR-0060).
     locked_flag: lock::SessionLockedFlag,
-    /// logind's half of the same fact (ADR-0138): what `loginctl show-session` reports as
-    /// `LockedHint`, published whenever the flag above changes.
+    /// logind half of the same fact (ADR-0138), publishing `loginctl show-session`'s `LockedHint`
+    /// whenever the marker changes.
     session_bridge: lock::logind::SessionBridge,
-    /// Every capability's state-version counter, keyed by name (ADR-0004).
+    /// Capability state-version counters by name (ADR-0004).
     revisions: HashMap<String, u32>,
-    /// The last StateSnapshot pushed per capability, keyed by name: hydrates a fresh Candidate's
-    /// first evaluation (Supervisor services § 14.2; ADR-0029).
+    /// Last snapshot per capability, seeding a Candidate's first evaluation (§ 14.2, ADR-0029).
     last_snapshots: HashMap<String, shared::StateSnapshot>,
-    /// The most recently sent `Reevaluate`'s sequence (ADR-0024).
+    /// Most recently sent `Reevaluate` sequence (ADR-0024).
     next_sequence: u64,
-    /// The id the next spawned generation gets, whether a PBA candidate or a crash replacement.
+    /// Id for the next PBA candidate or crash replacement.
     next_generation_id: u32,
-    /// The Renderer binary every spawn below runs.
+    /// Renderer binary for every spawn.
     renderer_path: String,
     restart_brake: RestartBrake,
-    /// Set only by [`Supervisor::replace_departed_renderer`], telling shutdown "still running,
-    /// needs reaping" from "already gone".
+    /// Set only by [`Supervisor::replace_departed_renderer`]; distinguishes shutdown reaping from
+    /// an already-gone Renderer.
     renderer_departed: bool,
-    /// ADR-0058 decision 4, ADR-0060: set when a Renderer dies holding the lock, or this process
-    /// started already locked. `relock_when_connected` is the intent; `relock_in_flight` tells a
-    /// re-acquisition's LockReport from an ordinary one's.
+    /// ADR-0058 decision 4, ADR-0060: intent after lock-holder death or locked startup;
+    /// `relock_in_flight` distinguishes its report.
     relock_when_connected: Option<RelockReason>,
     relock_in_flight: Option<RelockReason>,
-    /// Whether a topology-changing reload was refused while locked (ADR-0042). A bool, not a queue:
-    /// a second change while locked is still one reload to run.
+    /// Topology reload owed after unlock (ADR-0042). Bool, not queue: multiple locked changes need
+    /// one reload.
     swap_owed_on_unlock: bool,
-    /// Every process.run-spawned child still tracked (ADR-0026).
+    /// Tracked `process.run` children (ADR-0026).
     processes: LiveProcesses,
     process_done_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
 }
 
 impl Supervisor {
-    /// `boot_child` is generation 0, spawned earlier so a failure is fatal to `main` (ADR-0025).
+    /// Generation-0 child, spawned before construction so failure is fatal (ADR-0025).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         registry: socket::GenerationRegistry,
@@ -125,7 +117,7 @@ impl Supervisor {
         polkit_outcome_tx: tokio::sync::mpsc::UnboundedSender<(String, shared::PamOutcome)>,
         process_done_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
     ) -> Self {
-        // Read once, here: reading later would race the boot Renderer's registration.
+        // Read before boot registration; reading later would race it.
         let relock_when_connected = locked_flag.is_set().then_some(RelockReason::SupervisorRestarted);
         if relock_when_connected.is_some() {
             eprintln!(
@@ -158,15 +150,15 @@ impl Supervisor {
         }
     }
 
-    /// Addresses a `SetSessionLock` and pushes the state that goes with it: every command this
-    /// capability sends is also a state change a lock screen must see (ADR-0052 decision 4).
+    /// Sends `SetSessionLock` and its state snapshot; every command is a lock-screen-visible state
+    /// change (ADR-0052 decision 4).
     pub(crate) fn send_lock_command(&mut self, command: shared::SetSessionLock) {
         send_frame_logged(&self.registry, self.authoritative.generation_id, &SupervisorFrame::SetSessionLock(command));
         self.push_lock_state();
     }
 
-    /// Bumps the lock's revision and pushes its state (ADR-0052 decision 4): the only capability
-    /// pushed from the loop rather than `Capabilities`, since its controller is built in `main`.
+    /// Pushes lock state and revision from the loop, since `main` builds its controller
+    /// (ADR-0052 decision 4).
     pub(crate) fn push_lock_state(&mut self) {
         push_snapshot(
             &self.registry,
@@ -189,7 +181,7 @@ impl Supervisor {
         );
     }
 
-    /// polkitd asked for a challenge or withdrew one (ADR-0114).
+    /// Handles a polkitd challenge or withdrawal (ADR-0114).
     pub(crate) fn handle_polkit_request(&mut self, request: AgentRequest) {
         let changed = match request {
             AgentRequest::Begin { call, reply } => self.polkit.begin(call, reply),
@@ -200,9 +192,8 @@ impl Supervisor {
         }
     }
 
-    /// `secure_submit(polkit, authenticate)`: one helper conversation for the challenge on screen,
-    /// spawned for the reason the lock's is. `secret` is zeroized on the refusing path here and by
-    /// the helper task on the other.
+    /// Starts one helper conversation for the onscreen challenge. Spawned like lock; `secret` is
+    /// zeroized here on rejection and by the helper otherwise.
     pub(crate) fn begin_polkit_authentication(&mut self, mut secret: Vec<u8>, generation_id: u32) {
         match self.polkit.try_begin_authentication() {
             Some((uid, cookie)) => {
@@ -219,8 +210,8 @@ impl Supervisor {
         }
     }
 
-    /// The helper's answer for a polkit challenge. On success the helper has already told polkitd,
-    /// so ending the held `BeginAuthentication` is all that is left, in the order its docs require.
+    /// Handles the helper's answer. On success polkitd was already told; release the held
+    /// `BeginAuthentication` reply in the required order.
     pub(crate) fn record_polkit_outcome(&mut self, cookie: String, outcome: shared::PamOutcome) {
         match self.polkit.record_outcome(&cookie, outcome) {
             Answer::Stale => {
@@ -234,7 +225,7 @@ impl Supervisor {
         }
     }
 
-    /// One roster capability's signal, straight back out as a snapshot (ADR-0076).
+    /// Pushes one roster capability signal as a snapshot (ADR-0076).
     pub(crate) async fn push_capability_signal(&mut self, signal: Signal) {
         self.capabilities
             .push(
@@ -247,16 +238,14 @@ impl Supervisor {
             .await;
     }
 
-    /// Starts one reload cycle (ADR-0024, ADR-0041 decision 4), always for the authoritative
-    /// generation: a superseded one must not start a cycle.
+    /// Starts a reload for the authoritative generation (ADR-0024, ADR-0041 decision 4); a
+    /// superseded generation cannot start one.
     pub(crate) fn begin_reload(&mut self) {
         begin_reload(&self.registry, self.authoritative.generation_id, &mut self.next_sequence);
     }
 
-    /// Answers an `Unchanged` report: clears the reporting generation's idle registrations and
-    /// sends the go-ahead, unless a newer `Reevaluate` already went out, in which case it must not
-    /// fire for a superseded evaluation (ADR-0024). Addressed to the reporter: the apply lands on
-    /// whoever evaluated, not the authoritative generation.
+    /// Answers `Unchanged`: clear reporter idle registrations and send the go-ahead only for the
+    /// current `Reevaluate` (ADR-0024). Address the reporter, which evaluated it, not authority.
     pub(crate) async fn answer_unchanged_report(&self, generation_id: u32, sequence: u64) {
         if !crate::is_current_reload(sequence, self.next_sequence) {
             eprintln!(
@@ -266,7 +255,7 @@ impl Supervisor {
             );
             return;
         }
-        // Only if the config asked for a threshold: with no controller nothing is registered.
+        // No controller means no threshold was registered.
         if let Some(idle) = self.capabilities.idle() {
             idle.reset_registrations(generation_id).await;
         }
@@ -277,17 +266,14 @@ impl Supervisor {
         );
     }
 
-    /// Records that a swap could not run because the session is locked (ADR-0042); a later report
-    /// clearing the lock redeems it in [`Supervisor::record_lock_report`].
+    /// Records a locked swap for [`Supervisor::record_lock_report`] to redeem (ADR-0042).
     pub(crate) fn defer_swap(&mut self, sequence: u64) {
         eprintln!("generation swap for sequence {sequence} deferred: the session is locked (ADR-0042)");
         self.swap_owed_on_unlock = true;
     }
 
-    /// Replays every recorded snapshot to a generation that just registered, then hands it the lock
-    /// if one is owed. Only for the authoritative generation: a PBA candidate gets its own
-    /// hydration from `run_pba`'s snapshots argument instead (ADR-0029). Fixes the boot-time race:
-    /// state captured before this connection existed is delivered now.
+    /// Replays snapshots to a newly registered authoritative generation, then gives it an owed
+    /// lock. PBA candidates hydrate from `run_pba`'s snapshots (ADR-0029), fixing the boot race.
     pub(crate) fn hydrate(&mut self, generation_id: u32) {
         if generation_id != self.authoritative.generation_id {
             return;
@@ -295,9 +281,9 @@ impl Supervisor {
         for snapshot in self.last_snapshots.values() {
             send_frame_logged(&self.registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
         }
-        // ADR-0058 decision 4, after the replay above: a lock acquired before hydration paints one
-        // frame of defaults, indistinguishable from a broken shell. No auth-capability check here:
-        // the Renderer reports Refused when its tree has no way to reach PAM (ADR-0052 decision 3).
+        // ADR-0058 decision 4: replay before relock, or one default frame looks like a broken
+        // shell. No Supervisor-side auth-capability check here; Renderer reports Refused if its
+        // tree cannot reach PAM (ADR-0052 decision 3).
         if let Some(reason) = self.relock_when_connected.take() {
             self.relock_in_flight = Some(reason);
             eprintln!(
@@ -308,8 +294,8 @@ impl Supervisor {
         }
     }
 
-    /// Reports the authoritative Renderer's death and spawns its replacement (ADR-0058); `Some`
-    /// means the loop must stop, and carries why.
+    /// Reports authoritative Renderer death and spawns a replacement (ADR-0058); `Some` stops the
+    /// loop and carries the reason.
     pub(crate) fn replace_departed_renderer(
         &mut self,
         status: std::io::Result<std::process::ExitStatus>,
@@ -325,8 +311,8 @@ impl Supervisor {
         eprintln!("{}", departure_report(departure, self.authoritative.generation_id, was_locked));
         self.renderer_departed = true;
 
-        // Checked before the spawn, not after a failure (ADR-0058 decision 3): this defends against
-        // every spawn succeeding while every Renderer then dies on the same config.
+        // Check before spawning (ADR-0058 decision 3), covering the case where every spawn succeeds
+        // but each Renderer dies on the same config.
         if !self.restart_brake.allow(std::time::Instant::now()) {
             eprintln!(
                 "giving up: {RESTART_LIMIT} renderers have died within {}s, which is a config that kills whatever it is \
@@ -345,12 +331,10 @@ impl Supervisor {
                 self.authoritative = Authoritative { generation_id: replacement_generation_id, child };
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
-                // Hydration needs no code here: the replacement's connected registration replays
-                // every last_snapshots entry via `hydrate` above.
+                // Registration replays every `last_snapshots` entry via `hydrate`.
                 if was_locked {
-                    // ADR-0058 decision 4: the lock object died with the process, so `active` no
-                    // longer describes anything held; `RendererLost` lets `lock()` through anyway,
-                    // waiting to register since `send_frame_logged` needs a connection.
+                    // ADR-0058 decision 4: the lock object died; `active` is stale. `RendererLost`
+                    // lets `lock()` proceed, then waits for a connection to send it.
                     self.lock.record(lock::LockEvent::RendererLost);
                     self.relock_when_connected = Some(RelockReason::RendererReplaced);
                     eprintln!(
@@ -366,13 +350,10 @@ impl Supervisor {
         }
     }
 
-    /// Answers a PAM outcome for a lock authentication (ADR-0042). `acquisition` matters because a
-    /// PAM answer outlives the lock it answers for: about a second normally, up to
-    /// PAM_EXCHANGE_TIMEOUT's thirty when wedged, and in that window the compositor can end the
-    /// lock or an idle timer can take a new one; `record_authentication` refuses a stale answer.
-    /// `loginctl lock-session`, arriving as logind's `Lock` signal (ADR-0138). Nothing here is
-    /// special-cased: it takes the same path a `lock:invoke("lock")` from the bar takes, including
-    /// the already-locked guard inside [`LockController::lock`].
+    /// Handles a PAM lock answer (ADR-0042). `acquisition` rejects stale answers: PAM normally
+    /// takes a second, or `PAM_EXCHANGE_TIMEOUT`'s 30 seconds when wedged, while the compositor or
+    /// idle timer may change locks. `loginctl lock-session` (ADR-0138) arrives as logind's `Lock`
+    /// signal, uses the same lock path and already-locked guard as `lock:invoke("lock")`.
     pub(crate) fn lock_requested_by_logind(&mut self) {
         eprintln!("lock: logind asked for a lock (loginctl lock-session)");
         self.lock.lock();
@@ -382,21 +363,20 @@ impl Supervisor {
     pub(crate) fn record_pam_outcome(&mut self, acquisition: u64, outcome: shared::PamOutcome) {
         let succeeded = outcome == shared::PamOutcome::Success;
         if !self.lock.record_authentication(acquisition, outcome) {
-            // No push: a refused answer changed no state, and push_lock_state bumps it regardless.
+            // No push: refusal changed no state; `push_lock_state` would bump the revision anyway.
             eprintln!(
                 "lock: dropping a pam outcome for acquisition {acquisition}, which is no longer the lock on the glass"
             );
         } else if succeeded {
-            // The command's own arm pushes the snapshot that goes with it.
+            // The command arm pushes its snapshot.
             self.lock.unlock();
         } else {
             self.push_lock_state();
         }
     }
 
-    /// Records the authoritative generation's answer to a lock order (ADR-0052 decision 4), and
-    /// runs any swap ADR-0042 deferred once `defers_swap` clears, which Refused satisfies too (only
-    /// a request in flight keeps the gate shut), so a deferred change is never lost.
+    /// Records the authoritative lock answer (ADR-0052 decision 4), then runs a deferred swap
+    /// once `defers_swap` clears. Refused also clears it; only an in-flight request keeps the gate.
     pub(crate) fn record_lock_report(&mut self, report: shared::LockReport) {
         if let Some(who) = self.relock_in_flight.take() {
             let who = who.subject();
@@ -404,8 +384,7 @@ impl Supervisor {
                 shared::LockOutcome::Locked => {
                     eprintln!("{who} took the session lock over; the lock screen is back on the glass")
                 }
-                // Deliberately not lock_stays_authenticatable's wording: only the compositor's own
-                // fallback is on screen here.
+                // Only the compositor's fallback is onscreen, not `lock_stays_authenticatable`.
                 shared::LockOutcome::Refused(reason) => eprintln!(
                     "{who} could not take the session lock over: {reason}. The session stays locked with no lock screen on it, \
                      so the way back in is a VT switch (ADR-0058 decision 4, ADR-0060)"
@@ -413,12 +392,12 @@ impl Supervisor {
                 other => eprintln!("{who}'s lock re-acquisition ended as {other:?} rather than a lock"),
             }
         }
-        // Before record, off the outcome rather than LockState: the marker keeps saying "locked"
-        // through a RendererLost that clears active (ADR-0060).
+        // Derive from the outcome before recording; the marker stays "locked" through RendererLost,
+        // which clears `active` (ADR-0060).
         let change = lock::compositor_lock_change(&report.outcome);
         self.locked_flag.apply(change);
-        // The same change, told to logind. Off the outcome for the same reason, so `LockedHint`
-        // and the runtime marker can never disagree about what is on the glass (ADR-0138).
+        // Publish the same outcome-derived change to logind, keeping `LockedHint` and the marker
+        // aligned (ADR-0138).
         match change {
             lock::SessionLock::Taken => self.session_bridge.publish_locked_hint(true),
             lock::SessionLock::Released => self.session_bridge.publish_locked_hint(false),
@@ -427,16 +406,14 @@ impl Supervisor {
         self.lock.record(lock::LockEvent::Reported(report.outcome));
         self.push_lock_state();
         if !self.lock.defers_swap() && std::mem::take(&mut self.swap_owed_on_unlock) {
-            // A fresh reload call, not the deferred evaluation replayed: its sequence is stale and
-            // the config may have changed again since.
+            // Start fresh: the deferred sequence is stale and config may have changed.
             self.begin_reload();
         }
     }
 
-    /// Runs one generation swap for a `TopologyChanged` report (ADR-0025). Inlined synchronously,
-    /// not tokio::spawn'd: swaps are rare and bounded (seconds, `PBA_TIMINGS`), nothing else
-    /// capability-routed over this socket to starve. `inbound` is the loop's own receiver, borrowed
-    /// so `SocketCandidateLink` can read the Candidate's ReadySignal and evidence off it.
+    /// Runs one `TopologyChanged` swap (ADR-0025) inline. Swaps are rare and bounded by seconds
+    /// (`PBA_TIMINGS`), so capability traffic cannot starve. Borrow `inbound` so the link reads
+    /// Candidate ReadySignal/evidence from the loop's receiver.
     pub(crate) async fn swap_generation(
         &mut self,
         sequence: u64,
@@ -447,8 +424,8 @@ impl Supervisor {
             (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
             ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
         ];
-        // Every capability's latest snapshot hydrates the Candidate's first evaluation (Supervisor
-        // services § 14.2; ADR-0029), not just audio's.
+        // All latest snapshots hydrate Candidate's first evaluation (§ 14.2, ADR-0029), not just
+        // audio's.
         let snapshots: Vec<shared::StateSnapshot> = self.last_snapshots.values().cloned().collect();
         let mut link = SocketCandidateLink { registry: self.registry.clone(), candidate_generation_id, inbound };
 
@@ -456,9 +433,8 @@ impl Supervisor {
             .await
         {
             Ok(outcome) => {
-                // ADR-0043 decision 1: the widest point of the handoff: the Candidate has presented
-                // (run_pba returned Ok) and the superseded generation still owns every buffer, both
-                // fully resident. Sampled here since the swap reaps one first.
+                // ADR-0043 decision 1: widest handoff point, Candidate presented while superseded
+                // still owns every buffer and both are resident. Sample before swap reaps one.
                 memory::log_sample(
                     "pba handoff",
                     &[
@@ -482,14 +458,13 @@ impl Supervisor {
         }
     }
 
-    /// Routes a roster capability's command to its controller (ADR-0037); `lock` rides along
-    /// because its controller is built outside `Capabilities` (ADR-0052).
+    /// Routes a roster command to its controller (ADR-0037); `lock` is separate (ADR-0052).
     pub(crate) async fn dispatch_capability_command(
         &mut self,
         capability: Capability,
         envelope: &shared::CommandEnvelope,
     ) {
-        // Here rather than in `Capabilities`, beside the push a cancel needs (ADR-0114).
+        // Keep polkit here beside the cancel path (ADR-0114).
         if capability == Capability::Polkit {
             if polkit::dispatch(&mut self.polkit, envelope) {
                 self.push_polkit_state();
@@ -499,23 +474,22 @@ impl Supervisor {
         self.capabilities.dispatch(capability, envelope, &self.lock).await;
     }
 
-    /// Routes a `process` capability command (ADR-0026).
+    /// Routes a `process` command (ADR-0026).
     pub(crate) async fn dispatch_process_command(&mut self, envelope: &shared::CommandEnvelope) {
         process::registry::dispatch(&mut self.processes, &self.registry, &self.process_done_tx, envelope).await;
     }
 
-    /// Collects one finished `process.run` child. `wait` must never block `select!` (see
-    /// `wait_and_report_exit`'s doc comment), so only the fast, synchronous removal happens inline.
+    /// Removes one finished `process.run` child inline; `wait` stays off `select!` (see
+    /// `wait_and_report_exit`).
     pub(crate) fn reap_exited_process(&mut self, generation_id: u32, id: u64) {
         if let Some(child) = take_exited_process(&mut self.processes, generation_id, id) {
             tokio::spawn(wait_and_report_exit(self.registry.clone(), generation_id, id, child));
         }
     }
 
-    /// Reaps the authoritative Renderer and every still-live process.run child rather than exit out
-    /// from under them (SIGTERM-then-SIGKILL, `process::DEFAULT_REAP_GRACE`), skipping the Renderer
-    /// once [`Supervisor::replace_departed_renderer`] already collected it, so `reap_process_group`
-    /// logs "already reaped" under the crash report that explains it.
+    /// Reaps authoritative Renderer and live `process.run` children with SIGTERM/SIGKILL and
+    /// `DEFAULT_REAP_GRACE`. Skip a Renderer already collected by
+    /// [`Supervisor::replace_departed_renderer`], avoiding a misleading "already reaped" log.
     pub(crate) async fn reap(&mut self) {
         if !self.renderer_departed
             && let Err(err) =
@@ -529,8 +503,7 @@ impl Supervisor {
         reap_all_processes(&mut self.processes).await;
     }
 
-    /// Hands out the next generation id; every spawn goes through here, so no two generations share
-    /// an id however many crash replacements and swaps interleave.
+    /// Hands out unique generation ids for interleaved replacements and swaps.
     fn take_generation_id(&mut self) -> u32 {
         let id = self.next_generation_id;
         self.next_generation_id += 1;

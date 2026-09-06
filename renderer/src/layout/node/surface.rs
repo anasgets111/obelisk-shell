@@ -1,8 +1,5 @@
-//! Layer-shell topology: `layer`, `anchor`, `monitor`, `namespace`, `keyboard_interactivity`,
-//! `exclusive`, and the [`PanelSpec`] that bundles them with a panel's margin and size, built in
-//! one pass by `panel_spec` (§ 6). `layer`, `anchor`, `monitor` and `namespace` are the
-//! structural carve-outs [`is_structural_property`] names: `get_layer_surface` fixes all five at
-//! creation, so a `Signal` in one is rejected outright rather than resolved.
+//! Layer-shell topology and `PanelSpec` (§ 6). `get_layer_surface` fixes `layer`, `anchor`,
+//! `monitor`, and `namespace` at creation, so those structural fields reject `Signal`s.
 
 use std::collections::HashMap;
 
@@ -11,9 +8,8 @@ use mlua::Value;
 use super::content::parse_string_property;
 use super::*;
 
-/// § 6's `layer`, the layer-shell stacking level a `panel` is created on. `layout`'s own enum,
-/// not smithay-client-toolkit's `Layer` (same reason as [`KeyboardInteractivity`] below): this
-/// module stays free of Wayland types; `crate::wayland` maps it at the one call site.
+/// § 6's layer-shell stacking level. Kept separate from smithay-client-toolkit so this module has
+/// no Wayland types; `crate::wayland` maps it at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
     Background,
@@ -22,10 +18,8 @@ pub enum LayerKind {
     Overlay,
 }
 
-/// § 6's `layer` (`"Background"`/`"Bottom"`/`"Top"`/`"Overlay"`). Required, same shape as
-/// [`parse_surface_id`]. Validated, not passed through raw (ADR-0038 decision 1): `create_panel`
-/// creates one layer surface per instance from this value, so a typo'd `layer = "Toop"` must
-/// error, not silently fall to `Background`, since nothing on screen says why.
+/// § 6's required layer string (ADR-0038 decision 1). `create_panel` uses it per instance, so a
+/// typo such as `"Toop"` errors instead of silently selecting `Background`.
 pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, LayoutError> {
     match parse_string_property(properties, "layer", None)?.as_str() {
         "Background" => Ok(LayerKind::Background),
@@ -39,8 +33,7 @@ pub fn parse_layer(properties: &HashMap<String, Value>) -> Result<LayerKind, Lay
     }
 }
 
-/// § 6's `anchor` table (`{ top, bottom, left, right }` edge booleans). Same default-to-zero
-/// shape as [`EdgeInsets`], booleans instead of floats.
+/// § 6's `{ top, bottom, left, right }` edge booleans, defaulting to false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Anchor {
     pub top: bool,
@@ -68,38 +61,32 @@ pub fn parse_anchor(properties: &HashMap<String, Value>) -> Result<Anchor, Layou
     Ok(Anchor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// § 6's `monitor` (a specific output EDID, or `"All"`). Absent defaults to `"All"`, matching
-/// the IDL's own documented meaning for that value rather than treating the property as required.
+/// § 6's specific output EDID, or `"All"`; absent defaults to `"All"`.
 pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_string_property(properties, "monitor", Some("All"))
 }
 
-/// § 6's `namespace`: the layer-shell namespace string the compositor sees, and the key
-/// Hyprland's `layerrule` matches on for blur and animations. Defaults to `"oblisk-{id}"`, so every
-/// `panel` is addressable without the author naming one. A [`SurfaceTopology`] field:
-/// `get_layer_surface` takes it at creation with no request to change it afterwards, so an edit is
-/// a generation swap (`CONTEXT.md`, Topology change).
+/// § 6's layer-shell namespace, also used by Hyprland `layerrule` for blur and animations. It
+/// defaults to `"oblisk-{id}"`; `get_layer_surface` fixes it at creation, so edits swap generation.
 pub fn parse_namespace(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
     let default = format!("oblisk-{id}");
     parse_string_property(properties, "namespace", Some(&default))
 }
 
-/// § 6's `keyboard_interactivity`, mapping one-for-one onto layer-shell's own field.
-/// `layout`-owned, not smithay-client-toolkit's identical enum, keeping this module free of
-/// Wayland types; `crate::wayland::keyboard_interactivity_for` maps it at the one call site.
+/// § 6's `keyboard_interactivity`, mapped to layer-shell by
+/// `crate::wayland::keyboard_interactivity_for`; kept local to avoid Wayland types here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyboardInteractivity {
-    /// § 6's default: the surface never receives key events.
+    /// The surface never receives key events.
     #[default]
     None,
     OnDemand,
     Exclusive,
 }
 
-/// § 6's `keyboard_interactivity` (`"None"` (default) / `"OnDemand"` / `"Exclusive"`). An
-/// in-place field, deliberately outside [`SurfaceTopology`] and [`is_structural_property`]'s
-/// carve-out: `zwlr_layer_surface_v1::set_keyboard_interactivity` is valid on a live surface, so a
-/// `Signal` here resolves (ADR-0044 decision 1) as a value change, not a swap.
+/// § 6's `keyboard_interactivity`. It is live, not part of [`SurfaceTopology`]:
+/// `zwlr_layer_surface_v1::set_keyboard_interactivity` accepts changes on a mapped surface, so a
+/// `Signal` is a value change (ADR-0044 decision 1).
 pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
     // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as
     // [`parse_title`]'s: a field valid on a live surface is one only the resolved pass can read.
@@ -123,43 +110,29 @@ pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Resu
     }
 }
 
-/// What § 6's `exclusive` asks for: three answers, not the two a boolean carries. Each maps to
-/// one `zwlr_layer_surface_v1::set_exclusive_zone` value: positive reserves that much, `0` reserves
-/// nothing but still sits inside what everyone else reserved, and `-1` ignores every other
-/// surface's zone and covers the output. The third answer exists for a wallpaper:
-/// [`exclusive_zone_for`](crate::wayland) answers `0` for a surface anchored to all four edges (no
-/// single edge to reserve against), so `true` and `false` were the same request on exactly the
-/// surface that needed a third. Named for what each does, not the protocol's integer, and
-/// deliberately the same three Quickshell's `ExclusionMode` settles on (`Auto`, `Normal`,
-/// `Ignore`), whose `Ignore` carries the same "ignore exclusion zones of other shell layers"
-/// wording. `Reserve`/`Respect` name which non-ignoring answer was picked; `Auto`/`Normal` name how
-/// the number was derived.
+/// § 6's three exclusion answers mapped to `set_exclusive_zone`: positive reserves space, `0`
+/// stays inside other reservations, and `-1` ignores them. A wallpaper anchored to all four edges
+/// gets `0` from [`exclusive_zone_for`](crate::wayland), making boolean true/false identical there;
+/// `Ignore` supplies the missing third answer, matching Quickshell's `ExclusionMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exclusive {
-    /// Reserve screen area along the anchored edge, derived from the size the compositor
-    /// configured. § 6's "Reserves physical screen area for bar if true".
+    /// Reserve screen area along the anchored edge, using the compositor-configured size.
     Reserve,
-    /// Reserve nothing, and stay inside the area other surfaces reserved. The default, and the
-    /// protocol's `0`.
+    /// Reserve nothing and stay inside other surfaces' reservations. The default, protocol `0`.
     Respect,
-    /// Reserve nothing and ignore what everyone else reserved, covering the output. The protocol's
-    /// `-1`, and the only setting under which a wallpaper stays full-bleed once a bar is up.
+    /// Reserve nothing and ignore other reservations, covering the output. Protocol `-1`.
     Ignore,
 }
 
-/// § 6's `exclusive`. Default [`Exclusive::Respect`], so an undeclared panel floats over whatever
-/// is behind it rather than pushing windows aside or covering them. `boolean / string`, the same
-/// shape § 6 gives `width`/`height` (`integer / "Fill"`): `true` and `false` keep their meanings
-/// and `"Ignore"` is the value neither could express, additive so every config written before this
-/// one still means what it meant. In-place, same as [`parse_keyboard_interactivity`]:
-/// `set_exclusive_zone` is valid on a live surface, and the *zone* itself is computed by
-/// `crate::wayland` at configure time from the size the compositor actually chose.
+/// § 6's `exclusive`: booleans preserve their meanings, and `"Ignore"` adds the third protocol
+/// answer. It defaults to [`Exclusive::Respect`], so an undeclared panel floats over what is behind
+/// it rather than pushing windows aside or covering them. The additive default preserves old
+/// configs; `crate::wayland` computes the zone at configure time from the compositor's chosen size.
 pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive, LayoutError> {
-    // Deferred on the evaluation-time pass for [`parse_keyboard_interactivity`]'s reason:
-    // `exclusive = hide_bar` is a config § 5.1 permits and only this pass cannot read. `Respect`
-    // must be the placeholder since the value is genuinely unknown before any getter runs, and the
-    // other answers are visible mistakes for a frame: `Ignore` would paint over the bar, `Reserve`
-    // would shove every window aside.
+    // `exclusive = hide_bar` is a config § 5.1 permits and only this pass cannot read, so
+    // `Respect` is the placeholder: a signal is unknown before its getter runs, and the other
+    // answers are visible mistakes for a frame -- `Ignore` paints over the bar, `Reserve` shoves
+    // every window aside.
     if is_deferred_signal(properties, "exclusive") {
         return Ok(Exclusive::Respect);
     }
@@ -176,12 +149,10 @@ pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive,
     }
 }
 
-/// A surface's topology-relevant fields (`CONTEXT.md`, Topology change: adding or removing a
-/// top-level `surface` node, or changing its layer, anchor, monitor target, or namespace).
-/// Structural equality on `Vec<SurfaceTopology>` (order-sensitive) is the Renderer's own topology
-/// diff (`renderer/src/socket.rs`). The whole swap fingerprint: [`PanelSpec`]'s other fields
-/// (`margin`, `keyboard_interactivity`, `exclusive`, `width`, `height`) all reload in place
-/// instead, since layer-shell accepts them on a live surface (ADR-0038 decision 2).
+/// Creation-time topology (`layer`, `anchor`, `monitor`, `namespace`, and `id`). The
+/// order-sensitive
+/// `Vec<SurfaceTopology>` diff in `renderer/src/socket.rs` triggers a swap; other `PanelSpec`
+/// fields reload in place (ADR-0038 decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceTopology {
     pub id: String,
@@ -203,26 +174,21 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
     })
 }
 
-/// Everything one `zwlr_layer_surface_v1` needs, read off a `panel` node's properties in one pass
-/// (§ 6). `crate::socket`'s `surface_specs` builds one per declared `panel`;
-/// `layout::instance::expand_instances` turns them into per-output instances, and
-/// `crate::wayland::App::create_panel` binds them. `renderer/src/socket.rs`'s `handle_reevaluate`
-/// diffs *only* `topology`, so a `margin` reloads in place while a `layer` respawns the process.
+/// One `panel`'s layer-shell spec (§ 6): `surface_specs` builds it, `expand_instances` makes
+/// per-output instances, and `App::create_panel` binds them. `handle_reevaluate` diffs only
+/// `topology`, so `margin` reloads in place while `layer` swaps generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelSpec {
-    /// The swap fingerprint: id, layer, anchor, monitor, namespace.
+    /// Swap fingerprint: id, layer, anchor, monitor, namespace.
     pub topology: SurfaceTopology,
     pub keyboard_interactivity: KeyboardInteractivity,
     pub exclusive: Exclusive,
-    /// § 6's `margin`, which on a `panel` root is the layer-shell **anchor offset** (how far the
-    /// surface sits from the edges it is anchored to), not layout spacing between root and child:
-    /// `layout::scene`'s `Scene::apply_one_surface` passes `None` for both parent-margin arguments
-    /// when resolving a root, so a root's `margin` is consumed only by this field; below a root it
-    /// stays ordinary layout margin, parsed by the same [`parse_edge_insets`].
+    /// § 6's root anchor offset, not spacing between root and child. `Scene::apply_one_surface`
+    /// passes `None` for both parent-margin arguments when resolving a root. Below a root it
+    /// remains ordinary layout margin parsed by [`parse_edge_insets`].
     pub margin: EdgeInsets,
-    /// § 6's `width`/`height`, which become the layer-shell `set_size` request rather than a
-    /// layout constraint of their own. `SizeMode::Fill` is the protocol's `0` ("the anchors
-    /// decide"); a percent resolves against the output, at the one call site that knows it.
+    /// § 6's layer-shell `set_size` request. `SizeMode::Fill` is protocol `0`; percentages resolve
+    /// against the output at the call site that knows it.
     pub width: SizeMode,
     pub height: SizeMode,
 }
@@ -446,7 +412,7 @@ mod tests {
 
     /// The placeholder the raw pass takes, which has to be the answer that does nothing visible:
     /// `crate::socket`'s `surface_specs` runs before any getter, so it cannot know, and both other
-    /// answers are a wrong frame on screen (a wallpaper over the bar, or every window shoved aside).
+    /// answers are a wrong frame (a wallpaper over the bar, or every window shoved aside).
     #[test]
     fn a_signal_valued_exclusive_defers_to_respect_rather_than_guessing() {
         let lua = lua();

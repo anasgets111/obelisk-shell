@@ -1,11 +1,9 @@
-//! `oblisk.files` capability: the files in a folder a config asked to watch, kept current through
-//! inotify (ADR-0120). Top-level, sibling to `applications`/`system`: plain filesystem reads and
-//! one kernel watch per folder, no D-Bus proxy and no hardware thread.
+//! `oblisk.files` keeps a config-requested folder listing current through inotify (ADR-0120).
+//! Plain filesystem reads and one kernel watch per folder, with no D-Bus proxy or hardware thread.
 //!
-//! The config VM has no `io` (ADR-0048) and `process.run("ls")` would be a line parser for a
-//! listing the Supervisor can hand over as a table. A wallpaper picker was the first caller; a
-//! screenshot tray, a download shelf or a file browser is the same shape, which is why this is a
-//! folder watcher and not a wallpaper scanner.
+//! The config VM has no `io` (ADR-0048); `process.run("ls")` would parse lines for a table the
+//! Supervisor can provide. The first caller was a wallpaper picker, but screenshot trays, download
+//! shelves, and file browsers need the same folder watcher.
 
 pub mod controller;
 

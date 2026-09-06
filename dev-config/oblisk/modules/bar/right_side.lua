@@ -1,12 +1,9 @@
--- Mirrors RightSide.qml, including the order: the status indicators, then the tray, then the clock
--- last against the edge.
+-- Mirrors RightSide.qml: status indicators, tray, then the clock at the edge.
 --
--- There is no brightness module, which is also true of the config this mirrors. The level and its
--- two controls live in `modules/bar/panels/power_menu.lua`, where a panel has the width for a
--- labelled control and the bar does not.
+-- No brightness module, matching the reference. Its level and controls live in
+-- `modules/bar/panels/power_menu.lua`, where there is room for labels.
 --
--- `privacy` is on the left instead, which RightSide.qml would not do. It belongs beside `rescue`:
--- both are alerts rather than readouts, and both are absent most of the time.
+-- `privacy` is on the left beside `rescue`, unlike RightSide.qml; both are intermittent alerts.
 local theme = require("config.theme")
 local volume_module = require("modules.bar.indicators.volume")
 local network = require("modules.bar.indicators.network")
@@ -17,13 +14,12 @@ local date_time = require("modules.bar.indicators.date_time")
 local ui_state = require("lib.ui_state")
 local calendar_panel = require("modules.bar.panels.minimal_calendar")
 
--- One control holding the bell and the clock, which is what `DateTimeDisplay.qml` is. Two buttons
--- inside one ground rather than two controls side by side: the bell opens the notification history
--- and the date opens the calendar, and the mirror's single ground is what makes them read as one
--- clock rather than as two more indicators.
+-- One control holds bell and clock, as in `DateTimeDisplay.qml`. The bell opens history and the
+-- date
+-- opens the calendar; one ground makes them read as one clock.
 --
--- The ground is the row, and the two buttons inside it carry no background of their own, so the
--- seam between them is invisible and the hover shading covers the whole control at once.
+-- The row owns the ground; transparent inner buttons remove the seam and shade the whole hover
+-- area.
 local clock_slot = date_time.slot
 
 local function transparent_button(child, on_click)
@@ -72,8 +68,7 @@ return row {
         network.indicator,
         bluetooth.indicator,
         tray_module,
-        -- The clock row declares the hover region its tooltip reads, so the whole control is the
-        -- trigger rather than either button inside it.
+        -- The clock row owns the tooltip hover region, so the whole control triggers it.
         clock_pill,
     },
 }

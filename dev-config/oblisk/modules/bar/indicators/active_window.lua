@@ -1,38 +1,33 @@
--- Mirrors ActiveWindow.qml: the focused window's icon and title, side by side in the centre zone.
+-- Mirrors ActiveWindow.qml: the focused window's icon and title in the centre zone.
 --
--- Both halves read one push, `oblisk.workspaces.active_client`, so the caption tracks focus with
--- nothing asking it to. It used to be a click: the title lived in a `state` signal that a
--- `process.run("niri", {"msg", "-j", "focused-window"})` filled in, and until you clicked it the bar
--- read "click for the focused window". That was there to demonstrate `process.run` feeding
--- `json.decode` (ADR-0057), and it was the wrong module to demonstrate it in. ADR-0056 keeps
--- window *lists* out of `workspaces`, which is true and is not this: the focused window alone has
--- been in every snapshot since that ADR, as `active_client`, which is where the icon was already
--- getting `class`. Shelling out to niri for a string the supervisor had already pushed bought a
--- worse answer, a subprocess per click, and a request counter to throw away the replies that landed
--- out of order.
+-- Both halves read one push, `oblisk.workspaces.active_client`. The old title lived in a `state`
+-- signal and showed `click for the focused window` until clicked. Its click ran
+-- `process.run("niri", {"msg", "-j", "focused-window"})`, fed the result to `json.decode`
+-- (ADR-0057),
+-- and needed a request counter for out-of-order replies. That demo belonged elsewhere. ADR-0056
+-- excludes window lists, not the focused `active_client` already in every snapshot; shelling out to
+-- niri bought a subprocess per click while duplicating pushed data.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- The same budget `modules/bar/indicators/media.lua` uses, because the two share the centre zone
--- one at a time and a title that changed width when the player stopped would move the whole bar.
+-- The same budget as `modules/bar/indicators/media.lua`: the centre zone shows one at a time, and
+-- changing width when playback stops would move the whole bar.
 --
--- A character budget rather than the bounded box `components/cell.lua` argues for, and the argument
--- there is right in general: "WWWW" and "iiii" are the same four characters at twice the width.
--- This node has to stay content-sized anyway, because the centre zone's midpoint is its content's
--- midpoint, and a box wide enough to elide against is a box that fixes the zone's width.
+-- A character budget, not `components/cell.lua`'s bounded box: "WWWW" and "iiii" are both four
+-- characters, but "WWWW" is twice the width. This node must stay content-sized so the centre
+-- midpoint remains the bar midpoint; an elision box fixes the zone width.
 local TITLE_LIMIT = 44
 
--- `nil` until the first snapshot, and `nil` again whenever nothing holds focus, which the
--- supervisor sends as an absent key rather than a null (`workspaces/controller.rs`).
+-- `nil` before the first snapshot and whenever nothing holds focus; the supervisor omits the key
+-- rather than sending null (`workspaces/controller.rs`).
 local function focused(workspaces)
     return workspaces and workspaces.active_client
 end
 
--- The second `oblisk.applications` consumer (ADR-0061). `active_client.class` is a toplevel's
--- `app_id` (ADR-0056 decision 5), which is the spelling `util.app_entry` maps onto a `.desktop`
--- entry. Before that capability existed there was nowhere for an `app_id` to become an icon, which
--- is the caller ADR-0054 decision 5 said would arrive one day.
+-- The second `oblisk.applications` consumer (ADR-0061). `active_client.class` is the toplevel
+-- `app_id` (ADR-0056 decision 5), which `util.app_entry` maps to a `.desktop` entry. ADR-0054
+-- decision 5 reserved this caller before the capability existed.
 local focused_icon = icon {
     name = computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
         local client = focused(workspaces)
@@ -43,17 +38,15 @@ local focused_icon = icon {
     align_v = "Center",
 }
 
--- No pill and no button. `ActiveWindow.qml` puts the icon and the title straight on the bar with no
--- ground behind them, which is what makes the centre read as a caption rather than one more
--- control. The button that used to wrap the title was the click target for the fetch above and had
--- nothing to do once the title stopped needing one.
+-- No pill or button: `ActiveWindow.qml` puts the icon and title directly on the bar. No ground
+-- behind them makes the centre read as a caption rather than one more control. The old button only
+-- existed as the click target for the removed fetch.
 return row {
     height = theme.item_height,
     align_v = "Center",
     spacing = theme.spacing.sm,
-    -- Nothing focused means nothing to caption. Hiding the row rather than drawing an empty one
-    -- also gives the zone its width back, since an invisible child costs its parent no space and no
-    -- spacing (`layout::scene`'s row arm).
+    -- Nothing focused means nothing to caption. Hiding the row returns its width and spacing
+    -- because invisible children cost neither (`layout::scene`'s row arm).
     visible = oblisk.workspaces:map(function(workspaces)
         return focused(workspaces) ~= nil
     end),

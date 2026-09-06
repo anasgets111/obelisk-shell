@@ -1,8 +1,7 @@
-//! Leaf-node content parsers: text content, icon name/size, image source/fit, font size,
-//! foreground color, and identity strings (`id`, `surface_id`). None affect the box model;
-//! [`paint_style`](super::paint_style) runs them once per node per pass, alongside the geometry
-//! parsers. `parse_string_property` is `pub(super)`, reused by `surface`/`toplevel`/`popup` code
-//! for `namespace`, `title`, `app_id` and the like.
+//! Leaf-node content parsers: text, icons, images, font/color properties, and identity strings.
+//! None affect the box model; geometry parsers live beside them rather than here.
+//! [`paint_style`](super::paint_style) runs them once per node per pass. `parse_string_property`
+//! is shared by `surface`/`toplevel`/`popup` parsers.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -30,10 +29,8 @@ pub struct StyleRun {
     pub href: Option<String>,
 }
 
-/// One line of `text` cut at the points where its style changes: each piece is a byte range of
-/// the line and the run it falls in, or `None` for a plain stretch. What paint draws piece by piece
-/// and what a press walks to find the run under it (ADR-0104, ADR-0106). Pure, so the split -- the
-/// part of a styled draw that can go wrong quietly -- is tested without a GL context.
+/// Splits a line at style-run boundaries for painting and link hit-testing (ADR-0104, ADR-0106).
+/// Ranges are byte ranges into `line`; `None` marks a plain stretch.
 pub fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Option<&StyleRun>)> {
     let mut pieces = Vec::new();
     let mut cursor = line.start;
@@ -55,9 +52,8 @@ pub fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Opt
     pieces
 }
 
-/// The half of `runs` the shaper needs -- the ones in another face -- in the shape it takes. An
-/// underlined or recoloured run in the regular face measures like plain text and is left out, so
-/// two contents that differ only in colour share one memo entry.
+/// The bold/italic subset of `runs` in the form the shaper needs. Underline and colour do not
+/// change shaping, so contents differing only by underline or colour share a memo entry.
 pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
     runs.iter()
         .filter(|run| run.bold || run.italic)
@@ -65,18 +61,13 @@ pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
         .collect()
 }
 
-/// `text.content`: one string, or an array of runs `{ text = ..., bold = ..., italic = ...,
-/// underline = ..., color = ..., href = ... }` whose texts are joined into the string this returns
-/// and whose styles become the [`StyleRun`]s beside it (ADR-0104). The run shape is a notification
-/// body span's own (§ 2.7) minus `kind`, so a body's text spans can be handed over as they arrive;
-/// an image span has no `text` and is refused, since a picture inside a line of text is not
-/// something this node draws -- the caller filters those out.
+/// Parses `text.content` as one string or notification-body-style runs (§ 2.7, ADR-0104), joining
+/// run text and preserving each run's style. The run shape is a body span minus `kind`, so text
+/// spans can stream through; the caller filters image spans, which have no `text`.
 ///
-/// Absent `content` defaults to the empty string (ADR-0044 decision 1's nil rule): a `text` bound
-/// to a not-yet-pushed capability signal reads `nil` until its first `StateSnapshot`, and
-/// `run_startup_evaluation` runs before the poll loop drains one. Rejecting that would boot a
-/// blank shell. Accepted cost: a misspelled `content` key renders an empty node instead of
-/// failing the whole tree; `oblisk.rescue` covers the failures that matter.
+/// Absent `content` is empty (ADR-0044 decision 1): before the first `StateSnapshot`, a capability
+/// signal reads `nil`, and `run_startup_evaluation` runs before the poll loop drains one. A typo in
+/// `content` therefore renders an empty node; `oblisk.rescue` covers the important failures.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<(String, Vec<StyleRun>), LayoutError> {
     let Some(value) = properties.get("content") else {
         return Ok((String::new(), Vec::new()));
@@ -161,26 +152,20 @@ fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError
     Ok((content, styles))
 }
 
-/// `icon.name` (§ 5.2 item 5): a theme name or an absolute path, told apart by
-/// `image::icons::resolve`. Defaults to `""` for the same boot reason `content` does (ADR-0044): a
-/// signal-bound `name` is `nil` until its first push, and rejecting the tree would fail every
-/// config that binds one.
+/// `icon.name` (§ 5.2 item 5) is a theme name or absolute path; `image::icons::resolve` tells them
+/// apart. It defaults to `""` for the same pre-first-push nil rule as `content` (ADR-0044).
 pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "name")
 }
 
-/// `image.source` (ADR-0054 decision 3): an absolute path, never a theme name, the whole
-/// difference from [`parse_icon_name`] and why the two share no property spelling.
-/// `textfield.placeholder` (§ 5.2 item 8): what an empty field shows; defaults to `""`, the same
-/// boot-tolerance [`parse_content`] takes.
+/// `textfield.placeholder` (§ 5.2 item 8) is empty by default. `image.source` is an absolute path,
+/// never an icon theme name (ADR-0054 decision 3).
 pub fn parse_placeholder(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "placeholder")
 }
 
-/// `textfield.mask_character` (§ 5.2 item 8): the glyph drawn once per typed character. Defaults
-/// to U+2022 BULLET, the usual password-field glyph. An empty string means "draw nothing",
-/// honoured since a config wanting no visible length says so explicitly. Longer strings truncate
-/// to the first character: the property names a *character*, not worth failing a tree over.
+/// `textfield.mask_character` (§ 5.2 item 8) is drawn once per typed character. It defaults to
+/// U+2022 BULLET; `""` draws nothing, and longer strings use their first character.
 pub fn parse_mask_character(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     let declared = parse_optional_string(properties, "mask_character")?;
     if !properties.contains_key("mask_character") {
@@ -193,8 +178,8 @@ pub fn parse_image_source(properties: &HashMap<String, Value>) -> Result<String,
     parse_optional_string(properties, "source")
 }
 
-/// `image.fit` (ADR-0055 decision 3). Absent is `cover`; an unrecognised string errors rather
-/// than silently falling back, so `fit = "fill"` doesn't hide behind a silently-covered image.
+/// `image.fit` (ADR-0055 decision 3) defaults to `cover`; an unrecognised string errors rather
+/// than silently selecting a fit.
 pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError> {
     let Some(value) = properties.get("fit") else {
         return Ok(Fit::default());
@@ -206,9 +191,8 @@ pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError
     Fit::from_str(&s).ok_or_else(|| invalid("fit", format!("expected `cover`, `contain` or `stretch`, got {s:?}")))
 }
 
-/// `image.async` (ADR-0122). Absent and `false` decode in the frame; `true` hands the decode to
-/// the pool and draws nothing until it lands. A boolean or nothing, since a signal resolving to
-/// `nil` arrives as an absent key.
+/// `image.async` (ADR-0122): absent/`false` decodes in the frame; `true` uses the pool and draws
+/// nothing until the result lands. A signal resolving to `nil` arrives as an absent key.
 pub fn parse_load(properties: &HashMap<String, Value>) -> Result<Load, LayoutError> {
     match properties.get("async") {
         None | Some(Value::Boolean(false)) => Ok(Load::Inline),
@@ -217,7 +201,6 @@ pub fn parse_load(properties: &HashMap<String, Value>) -> Result<Load, LayoutErr
     }
 }
 
-/// The shared shape behind every § 5.2 string property that defaults to empty when absent.
 fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) -> Result<String, LayoutError> {
     let Some(value) = properties.get(property) else {
         return Ok(String::new());
@@ -228,13 +211,10 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
     }
 }
 
-/// `text.foreground` (§ 5.2 item 4). Absent defaults to white: `layout::paint`'s `paint_text`
-/// falls back to the same white whenever this parser errors on a present-but-malformed value, so
-/// the rendered result agrees whether the key was omitted or rejected.
-/// Where a run of glyphs sits inside the box the node was given, distinct from where the node
-/// sits inside its parent (`align_h`). Only visible when the box is wider than the text, so it
-/// does nothing on a `Content`-sized node measuring that same string; an explicit `width`,
-/// `"Fill"`, or a `Stretch`ed cross axis makes room for it to matter.
+/// `text.foreground` (§ 5.2 item 4) defaults to white; `layout::paint::paint_text` uses that same
+/// white when a present value is malformed. `TextAlign` places glyphs inside the node's
+/// box, unlike `align_h`, which places the node in its parent; it matters only when the box is
+/// wider than the measured text.
 ///
 /// Its own type rather than reusing [`Align`](super::Align): that carries `Stretch`, which would
 /// be meaningless here since a run of glyphs has no size to force.
@@ -246,19 +226,18 @@ pub enum TextAlign {
     End,
 }
 
-/// What to do with a run of text too wide for the box it was given.
+/// What to do with text too wide for its box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Elide {
-    /// Let the clip cut it off mid-glyph.
+    /// Let the clip cut it off.
     #[default]
     None,
     /// Drop trailing characters and finish with a single-character ellipsis.
     End,
 }
 
-/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`. Only `"End"` is offered:
-/// QML also has head and middle elision, but the reference config uses neither, and middle elide
-/// has to split a grapheme budget across two runs, real work nothing has asked for.
+/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Only `"End"` is offered: the reference config
+/// uses neither head nor middle elision, and middle elision needs a grapheme budget across runs.
 pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutError> {
     let Some(value) = properties.get("elide") else {
         return Ok(Elide::None);
@@ -273,30 +252,22 @@ pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutE
     }
 }
 
-/// Whether a run too wide for its box breaks onto another line, and where it may break.
-///
-/// Its own property rather than something `elide` implies: the two answer different questions and
-/// compose, `wrap = "Word"` with `elide = "End"` being the notification-body case -- fill the
-/// lines allowed, then ellipsize the last one.
+/// Whether oversized text breaks onto another line. It composes with `elide`: `wrap = "Word"` and
+/// `elide = "End"` fills the allowed lines, then ellipsizes the last one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Wrap {
-    /// One line, however long. What every `text` did before wrapping existed.
+    /// One line, however long.
     #[default]
     None,
     /// Break at word boundaries, falling back to a glyph boundary for a word wider than the box,
-    /// which is cosmic-text's own `Wrap::WordOrGlyph` and the only sensible behaviour for a
-    /// 40-character German compound in a 120px card.
+    /// using cosmic-text's `Wrap::WordOrGlyph`.
     Word,
 }
 
-/// `wrap` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `None`, which is what every existing
-/// config gets and what the engine did before: a `text` stays on one line unless it asks not to.
-///
-/// Opt-in rather than always-on even though measurement already wrapped. Before this, a
-/// fixed-width `text` measured its full wrapped height and painted one clipped line, so its box
-/// was already too tall; making wrapping the default would have started *drawing* into that extra
-/// height everywhere at once. `"None"` now measures one line too, so the box and the paint agree
-/// in both modes -- which is the actual fix, and the reason this is not purely additive.
+/// `wrap` (`oblisk-idl-api-specs.md` § 5.2 item 4) defaults to `None`. Before this, a fixed-width
+/// `text` measured its full wrapped height but painted one clipped line; making wrapping default
+/// would have drawn into that extra height everywhere. `None` now measures one line, keeping box
+/// and paint consistent.
 pub fn parse_wrap(properties: &HashMap<String, Value>) -> Result<Wrap, LayoutError> {
     let Some(value) = properties.get("wrap") else {
         return Ok(Wrap::None);
@@ -311,15 +282,10 @@ pub fn parse_wrap(properties: &HashMap<String, Value>) -> Result<Wrap, LayoutErr
     }
 }
 
-/// `max_lines` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent, or `0`, is no cap.
-///
-/// Zero means uncapped rather than being refused as nonsense, because the property exists to be
-/// driven by a signal: an expander is `max_lines = expanded:map(function(e) return e and 0 or 2
-/// end)`, and a `Bound` has no way to spell "absent". A negative is still an error -- there is no
-/// reading of it, and silently clamping would hide a sign slip in a config's arithmetic.
-///
-/// Only consulted when [`parse_wrap`] said `Word`: capping the lines of a run that cannot make a
-/// second one is a no-op, not an error, so a config can set both unconditionally.
+/// `max_lines` (`oblisk-idl-api-specs.md` § 5.2 item 4) is uncapped when absent or `0`; zero lets
+/// signal-driven values spell "absent" because `Bound` cannot. Negatives error rather than being
+/// clamped, which would hide a sign mistake in config arithmetic. It is consulted
+/// only for [`parse_wrap`] = `Word`, so setting both unconditionally is safe.
 pub fn parse_max_lines(properties: &HashMap<String, Value>) -> Result<Option<usize>, LayoutError> {
     let Some(value) = properties.get("max_lines") else {
         return Ok(None);
@@ -332,9 +298,8 @@ pub fn parse_max_lines(properties: &HashMap<String, Value>) -> Result<Option<usi
     Ok((n >= 1.0).then_some(n as usize))
 }
 
-/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4). Absent is `Start`. A string, matching
-/// `fit`, `layer`, `align_h` and `on_click`'s button name at this boundary. `Start`/`End` rather
-/// than `Left`/`Right`, the names § 5.2 uses for the same axis elsewhere, as `align_h` does.
+/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4) defaults to `Start` and uses the same
+/// string boundary as `fit`, `layer`, `align_h`, and `on_click`. `Start`/`End` match `align_h`.
 pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign, LayoutError> {
     let Some(value) = properties.get("text_align") else {
         return Ok(TextAlign::Start);
@@ -350,9 +315,8 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
     }
 }
 
-/// § 5.1's `foreground` when the node declares one, `None` when it does not. Separate from
-/// [`parse_foreground`] because an icon's default is not white: with none set it rasterizes
-/// exactly as its file says. Only a `currentColor` icon takes a colour from this (ADR-0072).
+/// § 5.1's declared `foreground`, or `None` when absent. Icons preserve their file colours unless
+/// a `currentColor` fill uses this value (ADR-0072).
 pub fn parse_optional_foreground(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     if !properties.contains_key("foreground") {
         return Ok(None);
@@ -379,14 +343,9 @@ pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         .ok_or_else(|| invalid("font_size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
-/// Absent `size` defaults to 12.0, the same nil-rule rationale as [`parse_content`] (ADR-0044's
-/// amendment banner): `icon` was the second property the amendment names as still failing after
-/// decision 1's nil rule alone. Same accepted cost: `icon { sizee = 24 }` now renders a
-/// 12.0-sized icon instead of being rejected.
-///
-/// § 5.2 documents `size` with no default of its own, so this matches [`parse_font_size`]'s
-/// default: `text` and `icon` are the two leaf kinds sized by one numeric property, so an icon
-/// dropped inline with default-sized text lands at the same visual scale.
+/// Absent `size` defaults to 12.0, matching [`parse_font_size`] and ADR-0044's nil rule. A typo
+/// such as `icon { sizee = 24 }` therefore draws a 12.0-sized icon rather than rejecting the tree;
+/// text and icons share the same default visual scale.
 pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("size") else {
         return Ok(12.0);
@@ -395,9 +354,9 @@ pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, Layou
         .ok_or_else(|| invalid("size", format!("expected a number, got {}", preview_for_error(value))))
 }
 
-/// Shared shape behind [`parse_surface_id`]/`surface::parse_layer`/`surface::parse_monitor`: fetch `property`,
-/// reject a `Signal`, require it to be a string. `default` supplies the value when the property
-/// is absent; `None` makes it required, erroring instead (Standards review, ADR-0024).
+/// Shared structural-string parser behind [`parse_surface_id`], `surface::parse_layer`, and
+/// `surface::parse_monitor`: reject a `Signal`, require a string, and use `default` when
+/// absent. `None` makes the property required (Standards review, ADR-0024).
 pub(super) fn parse_string_property(
     properties: &HashMap<String, Value>,
     property: &str,

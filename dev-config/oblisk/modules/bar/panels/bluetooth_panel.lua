@@ -1,18 +1,14 @@
--- Mirrors BluetoothPanel.qml: a masthead with the radio switch, then the paired devices and
--- whatever discovery has turned up, in two named sections.
+-- Mirrors BluetoothPanel.qml: radio switch, then paired and discovered devices in named sections.
 --
--- Laid out as the mirror lays it out, which it was not until now. This opened with a grey
--- "bluetooth" word, a switch labelled "enabled", a "scanning" line with a refresh button, and one
--- undifferentiated list in which a connected headset and an anonymous beacon were the same row --
--- and the beacon's row had no title at all, because a discovered device's `name` is often `""`
--- (§ 2.6) and `name or mac` does not fall through an empty string. Now: the connected device is
--- ringed under "paired", with its battery as a coloured badge and two quiet actions (disconnect,
--- forget); everything else is under "available", named by its address when it has no name, with
--- the one thing to do to it -- pair -- as a word on the right.
+-- The old header opened with a grey `bluetooth` word, an `enabled` switch, and a `scanning` line
+-- with a refresh button. Its single list made a connected headset and anonymous beacon identical;
+-- discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` does not skip an empty string.
+-- Two lists in one column would each want their own extent, and neither knows what the other took.
+-- Now paired devices are ringed with a battery badge and disconnect/forget actions; available
+-- devices use their address when unnamed and show only the pair action.
 --
--- Not carried over: the "Visible" tile (`set_discoverable` is not a command this capability has)
--- and the codec picker (`codec` is always `nil` this round, ADR-0030). Discovery is a button in
--- the header rather than the mirror's second tile, so the two radio panels open the same way.
+-- Dropped: the "Visible" tile (`set_discoverable` is unavailable) and codec picker (`codec` is
+-- always `nil`, ADR-0030). Discovery is a header button so both radio panels open the same way.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -28,13 +24,13 @@ local panel_empty_state = require("components.panel_empty_state")
 local KIND = "bluetooth"
 local SCROLL = scroll("bluetooth_devices")
 
--- One glyph per § 2.6 `category`, held in `config/icons.lua` beside the rest of them so a category
--- added there is added once. A discovered device carries no category and draws the generic one.
+-- One glyph per § 2.6 `category`, centralized in `config/icons.lua`; discovered devices without one
+-- use the generic glyph.
 local function device_icon(device)
     return icons.device[device.category or "generic"] or icons.device.generic
 end
 
--- `name or mac` was the bug: an empty string is true in Lua.
+-- `name or mac` was wrong because an empty string is true in Lua.
 local function display_name(device)
     if device.name == nil or device.name == "" then
         return device.mac or "?"
@@ -61,8 +57,7 @@ local function enabled(b)
     return b ~= nil and b.enabled
 end
 
--- The header's second line, the mirror's `subtitle`: what is connected, how charged, or what the
--- radio is doing instead.
+-- Header subtitle: connection count/name/battery, or the radio's current activity.
 local function state_line(b)
     if not b.enabled then
         return "off"
@@ -99,8 +94,7 @@ local function battery_badge(device)
     }
 end
 
--- The mirror's ghost `OButton { text: "Pair" }`: a word in accent that grows a ground under the
--- pointer. The one action an unpaired device has.
+-- Mirror `OButton { text: "Pair" }`: an accented word whose ground appears on hover.
 local function pair_button(device)
     local slot = "bluetooth-pair-" .. tostring(device.mac)
     local hovered = hover(slot)
@@ -122,9 +116,8 @@ local function pair_button(device)
     }
 end
 
--- Paired first under its own header, then found, as one list: two lists in one column would each
--- want their own extent and neither knows what the other took. Empty while the radio is off, which
--- is the mirror's `visible: root.active && ...` on the whole list.
+-- Paired and available rows share one list so neither section must guess the other's extent. It is
+-- empty while the radio is off, matching the mirror's `visible: root.active && ...`.
 local rows = oblisk.bluetooth:map(function(b)
     local out = {}
     if not enabled(b) then
@@ -165,9 +158,8 @@ local function device_row(item)
     else
         trailing[#trailing + 1] = pair_button(device)
     end
-    -- Neither row is itself a button, as in the mirror (`rowActionEnabled` is false for both): a
-    -- connected device's actions are its two icons, and an unpaired one's is the word. The row is
-    -- for reading.
+    -- Neither row is a button (`rowActionEnabled` is false): paired actions are icons, unpaired is
+    -- the word "pair"; the row is for reading.
     return panel_row {
         slot = "bluetooth-device-" .. tostring(device.mac),
         icon = device_icon(device),
@@ -187,10 +179,9 @@ local body = {
         active = oblisk.bluetooth:map(enabled),
         subtitle = util.label(oblisk.bluetooth, state_line),
         trailing = {
-            -- Scan, lit while discovery runs, and a second press stops it -- the mirror's "Scan"
-            -- tile as a button. Discovery used to be armed by this button and disarmed by nothing
-            -- but BlueZ's own timeout; now it is a toggle, and the header line says "scanning…"
-            -- while it is on.
+            -- Scan toggles discovery. It used to start discovery with no stop except BlueZ's
+            -- timeout;
+            -- the header now says "scanning…" while it runs.
             icon_button(icons.refresh, function()
                 local b = oblisk.bluetooth:get()
                 oblisk.bluetooth:invoke((b and b.discovering) and "stop_discovery" or "start_discovery")
@@ -210,7 +201,7 @@ local body = {
             end),
         },
     },
-    -- As tall as its rows up to the cap, then a scrolling viewport (ADR-0110): the mirror's
+    -- Rows up to the cap, then a scrolling viewport (ADR-0110), matching
     -- `Math.min(deviceList.contentHeight, Theme.itemHeight * 10)`.
     list {
         width = "Fill",

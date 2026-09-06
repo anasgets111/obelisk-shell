@@ -1,15 +1,12 @@
-//! Lock-state (caps/num/scroll) monitoring for `oblisk.keyboard` (ADR-0034).
-//!
-//! Kernel sysfs LED `brightness` files do not fire inotify `MODIFY` events when
-//! `input_leds` changes them. evdev `EV_LED` events are primary; sysfs provides a
+//! Lock-state monitoring for `oblisk.keyboard` (ADR-0034). Sysfs LED `brightness` files do not
+//! emit inotify `MODIFY` when `input_leds` changes them; evdev `EV_LED` is primary and sysfs is a
 //! read-once fallback.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Resolved sysfs LED node paths for all three lock indicators. All-or-nothing: if any one is
-/// missing, [`resolve_lock_leds`] returns `None` for the triple. Hardware exposes either all three
-/// as siblings, or none.
+/// Resolved sysfs nodes for all three lock indicators. All-or-nothing: a missing sibling makes
+/// [`resolve_lock_leds`] return `None` because hardware exposes all three or none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockLeds {
     pub caps: PathBuf,
@@ -17,8 +14,8 @@ pub struct LockLeds {
     pub scroll: PathBuf,
 }
 
-/// Scans `leds_root` for a subdirectory whose name ends with `::<suffix>`. Kernel LED-class
-/// naming is `<device>::<function>`, so matching the suffix accommodates any device prefix.
+/// Finds a `leds_root` directory ending in `::<suffix>`; LED-class names are
+/// `<device>::<function>`.
 fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(leds_root).ok()?;
     for entry in entries.flatten() {
@@ -37,8 +34,8 @@ pub fn resolve_lock_leds(leds_root: &Path) -> Option<LockLeds> {
     })
 }
 
-/// Reads one LED's `brightness` file. Kernel LED-class brightness is `0` = off, nonzero = on
-/// -- `!= 0` is correct, not `== 1`, since `max_brightness` isn't guaranteed to be `1`.
+/// Reads one LED's `brightness`: `0` is off, any nonzero value on. Use `!= 0`, since
+/// `max_brightness` need not be `1`.
 pub fn read_led_on(led_dir: &Path) -> io::Result<bool> {
     let text = std::fs::read_to_string(led_dir.join("brightness"))?;
     Ok(text.trim().parse::<i64>().unwrap_or(0) != 0)
@@ -54,8 +51,6 @@ mod tests {
         std::fs::write(led_dir.join("brightness"), brightness).unwrap();
         led_dir
     }
-
-    // ---- find_led / resolve_lock_leds ----
 
     #[test]
     fn resolve_lock_leds_finds_all_three_by_name_suffix() {
@@ -84,8 +79,6 @@ mod tests {
         assert_eq!(resolve_lock_leds(root.path()), None);
         assert_eq!(resolve_lock_leds(&root.path().join("does-not-exist")), None);
     }
-
-    // ---- read_led_on ----
 
     #[test]
     fn read_led_on_is_true_for_nonzero_brightness() {

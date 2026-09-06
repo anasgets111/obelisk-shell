@@ -1,26 +1,19 @@
-//! Notifications capability (`oblisk.notifications`, docs/oblisk-supervisor-services-dbus.md §1;
-//! docs/oblisk-idl-api-specs.md §2.7/§3.2; ADR-0033). Hosts `org.freedesktop.Notifications`
-//! on its own session-bus connection, backed by a 100-item FIFO queue (`notifications.feed` is a
-//! most-recent-20 view over it), a Supervisor-global do-not-disturb toggle, and a Lua-configured
-//! per-urgency sound registry played back through a dedicated PipeWire playback thread. A
-//! client's own `hints["sound-file"]` overrides the Lua tier default for that one notification,
-//! and `hints["suppress-sound"]` forces silence unconditionally ([`resolve_sound_path`]);
-//! `hints["sound-name"]` (an XDG sound-theme name) is not honored -- no theme-resolution
-//! capability exists.
+//! Notifications capability (`oblisk.notifications`, `docs/oblisk-supervisor-services-dbus.md` §1;
+//! `docs/oblisk-idl-api-specs.md` §2.7/§3.2, ADR-0033).
+//! Hosts `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view,
+//! global DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a
+//! tier default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
+//! theme-resolution capability exists.
 //!
-//! Mirrors `dbus::tray`'s shapes: a `*Controller` struct holding everything write actions need,
-//! degrade-to-inert on a missing/lost session bus, and pure, unit-testable helpers doing every
-//! real decision, with thin D-Bus glue calling into them. Unlike tray, notifications is not
-//! per-generation scoped (ADR-0033: the queue and DND state are global Supervisor state) -- no
-//! `reset_registrations` analog here.
+//! Like `dbus::tray`, a controller owns writes, degrades to inert without the session bus, and
+//! delegates decisions to pure helpers. Queue/DND are global Supervisor state (ADR-0033), not
+//! per-generation; there is no `reset_registrations`.
 //!
-//! Five allowlisted body-markup constructs (`<b>`, `<i>`, `<u>`, `<a href>`, `<img src>`) replace
-//! the base spec's blanket strip-to-plain-text sanitizer with a wider allowlist grammar
-//! ([`parse_markup`]) -- everything else is still rejected. `<img src>`, `image-path`, and
-//! action-icon references all resolve through one path-trust validator
-//! ([`validate_trusted_path`]): an absolute path under a small trusted-directory allowlist,
-//! confirmed via `canonicalize()` to really exist as a regular file inside one of them --
-//! anything else degrades to no icon, never an error.
+//! The parser replaces the base spec's blanket strip-to-plain-text sanitizer with a wider
+//! allowlist grammar: five constructs are allowlisted (`<b>`, `<i>`, `<u>`, `<a href>`,
+//! `<img src>`); everything else is rejected. Images, `image-path`, and action icons share
+//! [`validate_trusted_path`]: an
+//! existing regular file under a canonicalized trusted root, otherwise no icon and no error.
 
 use serde::Serialize;
 
@@ -36,22 +29,27 @@ pub use controller::{
 };
 pub use sound::run_sound_player;
 
-/// Every action `oblisk.notifications:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.notifications:invoke(...)`; exhaustive dispatch keeps variants and
+/// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationsAction {
+    /// Remove a queued notification by its server-assigned id.
     Dismiss,
+    /// Invoke a sender-declared action by notification id and action key.
     InvokeAction,
+    /// Submit reply text for a notification id that offered inline reply.
     Reply,
+    /// Register a trusted sound-file path for a `low`, `normal`, or `critical` urgency tier.
     SetSound,
+    /// Enable or disable the Supervisor-global do-not-disturb sound gate.
     SetDnd,
+    /// Hold expiry countdowns for whole seconds; `0` releases the hold immediately.
     HoldExpiry,
 }
 
-/// `oblisk.notifications`'s action dispatch (ADR-0037): `dismiss`/`invoke_action`/`reply` emit
-/// D-Bus signals and get `tokio::spawn`ed (ADR-0029); `set_sound`/`set_dnd`/`hold_expiry` only write
-/// Supervisor-held state under its lock (ADR-0033), so they run inline.
+/// Dispatch (ADR-0037): signal-emitting `dismiss`/`invoke_action`/`reply` use `tokio::spawn`
+/// (ADR-0029); locked state writes run inline (ADR-0033).
 pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<NotificationsAction>(params) else { return };
@@ -98,51 +96,42 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
     }
 }
 
-/// Well-known bus name and object path this controller hosts `org.freedesktop.Notifications` at
-/// (the base freedesktop notification spec's own fixed path).
+/// Well-known bus name and object path for `org.freedesktop.Notifications`.
 pub const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
 pub const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 
-/// §1.1's property caps (ADR-0033): bytes, not chars -- multi-byte UTF-8 must truncate on a char
-/// boundary at-or-before the cap, never splitting a sequence.
+/// §1.1 property caps (ADR-0033), measured in bytes and truncated at UTF-8 boundaries.
 const MAX_APP_NAME_BYTES: usize = 64;
 const MAX_SUMMARY_BYTES: usize = 128;
 const MAX_BODY_BYTES: usize = 512;
 
-/// `actions`' own caps (ADR-0090), on the same reasoning §1.1 caps the text properties: the array
-/// arrives from an unprivileged sender over the session bus and a config draws every entry. Eight
-/// is past anything a real notification offers -- the reference config's own busiest card has
-/// three -- and a label is a button, so it is capped tighter than a summary.
+/// Action caps (ADR-0090): unprivileged session-bus input is drawn by config. Eight exceeds the
+/// reference config's busiest card (three); labels are capped tighter than summaries.
 const MAX_ACTIONS: usize = 8;
 const MAX_ACTION_LABEL_BYTES: usize = 64;
 
-/// A theme name carried out of `app_icon` (ADR-0091). Same cap as `app_name`, which is the same
-/// kind of value from the same untrusted sender: a short identifier, not prose.
+/// Theme name from `app_icon` (ADR-0091), capped like the short identifier `app_name`.
 const MAX_APP_ICON_NAME_BYTES: usize = MAX_APP_NAME_BYTES;
 
-/// `hints["desktop-entry"]`'s cap (ADR-0101). A desktop file id is a reverse-DNS name and the
-/// longest real ones are around 40 bytes; this is `summary`'s cap, comfortably past that and short
-/// enough that a sender cannot use the field as a second body.
+/// `desktop-entry` cap (ADR-0101). Reverse-DNS ids top out around 40 bytes; use the summary cap.
 const MAX_DESKTOP_ENTRY_BYTES: usize = MAX_SUMMARY_BYTES;
-/// `hints["x-kde-reply-placeholder-text"]`'s cap (ADR-0101): it is drawn where a label would be.
+/// Reply placeholder cap (ADR-0101), matching a drawn action label.
 const MAX_REPLY_PLACEHOLDER_BYTES: usize = MAX_ACTION_LABEL_BYTES;
 
-/// The backing FIFO's hard cap and `notifications.feed`'s truncated view size over it (ADR-0033).
+/// Backing FIFO cap and `notifications.feed` view size (ADR-0033).
 const NOTIFICATION_QUEUE_CAP: usize = 100;
 const NOTIFICATION_FEED_VIEW: usize = 20;
 
-/// Raw `image-data`/`icon_data` hint bounds cap. Reuses `dbus::tray`'s own 128px cap rather than
-/// inventing a second, undocumented threshold.
+/// Raw image-data dimension cap, shared with `dbus::tray`.
 const MAX_IMAGE_DIMENSION: i32 = 128;
 
-/// `expire_timeout == -1`'s "a sensible server default" (ADR-0033 picks this to match the
-/// mako/dunst convention it cites).
+/// Server default for `expire_timeout == -1`, matching mako/dunst (ADR-0033).
 const DEFAULT_EXPIRE_MS: u64 = 5000;
 
-/// `GetCapabilities`'s exact 10 strings (ADR-0033) -- excludes only `icon-multi`: no wire
-/// mechanism for multiple icon sizes exists in the base `Notify()` signature. `sound` is
-/// genuinely honored: [`resolve_sound_path`] plays a client's own `sound-file` hint or the tier
-/// default, gated by [`should_play_sound`]; only `sound-name` stays unhonored.
+/// `GetCapabilities`'s exact 10 strings (ADR-0033). Only `icon-multi` is absent because `Notify`
+/// has no multi-size wire field. `sound` honors `sound-file`/tier default via
+/// [`should_play_sound`];
+/// only `sound-name` is unhonored.
 const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "action-icons",
     "actions",
@@ -156,68 +145,50 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "inline-reply",
 ];
 
-// -------------------------------------------------------------------------------------------
-// Wire-facing types (docs/oblisk-idl-api-specs.md §2.7, corrected by ADR-0033).
-// -------------------------------------------------------------------------------------------
+// Wire-facing types (docs/oblisk-idl-api-specs.md §2.7, ADR-0033).
 
-/// One allowlisted body-markup run (CONTEXT.md's "Notification body span"; ADR-0033). A text run
-/// carries its own styling and, for a `<a href>`, the link target; an image run carries only a
-/// spooled/validated path -- `alt` text is parsed for grammar completeness but not carried
-/// forward, since nothing in this round's scope reads it.
+/// One allowlisted body-markup run (CONTEXT.md, ADR-0033). Text carries styling and link target;
+/// images carry only a spooled/validated path. `alt` is parsed but not carried.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 pub enum NotificationSpan {
     #[serde(rename = "text")]
     Text {
-        /// The run's text, already unescaped. Empty runs are not emitted.
+        /// Unescaped text; empty runs are omitted.
         text: String,
-        /// The run sat inside `<b>`.
+        /// Whether the run was inside `<b>`.
         bold: bool,
-        /// The run sat inside `<i>`.
+        /// Whether the run was inside `<i>`.
         italic: bool,
-        /// The run sat inside `<u>`.
+        /// Whether the run was inside `<u>`.
         underline: bool,
-        /// The `<a href>` target this run links to, or `nil` for a run that is not a link. Carried
-        /// as text, not opened: launching it is a config's decision.
+        /// `<a href>` target, or `nil` when not a link. Config decides whether to open it.
         href: Option<String>,
     },
     #[serde(rename = "image")]
     Image {
-        /// An absolute path to an image that exists under a trusted root. A path outside one is
-        /// dropped during parsing rather than carried and refused later.
+        /// Existing absolute path under a trusted root; outside paths are dropped during parsing.
         image_path: String,
     },
 }
 
-/// One action button a sender offered (ADR-0090). `Notify` carries these as a flat
-/// `[key1, label1, key2, label2, ...]` array, which was read for one bool and thrown away until
-/// now -- so `GetCapabilities` advertised `actions` and `action-icons` and neither was true.
-///
-/// The two keys with meanings of their own are not in here: `"default"` is the whole
-/// notification's activation and becomes [`Notification::has_default_action`], and
-/// `"inline-reply"` becomes [`Notification::has_reply`]. Both would otherwise draw as buttons
-/// beside the ones a sender actually meant as buttons.
+/// One offered action button (ADR-0090), excluding `default` activation and `inline-reply`, which
+/// become [`Notification::has_default_action`] and [`Notification::has_reply`]. The flat array
+/// was once read for one bool and discarded, so `GetCapabilities` advertised `actions` and
+/// `action-icons` while neither was true; parsed buttons are retained now.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationAction {
-    /// What `notifications:invoke_action(id, key)` takes, and what travels back to the sender as
-    /// `ActionInvoked`'s `action_key`. Opaque: it means something to the application and nothing
-    /// here.
+    /// Opaque key accepted by `notifications:invoke_action(id, key)` and returned as
+    /// `ActionInvoked.action_key`.
     pub key: String,
-    /// What to draw on the button. The sender's own label, or the key when it sent an empty one
-    /// and the action is not icon-only.
+    /// Button label, falling back to the key when empty unless the action is icon-only.
     pub label: String,
-    /// A *theme icon name*, present only when the sender set the `action-icons` hint, in which
-    /// case the base spec says the key is that name. Not a path and never resolved here: `icon`
-    /// takes a theme name directly (ADR-0054 decision 2), so there is nothing to spool.
-    ///
-    /// A key holding a path separator is refused as an icon rather than carried, because `icon`
-    /// also accepts an absolute path -- without that check, a sender could name any file on this
-    /// machine and have the shell draw it.
+    /// Theme icon name when `action-icons` is set; never a path or resolved here. Keys containing
+    /// `/` are refused to prevent a sender naming arbitrary files (ADR-0054 decision 2).
     pub icon_name: Option<String>,
 }
 
-/// The `low`/`normal`/`critical` tier (CONTEXT.md's "Notification urgency"). `Hash`/`Eq` so it can
-/// key the sound registry directly.
+/// `low`/`normal`/`critical` urgency tier, also used as the sound-registry key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, schemars::JsonSchema)]
 pub enum Urgency {
     #[serde(rename = "low")]
@@ -229,8 +200,7 @@ pub enum Urgency {
     Critical,
 }
 
-/// `hints["urgency"]`'s raw byte (0/1/2), defaulting to `Normal` for anything absent or
-/// malformed (ADR-0033/base-spec convention: an unset/invalid hint is normal, not an error).
+/// Maps raw urgency byte 0/1/2; absent or malformed hints default to `Normal` (ADR-0033).
 fn urgency_from_hint_byte(byte: Option<u8>) -> Urgency {
     match byte {
         Some(0) => Urgency::Low,
@@ -239,23 +209,20 @@ fn urgency_from_hint_byte(byte: Option<u8>) -> Urgency {
     }
 }
 
-/// `hints["desktop-entry"]` as carried (ADR-0101): the sender's value, or `None` for an absent or
-/// empty one, or one holding a path separator. A desktop file id never contains `/` -- the desktop
-/// entry spec turns a subdirectory into a dash -- so one that does is not an id, and the only
-/// thing carrying it could do is let a sender aim a config's `by_app_id` lookup at a path.
+/// Carries `desktop-entry` (ADR-0101), or `None` when absent, empty, or containing `/`. Desktop
+/// ids use dashes for subdirectories, so a slash is not an id and cannot reach `by_app_id`.
 fn desktop_entry_from_hint(value: Option<&str>) -> Option<String> {
     let value = value.filter(|value| !value.is_empty() && !value.contains('/'))?;
     Some(truncate_utf8_bytes(value, MAX_DESKTOP_ENTRY_BYTES))
 }
 
-/// `hints["x-kde-reply-placeholder-text"]` as carried (ADR-0101): the text, capped, or `None` for
-/// absent or empty, since an empty placeholder is no placeholder.
+/// Carries the capped reply placeholder (ADR-0101), or `None` when absent/empty.
 fn reply_placeholder_from_hint(value: Option<&str>) -> Option<String> {
     let value = value.filter(|value| !value.is_empty())?;
     Some(truncate_utf8_bytes(value, MAX_REPLY_PLACEHOLDER_BYTES))
 }
 
-/// `notifications:set_sound(urgency, path)`'s `urgency` argument, one of the three wire strings.
+/// Parses `notifications:set_sound`'s `low`/`normal`/`critical` urgency string.
 fn parse_urgency_str(value: &str) -> Option<Urgency> {
     match value {
         "low" => Some(Urgency::Low),
@@ -265,135 +232,88 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
     }
 }
 
-/// One queued notification -- `notifications.feed[]`'s object shape (docs/oblisk-idl-api-specs.md
-/// §2.7, ADR-0033's corrections: `body` is a span array not a flat string, `urgency`/`has_reply`
-/// are new fields; ADR-0090 adds `actions` and `has_default_action`). Trimmed to what the feed
-/// shape and the write commands need: `expire_timeout` and `replaces_id` are acted on and not
-/// carried, since neither is a thing a config draws or decides.
+/// Queued `notifications.feed[]` object (idl §2.7; ADR-0033, ADR-0090). `expire_timeout` and
+/// `replaces_id` affect processing but are not feed data.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Notification {
-    /// The server-assigned id, counting up from `1`. What `notifications:dismiss`, `:reply` and
-    /// `:invoke_action` take. Reused when an application replaces its own notification in place.
+    /// Server id, starting at `1`; used by dismiss/reply/action and reused by replacement.
     pub id: u32,
-    /// When this content arrived, as Unix epoch seconds -- the same clock and the same unit as
-    /// `oblisk.system`'s `time` (§2.11), so a config's relative age is `system.time - timestamp`
-    /// and needs nothing else to line the two up.
-    ///
-    /// Set from the content, not from the id: a `replaces_id` replacement is a fresh `Notify` with
-    /// a fresh timestamp, because "3 new messages" arriving now is not four minutes old just
-    /// because "1 new message" was.
-    ///
-    /// Carried because a config cannot recover it. Nothing else in the feed says when anything
-    /// happened, and the obvious workaround -- noting the clock the first time an id is seen --
-    /// has to run inside a `computed`, which ADR-0021 requires to be side-effect-free.
+    /// Arrival time in Unix epoch seconds, matching `oblisk.system.time` (§2.11); age is
+    /// `system.time - timestamp`. Replacements get fresh timestamps; carried because configs
+    /// cannot recover history inside ADR-0021 side-effect-free `computed`s.
     pub timestamp: i64,
-    /// The sending application's name, truncated to 64 bytes on a character boundary.
+    /// Sending application, truncated to 64 bytes at a character boundary.
     pub app_name: String,
-    /// The title, truncated to 128 bytes on a character boundary. Plain text: any markup the
-    /// application sent is parsed out, not rendered.
+    /// Plain-text title, truncated to 128 bytes at a character boundary; markup is parsed out.
     pub summary: String,
-    /// The message as a run of spans rather than one string, because the freedesktop body is
-    /// markup. Truncated to 512 bytes before parsing. Each span is either text carrying its own
-    /// bold/italic/underline/href, or an image whose path passed the trusted-root check, so a
-    /// config draws the list in order and never has to parse markup itself.
+    /// Body spans, truncated to 512 bytes before parsing. Text carries bold/italic/underline/href;
+    /// images carry trusted paths, so config draws without parsing markup.
     pub body: Vec<NotificationSpan>,
-    /// The picture the sender attached -- album art, an avatar, a screenshot thumbnail -- as an
-    /// absolute path to a file that exists: either a decoded, bounds-checked image spooled to
-    /// the runtime directory, or a path it sent that passed the trusted-root check. `nil` when it attached
-    /// none. Never a theme name (ADR-0091).
-    ///
-    /// Was called `icon_path` and held this *and* the sending application's icon, whichever
-    /// arrived first. They are two different pictures with two different jobs, so they are now two
-    /// fields; see [`Notification::app_icon`].
+    /// Attached picture (album art/avatar/thumbnail) as an existing absolute path: decoded image
+    /// spooled to runtime storage or a trusted sender path. `nil` when absent; never a theme name
+    /// (ADR-0091). Formerly shared `icon_path` with the application icon; now separate.
     pub image_path: Option<String>,
-    /// The sending application's own icon: a theme name like `"firefox"`, or an absolute path when
-    /// it sent one that passed the trusted-root check. `nil` when it identified itself with
-    /// neither. Feeds `icon { name = ... }`, which takes either form (ADR-0054 decision 2).
-    ///
-    /// A theme name is the overwhelmingly common case and used to be dropped on the floor: this
-    /// value ran through the same absolute-path validator the attached picture does, and
-    /// `"firefox"` is not an absolute path, so nearly every real notification arrived with no icon
-    /// at all (ADR-0091).
+    /// Application icon: theme name (for example `"firefox"`) or trusted absolute path; `nil` if
+    /// neither was supplied. Feeds `icon { name = ... }` (ADR-0054 decision 2). ADR-0091 fixed
+    /// the former bug that sent theme names through absolute-path validation, leaving nearly every
+    /// notification with the generic fallback.
     pub app_icon: Option<String>,
-    /// `"low"`, `"normal"` or `"critical"`. `"normal"` for a sender that set no urgency hint.
-    /// Critical is the one that outlives do-not-disturb and never expires on its own.
+    /// `"low"`, `"normal"`, or `"critical"`; missing hint means `"normal"`. Critical bypasses DND
+    /// and never expires.
     pub urgency: Urgency,
-    /// The sender's timeout ran out. The notification is still here -- expiry *retires* an entry
-    /// from the popup and leaves it in the feed for the history to show (ADR-0100) -- so this is
-    /// what a popup filters on and a history ignores. `NotificationClosed(id, reason=1)` has
-    /// already gone to the sender by the time this reads `true`. A `replaces_id` replacement is
-    /// fresh content and reads `false` again. Never `true` on a critical notification or on one
-    /// sent with `expire_timeout = 0`, which never expire.
+    /// Whether the timeout expired. Ordinary expiry retires the entry from popups but leaves it in
+    /// feed history (ADR-0100), after `NotificationClosed(id, reason=1)`; replacements reset it.
+    /// Never true for critical or `expire_timeout = 0` notifications.
     pub expired: bool,
-    /// `hints["transient"]`: the sender says this is worth a popup and nothing more (§1's base
-    /// spec). An expired transient is removed outright rather than retired, so a history never
-    /// has to filter it after the fact; while it is live, this is how a history knows to leave
-    /// it to the popup (ADR-0100).
+    /// `hints["transient"]`: popup-only (§1). Expired transient entries are removed, not retired,
+    /// so history never sees them (ADR-0100).
     pub transient: bool,
-    /// `hints["desktop-entry"]`: the sender's `.desktop` file id, e.g. `"org.telegram.desktop"`,
-    /// which is the key `oblisk.applications`'s `by_app_id` is built to be looked up by (§ 2.13)
-    /// and the grouping key `app_name` is only a stand-in for -- two applications can share a
-    /// display name and one can change its own. `nil` for a sender that set none, which is most
-    /// command-line senders and few desktop applications. Carried as sent, minus anything holding
-    /// a path separator, since a desktop id never does (ADR-0101).
+    /// `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by
+    /// `oblisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`.
+    /// `nil` when absent; slashed values are dropped (ADR-0101).
     pub desktop_entry: Option<String>,
-    /// The sender offered an inline reply action, so `notifications:reply(id, text)` will be
-    /// accepted. Calling it on a notification without one is refused, which is why this is
-    /// carried rather than guessed.
+    /// Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.
     pub has_reply: bool,
-    /// `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say
-    /// -- "Reply to Alice" rather than a generic "Reply". `nil` for a sender that set none, and
-    /// meaningless without [`Notification::has_reply`]. Truncated to 64 bytes like a button label,
-    /// which is roughly what it is (ADR-0101).
+    /// `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say,
+    /// "Reply to Alice" rather than a generic "Reply"; capped at 64 bytes, `nil` if absent, and
+    /// meaningless without [`Notification::has_reply`] (ADR-0101).
     pub reply_placeholder: Option<String>,
-    /// The buttons the sender offered, in the order it listed them, minus the two keys that mean
-    /// something other than a button. Empty for the great majority of notifications.
+    /// Offered buttons in sender order, excluding `default` and `inline-reply`; often empty.
     pub actions: Vec<NotificationAction>,
-    /// The sender offered a `"default"` action: the whole card is activatable, and clicking it
-    /// should call `notifications:invoke_action(id, "default")`. Its own field rather than an
-    /// entry in `actions`, because it is not a button and drawing it as one is wrong.
+    /// Whether the card is activatable via `notifications:invoke_action(id, "default")`; separate
+    /// from `actions` because `default` is not a button.
     pub has_default_action: bool,
-    /// `hints["resident"]`: the sender wants the notification to survive an action being invoked,
-    /// which is what a media notification with prev/next buttons needs. Bookkeeping only,
-    /// `#[serde(skip)]` -- it decides what [`NotificationsController::invoke_action`] does next
-    /// and a config has no use for it.
+    /// `hints["resident"]`: keep the notification after an action, as media prev/next needs;
+    /// bookkeeping only and omitted from payload (`#[serde(skip)]`).
     #[serde(skip)]
     pub resident: bool,
-    /// Bookkeeping only, `#[serde(skip)]`. Bumped every time `Notify` places new content at this
-    /// id. Lets a stale expiry timer spawned for an earlier incarnation tell it's been
-    /// superseded before removing content it no longer describes (see [`find_expiring_entry`]).
+    /// Bookkeeping only (`#[serde(skip)]`): incremented per `Notify` placement so stale expiry
+    /// timers can detect replacement (see [`find_expiring_entry`]).
     #[serde(skip)]
     pub incarnation: u64,
 }
 
-/// `notifications.feed`/`notifications.dnd`'s `StateSnapshot` payload shape (ADR-0033).
+/// `notifications.feed`/`notifications.dnd` `StateSnapshot` payload (ADR-0033).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationsState {
-    /// The newest 20 notifications, most recent first: the ones still popped up *and* the ones
-    /// that expired unread, which stay until dismissed (ADR-0100) -- `expired` tells them apart.
-    /// A truncated view of a 100-deep queue (ADR-0033), so a notification can leave this list
-    /// while still being present and still dismissable by id.
+    /// Newest 20 first, including unread retired entries until dismissed (ADR-0100); `expired`
+    /// distinguishes them. This is a view of the 100-entry queue, so older entries remain
+    /// dismissable by id after leaving the list (ADR-0033).
     pub feed: Vec<Notification>,
-    /// Do-not-disturb, flipped by `notifications:set_dnd`. It gates exactly one thing in the
-    /// Supervisor: a non-critical notification's sound does not play. Notifications are still
-    /// accepted, still queued, and still appear in [`NotificationsState::feed`], so not drawing the
-    /// popup is the config's decision, and `"critical"` is the urgency worth letting through.
+    /// DND from `notifications:set_dnd`; gates only non-critical sounds. Notifications remain
+    /// accepted, queued, and in `feed`; popup suppression is config policy.
     pub dnd: bool,
 }
 
-/// The channel `NotificationsController` fans a queue/DND mutation out through -- mirrors
-/// `dbus::tray::TraySignal`'s single-variant shape.
+/// Channel carrying queue/DND changes, matching `dbus::tray::TraySignal`'s single variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationsSignal {
     Changed,
 }
 
-// -------------------------------------------------------------------------------------------
-// Property truncation (TDD seam 1): byte-capped, char-boundary-safe.
-// -------------------------------------------------------------------------------------------
+// Byte-capped, UTF-8-boundary-safe property truncation.
 
-/// Truncates `input` to at most `max_bytes` UTF-8 bytes, backing off to the nearest char boundary
-/// at-or-before that cap rather than splitting a multi-byte sequence (§1.1: "bytes, not chars").
+/// Truncates to `max_bytes`, backing off to a UTF-8 boundary (§1.1: bytes, not chars).
 fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         return input.to_string();
@@ -405,13 +325,12 @@ fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     input[..end].to_string()
 }
 
-/// Shared by every submodule's own `#[cfg(test)]`.
+/// Shared by submodule tests.
 #[cfg(test)]
 mod test_support {
     use super::NotificationSpan;
 
-    /// A single unstyled-or-styled [`NotificationSpan::Text`] literal, built from plain args
-    /// instead of the verbose struct-literal form.
+    /// Builds a text span from plain arguments.
     pub(super) fn text(text: &str, bold: bool, italic: bool, underline: bool, href: Option<&str>) -> NotificationSpan {
         NotificationSpan::Text { text: text.to_string(), bold, italic, underline, href: href.map(str::to_string) }
     }
@@ -421,8 +340,6 @@ mod test_support {
 mod tests {
     use super::test_support::text;
     use super::*;
-
-    // ---- truncate_utf8_bytes (TDD seam 1) ----
 
     #[test]
     fn truncate_utf8_bytes_is_a_no_op_under_the_cap() {
@@ -458,16 +375,12 @@ mod tests {
         assert_eq!(truncate_utf8_bytes(&long, MAX_BODY_BYTES).len(), MAX_BODY_BYTES);
     }
 
-    // ---- urgency_from_hint_byte / parse_urgency_str ----
-
     #[test]
     fn urgency_from_hint_byte_maps_the_three_defined_values() {
         assert_eq!(urgency_from_hint_byte(Some(0)), Urgency::Low);
         assert_eq!(urgency_from_hint_byte(Some(1)), Urgency::Normal);
         assert_eq!(urgency_from_hint_byte(Some(2)), Urgency::Critical);
     }
-
-    // ---- desktop_entry_from_hint / reply_placeholder_from_hint (ADR-0101) ----
 
     #[test]
     fn a_desktop_entry_hint_is_carried_unless_it_is_empty_or_looks_like_a_path() {
@@ -500,8 +413,6 @@ mod tests {
         assert_eq!(parse_urgency_str("critical"), Some(Urgency::Critical));
         assert_eq!(parse_urgency_str("urgent"), None);
     }
-
-    // ---- serde wire shape ----
 
     #[test]
     fn notification_span_text_serializes_with_a_kind_tag() {

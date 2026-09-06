@@ -1,6 +1,6 @@
 //! Pure connection-intent helpers for `oblisk.network`: band/security classification, AP dedup,
-//! link-name resolution, NetworkManager connection-dict construction, and write-command arg
-//! parsers. See `network/mod.rs` for the module-level doc.
+//! link-name resolution, NetworkManager dict construction, and write-command arg parsers; see
+//! `network/mod.rs` for the module-level contract.
 
 use std::collections::HashMap;
 
@@ -11,13 +11,12 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use super::AccessPointInfo;
 
-/// How many deduplicated access points [`dedup_and_top20`] keeps (docs/oblisk-supervisor-
-/// services-dbus.md §4.2: "serializes the top 20 access points").
+/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/oblisk-supervisor-services-dbus.md
+/// §4.2: "serializes the top 20 access points").
 const MAX_AVAILABLE_NETWORKS: usize = 20;
 
-/// Failure modes [`NetworkController::connect`] can hit before ever reaching NetworkManager
-/// itself. `Display` is both the log line and `NetworkState::connect_error`'s text: these are all
-/// "the attempt never started", which is worth saying in the panel as plainly as in the log.
+/// Failures before [`NetworkController::connect`] reaches NetworkManager. `Display` supplies both
+/// the log line and `NetworkState::connect_error`, so each says the attempt never started.
 #[derive(Debug)]
 pub(super) enum ConnectError {
     NoWifiDevice,
@@ -43,14 +42,12 @@ impl From<zbus::Error> for ConnectError {
     }
 }
 
-/// Why an activation attempt ended, in words fit to draw -- `LockState::error`'s convention, and
-/// the D-Bus half of what `NetworkService.qml` spells as `_connectErrorText`. The reason comes off
-/// `Connection.Active`'s `StateChanged(state, reason)`, the only place NetworkManager says *why*
-/// a connection went down; `State` alone just says that it did.
+/// Maps `Connection.Active`'s `StateChanged(state, reason)` to display text, following
+/// `LockState::error` and `NetworkService.qml`'s `_connectErrorText`; it is the only source that
+/// says why a connection went down, while `State` alone gives none.
 ///
-/// Everything outside the five named reasons collapses to one line on purpose: the rest are VPN
-/// service failures, dependency failures and realize failures, none of which a Wi-Fi row can act
-/// on and all of which read worse than "connection failed".
+/// Other reasons are VPN, dependency, or realize failures. A Wi-Fi row cannot act on them, so they
+/// collapse to "connection failed".
 pub(super) fn connect_error_text(reason: u32) -> &'static str {
     match NMActiveConnectionStateReason::try_from(reason) {
         Ok(NMActiveConnectionStateReason::NO_SECRETS) => "wrong password",
@@ -62,9 +59,9 @@ pub(super) fn connect_error_text(reason: u32) -> &'static str {
     }
 }
 
-/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"` (§4.2).
-/// `None` outside all three ranges -- real Wi-Fi hardware always falls inside one, so this is an
-/// honest "no band" rather than a guessed default.
+/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"`
+/// (§4.2). Real Wi-Fi hardware falls inside one range, so `None` is honest "no band", not a
+/// guessed default.
 pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
     match freq_mhz {
         2400..=2500 => Some("2.4 GHz"),
@@ -74,36 +71,32 @@ pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
     }
 }
 
-/// Whether an access point requires a security key: it advertises `PRIVACY` (WEP, the only case
-/// that flag alone signals) or either RSN (WPA2/3) or WPA1 key-management flags are non-empty.
+/// Whether an AP requires a key: `PRIVACY` alone signals WEP; non-empty RSN (WPA2/3) or WPA1
+/// key-management flags signal the other secured cases.
 pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32) -> bool {
     let flags = NM80211ApFlags::from_bits_truncate(flags);
     flags.contains(NM80211ApFlags::PRIVACY) || wpa_flags != 0 || rsn_flags != 0
 }
 
-/// Merges duplicate SSIDs keeping the highest signal strength, then serializes the connected one
-/// plus the strongest 19 (§4.2). Ties within the same SSID keep whichever entry was seen first --
-/// a tie only happens between two distinct BSSIDs broadcasting the same SSID, and picking either
-/// is equally correct.
+/// Merges duplicate SSIDs by highest strength, then serializes the connected one plus the strongest
+/// 19 (§4.2). Equal-strength duplicates keep the first sighting; a tie is only between distinct
+/// BSSIDs broadcasting the same SSID, so either choice is equally correct.
 ///
-/// Sorting `active` ahead of strength is what keeps the connected network inside the cut, and that
-/// is load-bearing rather than cosmetic: `build_state` reads `ssid` and `strength` off this list,
-/// so an association weaker than 20 neighbours would otherwise be truncated away and reported as
-/// no association at all, on a machine that is plainly online. Dense apartment RF reaches 20 SSIDs
-/// easily.
+/// `active` sorts ahead of strength because `build_state` reads `ssid` and `strength` here. Without
+/// it, an association weaker than 20 neighbours is truncated and an online machine reports no
+/// association. Dense apartment RF reaches 20 SSIDs easily.
 ///
-/// `active` is merged rather than carried by the winner, and that distinction is the whole of a bug
-/// this had: NetworkManager exposed two AP objects for one SSID at *the same BSSID*, strengths 62
-/// and 58, with `ActiveAccessPoint` naming the weaker one. Keeping the stronger entry wholesale
-/// dropped the flag with the object it came on, and a connected machine's bar read "offline".
+/// Merge `active` rather than carrying the winner's flag. NetworkManager once exposed two AP
+/// objects
+/// for one SSID at the same BSSID, strengths 62 and 58, with `ActiveAccessPoint` naming the 58.
+/// Keeping the stronger object dropped the flag and showed a connected machine as "offline".
 ///
-/// Strength is a property of an AP object; `active` is a property of the SSID the radio is
-/// associated with. So the strongest sighting wins the numbers and any sighting wins the flag.
+/// Strength belongs to an AP object; `active` belongs to the associated SSID. The strongest
+/// sighting
+/// supplies the numbers, and any sighting supplies the flag.
 ///
-/// The SSID tiebreak last is not cosmetic. `best` is a `HashMap`, so `into_values` hands these
-/// over in an order that reshuffles as access points come and go, and a stable sort preserves
-/// whatever that was: two APs at one strength would swap rows between rebuilds for no reason, and
-/// a tie across the 20th place would decide arbitrarily which one gets cut.
+/// SSID is the last tiebreak because `HashMap::into_values` reshuffles as APs come and go. Stable
+/// sorting then prevents equal-strength rows from swapping, including at the 20th-place cutoff.
 pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo> {
     let mut best: HashMap<String, AccessPointInfo> = HashMap::new();
     for ap in aps {
@@ -125,12 +118,11 @@ pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo>
     deduped
 }
 
-/// § 2.5's `ssid`: `"Ethernet"` when the default route is wired, the associated AP's name when it
-/// is not, and `None` when neither holds -- which is what a config reads as `nil` for "offline".
+/// § 2.5's `ssid`: `"Ethernet"` for a wired default route, the associated AP's name otherwise,
+/// and `None` when neither holds, which Lua reads as `nil` for offline.
 ///
-/// Wired wins over an association rather than the other way round: `ssid` names whatever
-/// `NetworkState::connected` is about, and a laptop docked over Ethernet stays joined to Wi-Fi the
-/// whole time, so the association is the one that is not carrying anything.
+/// Wired wins because `ssid` names what `NetworkState::connected` describes. A docked laptop may
+/// stay joined to Wi-Fi, but the association is not carrying the default route.
 pub(super) fn resolve_ssid(wired: bool, associated: Option<&AccessPointInfo>) -> Option<String> {
     match (wired, associated) {
         (true, _) => Some("Ethernet".to_string()),
@@ -139,9 +131,8 @@ pub(super) fn resolve_ssid(wired: bool, associated: Option<&AccessPointInfo>) ->
     }
 }
 
-/// Whether a `SettingsConnectionProxy::get_settings()` result's `connection.autoconnect` allows
-/// autoconnect -- absent means NetworkManager's own default of `true` (ADR-0029: only an
-/// explicit `false` disqualifies a profile).
+/// Whether `get_settings()` permits autoconnect. Missing means NetworkManager's default `true`
+/// (ADR-0029: only explicit `false` disqualifies a profile).
 pub(super) fn connection_wants_autoconnect(settings: &HashMap<String, HashMap<String, OwnedValue>>) -> bool {
     settings
         .get("connection")
@@ -150,8 +141,7 @@ pub(super) fn connection_wants_autoconnect(settings: &HashMap<String, HashMap<St
         .unwrap_or(true)
 }
 
-/// Whether a `SettingsConnectionProxy::get_settings()` result is a Wi-Fi profile for `ssid`
-/// (used by `forget`, which must delete every matching profile, not just the first -- §4.3 says
+/// Whether `get_settings()` is a Wi-Fi profile for `ssid`. `forget` deletes every match (§4.3 says
 /// "profiles", plural).
 pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>, ssid: &str) -> bool {
     settings
@@ -161,11 +151,10 @@ pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, Own
         .is_some_and(|bytes| bytes == ssid.as_bytes())
 }
 
-/// The `network:connect(ssid, hidden)` intent plus the `secure_submit` secret, boiled down to
-/// "open or WPA-PSK" before any zbus-specific `Value` wrapping -- kept unit-testable without a
-/// live D-Bus connection. An empty secret means an open network (ADR-0029); a non-empty one must
-/// be valid UTF-8 to become NM's `802-11-wireless-security.psk`, a D-Bus string -- an invalid
-/// encoding fails loudly ([`ConnectError::InvalidSecret`]) instead of lossily mangling it.
+/// The `network:connect(ssid, hidden)` intent plus `secure_submit` secret before zbus `Value`
+/// wrapping, keeping this unit-testable without D-Bus. Empty means open (ADR-0029); non-empty
+/// bytes must be UTF-8 for NM's string-valued `802-11-wireless-security.psk`, or fail as
+/// [`ConnectError::InvalidSecret`] instead of being mangled.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ConnectionIntent {
     pub(super) ssid: String,
@@ -180,9 +169,8 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
         match String::from_utf8(secret.to_vec()) {
             Ok(psk) => Some(psk),
             Err(err) => {
-                // The invalid-UTF-8 bytes are still a plaintext-password copy -- zeroize before
-                // propagating (ADR-0005/ADR-0014). Message captured first since
-                // FromUtf8Error::into_bytes consumes the error.
+                // Zeroize the invalid UTF-8 password copy before propagating (ADR-0005/ADR-0014).
+                // Capture the message first because `into_bytes` consumes the error.
                 let message = err.to_string();
                 let mut bytes = err.into_bytes();
                 bytes.zeroize();
@@ -193,9 +181,8 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
     Ok(ConnectionIntent { ssid: ssid.to_string(), hidden, psk })
 }
 
-/// Builds the minimal connection dict `AddAndActivateConnection2` needs for `intent` (§4.3):
-/// `802-11-wireless-security` is present only for a secured intent, and `hidden`/`scan-ssid`
-/// only when the intent's `hidden` flag is set.
+/// Builds the minimal `AddAndActivateConnection2` dict (§4.3): security only for a secured intent,
+/// and `hidden`/`scan-ssid` only when `intent.hidden` is set.
 pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, HashMap<&str, Value<'_>>> {
     let mut dict: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
@@ -209,9 +196,9 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     wireless.insert("mode", Value::new("infrastructure"));
     if intent.hidden {
         wireless.insert("hidden", Value::new(true));
-        // Not a real NM setting key (hidden-network probing is driven by hidden alone) --
-        // included anyway since §4.3 asks for both explicitly, and an extra key NM doesn't
-        // recognize is silently ignored rather than rejected.
+        // NM probes hidden networks from `hidden` alone, but §4.3 requires both. NM silently
+        // ignores
+        // the extra `scan-ssid` key.
         wireless.insert("scan-ssid", Value::new(true));
     }
     dict.insert("802-11-wireless", wireless);
@@ -226,13 +213,9 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     dict
 }
 
-/// A saved profile's own `GetSettings` read-back with `802-11-wireless-security` rewritten to
-/// WPA-PSK and `psk`, shaped for `SettingsConnection.Update` (§4.3).
-///
-/// Update replaces the whole profile, so this passes every other section straight through: a
-/// static address, a route metric or an autoconnect priority the user set on that profile survives
-/// a re-typed password. Only the security section is touched, and `key-mgmt` alongside `psk`
-/// because a profile saved as open has no security section to put a key into.
+/// Shapes a saved profile for `SettingsConnection.Update` (§4.3), changing only its security
+/// section to WPA-PSK. `Update` replaces the whole profile, so static addresses, route metrics, and
+/// autoconnect priority pass through; an open profile also needs a new `key-mgmt` section.
 pub(super) fn merge_psk<'a>(
     settings: &'a HashMap<String, HashMap<String, OwnedValue>>,
     psk: &'a str,
@@ -324,11 +307,8 @@ mod tests {
 
     #[test]
     fn dedup_and_top20_keeps_active_even_when_a_stronger_duplicate_is_not_the_connected_one() {
-        // Measured on a real session, not imagined: NetworkManager exposed two AP objects for one
-        // SSID at the same BSSID, strengths 62 and 58, and `ActiveAccessPoint` named the 58. The
-        // merge kept the 62 and dropped the flag with the object, so a connected machine's bar read
-        // "offline". `active` is a property of the SSID the radio is associated with, not of the AP
-        // object that happens to be advertising it loudest.
+        // Real session: the same BSSID appeared as strengths 62 and 58, with `ActiveAccessPoint`
+        // naming 58. Keeping 62 alone dropped `active` and showed "offline".
         let mut connected = ap("home", 58);
         connected.active = true;
         let merged = dedup_and_top20(vec![ap("home", 62), connected]);
@@ -351,8 +331,7 @@ mod tests {
 
     #[test]
     fn dedup_and_top20_leaves_an_unconnected_ssid_unconnected() {
-        // The flag is merged, not invented: two sightings of an SSID nothing is associated with
-        // stay inactive.
+        // Merge the flag, but do not invent it for an unassociated SSID.
         let merged = dedup_and_top20(vec![ap("home", 62), ap("home", 58)]);
         assert_eq!(merged.len(), 1);
         assert!(!merged[0].active);
@@ -360,9 +339,8 @@ mod tests {
 
     #[test]
     fn dedup_and_top20_keeps_the_connected_network_even_when_20_neighbours_are_stronger() {
-        // The failure this prevents is not a cosmetic ordering one: `build_state` reads `ssid` and
-        // `strength` off this list, so truncating the association away reports a plainly-online
-        // machine as joined to nothing.
+        // `build_state` reads `ssid` and `strength` here; truncating the association reports an
+        // online machine as joined to nothing.
         let mut aps: Vec<AccessPointInfo> = (0..25).map(|i| ap(&format!("neighbour{i}"), 50 + i as u8)).collect();
         let mut connected = ap("home", 20);
         connected.active = true;
@@ -382,9 +360,8 @@ mod tests {
 
     #[test]
     fn dedup_and_top20_breaks_strength_ties_by_ssid_so_the_order_is_deterministic() {
-        // `best.into_values()` is a HashMap drain, so without the tiebreak this order is whatever
-        // the current hash layout happens to be, and it moves as access points come and go. Eight
-        // equal-strength entries make an accidental pass a one-in-40320 shot.
+        // `HashMap::into_values` makes the input order nondeterministic as APs change. Eight equal
+        // strengths make an accidental pass a one-in-40320 shot.
         let aps: Vec<AccessPointInfo> = ["delta", "alpha", "hotel", "charlie", "golf", "bravo", "foxtrot", "echo"]
             .iter()
             .map(|ssid| ap(ssid, 55))
@@ -397,9 +374,9 @@ mod tests {
 
     #[test]
     fn dedup_and_top20_cuts_a_boundary_tie_by_ssid_rather_than_by_luck() {
-        // Nineteen strong entries and two tied for the last slot. Which of the two survives has to
-        // be the same answer on every rebuild, or the panel's twentieth row flickers between them
-        // while nothing about the radio has changed.
+        // Nineteen strong entries and two tied for slot 20 must yield the same row on every
+        // rebuild;
+        // otherwise the panel flickers without a radio change.
         let mut aps: Vec<AccessPointInfo> = (0..19).map(|i| ap(&format!("strong{i}"), 90)).collect();
         aps.push(ap("zulu", 40));
         aps.push(ap("kilo", 40));
@@ -418,8 +395,7 @@ mod tests {
     #[test]
     fn dedup_and_top20_keeps_the_20_strongest_not_just_the_first_20() {
         let mut aps: Vec<AccessPointInfo> = (0..30).map(|i| ap(&format!("ap{i}"), i as u8)).collect();
-        // The 30 strongest-first entries would be ap29..ap10 if sorting by strength works;
-        // shuffle the input order so a naive "take the first 20" bug would fail this.
+        // Reverse the input so a naive "take the first 20" implementation fails.
         aps.reverse();
         let result = dedup_and_top20(aps);
         assert!(result.iter().all(|a| a.strength >= 10), "must keep the strongest 20, not the first 20 seen");
@@ -436,8 +412,7 @@ mod tests {
 
     #[test]
     fn resolve_ssid_says_ethernet_even_while_wi_fi_stays_associated() {
-        // A docked laptop is joined to both. `connected` is about the default route, which is the
-        // cable, so `ssid` has to name the cable too or the two fields describe different links.
+        // Both links stay joined, but `connected` describes the cable's default route.
         assert_eq!(resolve_ssid(true, Some(&ap("home", 70))), Some("Ethernet".to_string()));
     }
 
@@ -530,8 +505,9 @@ mod tests {
 
     #[test]
     fn merge_psk_passes_every_other_section_through_untouched() {
-        // `Update` replaces the whole profile, so anything this drops is silently lost from the
-        // saved network: a static address, a metric, an autoconnect priority.
+        // `Update` replaces the whole profile; dropping any section loses static addresses,
+        // metrics,
+        // or autoconnect priority.
         let settings: HashMap<String, HashMap<String, OwnedValue>> = HashMap::from([
             (
                 "connection".to_string(),
@@ -550,8 +526,7 @@ mod tests {
 
     #[test]
     fn merge_psk_adds_a_security_section_to_a_profile_saved_as_open() {
-        // A network that was open and now has a key has no `802-11-wireless-security` section at
-        // all, so `key-mgmt` has to be written alongside the psk rather than assumed present.
+        // An open profile has no security section, so add `key-mgmt` beside `psk`.
         let settings =
             settings_with("802-11-wireless", "ssid", OwnedValue::try_from(Value::from(b"HomeWifi".to_vec())).unwrap());
 
@@ -572,8 +547,7 @@ mod tests {
 
     #[test]
     fn connect_error_text_names_the_reason_a_wrong_password_arrives_as() {
-        // NO_SECRETS is the one that matters: it is what NetworkManager reports for a bad PSK, and
-        // the whole point of watching the activation rather than the AddAndActivate return value.
+        // NM reports a bad PSK as `NO_SECRETS`; `AddAndActivate` returns before this verdict.
         assert_eq!(connect_error_text(NMActiveConnectionStateReason::NO_SECRETS as u32), "wrong password");
         assert_eq!(connect_error_text(NMActiveConnectionStateReason::LOGIN_FAILED as u32), "authentication failed");
         assert_eq!(connect_error_text(NMActiveConnectionStateReason::CONNECT_TIMEOUT as u32), "connection timed out");
@@ -581,7 +555,7 @@ mod tests {
 
     #[test]
     fn connect_error_text_falls_back_for_reasons_a_wifi_row_cannot_act_on() {
-        // SERVICE_START_FAILED is a VPN reason, and 255 is not a reason at all.
+        // `SERVICE_START_FAILED` is a VPN reason; 255 is not a reason at all.
         assert_eq!(connect_error_text(NMActiveConnectionStateReason::SERVICE_START_FAILED as u32), "connection failed");
         assert_eq!(connect_error_text(255), "connection failed");
     }

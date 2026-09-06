@@ -1,6 +1,5 @@
-//! Notify half of `oblisk.idle` (ADR-0032): `ext_idle_notifier_v1` on the Supervisor's own
-//! dedicated Wayland connection -- the fan-out registry (one listener per distinct threshold
-//! duration) and the dispatch thread/connection setup itself.
+//! Notify half of `oblisk.idle` (ADR-0032): `ext_idle_notifier_v1` on the Supervisor's dedicated
+//! Wayland connection, with one listener per distinct threshold and a dispatch thread.
 //! Split from `dbus::idle` -- see `hardware/idle/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
@@ -16,10 +15,9 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{self, ExtIdleNotificationV1};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 
-/// Registers `generation_id` against `sec`'s duration in `fanout`; returns whether a new
-/// `ext_idle_notification_v1` listener is needed for that duration (ADR-0032: one listener
-/// per distinct duration). No dedup: the same `sec` registered twice appends twice -- each
-/// registration is its own Lua-side callback pairing, so `fanout`'s lists are multisets.
+/// Registers `generation_id` for `sec`; returns whether a new listener is needed (ADR-0032: one
+/// per duration). No dedup: repeated `sec` entries are distinct Lua callback pairs, so lists are
+/// multisets.
 pub fn register_threshold_entry(fanout: &mut HashMap<Duration, Vec<u32>>, generation_id: u32, sec: u64) -> bool {
     let duration = Duration::from_secs(sec);
     let created_new_listener = !fanout.contains_key(&duration);
@@ -27,25 +25,23 @@ pub fn register_threshold_entry(fanout: &mut HashMap<Duration, Vec<u32>>, genera
     created_new_listener
 }
 
-/// Drops every fan-out entry belonging to `generation_id` (the notify half of
-/// `reset_registrations`, ADR-0006/ADR-0032). Leaves durations themselves untouched, even when
-/// now empty -- the listener stays alive until a fresh registration reuses it.
+/// Drops every `generation_id` entry (notify half of `reset_registrations`, ADR-0006/ADR-0032),
+/// but leaves durations and empty listeners alive for reuse.
 pub fn cleanup_generation_thresholds(fanout: &mut HashMap<Duration, Vec<u32>>, generation_id: u32) {
     for entries in fanout.values_mut() {
         entries.retain(|&id| id != generation_id);
     }
 }
 
-/// Dispatch target for the Supervisor's own, separate Wayland connection (ADR-0010, survives a
-/// Renderer crash or reload). Holds only the raw-event forwarding channel -- other state
-/// (fan-out registry, bound proxies) lives on the async side, reachable from [`IdleController`]
-/// directly, since Wayland proxies are `Send` (ADR-0032).
+/// Dispatch target for the separate Wayland connection (ADR-0010, survives Renderer crash/reload).
+/// Holds only the raw-event channel; fan-out state and bound `Send` proxies stay on the async side
+/// via [`IdleController`] (ADR-0032).
 pub(crate) struct WaylandThreadState {
     raw_events_tx: UnboundedSender<(Duration, shared::IdleState)>,
 }
 
-/// Required by [`registry_queue_init`]. The global lookup happens once, via `GlobalList::bind`
-/// right after init (see [`connect_wayland_idle`]); later registry events are never acted on.
+/// Required by [`registry_queue_init`]. `GlobalList::bind` performs the only lookup after init;
+/// later registry events are ignored (see [`connect_wayland_idle`]).
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandThreadState {
     fn event(
         _state: &mut Self,
@@ -58,8 +54,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandThreadStat
     }
 }
 
-/// `wl_seat` is bound only so `get_idle_notification` has an object to name -- this feature
-/// never creates a pointer/keyboard/touch object from it, so every seat event is dropped.
+/// Bind `wl_seat` only to name `get_idle_notification`; never create pointer/keyboard/touch
+/// objects, so seat events are dropped.
 impl Dispatch<WlSeat, ()> for WaylandThreadState {
     fn event(
         _state: &mut Self,
@@ -72,8 +68,8 @@ impl Dispatch<WlSeat, ()> for WaylandThreadState {
     }
 }
 
-/// `ext_idle_notifier_v1` has no `<event>` in its protocol XML -- this can never actually fire;
-/// kept only because `Dispatch` must be implemented for every proxy type an object is created for.
+/// `ext_idle_notifier_v1` has no `<event>` in its XML, so this cannot fire. It remains because
+/// `Dispatch` is required for every created proxy type.
 impl Dispatch<ExtIdleNotifierV1, ()> for WaylandThreadState {
     fn event(
         _state: &mut Self,
@@ -87,9 +83,8 @@ impl Dispatch<ExtIdleNotifierV1, ()> for WaylandThreadState {
     }
 }
 
-/// Forwards `idled`/`resumed` straight to the async side, tagged with the `Duration` this
-/// listener was created for (this proxy's user-data, set at `get_idle_notification` time --
-/// see [`IdleController::register_threshold`]). A dropped receiver is not logged.
+/// Forwards `idled`/`resumed` with the listener's creation `Duration` from proxy user-data (set by
+/// [`IdleController::register_threshold`]). A dropped receiver is not logged.
 impl Dispatch<ExtIdleNotificationV1, Duration> for WaylandThreadState {
     fn event(
         state: &mut Self,
@@ -122,33 +117,28 @@ pub(crate) struct LiveNotify {
     pub(crate) connection: Connection,
     pub(crate) queue_handle: QueueHandle<WaylandThreadState>,
     pub(crate) registry: Arc<Mutex<NotifyRegistry>>,
-    /// Kept alive for the controller's whole lifetime -- dropping it would stop the dispatch
-    /// thread. Never joined on shutdown.
+    /// Keeps the dispatch thread alive; never joined on shutdown.
     #[allow(dead_code)]
     dispatch_thread: std::thread::JoinHandle<()>,
 }
 
 pub(crate) enum NotifyState {
     Live(LiveNotify),
-    /// `ext_idle_notifier_v1`/`wl_seat` weren't advertised, or the dedicated Wayland connection
-    /// failed to establish -- degrade to inert, don't take the Supervisor down (ADR-0032).
+    /// Protocols were absent or the dedicated connection failed; degrade to inert, not Supervisor
+    /// failure (ADR-0032).
     Inert,
 }
 
-/// The channel [`connect_wayland_idle`] hands back: raw, not-yet-fanned-out `(Duration,
-/// IdleState)` events, one per fired `idled`/`resumed` on any live listener.
+/// Raw, not-yet-fanned-out `(Duration, IdleState)` events from [`connect_wayland_idle`], one per
+/// `idled`/`resumed` on a live listener.
 pub(crate) type RawIdleEventReceiver = UnboundedReceiver<(Duration, shared::IdleState)>;
 
-/// Establishes the Supervisor's own, separate Wayland connection (ADR-0010), binds `wl_seat`
-/// and `ext_idle_notifier_v1` at version 1, and spawns the dedicated dispatch thread
-/// (`wayland-client` 0.31's `blocking_dispatch` cannot run on the tokio executor -- ADR-0032).
-/// Returns the raw event receiver so the caller can wire up fan-out expansion against its own
-/// registry.
+/// Establishes the separate Wayland connection (ADR-0010), binds `wl_seat` and
+/// `ext_idle_notifier_v1` at version 1, and spawns its dispatch thread. `wayland-client` 0.31's
+/// `blocking_dispatch` cannot run on tokio (ADR-0032). Returns the raw receiver for fan-out.
 ///
-/// Genuinely blocking top to bottom -- never call this inline on the tokio executor;
-/// [`IdleController::new`] runs it inside `tokio::task::spawn_blocking`, bounded by
-/// [`IDLE_NOTIFY_SETUP_TIMEOUT`]. The error type is `Send + Sync` so the `Result` can cross
-/// that boundary.
+/// Blocking throughout: call only from [`IdleController::new`] inside `spawn_blocking`, bounded by
+/// [`IDLE_NOTIFY_SETUP_TIMEOUT`]. Its error is `Send + Sync` across that boundary.
 pub(crate) fn connect_wayland_idle()
 -> Result<(LiveNotify, RawIdleEventReceiver), Box<dyn std::error::Error + Send + Sync>> {
     let connection = Connection::connect_to_env()?;
@@ -161,13 +151,13 @@ pub(crate) fn connect_wayland_idle()
     let (raw_events_tx, raw_events_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut state = WaylandThreadState { raw_events_tx };
 
-    // One roundtrip so the freshly-bound proxies are fully live before this function hands them back.
+    // Roundtrip so freshly bound proxies are live before returning them.
     event_queue.roundtrip(&mut state)?;
 
     let dispatch_thread = std::thread::spawn(move || {
         loop {
             if event_queue.blocking_dispatch(&mut state).is_err() {
-                // connection died (compositor exited, socket closed); exit quietly rather than spin
+                // Compositor/socket died; exit quietly rather than spin.
                 break;
             }
         }
@@ -184,9 +174,8 @@ pub(crate) fn connect_wayland_idle()
     Ok((live, raw_events_rx))
 }
 
-/// Drains `raw_events_rx`, expanding each raw `(Duration, IdleState)` event into one
-/// [`shared::IdleEvent`] per `generation_id` registered against that duration (ADR-0032's
-/// fan-out), forwarding each to `events_tx` (drained by `main.rs`'s `select!` loop).
+/// Expands each raw `(Duration, IdleState)` into one [`shared::IdleEvent`] per registered
+/// `generation_id` (ADR-0032), forwarding them to `main.rs`'s `select!` channel.
 pub(crate) fn spawn_idle_event_forwarder(
     registry: Arc<Mutex<NotifyRegistry>>,
     gate: Arc<Mutex<super::gate::IdleGate>>,
@@ -198,9 +187,8 @@ pub(crate) fn spawn_idle_event_forwarder(
             let generation_ids = registry.lock().unwrap().fanout.get(&duration).cloned().unwrap_or_default();
             for generation_id in generation_ids {
                 let event = shared::IdleEvent { generation_id, threshold_sec: duration.as_secs(), state };
-                // Every threshold event passes the gate, which drops it while logind reports an
-                // idle inhibitor (ADR-0139). Here rather than at the listener, because the gate
-                // has to see the fanned-out event to know which pairs it owes a resume to.
+                // Gate after fan-out: it must see each pair to know which `Resumed` events it owes
+                // when an inhibitor arrives (ADR-0139).
                 let Some(event) = gate.lock().unwrap().observe(event) else { continue };
                 if events_tx.send(event).is_err() {
                     return;

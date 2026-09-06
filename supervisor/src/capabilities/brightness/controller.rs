@@ -1,5 +1,4 @@
-//! [`BrightnessController`]: the `oblisk.brightness` state owner and its one write action.
-//! Split from `brightness` -- see `brightness/mod.rs` for the module-level doc.
+//! [`BrightnessController`] owns `oblisk.brightness` and its write action.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,27 +11,23 @@ use udev::MonitorSocket;
 use super::super::read_attr;
 use super::super::scale::{percent_from_raw, raw_from_percent};
 
-/// `oblisk.brightness`'s full payload (§ 2.3). `percent` is the JSON key verbatim -- the
-/// Renderer routes it into the Lua `oblisk.brightness` signal table by name, unchanged.
-/// `Default` (`0`) is a placeholder before the first real read; never observed if no device
-/// was found, since no signal is sent in that case (see `brightness/mod.rs`).
+/// `oblisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
+/// key. `Default` (`0`) precedes the first read, but no-device construction emits no signal, so
+/// Lua never observes the placeholder (see `brightness/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
 pub struct BrightnessState {
-    /// Screen backlight, `0` to `100`. Read from sysfs `brightness`, the last requested value,
-    /// rather than `actual_brightness`, so it matches what was asked for instead of lagging
-    /// through a hardware fade.
+    /// Screen backlight, `0` to `100`, from sysfs `brightness` (the requested value), not
+    /// `actual_brightness`, which can lag during a hardware fade.
     pub percent: u8,
 }
 
-/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrightnessSignal {
     Changed,
 }
 
-/// § 2.3's device-selection preference: rank by `type` per
-/// `Documentation/ABI/stable/sysfs-class-backlight` -- firmware (0) < platform (1) < raw (2),
-/// unknown/missing last (3) rather than excluded.
+/// § 2.3 device preference from `Documentation/ABI/stable/sysfs-class-backlight`: firmware (0) <
+/// platform (1) < raw (2), with unknown/missing last (3), not excluded.
 fn device_type_rank(entry_dir: &Path) -> u8 {
     match read_attr(entry_dir, "type").as_deref() {
         Some("firmware") => 0,
@@ -42,15 +37,14 @@ fn device_type_rank(entry_dir: &Path) -> u8 {
     }
 }
 
-/// `max_brightness`, parsed; `0` (not `-1`) for a missing/unparseable reading -- the `> 0`
-/// filter in [`select_backlight_device`] treats every non-positive value as unusable.
+/// Parsed `max_brightness`; missing or malformed values become `0`, and the `> 0` filter in
+/// [`select_backlight_device`] rejects every non-positive value.
 fn read_max_brightness(entry_dir: &Path) -> i32 {
     read_attr(entry_dir, "max_brightness").and_then(|text| text.parse().ok()).unwrap_or(0)
 }
 
-/// Picks one backlight device under `backlight_root`: entries with `max_brightness > 0`
-/// (ADR-0053), ranked by [`device_type_rank`], ties broken by sorted
-/// directory name for a deterministic choice across boots. `None` if nothing qualifies.
+/// Picks one `max_brightness > 0` device (ADR-0053), ranked by [`device_type_rank`] and then
+/// sorted directory name for deterministic boot-to-boot selection. `None` if none qualifies.
 fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
     let mut entries: Vec<(PathBuf, i32)> = std::fs::read_dir(backlight_root)
         .ok()?
@@ -67,25 +61,22 @@ fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
     entries.into_iter().next()
 }
 
-/// `brightness.percent`: `brightness` (last requested value), not `actual_brightness`
-/// (hardware readback) -- they can differ during a driver fade or a rounded request, and a
-/// config that just called `set(50)` needs to see `50` come back. `0` on a missing/
-/// unparseable reading. `max` must be positive (guaranteed by [`select_backlight_device`]'s
-/// `> 0` filter), so the cast to `u8` is always in `[0, 100]`.
+/// Reads `brightness` (the last requested value), not `actual_brightness`: a driver fade or
+/// rounded request can differ, and `set(50)` must read back `50`. Missing/malformed reads are `0`.
+/// [`select_backlight_device`] guarantees positive `max`, so the `u8` result is `[0, 100]`.
 fn read_percent(device_dir: &Path, max: i32) -> u8 {
     let brightness = read_attr(device_dir, "brightness").and_then(|text| text.parse::<i32>().ok()).unwrap_or(0);
     percent_from_raw(brightness, max) as u8
 }
 
-/// `brightness:set(pct)`'s `arguments: [pct]`. No range check here (§ 3.2's `[0, 100]`) --
-/// clamping happens once, in `scale::raw_from_percent`.
+/// `brightness:set(pct)`'s `arguments: [pct]`; § 3.2 range validation is deferred to
+/// `scale::raw_from_percent`.
 pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
 
-/// `org.freedesktop.login1.Session.SetBrightness` on the fixed `session/auto` object path,
-/// which logind resolves to the caller's own session. Built fresh on each
-/// [`BrightnessController::set`] call rather than cached; this call is rare, not a hot path.
+/// `org.freedesktop.login1.Session.SetBrightness` on fixed `session/auto`, which logind resolves
+/// to the caller's session. Built per [`BrightnessController::set`] call because writes are rare.
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Session",
     default_service = "org.freedesktop.login1",
@@ -96,29 +87,22 @@ trait Login1Session {
     fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> zbus::Result<()>;
 }
 
-/// The device [`select_backlight_device`] chose at construction, resolved once -- a panel's
-/// `max_brightness` and sysfs directory don't change at runtime. `name` is cached since
-/// `set`'s `SetBrightness` call needs it on every call.
+/// The device [`select_backlight_device`] chose at construction. Its `max_brightness` and sysfs
+/// directory do not change at runtime; `name` is cached for each `SetBrightness` call.
 struct BacklightDevice {
     dir: PathBuf,
     name: String,
     max: i32,
 }
 
-/// Cadence for the fallback path only. Mirrors `battery::controller::POLL_INTERVAL`'s value;
-/// not imported since it's a private constant there.
+/// Fallback cadence, matching private `battery::controller::POLL_INTERVAL`.
 ///
-/// ponytail: this constant is the visible tip of a larger duplicate. `battery` and `brightness`
-/// now have the same three-function shape (initial read, udev watch loop, poll fallback, each
-/// pushing only on a real change), differing only in what they read and what state they write.
-/// Two instances is not a pattern and extracting a generic sysfs-watch harness for two callers
-/// with different payload types would be building the abstraction before knowing its shape. The
-/// third sysfs-watched capability is the upgrade point: extract then, taking the read closure and
-/// the state type as parameters, and this constant goes with it.
+/// ponytail: `battery` and `brightness` duplicate the initial-read, udev-watch, poll-fallback
+/// shape, but only two callers have different payload types. Extract a harness at the third
+/// sysfs-watched capability, parameterized by the read closure and state type; move this constant
+/// with it.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// `Clone`: `main.rs`'s `brightness:set` dispatch needs a cheap `Arc`-backed copy to hand to
-/// the `tokio::spawn`ed task the D-Bus call runs in.
 #[derive(Clone)]
 pub struct BrightnessController {
     state: Arc<Mutex<BrightnessState>>,
@@ -127,13 +111,10 @@ pub struct BrightnessController {
 }
 
 impl BrightnessController {
-    /// `backlight_root` (real default `/sys/class/backlight`) is injected for testability.
-    /// `system_bus` is the Supervisor's already-established connection;
-    /// [`Login1SessionProxy`] rides it directly.
-    ///
-    /// Returns immediately. No usable device under `backlight_root` leaves `device` at
-    /// `None` and never spawns the read task -- no signal is ever sent in that case either
-    /// (see `brightness/mod.rs`).
+    /// `backlight_root` (default `/sys/class/backlight`) is injected for tests. `system_bus` is
+    /// the Supervisor's existing connection used by [`Login1SessionProxy`]. No usable device
+    /// leaves `device` as `None`, skips the read task, and emits no signal (see
+    /// `brightness/mod.rs`).
     pub fn new(
         backlight_root: PathBuf,
         system_bus: zbus::Connection,
@@ -160,8 +141,7 @@ impl BrightnessController {
         *self.state.lock().expect("brightness state mutex poisoned")
     }
 
-    /// `brightness:set(pct)`. A silent no-op (logged once) when this machine has no backlight
-    /// device.
+    /// `brightness:set(pct)`. Logs and returns when this machine has no backlight device.
     pub async fn set(&self, pct: u64) {
         let Some(device) = self.device.as_ref() else {
             eprintln!("brightness: set called but no backlight device was found; ignored");
@@ -175,20 +155,18 @@ impl BrightnessController {
             }
         };
         let raw = raw_from_percent(pct, device.max) as u32;
-        // logind refuses SetBrightness from a session that isn't the seat's active session
-        // (e.g. a background VT); that surfaces as an `Err` here and is logged, not retried.
+        // logind refuses SetBrightness from a non-active session (for example a background VT).
+        // Log that error; do not retry it.
         if let Err(err) = proxy.set_brightness("backlight", &device.name, raw).await {
             eprintln!("brightness: SetBrightness(backlight, {}, {raw}) failed: {err}", device.name);
         }
-        // No optimistic local update: state changes flow through the signal, off the udev
-        // watch/poll loop.
+        // State changes arrive through the udev watch/poll loop, not an optimistic local update.
     }
 }
 
-/// Reads the initial percent, sends it, then hands off to [`run_brightness_watch_loop`].
-/// Falls back to [`run_brightness_poll_loop`] only if [`build_backlight_watch`] fails to
-/// stand up. This task only spawns once [`select_backlight_device`] already found a usable
-/// device, so there's no "stay at default forever" branch to reach here.
+/// Reads and sends the initial percent, then uses [`run_brightness_watch_loop`], falling back to
+/// [`run_brightness_poll_loop`] only when [`build_backlight_watch`] cannot start. Construction has
+/// already found a usable device, so this task cannot stay at the default forever.
 async fn run_brightness_task(
     device_dir: PathBuf,
     max: i32,
@@ -212,20 +190,17 @@ async fn run_brightness_task(
     }
 }
 
-/// Builds the `backlight` subsystem udev watch (same construction as
-/// `battery::controller::build_power_supply_watch`).
+/// Builds the `backlight` udev watch, like `battery::controller::build_power_supply_watch`.
 ///
-/// inotify does not fire reliably on a sysfs attribute write, confirmed via `udevadm monitor
-/// --udev --subsystem-match=backlight` while changing brightness, which does show a `change`
-/// uevent on the `backlight` subsystem.
+/// inotify misses sysfs attribute writes. `udevadm monitor --udev --subsystem-match=backlight`
+/// confirmed that brightness changes emit a `change` uevent on the `backlight` subsystem instead.
 fn build_backlight_watch() -> std::io::Result<AsyncFd<MonitorSocket>> {
     let socket = udev::MonitorBuilder::new()?.match_subsystem("backlight")?.listen()?;
     AsyncFd::new(socket)
 }
 
-/// Awaits the udev watch's fd becoming readable, drains pending netlink messages, then
-/// re-reads and pushes only on an actual change. Uses `readable_mut` (not `readable`) since
-/// only `udev`'s `send` feature is enabled, not `sync`.
+/// Awaits a readable udev fd, drains netlink messages, then pushes only a changed reading. Uses
+/// `readable_mut`, not `readable`, because only udev's `send` feature is enabled, not `sync`.
 async fn run_brightness_watch_loop(
     mut watch: AsyncFd<MonitorSocket>,
     device_dir: PathBuf,
@@ -258,8 +233,7 @@ async fn run_brightness_watch_loop(
     }
 }
 
-/// The fallback path: re-reads on a fixed timer instead of a real event, same push-on-change
-/// filter as the primary path.
+/// Fallback: fixed-timer reads with the primary path's push-on-change filter.
 async fn run_brightness_poll_loop(
     device_dir: PathBuf,
     max: i32,
@@ -295,8 +269,6 @@ mod tests {
         }
     }
 
-    // ---- device_type_rank ----
-
     #[test]
     fn device_type_rank_orders_firmware_before_platform_before_raw_before_unknown() {
         let root = tempfile::tempdir().unwrap();
@@ -309,8 +281,6 @@ mod tests {
         assert!(device_type_rank(&root.path().join("pf")) < device_type_rank(&root.path().join("rw")));
         assert!(device_type_rank(&root.path().join("rw")) < device_type_rank(&root.path().join("other")));
     }
-
-    // ---- select_backlight_device ----
 
     #[test]
     fn select_backlight_device_prefers_firmware_over_platform_over_raw() {
@@ -352,8 +322,6 @@ mod tests {
         assert_eq!(select_backlight_device(&root.path().join("does-not-exist")), None);
     }
 
-    // ---- read_percent ----
-
     #[test]
     fn read_percent_reads_the_requested_brightness_not_the_actual_one() {
         let root = tempfile::tempdir().unwrap();
@@ -372,8 +340,6 @@ mod tests {
         assert_eq!(read_percent(&root.path().join("bad_attr"), 100), 0);
     }
 
-    // ---- parse_set_args ----
-
     #[test]
     fn parse_set_args_reads_the_first_argument_as_a_percent() {
         let args = vec![serde_json::json!(42)];
@@ -386,8 +352,6 @@ mod tests {
         let args = vec![serde_json::json!("not a number")];
         assert_eq!(parse_set_args(&args), None);
     }
-
-    // ---- BrightnessController (construction/task wiring) ----
 
     async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
         let (a, b) = tokio::net::UnixStream::pair().expect("failed to create a unix socket pair");
@@ -428,8 +392,7 @@ mod tests {
 
         let controller = BrightnessController::new(root.path().to_path_buf(), caller_side, events_tx);
 
-        // No device means `new` never spawns the read task, so `events` is dropped at the end
-        // of `new` -- `recv` returns `None` immediately rather than hanging.
+        // No device means `new` drops `events`; `recv` returns `None` instead of hanging.
         let signal = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv()).await;
         assert_eq!(signal, Ok(None), "no device means no signal is ever sent, not even the default state");
         assert_eq!(controller.snapshot(), BrightnessState::default());

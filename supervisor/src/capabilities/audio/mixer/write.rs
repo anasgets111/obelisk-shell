@@ -1,7 +1,6 @@
-//! The write half of § 3.2's audio actions: applies one `AudioCommand` against the live
-//! `MixerState` maps `registry` populated. No optimistic state update anywhere here -- a
-//! successful write comes back as a `param`/`property` event on `registry`'s own listener,
-//! which publishes the new value, same as a change from `wpctl` or a headset button.
+//! Applies § 3.2 `AudioCommand`s against live `MixerState` maps. Writes are not optimistic:
+//! success returns through `registry`'s `param`/`property` listener, like `wpctl` or a headset
+//! button change.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,14 +17,9 @@ use super::state::{
 /// dump (`type:'Spa:String:JSON'`) rather than inferred from the value looking like JSON.
 const METADATA_JSON_TYPE: &str = "Spa:String:JSON";
 
-/// Applies one [`AudioCommand`] on the PipeWire loop's own thread. Every arm resolves its target
-/// against the live maps first and logs rather than guessing when it cannot: a registry id a
-/// config read moments ago can name a different node by the time the command lands, because
-/// PipeWire recycles ids.
-///
-/// No optimistic state update anywhere here. A successful write comes back as a `param` or
-/// `property` event on the same loop, which publishes the new value -- also what makes a volume
-/// changed by `wpctl` or a headset button look identical to one this shell asked for.
+/// Applies one [`AudioCommand`] on the PipeWire thread. Every arm resolves its target against live
+/// maps first and logs rather than guessing when it cannot. Stale ids matter because PipeWire
+/// recycles them. Results return through the same-loop event.
 pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioCommand) {
     match command {
         AudioCommand::SetMasterVolume(volume) => set_default_volume(state, DefaultDevice::Sink, volume),
@@ -45,15 +39,14 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
             };
             write_node_props(state, id, Some(channel_volumes), None);
         }
-        // No app_props lookup, same reason SetMasterMuted has none: a mute write needs no
-        // channel count. write_node_props already refuses an id with no bound node.
+        // Mute needs no channel count; write_node_props still rejects an unbound id.
         AudioCommand::SetAppMuted { id, muted } => write_node_props(state, id, None, Some(muted)),
         AudioCommand::SetDefaultSink(id) => write_default_device(state, DefaultDevice::Sink, id),
         AudioCommand::SetDefaultSource(id) => write_default_device(state, DefaultDevice::Source, id),
     }
 }
 
-/// `set_volume`/`set_source_volume`: the default device of one direction takes a new level.
+/// Sets one direction's default volume.
 fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volume: f32) {
     let Some((node_id, current)) = resolve_default(state, kind) else {
         eprintln!("audio: a {kind:?} volume of {volume} has no resolved default device to write to; ignored");
@@ -68,9 +61,8 @@ fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volu
     write_device_volume(state, kind, node_id, Some(channel_volumes), None);
 }
 
-/// `set_muted`/`toggle_mute` and their source twins. `None` toggles: a toggle needs the current
-/// mute, which the resolved `Props` carry; a set needs only the node, since a mute write carries
-/// no `channelVolumes` and so no channel count.
+/// Sets or toggles one direction's mute. `None` toggles using resolved `Props`; a set needs no
+/// channel count because mute carries no `channelVolumes`.
 fn set_default_muted(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, muted: Option<bool>) {
     let Some((node_id, current)) = resolve_default(state, kind) else {
         eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
@@ -79,9 +71,9 @@ fn set_default_muted(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, muted
     write_device_volume(state, kind, node_id, None, Some(muted.unwrap_or(!current.mute)));
 }
 
-/// One direction's default node id and its last-read `Props`, or `None` when none has resolved
-/// yet (the same window `master::compute_master` falls back over). Cloned out from behind the
-/// `RefCell`, not held across the write, because the write borrows the same state again.
+/// Resolves one direction's node and last-read `Props`, or `None` while unresolved, in the same
+/// window [`master::compute_master`] falls back to its default. Clones them out before writing
+/// because the write borrows the same `RefCell` again.
 fn resolve_default(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Option<(u32, master::RawSinkProps)> {
     let state = state.borrow();
     let entries = state.device_entries(kind);
@@ -93,18 +85,11 @@ fn resolve_default(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Opti
     Some((node_id, current))
 }
 
-/// Writes a sink's or source's volume and mute, through whichever object actually owns them.
-///
-/// **A sink backed by hardware does not own its own volume, and writing its node's `Props`
-/// succeeds and does nothing.** Found by running it, not by reading: `pw-cli set-param 59 Props
-/// '{ mute: true }'` against this machine's analog sink was accepted and had no effect, while the
-/// same write against a stream node worked immediately. The volume lives on the ALSA `Device`'s
-/// `Route` param, which the node's `channelVolumes` only mirrors, restored the moment anything
-/// writes over it. `pw-cli set-param 49 Route '{ index: 2, device: 7, props: { channelVolumes:
-/// [...] }, save: true }'` moved the volume; that is what this builds.
-///
-/// So the route path is used whenever one is known, and the node path is the fallback for a sink
-/// with no device behind it (a virtual or null sink), where the node really is the owner.
+/// Writes through the owning object. A hardware sink's node `Props` accepts
+/// `pw-cli set-param 59 Props '{ mute: true }'` but does nothing, while a stream write works;
+/// the volume lives on the ALSA `Device` `Route`, and node `channelVolumes` only mirrors it.
+/// Live `pw-cli set-param 49 Route '{ index: 2, device: 7, props: { channelVolumes: [...] },
+/// save: true }'` moved the volume. Use a known route, or node `Props` for virtual/null sinks.
 fn write_device_volume(
     state: &Rc<RefCell<MixerState>>,
     kind: DefaultDevice,
@@ -119,13 +104,9 @@ fn write_device_volume(
     }
 }
 
-/// Sends one `SPA_PARAM_Route` object to the ALSA device behind a sink, carrying the volume and
-/// mute in its nested `props`. `save: true` matches what every other mixer writes, and is what
-/// makes the setting survive the device being re-plugged.
-///
-/// The route `index` is not guessable: a card publishes several routes and only its own `Route`
-/// param says which one is active for a given `card.profile.device`. Without that index the
-/// write goes to the wrong route or to none.
+/// Sends `SPA_PARAM_Route` with nested `props`; `save: true` survives re-plug. The `index` is not
+/// guessable: cards publish several routes, and only `Route` reports the active one for a given
+/// `card.profile.device`; without it the write goes nowhere or to the wrong route.
 fn write_device_route(
     state: &Rc<RefCell<MixerState>>,
     node_id: u32,
@@ -158,12 +139,9 @@ fn write_device_route(
     device.set_param(pw::spa::param::ParamType::Route, 0, pod);
 }
 
-/// Sends one `SPA_PARAM_Props` object to a node. The write that works for a stream, and the
-/// fallback for a sink or source with no hardware device behind it (see [`write_device_volume`]).
-///
-/// The serialized bytes are held in a local for the whole call: `Pod::from_bytes` borrows them,
-/// and `set_param` reads through that borrow into C, so letting the `Vec` drop early would hand
-/// PipeWire a dangling pointer.
+/// Sends `SPA_PARAM_Props` to a stream or a node-owned sink/source. Keep serialized bytes local:
+/// `Pod::from_bytes` borrows them and `set_param` reads that borrow into C; dropping the `Vec`
+/// early would hand PipeWire a dangling pointer.
 fn write_node_props(
     state: &Rc<RefCell<MixerState>>,
     node_id: u32,
@@ -191,10 +169,9 @@ fn write_node_props(
     node.set_param(pw::spa::param::ParamType::Props, 0, pod);
 }
 
-/// `audio:set_default_sink(id)`/`set_default_source(id)`. The metadata keys name a device by
-/// `node.name`, not by registry id, so the id a config read off § 2.4's array is translated back
-/// through the same entry that produced it. `subject` is `0`, what a system-wide default is
-/// keyed under (`pw-metadata`'s own dump shows `update: id:0 key:'default.audio.sink'`).
+/// Writes `audio:set_default_sink/source(id)`. Metadata names devices by `node.name`, so an id
+/// read from § 2.4's array is translated through its tracked entry. System-wide defaults use `0`
+/// (`pw-metadata` shows `update: id:0 key:'default.audio.sink'`).
 fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id: u32) {
     let state = state.borrow();
     let node_name = match kind {

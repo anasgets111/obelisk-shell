@@ -1,14 +1,10 @@
--- The notification feed as a list, which is the half of § 2.7 the popup is not. The popup shows the
--- newest few for as long as the Supervisor keeps them; this is where all of them are.
+-- The list half of § 2.7: the popup shows the newest few for as long as the Supervisor keeps them;
+-- this shows the whole feed.
 --
--- Needed a scrolling container to exist at all: a feed is however many notifications have arrived,
--- so a fixed panel could show the first four and clip the rest with no way to reach them
--- (ADR-0069).
+-- A feed needs scrolling; a fixed panel showed four and clipped the rest (ADR-0069).
 --
--- The rows used to be `panel_row`s -- an icon, a title, a subtitle -- and are now the same
--- `components/notification_card.lua` the popup draws, so an action button, a reply and an expanded
--- body work here too. What is left in this file is the header, the do-not-disturb toggle, and the
--- sectioned list.
+-- Rows use the popup's `components/notification_card.lua`, so actions, replies, and expanded bodies
+-- work here too. This file owns the header, DND toggle, and sectioned list.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -26,10 +22,9 @@ local function feed(n)
     return (n and n.feed) or {}
 end
 
--- What the history lists: everything but the transients (ADR-0100), grouped by application and
--- split into "urgent" / "today" / "yesterday" / "earlier" sections. `oblisk.applications` is a
--- dependency because a group named by its desktop file reads the installed application's own name
--- and icon (ADR-0101); `oblisk.system` because "today" moves at midnight.
+-- List non-transients (ADR-0100), grouped by application into "urgent" / "today" / "yesterday" /
+-- "earlier". `oblisk.applications` supplies desktop-file names/icons (ADR-0101); `oblisk.system`
+-- moves "today" at midnight.
 local sections = computed({ oblisk.notifications, oblisk.applications, oblisk.system }, function(n, applications, s)
     local groups = util.group_notifications(feed(n), applications, { skip_transient = true })
     return util.notification_sections(groups, (s and s.time) or 0)
@@ -45,9 +40,7 @@ local function kept(n)
     return count
 end
 
--- The header's second line, the mirror's `historySummary`: how many, from how many applications,
--- and whether they are being silenced. A bare count said "5" and left the reader to guess five of
--- what; the mirror's phrasing answers that in the same width.
+-- `historySummary`: count, application count, and DND state. A bare "5" did not say five what.
 local function summary(n)
     local count, apps, seen = 0, 0, {}
     for _, notification in ipairs(feed(n)) do
@@ -75,9 +68,7 @@ local function summary(n)
 end
 
 local body = {
-    -- The same masthead the network and bluetooth panels open with: the bell on its plate, dim
-    -- while do-not-disturb has it silenced, the summary line under the title, and the two controls
-    -- at the edge.
+    -- Shared masthead shape: bell, DND-dimmed when silenced, summary, and two trailing controls.
     panel_header {
         title = "notifications",
         icon = oblisk.notifications:map(function(n)
@@ -88,9 +79,9 @@ local body = {
         end),
         subtitle = util.label(oblisk.notifications, summary),
         trailing = {
-            -- Do-not-disturb, the mirror's third bell state. The Supervisor's flag gates sound
-            -- (ADR-0033); the popup reads the same flag and stands down for everything but a
-            -- critical notification, so one toggle quiets both. Lit while on.
+            -- DND is the mirror's third bell state and this control is lit while on. The Supervisor
+            -- gates sound (ADR-0033), and the popup reads the same flag, standing down except for
+            -- critical notifications.
             icon_button(icons.bell_off, function()
                 local n = oblisk.notifications:get()
                 oblisk.notifications:invoke("set_dnd", not (n and n.dnd))
@@ -102,9 +93,9 @@ local body = {
                 end),
                 slot = "notification-dnd",
             }),
-            -- One `dismiss` per entry, because § 3.2 has no `dismiss_all`. Iterating a copy is
-            -- not needed here the way it is in `network_panel.lua`: nothing pushes a new feed
-            -- until this returns, so the list being walked cannot change underneath it.
+            -- One `dismiss` per entry; § 3.2 has no `dismiss_all`. No copy is needed: the feed
+            -- cannot
+            -- push until this callback returns, unlike `network_panel.lua`.
             icon_button(icons.clear_all, function()
                 for _, notification in ipairs(feed(oblisk.notifications:get())) do
                     oblisk.notifications:invoke("dismiss", notification.id)
@@ -114,18 +105,15 @@ local body = {
     },
     column {
         width = "Fill",
-        -- Same hold as the popup's stack and for the same reason (ADR-0094): a notification that
-        -- expired while you were reading the history of it would be the one place a list can
-        -- rearrange itself under a pointer with no input at all. A separate region from the
-        -- popup's, and the two never overlap -- they are different surfaces, so a pointer leaves
-        -- one before it enters the other.
+        -- Same hold as the popup (ADR-0094): expiry must not reorder the list under a pointer. The
+        -- history and popup regions are separate because their surfaces never overlap.
         hover = hover("notification_history_region"),
         on_hover = function(hovered)
             oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)
         end,
         children = {
-            -- As tall as its cards up to most of the screen, then a scrolling viewport (ADR-0110):
-            -- the mirror's `maxAvailableHeight`.
+            -- Card height up to the screen cap, then a scrolling viewport (ADR-0110), matching
+            -- `maxAvailableHeight`.
             list {
                 width = "Fill",
                 max_height = theme.notification_list_height,
@@ -136,9 +124,8 @@ local body = {
                     if item.kind == "header" then
                         return section_header(item.label)
                     end
-                    -- The lighter ground: this card sits inside a panel that is already glass, and
-                    -- the popup's heavier one over a wallpaper would read as a second sheet here.
-                    -- And a clock reading, which the popup does not carry: a history is about when.
+                    -- Lighter ground inside the glass panel; the popup's heavier ground would read
+                    -- as a second sheet. History also shows the time.
                     return notification_card(item, ui, { background = theme.GLASS_CONTENT, show_time = true })
                 end,
                 key = function(item)

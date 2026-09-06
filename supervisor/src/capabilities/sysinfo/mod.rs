@@ -1,4 +1,4 @@
-//! `oblisk.sysinfo` capability: CPU/RAM/swap/temperature telemetry, three independently
+//! `oblisk.sysinfo` provides CPU/RAM/swap/temperature telemetry with three independently
 //! Lua-configurable poll intervals (ADR-0035).
 
 pub mod controller;
@@ -8,16 +8,15 @@ pub mod temp;
 
 pub use controller::{SysinfoController, SysinfoSignal, parse_configure_args};
 
-/// Every action `oblisk.sysinfo:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Every action `oblisk.sysinfo:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SysinfoAction {
     Configure,
 }
 
-/// `oblisk.sysinfo`'s action dispatch (ADR-0037): `configure` is synchronous, so nothing here
-/// spawns -- it only rewrites the shared config under its lock and nudges the watch channels (ADR-0035).
+/// `configure` is synchronous: it rewrites shared config under its lock and nudges watch channels
+/// (ADR-0037, ADR-0035).
 pub fn dispatch(controller: &SysinfoController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<SysinfoAction>(params) else { return };

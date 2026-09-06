@@ -1,21 +1,18 @@
-//! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6) and `VirtualNode`, the loader's
-//! shallow, unvalidated table-to-Rust conversion.
+//! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6) and `VirtualNode`, the loader's shallow
+//! table-to-Rust conversion.
 //!
-//! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies every other key
-//! as-is into `properties`, and never recurses into a nested `children`/`child` table (that's
-//! reconciliation's job) or validates a value's shape, e.g. a `width` that's neither an integer
-//! nor `"Fill"` (that's the layout engine's, the only real consumer of typed properties).
+//! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies other keys unchanged,
+//! never recurses into `children`/`child` (reconciliation's job), and does not validate shapes such
+//! as `width` being an integer or `"Fill"` (the layout engine is the only typed-property consumer).
 
 use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's eight geometric nodes plus all four top-level surface roles a config declares under § 6:
-/// `panel`, `window`, `popup` and `lock` (ADR-0040: surface *roles*;
-/// "surface" is the umbrella term). `lock` joined under ADR-0052 decision 2: a constructor only
-/// decides where a declaration is *written*, separate (ADR-0049) from when the Wayland object
-/// exists. `window`/`popup` own no `xdg_toplevel`/`xdg_popup` until `visible`; `lock`'s trigger
-/// is the compositor's `locked` event instead.
+/// § 5.2's eight geometric nodes plus § 6's four root roles: `panel`, `window`, `popup`, `lock`
+/// (ADR-0040). `lock` joined under ADR-0052 decision 2: declaration location is separate from
+/// Wayland
+/// object lifetime (ADR-0049); `window`/`popup` wait for `visible`, `lock` for compositor `locked`.
 const NODE_KINDS: [&str; 13] = [
     "rect",
     "row",
@@ -32,8 +29,8 @@ const NODE_KINDS: [&str; 13] = [
     "lock",
 ];
 
-/// The § 5.1 properties every kind takes, surface roles included: geometry, identity and the two
-/// flags. `layout::scene` reads these off any node it resolves without asking what kind it is.
+/// § 5.1 properties every kind, including surface roles, takes: geometry, identity, and two flags.
+/// `layout::scene` reads them without checking kind.
 const COMMON_PROPERTIES: &[&str] = &[
     "align_h",
     "align_v",
@@ -51,39 +48,36 @@ const COMMON_PROPERTIES: &[&str] = &[
     "width",
 ];
 
-/// What every kind that paints as a box takes on top of [`COMMON_PROPERTIES`]: the fill, then the
-/// border. This is `node::paint_style`'s first match arm: `row`, `column` and `button` paint no
-/// differently from a `rect`, and neither do the four § 6 surface roles.
+/// Box-paint properties beyond [`COMMON_PROPERTIES`]. `node::paint_style`'s first arm paints
+/// `row`, `column`, `button`, `rect`, and all four § 6 roles alike.
 const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "clip", "radius"];
 
 /// Which kinds that arm covers.
 const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "window", "popup", "lock"];
 
-/// What each `kind` accepts beyond the two lists above, and why [`deserialize_lua_table`] can
-/// reject an unknown key at all: before this, a misspelled `aling_v = "Center"` was copied into
-/// `properties` and read by nothing, so the node silently didn't centre.
+/// Per-kind properties beyond the common and box lists. This rejects unknown keys; before it,
+/// misspelled `aling_v = "Center"` was copied, read by nothing, and silently failed to centre.
 ///
-/// ponytail: hand-written, because a node's schema is not a type: it's ~60 `properties.get("...")`
-/// calls across `layout/node/`, `layout/scene.rs` and `wayland/`, each with its own defaulting and
-/// coercion, guarded against drift by `every_property_a_parser_reads_is_accepted` and
-/// `the_stubs_declare_the_same_properties`. Upgrade path: a per-kind props struct, a rewrite.
+/// ponytail: hand-written because schema is ~60 `properties.get("...")` calls across
+/// `layout/node/`, `layout/scene.rs`, and `wayland/`, each with its own defaulting/coercion.
+/// Guards:
+/// `every_property_a_parser_reads_is_accepted`, `the_stubs_declare_the_same_properties`. Upgrade:
+/// per-kind props structs, which means rewriting the parsers.
 ///
-/// A name here that no parser reads yet is deliberate: `textfield`'s `on_change`/`on_submit` are
-/// typed to ADR-0027's shape while `zwp_text_input_v3` is unwired; rejecting them would fail a
-/// config written against the documented API.
+/// Deliberate parser-less names: `textfield`'s `on_change`/`on_submit` follow ADR-0027 while
+/// `zwp_text_input_v3` is unwired; rejecting them would break documented configs.
 const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("rect", &["children"]),
     ("row", &["children", "scroll", "spacing"]),
     ("column", &["children", "scroll", "spacing"]),
     ("text", &["content", "elide", "font_size", "foreground", "max_lines", "on_link", "text_align", "wrap"]),
-    // `foreground` means what CSS `color` means: what a `currentColor` fill in the resolved SVG
-    // resolves to (ADR-0072). A full-colour icon names no `currentColor`, so this is always safe.
+    // `foreground` is CSS `color`: the resolved SVG's `currentColor` fill (ADR-0072). Full-colour
+    // icons name no `currentColor`, so this is safe.
     ("icon", &["foreground", "name", "size"]),
     ("image", &["async", "fit", "source"]),
     ("button", &["children", "on_click", "on_drag", "on_wheel", "submit"]),
     ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),
-    // `font_size`, `foreground` and `text_align` are the text half `node::paint_style` reads off a
-    // `textfield` too: it draws either its placeholder or its masked content.
+    // `node::paint_style` reads these for `textfield`, which draws a placeholder or masked content.
     (
         "textfield",
         &[
@@ -119,9 +113,8 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("lock", &["child"]),
 ];
 
-/// Whether `kind` accepts `property`. An unknown `kind` accepts everything: it's a new
-/// constructor whose [`NODE_PROPERTIES`] row isn't written yet, and refusing it all would be
-/// worse than the silence this replaces.
+/// Whether `kind` accepts `property`. Unknown kinds accept all properties until their
+/// [`NODE_PROPERTIES`] row is written; rejecting all would be worse than the silence being fixed.
 fn accepts(kind: &str, property: &str) -> bool {
     let Some((_, own)) = NODE_PROPERTIES.iter().find(|(name, _)| *name == kind) else {
         return true;
@@ -131,7 +124,7 @@ fn accepts(kind: &str, property: &str) -> bool {
         || (BOX_KINDS.contains(&kind) && BOX_PROPERTIES.contains(&property))
 }
 
-/// Every property `kind` accepts, sorted, for the error message.
+/// Accepted properties, sorted for errors.
 fn accepted_properties(kind: &str) -> Vec<&'static str> {
     let mut names: Vec<&'static str> =
         NODE_PROPERTIES.iter().find(|(name, _)| *name == kind).map_or_else(Vec::new, |(_, own)| own.to_vec());
@@ -143,8 +136,8 @@ fn accepted_properties(kind: &str) -> Vec<&'static str> {
     names
 }
 
-/// A Lua node table, tagged with its constructor's `kind` and carrying every other prop
-/// untouched. Not the final in-memory scene node. See the module doc comment.
+/// Lua node table tagged with `kind`, carrying other properties unchanged. Not the final scene
+/// node.
 #[derive(Debug, Clone)]
 pub struct VirtualNode {
     pub kind: String,
@@ -159,14 +152,13 @@ pub enum DeserializeError {
     MissingKind,
     #[error("node table's `kind` field is not a string")]
     KindNotAString,
-    /// A key no parser of this `kind` reads. Rejected rather than copied through: see
-    /// [`NODE_PROPERTIES`].
+    /// A key no parser for this `kind` reads; rejected instead of copied through
+    /// ([`NODE_PROPERTIES`]).
     #[error("`{kind}` has no property `{property}`; it accepts {accepted}")]
     UnknownProperty { kind: String, property: String, accepted: String },
 }
 
-/// Registers every [`NODE_KINDS`] entry as Lua-callable sugar: each takes the props table Lua
-/// passed and tags it with `kind`. One loop, so adding a role is one edit.
+/// Registers each [`NODE_KINDS`] entry as a constructor that tags its props table with `kind`.
 pub fn register_node_constructors(lua: &Lua) -> mlua::Result<()> {
     for kind in NODE_KINDS {
         lua.globals().set(
@@ -233,8 +225,7 @@ mod tests {
         assert_eq!(table.get::<String>("background").unwrap(), "#11111B");
     }
 
-    /// The silence this replaces: `aling_v` was copied into `properties`, read by nothing, and
-    /// the node just did not centre.
+    /// Previously `aling_v` was copied, read by nothing, and silently failed to centre.
     #[test]
     fn a_misspelled_property_is_refused_and_the_message_names_what_the_kind_takes() {
         let lua = lua_with_constructors();
@@ -246,7 +237,7 @@ mod tests {
         assert!(err.contains("align_v"), "and the ones it accepts, so the typo is visible: {err}");
     }
 
-    /// The per-kind half. `layer` is real § 6 topology, and meaningless on a `rect`.
+    /// Per-kind check: `layer` is § 6 topology, not a `rect` property.
     #[test]
     fn a_property_of_another_kind_is_refused_too() {
         let lua = lua_with_constructors();
@@ -254,8 +245,7 @@ mod tests {
         assert!(deserialize_lua_table(&table).unwrap_err().to_string().contains("layer"));
     }
 
-    /// A surface root takes the § 5.1 base properties and paints like a rect, so neither half is
-    /// refused on one.
+    /// A surface root takes § 5.1 base and box properties, like `rect` paint.
     #[test]
     fn a_surface_root_takes_the_base_properties_and_the_box_ones() {
         let lua = lua_with_constructors();
@@ -312,8 +302,7 @@ mod tests {
 
     #[test]
     fn window_and_popup_are_constructors_a_config_can_call() {
-        // Named explicitly rather than left to the loop above, since the loop passes whatever
-        // the array happens to hold.
+        // Explicitly named; the loop would pass whatever the array contains.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"window") && NODE_KINDS.contains(&"popup"));
         let table: Table = lua.load(r#"return popup { id = "menu", parent = "bar" }"#).eval().unwrap();
@@ -323,8 +312,9 @@ mod tests {
 
     #[test]
     fn image_is_a_constructor_and_is_the_one_kind_section_5_2_does_not_list() {
-        // ADR-0054 decision 3 adds this outside § 5.2's eight; pinned by name so an edit
-        // that dropped it would fail loudly rather than take the wallpaper with it silently.
+        // ADR-0054 decision 3 adds this outside § 5.2's eight; pin the name so dropping it fails
+        // loudly
+        // instead of silently removing wallpaper support.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"image"));
         let table: Table = lua.load(r#"return image { source = "/tmp/wall.png", fit = "cover" }"#).eval().unwrap();
@@ -335,8 +325,7 @@ mod tests {
 
     #[test]
     fn lock_is_a_constructor_a_config_can_call_because_declaring_one_is_not_locking() {
-        // Pinned by name (ADR-0052 decision 2) rather than by the loop above, which would go
-        // on passing if a later edit dropped the entry.
+        // Pin by name (ADR-0052 decision 2); the loop could pass after this entry was dropped.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"lock"));
         let table: Table = lua.load(r#"return lock { id = "screen-lock" }"#).eval().unwrap();
@@ -345,16 +334,14 @@ mod tests {
     }
 }
 
-/// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` are hand-written and always will be. There is
-/// no type to generate them from: a node's schema is 29 scattered `properties.get("...")` calls
-/// across `layout/node/`, each validating one key inline, so the schema is control flow rather
-/// than data. `lua-meta/oblisk.lua` is the opposite case and is generated
-/// (`supervisor/src/stubs.rs`), because the capability payloads are real `Serialize` structs.
+/// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` stay hand-written: no type describes their 29
+/// scattered `properties.get("...")` calls across `layout/node/`, each validating inline.
+/// `lua-meta/oblisk.lua` is generated (`supervisor/src/stubs.rs`) because capability payloads are
+/// real `Serialize` structs.
 ///
-/// So this guard covers the hand-written half. It checks the roster, not the fields, which is the
-/// drift that actually happens: someone adds a node kind and forgets the stub. The capability
-/// check stays here too, because a config reaches `oblisk.<name>` through the same file and this
-/// crate is the one that owns `shared::Capability::ALL`'s Lua-side spelling.
+/// This guard covers the hand-written half, checking roster drift where a new kind lacks a stub;
+/// the capability check stays here because this crate owns `shared::Capability::ALL`'s Lua
+/// spelling.
 #[cfg(test)]
 mod meta_stub_tests {
     use std::collections::BTreeSet;
@@ -366,7 +353,7 @@ mod meta_stub_tests {
             .unwrap_or_else(|err| panic!("{} is missing or unreadable: {err}", path.display()))
     }
 
-    /// Every name a config can call as a node constructor, declared exactly once.
+    /// Every callable node constructor, exactly once.
     #[test]
     fn the_stubs_declare_every_node_kind_and_no_others() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
@@ -376,13 +363,10 @@ mod meta_stub_tests {
         assert_eq!(declared, expected, "lua-meta is out of step with NODE_KINDS");
     }
 
-    /// Every kind's `---@field` set, inherited classes folded in, against [`super::accepted_properties`].
-    ///
-    /// The stubs are what a config author sees in an editor, so a name here that the engine
-    /// refuses is worse than a missing one: the completion offers it and the config fails to
-    /// load. This ran red the day it was written -- `RowProps` declared no `background` while
-    /// `node::paint_style` has painted one since ADR-0068, and all four surface classes were
-    /// missing the `NodeBase` half they have always taken.
+    /// Every kind's inherited `---@field` set matches [`super::accepted_properties`]. Editor
+    /// stubs offering a refused name are worse than omission. This first ran red because `RowProps`
+    /// lacked `background` despite `node::paint_style` painting it since ADR-0068, and all four
+    /// surface classes lacked their long-standing `NodeBase` fields.
     #[test]
     fn the_stubs_declare_the_same_properties_the_engine_accepts() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
@@ -395,13 +379,10 @@ mod meta_stub_tests {
         }
     }
 
-    /// Every property name the parsers actually read has to be accepted by some kind, or that
-    /// parser is dead code reading a key `deserialize_lua_table` already refused.
-    ///
-    /// One-directional on purpose: a name in the table that no parser reads yet is fine and
-    /// deliberate (`textfield`'s `on_change`/`on_submit`, typed while `zwp_text_input_v3` is
-    /// unwired). A source grep, like `supervisor/src/stubs.rs`'s used to be, because a property
-    /// name lives in a string literal and not in a type.
+    /// Every parser-read property must be accepted by some kind, or deserialization refuses it
+    /// first. One-way by design: parser-less names remain allowed (`textfield`'s `on_change`/
+    /// `on_submit`, typed while `zwp_text_input_v3` is unwired). Source grep is needed because
+    /// property names live in string literals, not types.
     #[test]
     fn every_property_a_parser_reads_is_accepted_by_some_kind() {
         let accepted: BTreeSet<String> =
@@ -409,7 +390,7 @@ mod meta_stub_tests {
         let mut read = BTreeSet::new();
         for source in rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
             let text = std::fs::read_to_string(&source).expect("a source file this build compiled is readable");
-            // Below `#[cfg(test)]`, a fixture is free to name anything.
+            // Test fixtures below `#[cfg(test)]` may name anything.
             let production = text.split_once("\n#[cfg(test)]").map_or(text.as_str(), |(before, _)| before);
             read.extend(property_literals(production));
         }
@@ -477,8 +458,8 @@ mod meta_stub_tests {
         out
     }
 
-    /// The two shapes a property name is written in: `properties.get("x")`, and the `"x"` a
-    /// parser taking a property name is called with (`parse_align(properties, "align_v")`).
+    /// Property literals in `properties.get("x")` or as the named parser argument in
+    /// `parse_align(properties, "align_v")`.
     fn property_literals(text: &str) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         for (index, _) in text.match_indices("properties") {
@@ -501,26 +482,14 @@ mod meta_stub_tests {
         names
     }
 
-    /// Every type `lua-meta` declares, fed to the engine through a real `Scene::apply`.
-    ///
-    /// The other two tests here check *names*. This one checks the claims the names carry, which is
-    /// the half nothing checked until ADR-0081: 21 properties declared a type that refused a
-    /// binding the engine takes, and the stubs had said so for as long as they had existed.
-    ///
-    /// It runs in this direction only. A member the engine accepts and the stub omits is invisible
-    /// here, and is what `just types` catches from the other side by checking `dev-config` against
-    /// these same declarations. Together they close the loop: this proves the stub does not promise
-    /// what the engine refuses, and `just types` proves a config written to the stub compiles.
-    ///
-    /// All 455 of them, with no skips: a type `sample` has no row for fails the test rather than
-    /// passing quietly, so the table cannot rot into covering half the file.
-    ///
-    /// ponytail: this checks the types, it does not derive them. `lua-meta/nodes.lua` is still
-    /// hand-written, because a node's schema is 49 parse functions and 45 `properties.get` calls
-    /// across ten files rather than a type to hang a derive on. The upgrade path is a per-kind
-    /// props struct the parsers read fields off, which would make the file generable the way
-    /// `oblisk.lua` is; it is a rewrite of the parse layer, and it would trade this crate's
-    /// property-by-property error messages for serde's. Not worth it while this test holds.
+    /// Feeds every `lua-meta` type through a real `Scene::apply`. Names are checked elsewhere; this
+    /// catches type claims that the engine rejects, the ADR-0081 gap that once affected 21
+    /// properties. One-way by design: `just types` catches engine-accepted fields missing from the
+    /// stub by checking `dev-config`. All 455 types are sampled; missing `sample` rows fail.
+    /// ponytail: checks, does not derive. The node schema remains hand-written: 49 parse functions
+    /// and 45 `properties.get` calls across ten files. Upgrade to per-kind props structs, making
+    /// `nodes.lua` generable like `oblisk.lua`; that rewrites parsing and trades property-specific
+    /// errors for serde's. Not worth it while this test holds.
     #[test]
     fn every_type_the_stubs_declare_is_accepted_by_the_engine() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
@@ -532,27 +501,19 @@ mod meta_stub_tests {
         for kind in super::NODE_KINDS {
             let class = format!("{}Props", capitalize(kind));
             for (field, ty) in typed_fields(&classes, &class) {
-                // Split on `|` only when the spelling is a flat union. `constraint_adjustment` is
-                // `("SlideX"|"SlideY"|...)[]`, an array *of* a union, and splitting it yields
-                // fragments that are not types; an inline table shape holds `|` of its own. Those
-                // go in the sample table whole, or not at all. A bare `[]` suffix is fine to split
-                // around: `string|TextRun[]|Bound` is three types, one of them an array.
+                // Split only flat unions. `constraint_adjustment` is `("SlideX"|...)[]`, an array
+                // of a union, and inline table shapes contain their own `|`; keep those whole.
+                // `string|TextRun[]|Bound` is safe to split.
                 let members: Vec<&str> =
                     if ty.contains(['(', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
                 for member in members {
-                    // `Bound` is not a type of its own here, it is a carrier: the engine
-                    // resolves the handle and then applies the sibling member's rules to what came
-                    // out. So the probe wraps a sibling's sample rather than an arbitrary value,
-                    // which is the difference between testing `align_h = Bound` and testing
-                    // `align_h = <a signal holding 8>`.
-                    // `Bound` prefers to wrap a sibling, and only falls back to the field's own
-                    // sample when it has none. The order matters both ways: `image.source` is
-                    // `string|Bound` and wants a signal holding a string, while `list.source` is
-                    // `Bound` alone and wants one holding an array. Keying on the field first would
-                    // give both the array; keying on the wrap first would give both the string.
+                    // `Bound` carries a handle; the engine resolves it, then applies sibling rules.
+                    // Wrap a sibling sample, falling back to the field sample. Order is
+                    // load-bearing: `image.source` (`string|Bound`) needs a string signal, while
+                    // `list.source` (`Bound`) needs an array; field-first gives both arrays,
+                    // wrap-first both strings.
                     let literal = if member == "Bound" {
-                        // `ty.split` is safe here: a bracketed type never splits, so it never
-                        // reaches this branch with `member == "Bound"`.
+                        // Bracketed types never split, so cannot reach `Bound` here.
                         ty.split('|')
                             .filter(|m| *m != "Bound")
                             .find_map(|m| sample(&field, m))
@@ -578,8 +539,7 @@ mod meta_stub_tests {
             failures.len(),
             failures.join("\n")
         );
-        // A skip is a hole in the check, so it fails here rather than passing quietly. Adding a
-        // spelling to `sample` is how you close one; there is no arm for "cannot be probed".
+        // A skip is a hole, so fail; add its spelling to `sample`. No "cannot be probed" arm.
         assert!(
             unsampled.is_empty(),
             "{} declared type(s) have no sample, so nothing checked them. Add a row to `sample`:\n{}",
@@ -589,35 +549,31 @@ mod meta_stub_tests {
         assert_eq!(probed, 585, "the number of declared type members moved; confirm the change is intended");
     }
 
-    /// One Lua literal per declared type. `None` means "no sample", which skips rather than guesses.
-    ///
-    /// Takes the field name because two properties share a spelling and not a domain: `opacity` is
-    /// a `number` in `[0, 1]` where `size` is a `number` of pixels, and `border_color`'s `Edges`
-    /// holds colours where `margin`'s holds lengths. A type-only table would probe those with a
-    /// value the engine is right to refuse, and the test would be reporting itself.
+    /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when
+    /// spelling shares a type but not a domain: `opacity` is `[0, 1]`, `size` is pixels, and
+    /// `border_color`'s `Edges` holds colors while `margin`'s holds lengths.
     fn sample(field: &str, ty: &str) -> Option<String> {
         match (field, ty) {
             ("opacity", _) => return Some("0.5".to_string()),
             ("border_color", "BorderColors") => return Some("{ top = \"#112233\" }".to_string()),
             ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
-            // The inline table shapes, which have no alias to key off.
+            // Inline table shapes have no alias.
             ("anchor", shape) if shape.starts_with('{') => return Some("{ top = true, left = true }".to_string()),
             ("min_size" | "max_size", _) => return Some("{ width = 8, height = 8 }".to_string()),
             ("offset", _) => return Some("{ x = 1, y = 1 }".to_string()),
             ("secure_submit", _) => {
                 return Some("{ capability = \"lock\", action = \"authenticate\" }".to_string());
             }
-            // A callback: the parsers ask whether it is a function, not what its arity is. The two
-            // a `list` calls during layout are the exception, since it uses what comes back.
-            // Typed `Bound` with nothing beside it: these three take the handle itself.
+            // Parsers check callbacks only as functions, except `list`'s two layout calls, which
+            // use the return value. These three bare `Bound` fields take the handle itself.
             ("hover", _) => return Some("hover(\"probe\")".to_string()),
             ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
             ("source", "Bound") => return Some("SIGNAL_LIST".to_string()),
-            // The literal-array half of `list.source`: legal, and fixed for the life of the pass,
-            // which is why the signal beside it is what a real list uses (ADR-0113 decision 3).
+            // Literal-array `list.source` is fixed for the pass; real lists therefore use the
+            // adjacent signal (ADR-0113 decision 3).
             ("source", "any[]") => return Some("{ 1, 2 }".to_string()),
             ("itemfn", _) => return Some("function(item) return rect {} end".to_string()),
-            // `panel`/`lock`'s per-output builder (ADR-0121): the probe calls it with `"PROBE"`.
+            // `panel`/`lock` per-output builder (ADR-0121), called with `"PROBE"` here.
             ("child", shape) if shape.contains("fun(") => {
                 return Some("function(output) return rect {} end".to_string());
             }
@@ -642,13 +598,12 @@ mod meta_stub_tests {
                 }
                 "Align" => "\"Center\"",
                 "Cursor" => "\"pointer\"",
-                // No row for a bare `Bound`: the caller wraps a sibling member's sample instead,
-                // and the three properties typed `Bound` alone are handled by field above. A row
-                // here would shadow both and probe every property with the same wrong payload.
+                // No bare `Bound` row: callers wrap sibling samples, while the three bare fields
+                // are handled above. A row would shadow both and feed every property the wrong
+                // value.
                 "Rect" => "{ x = 0, y = 0, width = 1, height = 1 }",
                 "PopupAnchor" => "\"Top\"",
-                // A string-literal union: its first member stands for all of them, since the
-                // parser matches them in one `match`.
+                // First string-literal union member stands for all; the parser matches one `match`.
                 literal if literal.starts_with('"') => literal,
                 _ => return None,
             }
@@ -656,8 +611,8 @@ mod meta_stub_tests {
         )
     }
 
-    /// The properties each kind cannot be built without, so a probe of one optional field is not
-    /// rejected for the absence of a required one. Taken from the stubs' own non-optional fields.
+    /// Required properties per kind, so optional-field probes can build. Taken from non-optional
+    /// stub fields.
     fn required(kind: &str) -> &'static [(&'static str, &'static str)] {
         match kind {
             "panel" => &[("id", "\"probe\""), ("layer", "\"Top\"")],
@@ -674,9 +629,8 @@ mod meta_stub_tests {
         }
     }
 
-    /// What a *field* needs a sibling for, as opposed to what a [`required`] kind does. `on_hover`
-    /// is refused without a `hover` slot on the same node (ADR-0095), so probing it alone would be
-    /// testing the pairing rule rather than the type the stub declares for it.
+    /// Field companions, distinct from kind requirements. `on_hover` needs a same-node `hover`
+    /// slot (ADR-0095), or a probe tests pairing rather than its declared type.
     fn companions(field: &str) -> &'static [(&'static str, &'static str)] {
         match field {
             "on_hover" => &[("hover", "hover(\"probe\")")],
@@ -684,8 +638,8 @@ mod meta_stub_tests {
         }
     }
 
-    /// `kind { field = literal }` through `Scene::apply`, which is what actually calls all 49
-    /// parsers. A surface role is its own root; anything else hangs under a minimal `panel`.
+    /// Applies `kind { field = literal }` through `Scene::apply`, calling all 49 parsers. Surface
+    /// roles are roots; other kinds hang under a minimal `panel`.
     fn apply_one(kind: &str, field: &str, literal: &str) -> Result<(), String> {
         let mut props: Vec<String> = required(kind)
             .iter()
@@ -704,9 +658,8 @@ mod meta_stub_tests {
         let lua = mlua::Lua::new();
         super::register_node_constructors(&lua).map_err(|e| e.to_string())?;
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).map_err(|e| e.to_string())?;
-        // `state` rather than a bare `signal()`, because there is no such global: the five the
-        // engine registers are `state`, `computed`, `hover`, `hover_rect` and `scroll`, which is
-        // what `lua-meta/signals.lua` declares.
+        // Use `state`; no bare `signal()` global exists. The five registered globals are `state`,
+        // `computed`, `hover`, `hover_rect`, and `scroll`, matching `lua-meta/signals.lua`.
         let prelude = r#"
             local SIGNAL_LIST = state("probe_list", { 1, 2 })
         "#;
@@ -714,9 +667,8 @@ mod meta_stub_tests {
         let virtual_node = super::deserialize_lua_table(&table).map_err(|e| format!("{e:?}"))?;
         let mut scene = crate::layout::scene::Scene::new();
         let shaping = crate::text::shaping::ShapingHandle::spawn();
-        // `scene::tests::apply_at` is `pub(super)` and stays that way: widening a test helper's
-        // visibility to reach it from here is the move the `docs` baseline in the justfile exists to
-        // discourage. One instance, one output, which is all this probe needs.
+        // Keep `scene::tests::apply_at` `pub(super)`; widening a test helper is what the justfile's
+        // `docs` baseline discourages. One instance and output suffice for this probe.
         let declared = crate::layout::node::parse_surface_id(&virtual_node.properties).map_err(|e| format!("{e:?}"))?;
         let instances = [crate::layout::instance::SurfaceInstance {
             instance_id: format!("{declared}@PROBE"),
@@ -729,11 +681,10 @@ mod meta_stub_tests {
 
     const SURFACE_KINDS: [&str; 4] = ["panel", "window", "popup", "lock"];
 
-    /// One `---@class` as the checker needs it: its name, the classes it extends, and its own
-    /// `(field, declared type)` pairs in declaration order.
+    /// One `---@class`: name, parents, and own `(field, declared type)` pairs in order.
     type TypedClass = (String, Vec<String>, Vec<(String, String)>);
 
-    /// Like [`parse_classes`], keeping each field's declared type alongside its name.
+    /// [`parse_classes`] with each field's declared type.
     fn parse_typed_classes(source: &str) -> Vec<TypedClass> {
         let mut classes: Vec<TypedClass> = Vec::new();
         for line in source.lines() {
@@ -755,7 +706,7 @@ mod meta_stub_tests {
         classes
     }
 
-    /// One class's `(field, type)` pairs plus every parent's.
+    /// One class's pairs plus every parent's.
     fn typed_fields(classes: &[TypedClass], name: &str) -> Vec<(String, String)> {
         let Some((_, parents, own)) = classes.iter().find(|(class, ..)| class == name) else {
             panic!("lua-meta declares no `{name}` class");
@@ -768,17 +719,15 @@ mod meta_stub_tests {
         out
     }
 
-    /// Every `shared::Capability::ALL` name, as a field on the `Oblisk` class.
+    /// Every `shared::Capability::ALL` name as an `Oblisk` field.
     #[test]
     fn the_stubs_declare_every_capability_and_no_others() {
         let source = meta("oblisk.lua");
-        // The `---@field` block under `---@class Oblisk`, which is the namespace a config sees.
-        // Split on the trailing newline too, or this matches `---@class ObliskVersion` first.
+        // The `---@field` block under `---@class Oblisk`, not `ObliskVersion`.
         let class = source.split("---@class Oblisk\n").nth(1).expect("oblisk.lua declares an Oblisk class");
-        // The `oblisk` table's off-roster members, which have no `StateSnapshot` behind them and
-        // so no roster entry: see `lua::namespace::build`. `idle` left this list with ADR-0141 --
-        // it is a roster capability now, wrapped in its own userdata for the three methods whose
-        // callbacks cannot cross the wire.
+        // Off-roster members lack a `StateSnapshot` and roster entry (`lua::namespace::build`).
+        // `idle` left this list under ADR-0141: it is now a roster capability wrapped for three
+        // callbacks that cannot cross the wire.
         let off_roster = ["screens", "rescue", "version", "config_dir"];
         let declared: BTreeSet<&str> = class
             .lines()

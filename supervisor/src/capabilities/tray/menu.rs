@@ -1,5 +1,4 @@
-//! DBusMenu `GetLayout` reply parsing: recursive `zvariant::Value` walking into a [`MenuItem`] tree
-//! (ADR-0031: parsed by hand, recursively, from the raw zvariant Value).
+//! DBusMenu `GetLayout` parsing: recursive `zvariant::Value` walking into [`MenuItem`] (ADR-0031).
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
 use serde::Serialize;
@@ -7,39 +6,34 @@ use zbus::zvariant::Value;
 
 use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
 
-/// One node of a DBusMenu layout tree, already resolved into what `tray.items[].menu` needs
-/// (docs/oblisk-idl-api-specs.md §2.14).
+/// One DBusMenu layout node, resolved to `tray.items[].menu` (docs/oblisk-idl-api-specs.md §2.14).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MenuItem {
-    /// DBusMenu's own item id. What `tray:activate_menu_item` and `tray:menu_will_show` take.
+    /// DBusMenu item id used by `tray:activate_menu_item` and `tray:menu_will_show`.
     pub id: i32,
     /// `"standard"` or `"separator"`. A separator carries no label and is not clickable.
     pub menu_type: String,
-    /// The entry text, exactly as the application sent it. `nil` when it sent none, which is the
-    /// normal case on a separator. DBusMenu's `_` mnemonic markers are *not* stripped, so a label
-    /// can arrive as `"_Quit"`; strip it in the config if you do not want the underscore drawn.
+    /// Entry text exactly as sent, or `nil`. Separators normally have none. `_` mnemonic markers
+    /// remain, so `"_Quit"` is sent as-is; strip it in config if you do not want the underscore
+    /// drawn.
     pub label: Option<String>,
-    /// `false` for an entry the application has greyed out. Activating one is a no-op, so draw it
-    /// as unavailable rather than filtering it away: the gap is the application's own layout.
+    /// `false` for a greyed-out entry. Activation is a no-op; keep it to preserve the application's
+    /// layout instead of filtering it.
     pub enabled: bool,
-    /// A theme icon name for the entry, or `nil`. DBusMenu's pixmap form is not carried.
+    /// Theme icon name, or `nil`; DBusMenu pixmaps are not carried.
     pub icon_name: Option<String>,
     /// `"checkmark"`, `"radio"`, or `nil` for an entry that is not a toggle.
     pub toggle_type: Option<String>,
-    /// DBusMenu's own `0` off, `1` on, `-1` indeterminate. `nil` exactly when
-    /// [`MenuItem::toggle_type`] is, and `-1` for an item that declared a toggle type and then sent
-    /// no state, which is the same thing DBusMenu means by indeterminate.
+    /// DBusMenu state: `0` off, `1` on, `-1` indeterminate. `nil` exactly when
+    /// [`MenuItem::toggle_type`] is `nil`; a missing state with a toggle type becomes `-1`.
     pub toggle_state: Option<i32>,
-    /// Nested entries, recursive. The whole tree arrives in one `GetLayout(0, -1)` reply rather
-    /// than a submenu at a time, so this is populated without any `tray:menu_will_show` first.
-    /// Empty for a leaf, and also empty for a node past [`MAX_MENU_DEPTH`], whose children are
-    /// dropped with a line on stderr.
+    /// Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is
+    /// needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose
+    /// children are dropped with an stderr line.
     pub children: Vec<MenuItem>,
 }
 
-/// Unwraps a nested D-Bus variant (`Value::Value(Box<Value>)`) down to the real payload --
-/// DBusMenu's `av` (array-of-variant) children come back this way, one variant layer per
-/// element.
+/// Unwraps `Value::Value(Box<Value>)` layers; DBusMenu `av` children add one variant layer each.
 fn unwrap_variant<'a>(value: &'a Value<'_>) -> &'a Value<'a> {
     match value {
         Value::Value(inner) => unwrap_variant(inner),
@@ -75,22 +69,16 @@ fn dict_str_key<'a>(key: &'a Value<'_>) -> Option<&'a str> {
     }
 }
 
-/// Hard cap on [`parse_menu_node`]'s own recursion depth: a `GetLayout` reply's tree
-/// structure is controlled by whichever session-bus peer registered the tray item's `Menu`
-/// object, so a deeply nested but legally-encoded reply could otherwise stack-overflow this
-/// task via unbounded Rust recursion. Generous for any real, human-authored menu -- DBusMenu
-/// trees nested more than a handful of levels deep don't happen in practice.
+/// Recursion cap for [`parse_menu_node`]. A session-bus peer controls `GetLayout`, so an encoded
+/// deep tree could otherwise stack-overflow this task. 32 is generous; real menus rarely nest more
+/// than a handful of levels.
 const MAX_MENU_DEPTH: u32 = 32;
 
-/// Parses one `(ia{sv}av)`-shaped DBusMenu layout node -- `id`, its properties dict, and its
-/// `av` children array -- recursively into a [`MenuItem`] tree. `None` on any structural
-/// mismatch; a missing/malformed property falls back to its DBusMenu spec default rather
-/// than failing the whole node.
+/// Parses one `(ia{sv}av)` node recursively. `None` on structural mismatch; missing or malformed
+/// properties use DBusMenu defaults.
 ///
-/// `depth` is this node's own recursion depth (`0` for the tree's root). At
-/// [`MAX_MENU_DEPTH`], this node itself still parses normally, but its `children` are
-/// truncated to empty instead of recursing further -- logged, since a legitimate app should
-/// never hit this.
+/// `depth` is this node's depth (`0` at the root). At [`MAX_MENU_DEPTH`], this node still parses,
+/// but children become empty and the truncation is logged.
 pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem> {
     let structure = match unwrap_variant(value) {
         Value::Structure(structure) => structure,
@@ -283,10 +271,8 @@ mod tests {
 
     #[test]
     fn parse_menu_node_truncates_at_the_depth_cap_without_panicking_or_overflowing() {
-        // A chain well deeper than MAX_MENU_DEPTH: a malicious (or just buggy) GetLayout reply
-        // could hand this parser exactly this shape, and unbounded recursion through it is a
-        // stack-overflow DoS any session-bus peer registering a tray item's Menu object could
-        // otherwise trigger.
+        // A deeper chain models a malicious or buggy `GetLayout`; unbounded recursion would allow a
+        // stack-overflow DoS from any peer owning a tray item's `Menu` object.
         fn deep_chain(remaining: u32, id: i32) -> Value<'static> {
             if remaining == 0 {
                 menu_node_value(id, vec![], vec![])
@@ -297,7 +283,7 @@ mod tests {
 
         let root = deep_chain(MAX_MENU_DEPTH + 20, 0);
 
-        // Must complete (no panic, no stack overflow) and return a real, if truncated, tree.
+        // Must complete without panic or stack overflow and return the truncated tree.
         let item = parse_menu_node(&root, 0).expect("the root node itself must still parse");
 
         let mut current = &item;

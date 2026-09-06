@@ -1,21 +1,16 @@
--- A track that fills to a fraction and takes the pointer, `Components/Slider.qml`: drag anywhere
--- along it to set the value, roll the wheel over it to step. Built on `button`'s `on_drag` and
--- `on_wheel` (ADR-0116), which hand this the pointer in the track's own coordinates and the wheel
--- in notches; everything else here is arithmetic.
---
--- Two values are drawn from. While a drag is held the fill follows `pending`, a `state()` this
--- component owns, so the track tracks the finger without a round trip through the Supervisor per
--- pixel. On release `on_commit` is called once with where the drag ended, which is `Slider.qml`'s
--- `committed` and not a stream of writes. `pending` is kept until the capability's next snapshot
--- carries the value, cleared from a single `on_change` per slider name: clearing it on release
--- showed the old value for the frames the round trip through PipeWire takes, and a click flashed
--- new, old, new. A signal without `on_change` (a plain `state`) clears on release instead.
---
--- `pending` is a number because `state()` fixes a signal's type from its initial value and `nil`
--- has none; `-1` is "nothing held", a fraction never is.
---
--- `children` stack on top of the fill, so the volume pill is this component with its glyph and
--- percentage laid over the track, the way `Volume.qml` fills the whole control.
+-- Fraction-filled track matching `Components/Slider.qml`: drag anywhere to set the value and wheel
+-- to step. `button`'s `on_drag`/`on_wheel` provide track-local pointer coordinates and wheel
+-- notches
+-- (ADR-0116); the rest is arithmetic.
+-- During a drag, the fill follows owned `state()` `pending`, avoiding a Supervisor round trip per
+-- pixel. Release calls `on_commit` once at the final position, matching `Slider.qml`'s `committed`.
+-- Keep `pending` until the capability snapshot carries the value, then clear it from one
+-- `on_change` per slider name: clearing on release showed the old value during the PipeWire round
+-- trip and flashed new, old, new. A signal without `on_change` (plain `state`) clears on release.
+-- `pending` is numeric because `state()` fixes its signal type from the initial value and `nil` has
+-- none; `-1` means "nothing held", outside the fraction range.
+-- `children` stack over the fill, letting the volume pill lay its glyph and percentage over the
+-- track as `Volume.qml` fills the whole control.
 local theme = require("config.theme")
 
 ---@class SliderOpts
@@ -43,8 +38,7 @@ local function clamp(fraction)
     return math.max(0, math.min(1, fraction))
 end
 
--- The nearest of `steps` positions, so a drag that stopped at 79% commits 80% the way the mirror's
--- does, and a config reading the value back sees round numbers.
+-- Snap to the nearest `steps` position: a 79% drag commits 80%, as in the mirror.
 local function quantize(fraction, steps)
     if steps == nil or steps <= 0 then
         return clamp(fraction)
@@ -63,9 +57,8 @@ local function fraction_of(read, payload)
     return clamp(value)
 end
 
--- Slider names whose signal already has this component's `on_change`. A `list` rebuilds its rows,
--- and each rebuild constructs the slider again; the `state()` behind a name is one signal, so one
--- handler per name is enough and a second would only clear it twice.
+-- Names whose signal already has this component's `on_change`. A `list` rebuilds rows and sliders,
+-- but one named `state()` signal needs one handler; a second would clear it twice.
 local watched = {}
 
 ---@param opts SliderOpts
@@ -83,7 +76,7 @@ return function(opts)
                 return
             end
             local now = fraction_of(opts.read, current)
-            -- The commit landed, or someone else moved it; either way the snapshot is the truth again.
+            -- The commit landed, or another writer moved it; the snapshot is authoritative again.
             if quantize(now, steps) == held or now ~= fraction_of(opts.read, previous) then
                 pending:set(-1)
             end
@@ -138,7 +131,7 @@ return function(opts)
             end
             local held = pending:get()
             local current = held >= 0 and held or fraction_of(opts.read, opts.signal:get())
-            -- Onto the grid first, so a 79% set by another mixer steps to 80% and 85%, not 84%.
+            -- Snap first: a 79% value from another mixer steps to 80% then 85%, not 84%.
             local next_fraction = quantize(quantize(current, steps) + notches / steps, steps)
             if on_change then
                 pending:set(next_fraction)

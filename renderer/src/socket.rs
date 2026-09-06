@@ -1,15 +1,14 @@
-//! Renderer-side Unix control-socket client, and the `SupervisorFrame` handling hanging off it.
-//! Connects to `$XDG_RUNTIME_DIR/oblisk-shell.sock`; the Supervisor listens
-//! (`supervisor/src/socket.rs`) and gets a `shared::ConnectionHandshake` as the first frame.
-//! Two threads, two channels (ADR-0039): the socket thread only does framed I/O ([`pump`]); Lua
-//! state lives on the *Wayland* thread instead, since `mlua::Lua` is `!Send` and the paint pass
-//! owns the GL context. A `StateSnapshot` only hydrates a capability's signal and dirties the scene
-//! (ADR-0044 decision 2), then runs the config's `on_change` handlers for that capability
-//! (ADR-0115); only `Reevaluate` triggers a Lua evaluation, classified as `Unchanged`,
-//! `TopologyChanged` or `Failed` against `applied_topology`, `None` meaning "safe to apply", not
-//! "empty topology" (misclassifying a startup failure would blank the shell). A dropped
-//! connection is not reconnected (ADR-0059 decision 1): the Supervisor holds every capability,
-//! `process.run` child and PAM, so nothing here is left to reconnect with.
+//! Renderer-side Unix control-socket client and `SupervisorFrame` handling. Connects to
+//! `$XDG_RUNTIME_DIR/oblisk-shell.sock`; the Supervisor listens (`supervisor/src/socket.rs`) and
+//! sends `shared::ConnectionHandshake` first. Two threads/channels (ADR-0039): [`pump`] does
+//! framed I/O, while the Wayland thread owns Lua and the GL-context paint pass because
+//! `mlua::Lua` is `!Send`. `StateSnapshot` hydrates a capability signal and dirties the scene
+//! (ADR-0044 decision 2), then runs its `on_change` handlers (ADR-0115); only `Reevaluate` runs
+//! Lua,
+//! classifying against `applied_topology` as `Unchanged`, `TopologyChanged`, or `Failed`. `None`
+//! means "safe to apply", not "empty topology", or startup failure would blank the shell. No
+//! reconnect after disconnect (ADR-0059 decision 1): the Supervisor owns capabilities,
+//! `process.run` children, and PAM.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,14 +35,13 @@ use crate::lua::surfaces::{evaluate_and_specs, surface_specs};
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
-/// This Renderer's own generation id (`OBLISK_GENERATION_ID`, defaulting to `0`), stamped into
-/// the handshake and every outbound `CommandEnvelope`/`SecureSubmit`.
+/// This Renderer's generation id (`OBLISK_GENERATION_ID`, default `0`), stamped into the handshake
+/// and every outbound `CommandEnvelope`/`SecureSubmit`.
 pub fn generation_id_from_env() -> u32 {
     std::env::var(shared::GENERATION_ID_ENV).ok().and_then(|value| value.parse().ok()).unwrap_or(0)
 }
 
-/// Connects to `path` and sends the handshake identifying `generation_id`, returning the
-/// live stream on success.
+/// Connects to `path`, sends the `generation_id` handshake, and returns the live stream.
 async fn connect_and_handshake(
     path: &Path,
     generation_id: u32,
@@ -53,9 +51,9 @@ async fn connect_and_handshake(
     Ok(stream)
 }
 
-/// Spawns the dedicated connect-and-hold-open thread. A connection failure logs and drops
-/// `inbound_tx`, read by the Wayland thread as `Disconnected` (ADR-0059 decision 1). No startup
-/// race: `supervisor/src/main.rs` binds the control socket before spawning the first Renderer.
+/// Spawns the connect-and-hold-open thread. Failure logs and drops `inbound_tx`, which the Wayland
+/// thread reads as `Disconnected` (ADR-0059 decision 1). `supervisor/src/main.rs` binds first, so
+/// there is no startup race.
 pub fn spawn_client(
     generation_id: u32,
     inbound_tx: std::sync::mpsc::Sender<SupervisorFrame>,
@@ -63,9 +61,8 @@ pub fn spawn_client(
     waker: crate::wake::Waker,
 ) {
     std::thread::spawn(move || {
-        // Held for the thread's life, so however it ends (connection closed, runtime refused, a
-        // panic) the Wayland thread wakes to find `inbound_rx` disconnected rather than blocking
-        // on a poll nothing will ever satisfy (ADR-0124).
+        // Hold for the thread's life: connection close, runtime failure, or panic wakes Wayland to
+        // find `inbound_rx` disconnected, rather than blocking on an unsatisfiable poll (ADR-0124).
         let _wake_on_exit = crate::wake::WakeOnDrop(waker.clone());
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
             Ok(runtime) => runtime,
@@ -78,94 +75,87 @@ pub fn spawn_client(
     });
 }
 
-/// One connection's reload bookkeeping. `applied_topology` is this generation's surface topology,
-/// `None` only when nothing has evaluated yet (module doc comment). `pending` holds the
-/// evaluated-but-unapplied output/topology between an `Unchanged` `Reevaluate` and its
-/// `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve target (Supervisor
-/// services § 14.2), outliving its evaluation so a later push skips re-running `shell.lua`. mlua
-/// 0.12's `ValueRef` holds a `WeakLua`, so a retained `mlua::Value` doesn't keep the VM alive and
-/// panics via `ValueRef::to_pointer` on a dead state; `Lua` must outlive it, per Rust's field-drop
-/// order (see [`RendererClient`]).
+/// Reload state. `applied_topology` is this generation's topology and is `None` only before any
+/// evaluation. `pending` holds evaluated-but-unapplied output/topology between `Unchanged`
+/// `Reevaluate` and `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve
+/// target (Supervisor services § 14.2), retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef`
+/// holds `WeakLua`: a retained `mlua::Value` does not keep Lua alive and
+/// `ValueRef::to_pointer` panics after death, so Rust field-drop order must keep `Lua` last (see
+/// [`RendererClient`]).
 struct ReloadState {
     applied_topology: Option<Vec<SurfaceFingerprint>>,
     applied_output: Option<lua::LoadOutput>,
     pending: Option<(u64, lua::LoadOutput, Vec<SurfaceFingerprint>)>,
 }
 
-/// What one inbound [`SupervisorFrame`] still owes the Wayland thread after
-/// [`RendererClient::handle_frame`]. One enum, not an `Option<u64>` plus an out-parameter:
-/// `ActivateDraw` and `SetSessionLock` are the two frames whose work lives on
-/// `crate::wayland::App` (EGL/surface state for the first, SCTK's `SessionLockState` and lock
-/// surfaces for the second, ADR-0042), and two `Option`s could let a caller service both.
+/// What an inbound frame still owes Wayland after [`RendererClient::handle_frame`]. One enum avoids
+/// an `Option<u64>` plus out-parameter: `ActivateDraw` needs `crate::wayland::App`'s EGL/surface
+/// state; `SetSessionLock` needs SCTK `SessionLockState` and lock surfaces (ADR-0042). Two options
+/// could make a caller service both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
-    /// Fully serviced inside [`RendererClient::handle_frame`].
+    /// Fully serviced by [`RendererClient::handle_frame`].
     Handled,
-    /// Supervisor services § 14.2's `ActivateDraw`: draw the surface set, request presentation
-    /// feedback per surface, tagged with this nonce (`crate::wayland::App::activate_draw`).
+    /// Supervisor services § 14.2's `ActivateDraw`: draw surfaces and request per-surface
+    /// presentation feedback tagged with this nonce (`crate::wayland::App::activate_draw`).
     ActivateDraw(u64),
     /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
     /// (`crate::wayland::App::set_session_lock`).
     SetSessionLock(bool),
 }
 
-/// One generation's whole Lua side: the VM, the retained scene, the live signals, and reload
-/// bookkeeping, grouped to travel as one receiver. `!Send` deliberately: `crate::wayland::App`
-/// owns one directly (ADR-0039), so a Lua closure, a scene reconcile, and the EGL context are
-/// all reachable without a channel hop. **Field order is load-bearing: `loader` must stay
-/// last**, since almost every other field holds `mlua::Value`s that don't keep the VM alive (see
-/// [`ReloadState`]'s doc comment on `ValueRef`'s `WeakLua`); `loader` first would drop `Lua`
-/// before them and panic.
+/// One generation's Lua side: VM, retained scene, live signals, and reload state. Deliberately
+/// `!Send`; `crate::wayland::App` owns it directly (ADR-0039), so closures, reconcile, and EGL
+/// need no channel hop. **Field order is load-bearing: `loader` must stay last**. Most fields hold
+/// `mlua::Value`s whose `WeakLua` does not keep the VM alive; moving `loader` first drops Lua
+/// before them and panics (see [`ReloadState`]).
 pub struct RendererClient {
     shell_lua_path: PathBuf,
     scene: Scene,
-    /// The `(surface, output)` pairs this generation is resolving (`expand_instances`); shared by
-    /// [`Self::apply_instances`], [`Self::handle_apply_pending`], [`Self::re_resolve_if_dirty`].
+    /// `(surface, output)` pairs resolved by `expand_instances`, shared by
+    /// [`Self::apply_instances`], [`Self::handle_apply_pending`], and
+    /// [`Self::re_resolve_if_dirty`].
     instances: Vec<SurfaceInstance>,
-    /// Whether this process holds or has asked for a session lock, via
-    /// [`Self::set_session_locked`]. Arms [`lock_stays_authenticatable`]:
-    /// `SurfaceFingerprint::Lock` carries only the `id`, so a lock's `child` reads `Unchanged`
-    /// and reloads *in place*, and deleting the password field while up would leave no way out
-    /// but a VT switch. Written only by `crate::wayland::App::set_session_lock` and its teardown.
-    /// **A `bool`, not instance ids**: a list couldn't survive a hotplug, so the veto reads
-    /// [`Self::instances`] instead.
+    /// Whether this process holds or requested a lock. Arms [`lock_stays_authenticatable`]:
+    /// `SurfaceFingerprint::Lock` carries only `id`, so editing `child` reads `Unchanged` and
+    /// reloads in place; deleting the password while locked would leave only a VT switch. Written
+    /// by `crate::wayland::App::set_session_lock` and teardown. **A `bool`, not instance ids**:
+    /// hotplug replaces instances, so the veto reads [`Self::instances`].
     holds_session_lock: bool,
-    /// A clone of `crate::wayland::App`'s `ShapingHandle`: one worker thread, one `FontSystem`
-    /// for the whole process (ADR-0023).
+    /// Clone of `crate::wayland::App`'s `ShapingHandle`: one worker and `FontSystem` per process
+    /// (ADR-0023).
     shaping: ShapingHandle,
-    /// One handle per capability, keyed by `StateSnapshot.capability` (ADR-0029), seeded from
-    /// `shared::Capability::ALL` at construction (ADR-0037). `RefCell`: reached via `&self`.
+    /// Capability handles keyed by `StateSnapshot.capability` (ADR-0029), seeded from
+    /// `shared::Capability::ALL` (ADR-0037). `RefCell` permits access through `&self`.
     capabilities: RefCell<HashMap<String, CapabilityHandle>>,
-    /// Cloned into every [`Capability`] this client builds, including the lazy path's.
+    /// Cloned into every [`Capability`], including lazy ones.
     commands: CommandSender,
     rescue_handle: LiveSignalHandle,
-    /// `oblisk.screens`'s handle (ADR-0041 decision 2), Renderer-sourced, not in `capabilities`.
+    /// Renderer-sourced `oblisk.screens` handle (ADR-0041 decision 2), not in `capabilities`.
     screens_handle: LiveSignalHandle,
-    /// What `screens_handle` holds, mirrored as JSON so [`Self::set_screens`] detects real change.
+    /// `screens_handle`'s JSON mirror for [`Self::set_screens`] change detection.
     screens_payload: serde_json::Value,
-    /// What `rescue_handle` holds, mirrored so [`Self::set_rescue_state`] can detect a no-op.
+    /// `rescue_handle`'s mirror for [`Self::set_rescue_state`] no-op detection.
     rescue_state: (bool, String),
     process_registry: ProcessRegistry,
-    /// `oblisk.idle`'s threshold callbacks (ADR-0032), Renderer-sourced like `screens_handle`.
+    /// Renderer-sourced `oblisk.idle` threshold callbacks (ADR-0032).
     idle_registry: crate::lua::idle::IdleRegistry,
-    /// The scene-dirty flag (ADR-0044 decision 2), cloned into every `LiveSignalHandle` handed out.
+    /// Scene-dirty flag (ADR-0044 decision 2), cloned into every handed-out `LiveSignalHandle`.
     dirty: DirtyFlag,
     state: ReloadState,
-    /// Where a `ReevaluateReport` goes: the socket thread's [`pump`] drains this to the wire.
+    /// `ReevaluateReport` destination; socket-thread [`pump`] drains it to the wire.
     outbound_tx: mpsc::UnboundedSender<RendererFrame>,
-    /// The `oblisk` table, so [`Self::capability_handle`] can add a member later. Above `loader`
-    /// for this struct's own drop-order reason.
+    /// `oblisk` table for lazy members. Above `loader` for drop order.
     oblisk: mlua::Table,
-    /// Last, and that is load-bearing: see this struct's own doc comment.
+    /// Last, load-bearing; see the struct docs.
     loader: Loader,
 }
 
 impl RendererClient {
-    /// Builds one generation's entire Lua side on the calling thread: the VM, the rescue signal,
-    /// the `process` global's registry, and the capability roster's seeded signals. Called from
-    /// `crate::wayland::run`, never the socket thread: `mlua::Lua` is `!Send` and must be built
-    /// on the thread that runs it (ADR-0039). Fatal on failure: a Renderer with no VM can never
-    /// evaluate `shell.lua` or put anything on screen.
+    /// Builds one generation's VM, rescue signal, `process` registry, and seeded capability signals
+    /// on the calling thread. `crate::wayland::run` calls it, never the socket thread: `mlua::Lua`
+    /// is `!Send` and must be built where it runs (ADR-0039). Failure is fatal; no VM means no
+    /// `shell.lua` evaluation or screen output.
     pub fn start(
         shaping: ShapingHandle,
         outbound_tx: mpsc::UnboundedSender<RendererFrame>,
@@ -173,10 +163,9 @@ impl RendererClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shell_lua_path =
             shared::shell_lua_path().map_err(|err| format!("failed to resolve shell.lua's path: {err}"))?;
-        // One flag for the whole generation (ADR-0044 decision 2), so the rescue signal shares it.
+        // One flag per generation (ADR-0044 decision 2), shared by rescue.
         let dirty = DirtyFlag::new();
-        // Where `require` looks and nowhere else (ADR-0047 decision 1); derived here so it can't
-        // disagree with a second `shared::config_dir()` call.
+        // `require` searches here and nowhere else (ADR-0047 decision 1); derive it once.
         let config_dir = shell_lua_path.parent().ok_or("shell.lua's path has no parent directory")?.to_path_buf();
         let loader =
             Loader::new(dirty.clone(), &config_dir).map_err(|err| format!("failed to start the Lua loader: {err}"))?;
@@ -184,18 +173,16 @@ impl RendererClient {
         loader
             .register_process(process_registry.clone())
             .map_err(|err| format!("failed to register the process global: {err}"))?;
-        // Same generation id `ProcessRegistry` keys its children by, so a `process.kill` cannot
-        // reach a child of another generation.
-        // § 3.2's commands all take this one write path.
+        // `ProcessRegistry` uses the same id, so `process.kill` cannot cross generations. § 3.2
+        // commands all use this write path.
         let commands = CommandSender::new(generation_id, outbound_tx);
         let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
             .map_err(|err| format!("failed to build the `oblisk` namespace: {err}"))?;
         Ok(client)
     }
 
-    /// The `oblisk` namespace is [`lua::namespace::build`]'s, not this function's; construction is
-    /// separate from frame handling, and [`Self::capability_handle`] holds the lazy fallback for
-    /// an unrostered name since that one *is* reached from a `StateSnapshot`.
+    /// [`lua::namespace::build`] owns the `oblisk` namespace; construction is separate from frame
+    /// handling. [`Self::capability_handle`] lazily handles unrostered names from snapshots.
     fn new(
         loader: Loader,
         shell_lua_path: PathBuf,
@@ -204,7 +191,7 @@ impl RendererClient {
         process_registry: ProcessRegistry,
         dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
-        // Taken off `commands`, not a separate clone that could drift from it.
+        // Take it from `commands`, avoiding a drifting clone.
         let outbound_tx = commands.frames();
         let namespace = lua::namespace::build(&loader, &dirty, &commands, &shell_lua_path)?;
         Ok(Self {
@@ -218,7 +205,7 @@ impl RendererClient {
             rescue_handle: namespace.rescue,
             screens_handle: namespace.screens,
             screens_payload: namespace.screens_payload,
-            // Matches what `lua::namespace::build` already put in the `rescue` signal.
+            // Matches `lua::namespace::build`'s initial rescue signal.
             rescue_state: (false, String::new()),
             process_registry,
             idle_registry: namespace.idle,
@@ -230,12 +217,11 @@ impl RendererClient {
         })
     }
 
-    /// Writes the `rescue` global's `{ is_rescue, error_log }` table, but only when it differs.
-    /// Not an optimization: writing marks the shared `DirtyFlag` (ADR-0044 decision 2), and a
-    /// rewrite could leave it set on a generation that must not be mutated (not the memoization
-    /// ADR-0044 decision 3 rejects: a genuine transition still dirties). `pub` for
-    /// `crate::wayland::App`'s `SessionLockHandler`, per ADR-0052 decision 4: called on a refused
-    /// lock and both `finished` cases, the only channel reaching the user there.
+    /// Writes `rescue`'s `{ is_rescue, error_log }` only when changed. A write marks the shared
+    /// `DirtyFlag` (ADR-0044 decision 2); a no-op rewrite could dirty a generation that must not
+    /// mutate, unlike the genuine transition rejected by ADR-0044 decision 3. `pub` for
+    /// `crate::wayland::App`'s `SessionLockHandler` (ADR-0052 decision 4), used for refused locks
+    /// and both `finished` cases, the only user-facing path there.
     pub fn set_rescue_state(&mut self, is_rescue: bool, error_log: &str) {
         if self.rescue_state.0 == is_rescue && self.rescue_state.1 == error_log {
             return;
@@ -249,35 +235,32 @@ impl RendererClient {
         }
     }
 
-    /// Only hydrates `snapshot.capability`'s own live signal; no Lua evaluation runs here (module
-    /// doc comment). `&self`: the lazy-registration path below needs `capabilities`' `RefCell`
-    /// anyway.
+    /// Hydrates only `snapshot.capability`; no Lua evaluation (module docs). `&self` is needed for
+    /// the lazy `capabilities` registration.
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
-        // The revision a later `oblisk.<name>:invoke(...)` stamps into its command; advisory,
-        // since dispatch does not enforce it (Supervisor services § 13).
+        // Revision stamped into later `oblisk.<name>:invoke(...)`; advisory because dispatch does
+        // not enforce it (Supervisor services § 13).
         let handle = self.capability_handle(&snapshot.capability)?;
         let previous = handle.hydrate(value, snapshot.revision);
-        // The `on_change` handlers (ADR-0115) run here, after the value landed and before any
-        // layout pass: the only Lua a push runs, and not an evaluation of `shell.lua`.
+        // Run `on_change` handlers (ADR-0115) after hydration and before layout. This is the only
+        // Lua a push runs, not a `shell.lua` evaluation.
         handle.notify_change(self.loader.lua(), previous);
         Ok(())
     }
 
-    /// Before every evaluation of `shell.lua`: the evaluation registers its `on_change` handlers
-    /// afresh, so the previous evaluation's must go, or a config save would double every side
-    /// effect (ADR-0115).
+    /// Before each `shell.lua` evaluation, clear old `on_change` handlers. Evaluation registers
+    /// them afresh; retaining them doubles side effects after a config save (ADR-0115).
     fn clear_change_handlers(&self) {
         for handle in self.capabilities.borrow().values() {
             handle.clear_handlers();
         }
     }
 
-    /// Looks up `capability`'s handle, adding a fresh `oblisk.<capability>` member (`nil`,
-    /// revision `0`) the first time it is seen (ADR-0029); unreachable in a debug build, since
-    /// `push_snapshot`'s `debug_assert` rejects an off-roster capability first. **Refuses to
-    /// overwrite a held name**: `Table::set` is silent over an existing key, and an off-roster
-    /// `rescue` push would replace the config-failure signal (ADR-0052 decision 1's bug).
+    /// Returns a handle, lazily adding `oblisk.<capability>` as `nil`, revision `0` (ADR-0029).
+    /// Debug builds reject off-roster pushes first. **Refuses held names**: `Table::set` is silent,
+    /// and an off-roster `rescue` push would replace the config-failure signal (ADR-0052 decision
+    /// 1's bug).
     fn capability_handle(&self, capability: &str) -> mlua::Result<CapabilityHandle> {
         if let Some(handle) = self.capabilities.borrow().get(capability) {
             return Ok(handle.clone());
@@ -293,20 +276,17 @@ impl RendererClient {
         Ok(handle)
     }
 
-    /// Evaluates `shell.lua` once at startup; no Supervisor round trip needed yet (ADR-0024, "safe
-    /// to apply" per the module doc comment). `state.applied_topology` stays `None` only when the
-    /// *evaluation* fails; a failed *apply* leaves it, since the caller has already bound the
-    /// declared surfaces and a later topology change needs a new generation (ADR-0038). Runs before
-    /// any layer surface is bound (Supervisor services § 14.2's order), split so the caller can
-    /// expand the returned [`SurfaceSpec`](layout::node::SurfaceSpec)s via
-    /// [`Self::apply_instances`].
+    /// Evaluates `shell.lua` once at startup without a Supervisor round trip (ADR-0024, "safe to
+    /// apply"). `applied_topology` stays `None` only on *evaluation* failure; a failed *apply*
+    /// leaves it because surfaces are already bound and later topology changes need a new
+    /// generation (ADR-0038). Runs before layer binding (Supervisor services § 14.2), split so the
+    /// caller expands returned specs via [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         self.clear_change_handlers();
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
                 self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
-                // ADR-0044 decision 2's re-resolve target, held so a later push doesn't need
-                // shell.lua re-run.
+                // ADR-0044 decision 2 target: later pushes skip `shell.lua`.
                 self.state.applied_output = Some(output);
                 Some(specs)
             }
@@ -318,30 +298,28 @@ impl RendererClient {
         }
     }
 
-    /// Replaces the `(surface, output)` pairs this generation resolves against, from
-    /// `crate::wayland::run` before the first apply and from `OutputHandler` on every hotplug
-    /// (ADR-0038 decision 3).
+    /// Replaces `(surface, output)` pairs, from `crate::wayland::run` before first apply and
+    /// `OutputHandler` on each hotplug (ADR-0038 decision 3).
     pub fn set_instances(&mut self, instances: Vec<SurfaceInstance>) {
         self.instances = instances;
     }
 
-    /// Arms or disarms the lock-authentication veto every `Scene::apply` carries (ADR-0052
-    /// decision 3), the moment the lock is asked for rather than when `locked` arrives: a reload
-    /// landing in that window would strip the field from the tree the compositor is about to show.
+    /// Arms the per-`Scene::apply` lock-authentication veto (ADR-0052 decision 3) when lock is
+    /// requested, not when `locked` arrives; a reload in between could strip the field about to be
+    /// shown.
     pub fn set_session_locked(&mut self, locked: bool) {
         self.holds_session_lock = locked;
     }
 
-    /// The set [`Self::set_instances`] last stored, so `crate::wayland::App` can diff a fresh
-    /// expansion against it without keeping a second copy that could drift from this one.
+    /// The set last stored by [`Self::set_instances`], for `crate::wayland::App` to diff without a
+    /// second copy that could drift.
     pub fn instances(&self) -> &[SurfaceInstance] {
         &self.instances
     }
 
-    /// The whole declared surface roster of the evaluation applied, re-parsed from
-    /// `applied_output` rather than re-read from `shell.lua`. What a hotplug expands against
-    /// (ADR-0038 decision 3): re-evaluating would race the Supervisor's own `Reevaluate`
-    /// (ADR-0041 decision 4). Empty when nothing has ever applied.
+    /// Declared surfaces from the applied evaluation, reparsed from `applied_output`, never
+    /// `shell.lua`. Hotplug expands against this (ADR-0038 decision 3); reevaluation would race
+    /// the Supervisor's `Reevaluate` (ADR-0041 decision 4). Empty before any apply.
     pub fn applied_surface_specs(&self) -> Vec<SurfaceSpec> {
         let Some(output) = self.state.applied_output.as_ref() else {
             return Vec::new();
@@ -349,27 +327,26 @@ impl RendererClient {
         match surface_specs(output) {
             Ok(specs) => specs,
             Err(err) => {
-                // Unreachable in practice: `surface_specs` already succeeded on `applied_output`.
-                // Not a panic, which would take down a shell that is painting fine.
+                // `surface_specs` already succeeded on `applied_output`; log, not panic, to keep a
+                // painting shell alive.
                 eprintln!("control-socket client: the applied evaluation's surface specs no longer parse: {err}");
                 Vec::new()
             }
         }
     }
 
-    /// Asks the Supervisor to start a reload cycle (ADR-0041 decision 4): a topology change only
-    /// it decides (ADR-0041 decision 3). Carries no sequence: `supervisor/src/main.rs` drops any
-    /// report not naming its own `next_sequence`, so this only asks it to *begin* a cycle. Sent
-    /// when a config that loops over `screens` declares a different surface set.
+    /// Asks the Supervisor to start a reload cycle (ADR-0041 decision 4); it alone decides
+    /// topology changes (ADR-0041 decision 3). No sequence: `supervisor/src/main.rs` drops reports
+    /// without its `next_sequence`, so this only begins a cycle. Used when a `screens` loop changes
+    /// the surface set.
     pub fn request_reload(&self) {
         if let Err(err) = self.outbound_tx.send(RendererFrame::RequestReload) {
             eprintln!("control-socket client: failed to request a reload after an output change: {err}");
         }
     }
 
-    /// Pushes the `screens` signal's new value (ADR-0041 decision 2), reporting whether it
-    /// changed. Same early-return rule as `set_rescue_state`: the caller gates
-    /// [`Self::request_reload`] on this, so a re-push would ask for an unjustified reload too.
+    /// Pushes `screens` (ADR-0041 decision 2) and reports change. As with `set_rescue_state`, the
+    /// caller gates [`Self::request_reload`], so a duplicate must not request a reload.
     pub fn set_screens(&mut self, payload: serde_json::Value) -> bool {
         if self.screens_payload == payload {
             return false;
@@ -387,25 +364,24 @@ impl RendererClient {
         }
     }
 
-    /// One instance's `available` size, replaced by what the compositor configured, dirtying the
-    /// scene (ADR-0023) via [`DirtyFlag`] from ADR-0044 decision 2. An unknown `instance_id` is
-    /// ignored: doing nothing beats dirtying the whole scene over a surface that shouldn't exist.
+    /// Replaces one instance's compositor-configured `available` size and dirties the scene through
+    /// ADR-0044 decision 2's [`DirtyFlag`] (ADR-0023). Ignore unknown ids instead of dirtying a
+    /// nonexistent surface.
     pub fn set_instance_size(&mut self, instance_id: &str, size: layout::LogicalSize) {
         let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) else {
             return;
         };
         if instance.available == size {
-            // Same early-return rule as `set_rescue_state`'s.
+            // Same no-op rule as `set_rescue_state`.
             return;
         }
         instance.available = size;
         self.dirty.mark();
     }
 
-    /// The second half of [`Self::run_startup_evaluation`]'s split: resolves the last evaluation
-    /// against the current instance set, setting rescue on failure. Returns whether it succeeded,
-    /// so `crate::wayland::run` can tell a Candidate that must exit from one that may carry on.
-    /// Takes no instance argument: [`Self::set_instances`] is the one place the set is written.
+    /// Applies the last evaluation to current instances, setting rescue on failure. Returns success
+    /// so `crate::wayland::run` can distinguish an exiting Candidate. Instances come only from
+    /// [`Self::set_instances`].
     pub fn apply_instances(&mut self) -> bool {
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
@@ -419,12 +395,11 @@ impl RendererClient {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
-                // Nothing holds a lease, so nothing can be holding a subtree this apply retired.
+                // No lease can hold a subtree this apply retired.
                 self.scene.release_all_retired();
                 self.set_rescue_state(false, "");
-                // Accounts for `set_screens`'s seed (ADR-0041 decision 2), which must run before
-                // the startup evaluation; only on success, so a
-                // failed apply leaves the flag for the next one.
+                // Consume `set_screens`'s pre-evaluation seed (ADR-0041 decision 2) only after
+                // success; a failed apply leaves it for the next one.
                 self.dirty.take();
                 true
             }
@@ -436,24 +411,22 @@ impl RendererClient {
         }
     }
 
-    /// The retained scene, for `crate::wayland::App::paint_surface` to look one instance's
-    /// resolved tree up in by the same `"{id}@{output}"` id its `TrackedSurface` carries.
+    /// Retained scene; `paint_surface` looks up the resolved tree by the `"{id}@{output}"` id in
+    /// its `TrackedSurface`.
     pub fn scene(&self) -> &Scene {
         &self.scene
     }
 
-    /// This generation's `Lua`, for building the one argument `button`'s `on_click` takes
-    /// (ADR-0050 decision 3): `crate::wayland::App` holds the `mlua::Function` but no VM.
-    /// Callers must not hold the borrow across the Lua call it feeds; see
-    /// [`crate::wayland::App::fire_on_click`].
+    /// This generation's `Lua` builds the `button` `on_click` argument (ADR-0050 decision 3):
+    /// `crate::wayland::App` holds the `mlua::Function`, not a VM. Do not hold the borrow across
+    /// the call; see [`crate::wayland::App::fire_on_click`].
     pub fn lua(&self) -> &mlua::Lua {
         self.loader.lua()
     }
 
-    /// Handles one inbound `SupervisorFrame`, decoded by [`pump`]. Returns [`FrameOutcome`]:
-    /// `Handled`, or a hand-back needing `crate::wayland::App` state: EGL/surface for a draw
-    /// (Supervisor services § 14.2), or SCTK's `SessionLockState`/lock surfaces for
-    /// `SetSessionLock` (ADR-0042).
+    /// Handles one [`pump`]-decoded frame. Returns [`FrameOutcome`]: `Handled`, or work handed to
+    /// `crate::wayland::App` for EGL/surface draw (Supervisor § 14.2) or SCTK
+    /// `SessionLockState`/lock surfaces (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
         match frame {
@@ -466,7 +439,7 @@ impl RendererClient {
             SupervisorFrame::ApplyPendingReload(apply) => self.handle_apply_pending(apply),
             SupervisorFrame::ActivateDraw(activate) => return FrameOutcome::ActivateDraw(activate.nonce),
             SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
-                // No per-surface input-region/focus machinery exists yet (ADR-0025).
+                // No per-surface input-region/focus machinery yet (ADR-0025).
                 eprintln!(
                     "control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)"
                 );
@@ -480,15 +453,15 @@ impl RendererClient {
             SupervisorFrame::ProcessExited(ProcessExited { id, code }) => {
                 self.process_registry.dispatch_exit(id, code);
             }
-            // `ext_session_lock_v1` is a Wayland object; servicing it lives on
-            // `crate::wayland::App` (ADR-0042, ADR-0052 decision 1).
+            // `ext_session_lock_v1` is a Wayland object; `crate::wayland::App` services it
+            // (ADR-0042, ADR-0052 decision 1).
             SupervisorFrame::SetSessionLock(SetSessionLock { locked }) => return FrameOutcome::SetSessionLock(locked),
-            // Not checked: the Supervisor addresses this process via its own socket (ADR-0032).
+            // The Supervisor addresses this process via its own socket (ADR-0032).
             SupervisorFrame::IdleEvent(IdleEvent { generation_id: _, threshold_sec, state }) => {
                 self.idle_registry.dispatch_event(threshold_sec, state);
             }
-            // ADR-0112: `oblisk set`/`oblisk toggle`. Refused by name to stderr, the only place a
-            // keybind's mistake can be reported; the write itself marks the scene dirty.
+            // ADR-0112: `oblisk set`/`oblisk toggle`. Refuse by name to stderr, the only place a
+            // keybind mistake can be reported; the write dirties the scene.
             SupervisorFrame::SetState(set) => {
                 if let Err(why) = lua::signal::write_state(self.lua(), &set) {
                     eprintln!(
@@ -501,13 +474,11 @@ impl RendererClient {
         FrameOutcome::Handled
     }
 
-    /// Runs one `Reevaluate` request: evaluates `shell.lua`, classifies against
-    /// `state.applied_topology`, updates `state.pending`/rescue, and queues the verdict.
-    /// `None` counts as "not changed" (module doc comment). Diffs only each spec's
+    /// Evaluates one `Reevaluate`, classifies against `state.applied_topology`, updates pending or
+    /// rescue, and queues the verdict. `None` means "not changed". Diff only
     /// [`SurfaceFingerprint`](layout::node::SurfaceFingerprint) (ADR-0038 decision 2, ADR-0049
-    /// decision 3): a `margin`, `keyboard_interactivity`, `exclusive`, size, or `window` `title`
-    /// edit is accepted on a live object, so it reports `Unchanged` and reloads in place, not the
-    /// generation swap comparing whole specs would trigger.
+    /// decision 3): live objects accept `margin`, `keyboard_interactivity`, `exclusive`, size,
+    /// and `window` `title`, so those reload in place instead of swapping generations.
     fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
         self.clear_change_handlers();
         let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
@@ -516,7 +487,7 @@ impl RendererClient {
                 self.set_rescue_state(false, "");
                 let topology_changed = self.state.applied_topology.as_ref().is_some_and(|applied| applied != &topology);
                 if topology_changed {
-                    // The swap path is a different generation's job; this one's scene stays put.
+                    // Another generation owns the swap; keep this scene unchanged.
                     ReevaluateReport::TopologyChanged { sequence: request.sequence }
                 } else {
                     self.state.pending = Some((request.sequence, output, topology));
@@ -534,8 +505,8 @@ impl RendererClient {
         }
     }
 
-    /// Applies `state.pending` to the `Scene` only if it's still the evaluation `apply.sequence`
-    /// refers to: a mismatch means a newer `Reevaluate` already superseded it, logged and ignored.
+    /// Applies `state.pending` only when its sequence matches `apply.sequence`; otherwise a newer
+    /// `Reevaluate` superseded it, so log and ignore.
     fn handle_apply_pending(&mut self, apply: ApplyPendingReload) {
         if !matches!(&self.state.pending, Some((sequence, _, _)) if *sequence == apply.sequence) {
             eprintln!(
@@ -553,11 +524,11 @@ impl RendererClient {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
                 self.scene.release_all_retired();
-                // `ApplyPendingReload` only follows `Unchanged`, so this matches the earlier write.
+                // `ApplyPendingReload` follows only `Unchanged`, so this matches the earlier write.
                 self.state.applied_topology = Some(topology);
-                // ADR-0044 decision 2's re-resolve target.
+                // ADR-0044 decision 2 re-resolve target.
                 self.state.applied_output = Some(output);
-                // Nothing else told the screen; the poll loop repaints on `re_resolve_if_dirty`.
+                // The poll loop repaints on `re_resolve_if_dirty`.
                 self.dirty.mark();
             }
             Err(err) => {
@@ -566,15 +537,14 @@ impl RendererClient {
         }
     }
 
-    /// Re-runs `Scene::apply` against `state.applied_output` when a live signal's `set` marked
-    /// the scene dirty (ADR-0044 decision 2). Does not touch `shell.lua`: `applied_output`'s
-    /// retained tree still holds the `Signal` handles Lua put there, readable via this client's
-    /// field ordering through decision 1's resolve-at-layout-time rule. Called once per poll turn
-    /// after draining inbound frames: `DirtyFlag::take` collapses many pushes into one `true`.
-    /// Returns whether it re-resolved; `false` covers "nothing was dirty" and "failed".
+    /// Re-runs `Scene::apply` against `state.applied_output` after a live signal marks the scene
+    /// dirty (ADR-0044 decision 2). Never touches `shell.lua`: the retained tree holds its signals,
+    /// readable through this client's field ordering and decision 1's resolve-at-layout-time rule.
+    /// Called once per poll turn after inbound frames; `DirtyFlag::take` coalesces pushes. Returns
+    /// whether it re-resolved; `false` means clean or failed.
     pub fn re_resolve_if_dirty(&mut self) -> bool {
-        // Checked *before* the flag is taken: taking it first would let a config that fails its
-        // first apply swallow every push and stay blank until an inotify edit forces a re-eval.
+        // Check before taking the flag: a failed first apply must not swallow pushes and stay blank
+        // until an inotify edit forces reevaluation.
         let Some(output) = self.state.applied_output.as_ref() else {
             return false;
         };
@@ -587,28 +557,25 @@ impl RendererClient {
                 lock_stays_authenticatable(scene, instances, locked)
             });
         if let Err(err) = applied {
-            // Rolls back on error, keeping the prior scene on screen. Not `set_rescue_state`:
-            // that's for shell.lua failing to evaluate, not one capability's rejected push.
-            //
-            // ponytail: logging forever, nothing user-visible. Upgrade: a rescue-adjacent
-            // channel for a rejected pushed value.
+            // Rollback keeps the prior scene. Do not set rescue: that is for `shell.lua`
+            // evaluation,
+            // not a rejected capability push.
+            // ponytail: logging forever, nothing user-visible. Upgrade: rescue-adjacent channel
+            // for rejected pushed values.
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
             return false;
         }
-        // The one apply site that leaks an undrained lease bag at cadence: a re-resolve that
-        // shortens a `children` list retires the tail on every poll turn carrying a push.
+        // The cadence leak: shortening `children` retires its tail on every push-bearing poll turn.
         self.scene.release_all_retired();
         dump_layout_if_asked(&self.scene);
         true
     }
 }
 
-/// `OBLISK_DUMP_LAYOUT=<instance id>`, e.g. `panel_host@eDP-1`: prints that surface's resolved
-/// tree -- every visible node's kind, rect and, for a `text`, its content -- after each pass.
-/// Diagnostic only, off unless asked. The one geometry question a screenshot cannot answer is
-/// which node came out the wrong size, and the layout that goes wrong in a session is the one
-/// the test harness did not think to build (a card placed where the bell is, at the output's
-/// scale, with a feed the Supervisor had by then), so this reads the live answer instead.
+/// `OBLISK_DUMP_LAYOUT=<instance id>` (e.g. `panel_host@eDP-1`) prints each visible node's kind,
+/// rect, and text after every pass. Off unless asked. It answers which node has the wrong geometry
+/// in a live session, including layouts the test harness did not build (a card at the bell's
+/// output scale with the Supervisor's current feed).
 fn dump_layout_if_asked(scene: &Scene) {
     let Ok(wanted) = std::env::var("OBLISK_DUMP_LAYOUT") else { return };
     let Some(surface) = scene.surface(&wanted) else { return };
@@ -657,14 +624,11 @@ async fn run(
     pump(&mut read_half, &mut write_half, &inbound_tx, &mut outbound_rx, Some(&waker)).await;
 }
 
-/// The socket thread's entire job after the handshake: forward every decoded `SupervisorFrame`
-/// to the Wayland dispatch thread, and write every queued `RendererFrame` to the wire (ADR-0039).
-/// A frame that fails to decode is a transport-level failure (one sender, fixed shapes: a bad
-/// frame means desync), unlike an expected, recoverable `ApplyPendingReload` sequence mismatch.
-/// Read and write get their own long-lived loop, selected as two whole futures rather than one
-/// frame each: `read_json_frame`'s two sequential `read_exact` awaits keep partial progress in
-/// that future, so racing it against `outbound_rx.recv()` in one `select!` would drop it whenever
-/// outbound won, desyncing the connection; neither loop completes normally, so this never happens.
+/// After handshake, forward decoded `SupervisorFrame`s to Wayland and queued `RendererFrame`s to
+/// the wire (ADR-0039). Decode failure is transport failure: one sender and fixed shapes mean
+/// desync, unlike a recoverable `ApplyPendingReload` sequence mismatch. Read and write are separate
+/// long-lived futures. `read_json_frame` has two sequential `read_exact`s; racing one frame read
+/// against `outbound_rx.recv()` would drop partial bytes when outbound wins and desync the stream.
 async fn pump<R, W>(
     read_half: &mut R,
     write_half: &mut W,
@@ -699,10 +663,9 @@ async fn pump<R, W>(
             if let Err(err) = write_json_frame(write_half, &frame).await {
                 eprintln!("control-socket client: failed to send a {} frame: {err}", frame_label(&frame));
             }
-            // Scrubbed the instant the write completes, not left to `Drop` (ADR-0005/ADR-0027).
-            //
-            // ponytail: covers only copies this site controls; `write_json_frame`'s
-            // `serde_json::to_vec` drops its own buffer unscrubbed. Upgrade: non-JSON wire path.
+            // Scrub immediately after write, not at `Drop` (ADR-0005/ADR-0027).
+            // ponytail: only copies this site controls; `write_json_frame`'s
+            // `serde_json::to_vec` buffer is not scrubbed. Upgrade: non-JSON wire path.
             if let RendererFrame::SecureSubmit(inner) = &mut frame {
                 inner.secret.zeroize();
             }
@@ -715,9 +678,8 @@ async fn pump<R, W>(
     }
 }
 
-/// Names an outbound frame for a write-failure log line. A fixed label per variant, not
-/// `{frame:?}`: `RendererFrame`'s derived `Debug` would print a `SecureSubmit`'s `secret` bytes
-/// into the log (ADR-0005).
+/// Names a frame for write-failure logs. Fixed labels avoid `{frame:?}`, whose derived `Debug`
+/// would print `SecureSubmit.secret` (ADR-0005).
 fn frame_label(frame: &RendererFrame) -> &'static str {
     match frame {
         RendererFrame::ReadySignal(_) => "ReadySignal",
@@ -728,18 +690,16 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
         RendererFrame::StartCapability { .. } => "StartCapability",
-        // Never sent by this process (ADR-0112), but the label costs nothing and a wildcard would
-        // let the next variant slip past unnamed.
+        // Never sent here (ADR-0112), but a wildcard could hide a new unnamed variant.
         RendererFrame::SetState(_) => "SetState",
     }
 }
 
-/// Starts every capability an applied tree names in a `textfield`'s `secure_submit` (ADR-0070
-/// decision 5), so a password prompt registers its agent even if nothing reads the member.
-/// Deduplicated by `CommandSender::start_capability`.
+/// Starts capabilities named by applied `textfield` `secure_submit`s (ADR-0070 decision 5), so a
+/// password prompt registers its agent even if nothing reads the member. The sender deduplicates.
 ///
 /// ponytail: not called from `re_resolve_if_dirty` (`Scene::surface` deep-clones every repaint).
-/// Gap: a later-pushed `textfield` waits for the next evaluation. Upgrade: an accumulated roster.
+/// Gap: a later-pushed `textfield` waits for reevaluation. Upgrade: accumulated roster.
 fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance], commands: &CommandSender) {
     for instance in instances {
         let Some(tree) = scene.surface(&instance.instance_id) else { continue };
@@ -749,9 +709,8 @@ fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance]
     }
 }
 
-/// Logs each surface *instance*'s resolved geometry after a `scene.apply`, diagnostic only.
-/// Iterates instances, not declared surfaces: one declaration can be several instances at
-/// different sizes.
+/// Diagnostic geometry after `scene.apply`. Iterates *instances*, not declarations: one declaration
+/// can produce several sizes.
 fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
     dump_layout_if_asked(scene);
     for instance in instances {
@@ -807,26 +766,21 @@ mod tests {
         path
     }
 
-    /// Evaluates `setup` above a minimal `panel` and reads one of the globals it left behind.
-    ///
-    /// A global rather than a value smuggled onto the returned node: a node refuses a key no
-    /// parser of its kind reads (`lua::nodes::NODE_PROPERTIES`), and a probe name is exactly
-    /// such a key.
+    /// Evaluates `setup` above a minimal `panel`, then reads a global. A global avoids smuggling a
+    /// value onto the node, which rejects keys absent from `lua::nodes::NODE_PROPERTIES`.
     fn probe<T: mlua::FromLua>(loader: &Loader, setup: &str, name: &str) -> T {
         loader.evaluate(&format!("{setup}\nreturn panel {{ id = \"_probe\", layer = \"Top\" }}")).unwrap();
         loader.lua().globals().get(name).unwrap()
     }
 
-    /// Reads `rescue:get()`'s current fields back out by evaluating a tiny probe script --
-    /// `LiveSignalHandle` only exposes `set`, so this is the only way to observe what a prior
-    /// `set_rescue_state` call actually stored.
+    /// Reads `rescue:get()` by probe script; `LiveSignalHandle` exposes only `set`, so this is the
+    /// only way to observe `set_rescue_state`'s stored value.
     fn rescue_state(loader: &Loader) -> (bool, String) {
         let setup = "is_rescue, error_log = oblisk.rescue:get().is_rescue, oblisk.rescue:get().error_log";
         (probe(loader, setup, "is_rescue"), probe(loader, setup, "error_log"))
     }
 
-    /// A client wired to a real outbound channel, whose receiver is handed back so a test can
-    /// read whatever the client queued for the socket thread.
+    /// Client with a real outbound channel; return its receiver for queued socket frames.
     fn test_client(shell_lua_path: &std::path::Path) -> (RendererClient, mpsc::UnboundedReceiver<RendererFrame>) {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let dirty = DirtyFlag::new();
@@ -846,14 +800,13 @@ mod tests {
         (client, outbound_rx)
     }
 
-    /// The one output every fixture below resolves against: a single 1920x1080 `"TEST"` monitor
-    /// keeps instance ids readable (`"bar@TEST"`).
+    /// One 1920x1080 `"TEST"` output keeps fixture ids readable (`"bar@TEST"`).
     fn test_outputs() -> Vec<OutputGeometry> {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
     }
 
-    /// `crate::wayland::run`'s whole startup sequence in one call (Supervisor services § 14.2's
-    /// Candidate order): evaluate, expand the specs into instances, store them, apply.
+    /// `crate::wayland::run` startup in Supervisor § 14.2 Candidate order: evaluate, expand,
+    /// store instances, apply.
     fn run_startup(client: &mut RendererClient) -> bool {
         let Some(specs) = client.run_startup_evaluation() else {
             return false;
@@ -863,8 +816,7 @@ mod tests {
         client.apply_instances()
     }
 
-    /// The instance set for a config declaring exactly `ids`, for tests that seed `state.pending`
-    /// by hand instead of going through [`run_startup`].
+    /// Instances for exactly `ids`, for tests that seed `state.pending` instead of [`run_startup`].
     fn instances_for(ids: &[&str]) -> Vec<SurfaceInstance> {
         ids.iter()
             .map(|id| SurfaceInstance {
@@ -876,13 +828,10 @@ mod tests {
             .collect()
     }
 
-    /// The one frame `client` queued, or a panic naming what was missing.
-    /// The next queued frame that is not a capability start.
-    ///
-    /// Skipping those is not hiding them: reading `oblisk.lock` at all queues one
-    /// (ADR-0070 decision 1), so every test that reaches a capability would otherwise have to
-    /// step over it before asserting on what it actually queued.
-    /// `a_capability_read_asks_the_supervisor_to_start_it` is what holds the starts to account.
+    /// Next queued non-start frame, or a panic naming what was missing. Reading `oblisk.lock`
+    /// queues
+    /// a start (ADR-0070 decision 1), so tests would otherwise step over it; the dedicated
+    /// `a_capability_read_asks_the_supervisor_to_start_it` test accounts for starts.
     fn queued_frame(outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> RendererFrame {
         loop {
             match outbound_rx.try_recv().expect("a frame must have been queued for the socket thread") {
@@ -892,7 +841,7 @@ mod tests {
         }
     }
 
-    /// Every frame queued so far, so a test can assert on the starts `queued_frame` steps over.
+    /// All queued capability starts that `queued_frame` skips.
     fn queued_starts(outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> Vec<String> {
         let mut started = Vec::new();
         while let Ok(frame) = outbound_rx.try_recv() {
@@ -903,8 +852,7 @@ mod tests {
         started
     }
 
-    /// ADR-0070 decision 1: the read is the start. Nothing else in this process asks the
-    /// Supervisor to build a controller, so a capability a config never mentions never runs.
+    /// ADR-0070 decision 1: reading starts it. Unmentioned capabilities never run.
     #[test]
     fn a_capability_read_asks_the_supervisor_to_start_it() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -915,7 +863,7 @@ mod tests {
         assert_eq!(queued_starts(&mut outbound_rx), vec!["audio".to_string()]);
     }
 
-    /// The whole point of the gate: an evaluation that touches nothing costs nothing.
+    /// An evaluation touching no capability costs nothing.
     #[test]
     fn a_config_that_reads_no_capability_starts_none() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -926,9 +874,9 @@ mod tests {
         assert!(queued_starts(&mut outbound_rx).is_empty(), "`version` is off the roster and has nothing behind it");
     }
 
-    /// `__index` fires once per name, because the member is moved onto the table on the way out.
-    /// A `computed` inside a `list`'s `itemfn` reads `oblisk.audio` once per row per layout pass,
-    /// so a start per read would be a frame per row per frame.
+    /// `__index` fires once per name because it moves the member onto the table. A `computed` in a
+    /// `list` `itemfn` reads `oblisk.audio` once per row per layout pass; starting per read would
+    /// be a frame per row per frame.
     #[test]
     fn re_reading_a_capability_queues_no_second_start() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -939,9 +887,8 @@ mod tests {
         assert_eq!(queued_starts(&mut outbound_rx), vec!["audio".to_string()]);
     }
 
-    /// A typo must stay an ordinary nil, so the config's own line is what the error names. The
-    /// metamethod answering with anything else would turn `oblisk.audioo:get()` into an error
-    /// raised from inside the engine.
+    /// A typo stays ordinary nil so the config line gets named. Any other metamethod result would
+    /// make `oblisk.audioo:get()` fail inside the engine.
     #[test]
     fn a_name_no_capability_owns_reads_nil_and_starts_nothing() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -953,9 +900,9 @@ mod tests {
         assert!(queued_starts(&mut outbound_rx).is_empty());
     }
 
-    /// ADR-0070 decision 5. polkit has no roster entry and no `oblisk.polkit`, so a
-    /// `secure_submit` naming it is the only thing a config can write that asks for the
-    /// authentication agent.
+    /// ADR-0070 decision 5: polkit has no roster entry or `oblisk.polkit`, so only a
+    /// `secure_submit`
+    /// naming it can request the authentication agent.
     #[test]
     fn a_secure_submit_target_starts_the_capability_it_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -992,8 +939,7 @@ mod tests {
 
     #[test]
     fn apply_state_snapshot_lazily_registers_an_unrostered_capabilitys_live_signal() {
-        // ADR-0029: the first StateSnapshot naming an off-roster capability must create the
-        // Lua global on the spot, not error.
+        // ADR-0029: the first off-roster snapshot creates the Lua global, not an error.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
         assert!(shared::Capability::from_name("workspace").is_none(), "this test needs a genuinely unrostered name");
@@ -1008,10 +954,9 @@ mod tests {
         assert_eq!(probe::<i64>(&client.loader, "active = oblisk.workspace:get().active", "active"), 2);
     }
 
-    /// Every bar-backing capability at or past the width its module can draw, for
-    /// [`the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing`]. The strings
-    /// run past each module's own `util.truncate` limit deliberately: the module clamps them, and
-    /// a test feeding short ones would be measuring the clamp rather than the layout.
+    /// Bar capabilities at or beyond module width for
+    /// [`the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing`]. Strings exceed
+    /// each `util.truncate` limit so the module clamp is exercised, not mistaken for layout.
     fn widest_bar_snapshots() -> Vec<(&'static str, serde_json::Value)> {
         vec![
             ("audio", serde_json::json!({ "volume": 1.0, "muted": false, "apps": [] })),
@@ -1062,11 +1007,9 @@ mod tests {
 
     #[test]
     fn a_hover_bound_by_a_config_survives_resolution_and_drives_what_it_is_bound_to() {
-        // The half of ADR-0062 no unit test on either side reaches: that a `hover` handle a
-        // config wrote into a node property is still a handle by the time the pointer handler sees
-        // the resolved tree (decision 3), and that writing it moves what a second node bound it to.
-        // `pointer_frame` itself needs a real compositor, so this drives `layout::hover` against a
-        // genuinely resolved tree instead -- everything between the config and the write.
+        // The untested half of ADR-0062: a config-authored `hover` property remains a handle in the
+        // resolved tree (decision 3), and writing it moves a second bound node. `pointer_frame`
+        // needs a compositor, so drive `layout::hover` on a real resolved tree instead.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -1088,8 +1031,7 @@ mod tests {
             |client: &RendererClient| client.scene.surface("bar@TEST").expect("the bar resolves").children[0].clone();
         assert!(!hover_row(&client).children[0].visible, "nothing is hovered before the pointer arrives");
 
-        // The pointer lands inside the row. `hover_writes` is what `App::sync_hover` calls, given
-        // the same tree it would be given.
+        // `hover_writes` receives the same tree as `App::sync_hover` when the pointer enters.
         let tree = client.scene.surface("bar@TEST").unwrap();
         let writes = layout::hover::hover_writes(&tree, Some(layout::hit::LogicalPoint { x: 50.0, y: 10.0 }));
         assert_eq!(writes.len(), 1, "one node declared a hover, so there is one write");
@@ -1106,8 +1048,8 @@ mod tests {
         assert!(client.re_resolve_if_dirty(), "a hover that changed has to re-resolve the scene");
         assert!(hover_row(&client).children[0].visible, "the node bound to the hover is showing now");
 
-        // And back off, which is the edge a callback-shaped design drops when a re-resolve replaces
-        // the node between the two events (ADR-0062 decision 1).
+        // Leave again, the edge callback designs lose when reevaluation replaces the node
+        // (ADR-0062 decision 1).
         let tree = client.scene.surface("bar@TEST").unwrap();
         for write in layout::hover::hover_writes(&tree, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
@@ -1118,19 +1060,18 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_config_evaluates_and_declares_every_surface_it_ships() {
-        // Against `dev-config/oblisk/shell.lua` itself, not a fixture. That config is this repo's
-        // worked example and its live-session fixture, and it is split across thirty-odd files
-        // that reach each other through `require`, so a rename or a moved module breaks it in a
-        // way no unit test over `components/` can see. Evaluated exactly as `run_startup_
-        // evaluation` would: capabilities seeded and reading nil, which is also the state a real
-        // boot evaluates in before the first snapshot lands.
+        // Use `dev-config/oblisk/shell.lua`, not a fixture: it is the worked example split across
+        // thirty-odd `require`d files, so renames or moved modules escape `components/` tests.
+        // Evaluate as `run_startup_evaluation`: seeded capabilities read nil before the first
+        // snapshot,
+        // as at real boot.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (client, _outbound_rx) = test_client(&shell_lua);
 
         let (_output, specs) = evaluate_and_specs(&client.loader, &shell_lua)
             .unwrap_or_else(|err| panic!("the shipped dev config must evaluate: {err}"));
 
-        // By id and role rather than by count, so this says which surface went missing.
+        // Assert id and role, not only count, to identify a missing surface.
         let declared: Vec<(&str, &str)> = specs
             .iter()
             .map(|spec| {
@@ -1172,8 +1113,8 @@ mod tests {
         point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height
     }
 
-    /// The absolute centre of every node in `node` declaring a `hover` property, accumulating the
-    /// parent-relative origins on the way down the way `layout::hit` does.
+    /// Absolute centres of `hover` nodes, accumulating parent-relative origins as `layout::hit`
+    /// does.
     fn hover_region_centres(
         node: &crate::layout::ResolvedNode,
         x: f32,
@@ -1191,9 +1132,8 @@ mod tests {
 
     #[test]
     fn every_hover_region_the_shipped_bar_declares_lights_exactly_one_slot() {
-        // The wiring check the per-module tooltips need and no unit test reaches: each region names
-        // a slot by string, and a typo is a region that lights nothing and a tooltip that never
-        // opens. Silent in every other gate, because both halves parse and both resolve.
+        // Wiring check for per-module tooltips: regions name slots by string, so a typo lights
+        // nothing and never opens its tooltip while both halves still parse and resolve.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         for (capability, payload) in widest_bar_snapshots() {
@@ -1208,10 +1148,9 @@ mod tests {
         hover_region_centres(&bar, 0.0, 0.0, &mut centres);
         assert!(centres.len() >= 2, "the bar declares more than one hover region, got {}", centres.len());
 
-        // Regions nest: a pill's row declares one so its circles can hide when the pointer is
-        // off the whole pill, and each circle declares its own, so a point on a circle lights two.
-        // What must hold is that a lit region contains the point and an unlit one does not, since
-        // `hover_writes` answers containment for every region and not innermost-only.
+        // Regions nest: a pill row hides circles off the pill, while a point on a circle lights
+        // both. `hover_writes` checks every region, not only the innermost; each lit region must
+        // contain the point and each unlit one must not.
         for centre in &centres {
             let writes = layout::hover::hover_writes(&bar, Some(*centre));
             let lit: Vec<bool> = writes.iter().map(|write| write.hovered).collect();
@@ -1225,9 +1164,8 @@ mod tests {
             }
         }
 
-        // Distinct slots, not one signal shared by every region. A slot name copy-pasted between
-        // two modules reads as a tooltip opening over the wrong one live, and passes every other
-        // check here: both regions parse, both resolve, and each lights exactly one *write*.
+        // Distinct slots, not one signal shared by regions. A copied slot name opens the wrong live
+        // tooltip while both regions parse, resolve, and light one *write*.
         let writes = layout::hover::hover_writes(&bar, Some(centres[0]));
         let first = writes.first().expect("the walk found regions above");
         first.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(true));
@@ -1244,12 +1182,11 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_configs_battery_tooltip_opens_when_its_pill_is_hovered() {
-        // ADR-0062 against the config this repo ships, which is the only place the whole chain
-        // exists at once: `hover(name)` in `battery.lua`, the `hover` property on the pill,
-        // `hover_rect(name)` on the tooltip's `anchor_rect`, and the popup's `visible`.
+        // ADR-0062 against the shipped config, the only full chain: `hover(name)` in `battery.lua`,
+        // pill `hover`, tooltip `hover_rect(name)` -> `anchor_rect`, and popup `visible`.
         //
-        // Found by walking for the `hover` property rather than by indexing into the left zone, so
-        // reordering the bar does not silently turn this into a test of the wrong module.
+        // Walk for `hover`, rather than indexing the left zone, so bar reordering cannot test the
+        // wrong module silently.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         for (capability, payload) in widest_bar_snapshots() {
@@ -1263,14 +1200,10 @@ mod tests {
             |client: &RendererClient| client.scene.surface("battery_tooltip").expect("the tooltip resolves").visible;
         assert!(!tooltip_is_up(&client), "a tooltip is not up before the pointer has been anywhere");
 
-        // Both of this slice's live bugs were in the state *before* anything is hovered, which the
-        // rest of this test walks straight past, so they are pinned here.
-        //
-        // `grab` is § 6's default `true` unless a popup says otherwise, and a grabbing popup
-        // needs an armed input serial that a hover cannot produce -- the tooltip resolved
-        // `visible = true` on a real pointer and the compositor refused it on every re-resolve.
-        // `anchor_rect` is required and non-zero, and the rect signal started nil, which reads as
-        // the property being absent rather than as a rect.
+        // Pin two bugs that occur before the first hover. `grab` defaults true in § 6, but a
+        // grabbing popup needs an input serial hover cannot produce; the compositor refused the
+        // tooltip's `visible = true` on every re-resolve. `anchor_rect` is required and non-zero,
+        // while its rect signal began nil, which reads as absent, not a rect.
         let (_output, specs) = evaluate_and_specs(&client.loader, &shell_lua).expect("the shipped config evaluates");
         let tooltip = specs
             .iter()
@@ -1286,15 +1219,11 @@ mod tests {
             tooltip.anchor_rect
         );
 
-        // Every region on the bar is tried, not just the first one the walk finds. `HoverWrite`
-        // carries the signal and no name, so there is no way to ask for the battery's region by
-        // slot; the first region used to be the battery's only because nothing to its left declared
-        // one. It now sits behind four circles that do, and `centres.first()` quietly turned this
-        // into a test of the power button.
-        //
-        // Trying all of them tests the stronger claim anyway: exactly one region on this bar opens
-        // the battery tooltip, so a slot renamed on either side fails here rather than passing with
-        // the wrong module hovered.
+        // Try every region. `HoverWrite` carries a signal, not its name, so the battery region
+        // cannot be selected by slot. It used to be first because nothing left of it declared one;
+        // now four circles precede it, and `centres.first()` tests the power button. The stronger
+        // assertion is that exactly one region opens the battery tooltip, catching either side's
+        // slot rename.
         let bar = client.scene.surface("bar@TEST").unwrap();
         let mut centres = Vec::new();
         hover_region_centres(&bar, 0.0, 0.0, &mut centres);
@@ -1303,9 +1232,8 @@ mod tests {
         let mut opened_by = 0;
         for centre in centres {
             let writes = layout::hover::hover_writes(&bar, Some(centre));
-            // A point inside one region is outside every region that does not enclose it. Every
-            // write is applied the way `App::sync_hover` applies them, because turning the others
-            // *off* is half of what the walk is for.
+            // Apply writes as `App::sync_hover` does: a point inside one region is outside the
+            // others, and turning those *off* is half the walk.
             for write in &writes {
                 assert_eq!(
                     write.hovered,
@@ -1318,9 +1246,9 @@ mod tests {
                 let Some(rect) = write.rect else {
                     continue;
                 };
-                // Built here rather than reached for through `crate::wayland::input`, which is
-                // private: the shape is § 6's `anchor_rect`, and a wrong one fails the re-resolve
-                // asserted just below rather than passing quietly.
+                // Build here because `crate::wayland::input` is private. This is § 6's
+                // `anchor_rect`;
+                // a wrong shape fails the re-resolve below.
                 let table = client.lua().create_table().unwrap();
                 table.set("x", rect.x).unwrap();
                 table.set("y", rect.y).unwrap();
@@ -1335,8 +1263,8 @@ mod tests {
         }
         assert_eq!(opened_by, 1, "exactly one hover region on the bar opens the battery tooltip");
 
-        // And closes again. `anchor_rect` keeps the rect it was last given rather than clearing,
-        // which is what stops § 6's non-zero rule failing the evaluation on the way out.
+        // Close again. `anchor_rect` retains its last rect instead of clearing, preserving § 6's
+        // non-zero rule on the way out.
         let bar = client.scene.surface("bar@TEST").unwrap();
         for write in layout::hover::hover_writes(&bar, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
@@ -1347,9 +1275,8 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_configs_notification_card_is_up_only_while_something_is_in_the_feed() {
-        // The bug this is here for was on screen for the whole slice: the surface had no `visible`
-        // binding at all, so a card reading "no notifications" sat in the corner permanently. An
-        // empty state is what a *panel* shows; a popup that is always up is not a notification.
+        // Regression: no `visible` binding left a "no notifications" card permanently in the
+        // corner. Empty state belongs to a *panel*; an always-up popup is not a notification.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
@@ -1369,8 +1296,8 @@ mod tests {
         assert!(client.re_resolve_if_dirty());
         assert!(card_is_up(&client), "a notification in the feed puts the card up");
 
-        // And back down when the Supervisor expires it out of the feed (ADR-0033), which is
-        // the whole of this config's auto-hide: no timer here, just an empty list.
+        // The Supervisor expires it from the feed (ADR-0033); auto-hide is only this empty list,
+        // with no timer here.
         client
             .apply_state_snapshot(StateSnapshot {
                 capability: "notifications".to_string(),
@@ -1384,14 +1311,12 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_configs_history_card_is_as_tall_as_the_notifications_in_it() {
-        // The last notification in the history was drawn with its bottom edge cut off by the panel
-        // card: the card's content-sized height (ADR-0110) came out one line of body text short.
-        // The trigger was position, not content -- taffy 0.14 adds a container's own margin to its
-        // children's minimum cross size while measuring them (`layout::scene::taffy_style` says
-        // how this engine sidesteps that), and the card's margin is what centres it under its
-        // indicator, most of the way across the output. So this places the anchor where the bell
-        // is and seeds the output the session ran on, and asks that every node in the card holds
-        // its children: the card its body, the body its list, the list its cards, a card its rows.
+        // Regression: the last history notification's bottom was clipped because content-sized
+        // card height (ADR-0110) was one body-text line short. Position, not content, triggered it:
+        // taffy 0.14 adds a container's margin to children's minimum cross size while measuring
+        // (`layout::scene::taffy_style` shows the workaround), and the card margin centers it under
+        // the indicator. Put the anchor at the bell, seed the session's output, and require every
+        // card node to contain its child: card/body/list/cards/rows.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         client
@@ -1454,11 +1379,9 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_configs_lock_screen_draws_one_mask_glyph_per_typed_character() {
-        // The lock screen is the one surface where drawing nothing is a lockout risk rather than a
-        // cosmetic gap: typing blind makes a typo invisible, `pam_unix` answers a wrong password
-        // with a two second delay, and `pam_faillock` locks the account after three. Asserted
-        // against the shipped `lock.lua` rather than a fixture, because what has to hold is that
-        // *this* config's field is the one that fills.
+        // Lock screen blankness risks lockout: blind typing hides typos, `pam_unix` delays a wrong
+        // password two seconds, and `pam_faillock` locks after three. Use shipped `lock.lua`, not a
+        // fixture, so this config's field is the one filling.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
@@ -1481,7 +1404,7 @@ mod tests {
             "an untouched field shows its placeholder: {unfocused:?}"
         );
 
-        // The pair `lock.lua` declares, and the pair the Supervisor's unlock path answers.
+        // The pair declared by `lock.lua` and answered by the Supervisor unlock path.
         let target =
             layout::node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() };
         let typed = masked(Some(&layout::paint::FieldFocus::Masked { target: &target, filled: 5 }));
@@ -1497,22 +1420,14 @@ mod tests {
 
     #[test]
     fn the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing() {
-        // The failure this catches has happened twice and is invisible until a screenshot: a zone
-        // is a fixed percentage of the bar and `row` does not shrink a child to make its siblings
-        // fit, so a zone one module too full silently paints the last one past its own right edge
-        // and off the bar. Resolved against a 1920x1080 output, which is what `test_outputs` gives.
-        //
-        // The zones are a fixed percentage by the config's choice now, not by the engine's limit. A
-        // `Fill` child is sized from the remainder its siblings leave, so two `Fill` spacers around
-        // a content-sized centre zone would centre it at any module width and retire this whole
-        // failure mode. `dev-config/oblisk/modules/bar/init.lua` says why that rewrite is not done
-        // yet. Until it is, this test is what stands between a full zone and a clipped module.
-        //
-        // A loaded bar, not the boot one. Left to itself every capability reads nil and each
-        // module draws its shortest placeholder, so an empty bar would pass this and a real
-        // session would still clip. The snapshots below are each module at or near its widest:
-        // every string that gets truncated is fed past its truncation limit, the tray carries
-        // items, and the privacy pill -- normally hidden -- is forced visible with a camera user.
+        // Regression happened twice and appears only in screenshots: fixed-percentage zones plus a
+        // non-shrinking `row` let an overfull zone paint past its right edge. Resolve at 1920x1080
+        // (`test_outputs`). Zone sizing is a config choice; two `Fill` spacers around a
+        // content-sized center would remove this failure, but
+        // `dev-config/oblisk/modules/bar/init.lua`
+        // explains why that rewrite waits. Until then, this test guards clipping.
+        // Load the bar with near-worst-case snapshots, not boot nils: strings exceed truncation,
+        // tray has items, and normally hidden privacy is visible with a camera user.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (mut client, _outbound_rx) = test_client(&shell_lua);
         for (capability, payload) in widest_bar_snapshots() {
@@ -1523,11 +1438,11 @@ mod tests {
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
         let bar = client.scene.surface("bar@TEST").expect("the bar instance must resolve");
-        // bar -> the padded row -> the three zones.
+        // bar -> padded row -> three zones.
         let zones = &bar.children[0].children;
         assert_eq!(zones.len(), 3, "the bar is three zones (`modules/bar/init.lua`)");
 
-        // Every zone reported before any assertion, so one overflow does not hide the next.
+        // Report every zone before asserting, so one overflow cannot hide the next.
         let overflowing: Vec<String> = zones
             .iter()
             .enumerate()
@@ -1549,15 +1464,11 @@ mod tests {
             .collect();
         assert!(overflowing.is_empty(), "a bar zone will paint past its own edge -- {}", overflowing.join("; "));
 
-        // The panel host has the other axis to worry about. Its card is as tall as the panel in it
-        // (ADR-0110): each body's list is capped and scrolls, so what can still overflow is the
-        // card as a whole running off the bottom of the output, and the surface's own height is the
-        // room under the bar.
-        //
-        // `children[0]` is the surface's one root node, holding the click-outside catcher and the
-        // card in that order (`modules/shell/panel_host.lua`); the card is the second so that it
-        // paints, and hit-tests, over the catcher. Opened first: a closed panel host is a frozen
-        // root with nothing under it (ADR-0124), so the card exists only once a kind is showing.
+        // Panel host's other axis: its card is as tall as the panel (ADR-0110), and each body list
+        // caps and scrolls. Only the card can run off the output; surface height is the room below
+        // the bar. `children[0]` is the root with click-outside catcher then card
+        // (`modules/shell/panel_host.lua`), so card paints and hit-tests above it. A closed host is
+        // a frozen empty root (ADR-0124), so the card exists only when a kind is shown.
         client
             .lua()
             .load(r#"state("panel_open", false):set(true) state("panel_kind", ""):set("notifications")"#)
@@ -1573,9 +1484,8 @@ mod tests {
             host.rect.height
         );
         let widest = card.children.iter().map(|section| section.rect.width).fold(0.0_f32, f32::max);
-        // Derived the same way and for the same reason: the hard-coded 24 assumed `spacing.md` was
-        // 12px, and it is 11px once the responsive scale has been through it, so this compared a
-        // `Fill` section against a card two pixels narrower than the one it was filling.
+        // Same derivation: hard-coded 24 assumed `spacing.md` was 12px, but responsive scale makes
+        // it 11px, comparing a `Fill` section with a card two pixels too narrow.
         let content_width = card.rect.width - 2.0 * card.children.first().map_or(0.0, |first| first.rect.x);
         assert!(
             widest <= content_width,
@@ -1585,9 +1495,8 @@ mod tests {
 
     #[test]
     fn every_rostered_capability_is_on_the_oblisk_table_and_reads_nil_before_its_first_snapshot() {
-        // ADR-0037's uniform contract: a shell.lua reading any rostered capability at boot gets a
-        // live signal reading nil, never an index-into-nil error into rescue, under the name
-        // `oblisk.<roster name>`.
+        // ADR-0037: every rostered capability is `oblisk.<name>`, a live signal reading nil at
+        // boot, never an index-into-nil rescue error.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -1602,14 +1511,13 @@ mod tests {
 
     #[test]
     fn no_rostered_capability_is_left_as_a_bare_global() {
-        // `set_global` never removes anything, so a leftover bare seed would keep working until
-        // the day the name collided with a node constructor the way `lock` did (ADR-0052
-        // decision 1).
+        // `set_global` never removes a bare seed; it would work until colliding with a node
+        // constructor as `lock` did (ADR-0052 decision 1).
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::Capability::ALL.iter().map(|c| c.as_str()) {
-            // `lock` is excluded: § 6's node constructor legitimately owns that global.
+            // `lock` is § 6's legitimate node constructor.
             if capability == "lock" {
                 continue;
             }
@@ -1623,9 +1531,8 @@ mod tests {
 
     #[test]
     fn an_unrostered_push_refuses_to_replace_a_name_the_oblisk_table_already_holds() {
-        // `rescue` reports config failures, so replacing it with an empty capability would make
-        // the shell stop reporting its own breakage -- how ADR-0052 decision 1's `lock` bug
-        // happened.
+        // `rescue` reports config failures; replacing it with an empty capability hides the shell's
+        // breakage, as in ADR-0052 decision 1's `lock` bug.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -1633,13 +1540,13 @@ mod tests {
         let err = client.apply_state_snapshot(snapshot).unwrap_err().to_string();
         assert!(err.contains("already something else"), "the refusal must say why: {err}");
 
-        // The real `rescue` still reads its own table, not an empty capability.
+        // Real `rescue` still reads its own table, not an empty capability.
         assert!(probe::<bool>(&client.loader, "intact = oblisk.rescue:get().is_rescue == false", "intact"));
     }
 
     #[test]
     fn rescue_and_screens_moved_onto_the_same_table_as_the_roster() {
-        // § 2.10 and § 2.15 name both of these `oblisk.*` like every capability.
+        // § 2.10 and § 2.15 name both `oblisk.*`, like capabilities.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -1657,38 +1564,33 @@ mod tests {
 
     #[test]
     fn oblisk_version_is_three_integers_a_config_can_compare() {
-        // The value matters less than the shape: a config guards with `if oblisk.version.major >
-        // 0 or oblisk.version.minor >= 2 then`, so all three fields must be present and numeric.
+        // Shape matters: configs compare `oblisk.version.major > 0` or `minor >= 2`, so all three
+        // fields must be numeric.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
         let setup = "major, minor, patch = oblisk.version.major, oblisk.version.minor, oblisk.version.patch";
-        // Read back through Lua and compared against Cargo's own string, rather than against a
-        // second call to the function that built the table: this asserts the number a config
-        // actually sees, not that one function agrees with itself. It also reaches
-        // `lua::namespace::version_parts`'s `expect`, which is why that function carries no
-        // narrower test of its own.
+        // Read through Lua against Cargo's string, not a second builder call: assert what config
+        // sees. This also reaches `lua::namespace::version_parts`'s `expect`, so it needs no
+        // narrower test.
         let field = |name: &str| probe::<i64>(&client.loader, setup, name);
         assert_eq!(format!("{}.{}.{}", field("major"), field("minor"), field("patch")), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn oblisk_config_dir_is_the_directory_shell_lua_was_loaded_from() {
-        // Derived from the loaded path rather than re-resolved, so a Renderer started with an
-        // explicit `shell.lua` cannot report a directory it is not reading from.
+        // Derive from the loaded path, not a fresh resolution, so explicit `shell.lua` cannot
+        // report an unread directory.
         let (client, _outbound_rx) = test_client(std::path::Path::new("/opt/oblisk-config/shell.lua"));
         let dir = probe::<String>(&client.loader, "dir = oblisk.config_dir", "dir");
         assert_eq!(dir, "/opt/oblisk-config");
     }
 
-    /// `RendererClient::new` seeds the roster *after* `Loader::new` registered § 6's node
-    /// constructors, so seeding `lock` as a bare global would overwrite the constructor -- and a
-    /// `set` over an existing global is silent, so the failure would surface as "attempt to call
-    /// a userdata value" from the config's own `lock { ... }` line, pointing at the config rather
-    /// than the seed.
-    ///
-    /// Asserted after a whole generation is built, not after the seed alone, since the ordering
-    /// between the two registrations is exactly what is under test.
+    /// `RendererClient::new` seeds after `Loader::new` registers § 6 constructors. A bare `lock`
+    /// seed would silently overwrite the constructor; `set` over an existing global is silent, so
+    /// `lock { ... }` would report "attempt to call a userdata value" against the config rather
+    /// than the seed. Assert after a full generation, because that registration order is the
+    /// contract.
     #[test]
     fn a_full_generation_keeps_lock_as_the_node_constructor_and_puts_the_capability_on_oblisk() {
         let dir = tempfile::tempdir().unwrap();
@@ -1713,7 +1615,7 @@ mod tests {
 
         assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
 
-        // The constructor survived: a `lock { ... }` at the root still produced a § 6 surface.
+        // The root `lock { ... }` still produced a § 6 surface.
         let setup = r#"
             lock_kind = lock { id = "screen" }.kind
             capability_type = type(oblisk.lock)
@@ -1724,7 +1626,7 @@ mod tests {
             "lock",
             "the global `lock` must still be § 6.4's node constructor"
         );
-        // The capability is reachable, hydrated, under the name § 2 gives it.
+        // The § 2 capability name is reachable and hydrated.
         assert_eq!(probe::<String>(&client.loader, setup, "capability_type"), "userdata");
         assert_eq!(
             probe::<i64>(&client.loader, setup, "attempts"),
@@ -1735,8 +1637,8 @@ mod tests {
 
     #[test]
     fn a_declared_store_opens_the_file_the_config_named_and_nothing_else() {
-        // ADR-0136: the path, the file name and the defaults are all the config's, so the
-        // envelope must carry exactly what `shell.lua` wrote and no directory this crate chose.
+        // ADR-0136: path, file name, and defaults belong to config; the envelope must carry exactly
+        // `shell.lua`'s values, not a directory chosen here.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, mut outbound_rx) = test_client(&missing);
 
@@ -1820,9 +1722,10 @@ mod tests {
 
     #[test]
     fn two_declarations_of_one_file_are_one_table() {
-        // A reusable module and `shell.lua` can both declare the same store, and an in-place
-        // reload re-runs every declaration: all three must land on one table with one signal per
-        // key, or a `:set()` through one would leave the other reading a stale signal.
+        // A module and `shell.lua` may redeclare a store, and in-place reload reruns all
+        // declarations:
+        // all three executions land on one table and signal per key, or one `:set()` leaves the
+        // other stale.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -1834,8 +1737,7 @@ mod tests {
         assert!(probe::<bool>(&client.loader, setup, "same"), "the joined path is the identity");
     }
 
-    /// The write half of the same object: a config's own `on_click` calling the lock action puts
-    /// a real § 7 envelope on the outbound channel.
+    /// A config `on_click` invoking lock queues a real § 7 envelope.
     #[test]
     fn a_config_calling_the_lock_action_queues_a_command_for_the_supervisor() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -1889,7 +1791,7 @@ mod tests {
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
     }
 
-    /// A `window` and a `popup` declared alongside the panels.
+    /// A `window` and `popup` alongside panels.
     fn three_roles_config() -> &'static str {
         r#"return {
             panel { id = "bar", layer = "Top" },
@@ -1901,8 +1803,8 @@ mod tests {
 
     #[test]
     fn every_declared_role_comes_back_from_the_startup_evaluation_tagged_with_its_own_spec() {
-        // The whole roster, not just the panels: `expand_instances` and `create_surfaces` both
-        // branch on the variant, so an untagged role could only ever be bound as a layer surface.
+        // All roles matter: `expand_instances` and `create_surfaces` branch on the variant; an
+        // untagged role could bind only as a layer surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), three_roles_config());
         let (mut client, _outbound_rx) = test_client(&path);
@@ -1916,9 +1818,8 @@ mod tests {
 
     #[test]
     fn the_swap_fingerprint_carries_every_role_so_adding_a_window_is_a_topology_change() {
-        // ADR-0049 decision 3: a `window`'s Wayland object comes and goes inside one
-        // generation, but its *declaration* is fixed for that generation's life, so adding one is
-        // a topology change like any other.
+        // ADR-0049 decision 3: a window object may come and go within a generation, but its
+        // *declaration* is fixed, so adding one changes topology.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -1940,7 +1841,7 @@ mod tests {
         assert!(client.state.pending.is_none());
     }
 
-    /// A lock screen whose `child` holds the one `secure_submit` field § 6 needs.
+    /// Lock screen whose `child` holds § 6's `secure_submit` field.
     fn lock_config(background: &str) -> String {
         format!(
             r##"return {{
@@ -1954,18 +1855,16 @@ mod tests {
 
     #[test]
     fn an_in_place_reload_may_restyle_a_live_lock_screen_but_not_remove_its_way_out() {
-        // `SurfaceFingerprint::Lock` carries only the `id`, so an edit *inside* the lock diffs as
-        // `Unchanged` and takes the in-place path, which the generation-swap gate does not
-        // police. Both halves are the point: the restyle has to keep landing (ADR-0052
-        // decision 2), but the edit that removes the way out must be refused, and `Scene::apply`'s
-        // rollback is what leaves the live tree exactly as it was.
+        // `SurfaceFingerprint::Lock` carries only `id`, so edits inside the lock are `Unchanged`
+        // and bypass the generation-swap gate. Restyles must land (ADR-0052 decision 2), but
+        // removing the way out must be refused; `Scene::apply` rollback preserves the live tree.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
         let (mut client, mut outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
         client.set_session_locked(true);
 
-        // A restyle: same surfaces, same field, different colour.
+        // Restyle: same surfaces and field, different colour.
         write_shell_lua(dir.path(), &lock_config("#204080FF"));
         client.handle_reevaluate(ReevaluateRequest { sequence: 20 });
         assert_eq!(
@@ -1980,7 +1879,7 @@ mod tests {
             "restyling a live lock screen is the reason it is painted from Lua at all"
         );
 
-        // The edit that must not land: same lock, no `textfield` under it.
+        // Must refuse: same lock, no `textfield`.
         write_shell_lua(
             dir.path(),
             r##"return {
@@ -2006,8 +1905,7 @@ mod tests {
 
     #[test]
     fn an_unlocked_session_may_still_delete_its_lock_screens_password_field() {
-        // With no lock held there is nothing to be locked out of, so a config may edit its lock
-        // screen down to nothing like any other surface.
+        // With no lock held, the lock screen may become empty like any surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -2035,13 +1933,11 @@ mod tests {
 
     #[test]
     fn the_lock_veto_follows_the_outputs_rather_than_the_instances_it_was_armed_with() {
-        // The veto used to be armed with the `lock` instance ids that existed at
-        // `LockCommand::Acquire`. `handle_output_change` retires instances and creates new ones
-        // on every hotplug without revisiting that list, so a lid closing onto a dock left the
-        // veto validating a fossil nothing can paint while the live lock screen went unguarded.
-        //
-        // The apply below is the same sequence `handle_output_change` performs: re-expand the
-        // applied specs against the outputs that exist now, store them, resolve.
+        // The veto used to store `lock` instance ids from `LockCommand::Acquire`. Each hotplug's
+        // `handle_output_change` replaces instances without revisiting that list; a lid closing on
+        // a dock left the veto checking an unpaintable fossil while the live lock screen was open.
+        // This apply mirrors `handle_output_change`: re-expand applied specs against current
+        // outputs, store, resolve.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -2081,14 +1977,12 @@ mod tests {
 
     #[test]
     fn a_second_lock_declaration_is_refused_at_evaluation_naming_6_4() {
-        // `expand_instances` emits one instance per lock spec per output, so two `lock`
-        // declarations make `ensure_lock_surfaces` send two `get_lock_surface` for the same
-        // `wl_output`, which `ext-session-lock-v1` calls a `duplicate_output` protocol error. The
-        // compositor kills the connection *after* the lock is taken, so the only way back in is a
-        // VT switch.
-        //
-        // Both entry points, since both reach a generation: startup refuses to hand any specs
-        // back, and a `Reevaluate` reports `Failed` rather than staging it.
+        // `expand_instances` makes one instance per lock spec/output. Two declarations make
+        // `ensure_lock_surfaces` send two `get_lock_surface`s for one `wl_output`;
+        // `ext-session-lock-v1` calls that `duplicate_output`, and the compositor kills the
+        // connection after lock, leaving
+        // only a VT switch. Both entry points reject it: startup returns no specs and `Reevaluate`
+        // reports `Failed`, never staging it.
         let dir = tempfile::tempdir().unwrap();
         let two_locks = r#"return { lock { id = "first" }, lock { id = "second" } }"#;
         let path = write_shell_lua(dir.path(), two_locks);
@@ -2125,8 +2019,8 @@ mod tests {
 
     #[test]
     fn a_windows_title_is_an_in_place_field_rather_than_a_topology_one() {
-        // `xdg-shell.xml` says a `set_title`/`set_app_id` request may be sent after the toplevel
-        // is mapped, so a changed title must not respawn the process to deliver it.
+        // `xdg-shell.xml` permits `set_title`/`set_app_id` after mapping, so a title change must
+        // not respawn the process.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Settings" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -2153,10 +2047,9 @@ mod tests {
 
     #[test]
     fn a_popup_with_a_zero_anchor_rect_fails_the_evaluation_and_names_the_property_in_rescue() {
-        // § 6's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`, and a zero size leaves
-        // the positioner incomplete, raising `invalid_positioner` at `get_popup` and killing the
-        // whole Wayland connection. A config typo must be a `LayoutError` at evaluation, never a
-        // protocol error at runtime, landing in `rescue`'s `error_log` with the property named.
+        // § 6's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`; zero size leaves it
+        // incomplete, so `get_popup` raises `invalid_positioner` and kills Wayland. A config typo
+        // must instead be an evaluation `LayoutError` in `rescue.error_log`, naming the property.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2180,8 +2073,8 @@ mod tests {
 
     #[test]
     fn a_window_whose_max_size_is_below_its_min_size_fails_the_evaluation() {
-        // The `window` half of the same rule: `set_max_size` raises `invalid_size` on a maximum
-        // under the minimum, so the check has to run at evaluation, where a config author sees it.
+        // Likewise, `set_max_size` raises `invalid_size` when max < min; validate at evaluation so
+        // the config author sees it.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2212,9 +2105,8 @@ mod tests {
 
     #[test]
     fn a_successful_reevaluate_after_a_startup_failure_recovers_instead_of_reporting_topology_changed_forever() {
-        // Treating "nothing applied yet" as an empty topology, rather than "no prior state to
-        // protect", made every subsequent evaluation permanently misclassify as `TopologyChanged`,
-        // which nothing here ever applies, leaving the shell blank forever.
+        // Treating "nothing applied yet" as empty topology instead of "no prior state" made every
+        // later evaluation `TopologyChanged`, which nothing applies, leaving the shell blank.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("shell.lua");
         let (mut client, mut outbound_rx) = test_client(&missing);
@@ -2259,7 +2151,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        // Seed a *different* applied topology so the fresh evaluation reads as changed.
+        // Seed a *different* topology so fresh evaluation reads as changed.
         client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
             id: "other".to_string(),
             layer: LayerKind::Top,
@@ -2279,10 +2171,9 @@ mod tests {
 
     #[test]
     fn editing_only_the_in_place_panel_fields_reports_unchanged_and_reloads_in_place() {
-        // ADR-0038 decision 2: `margin`, exclusive zone, `keyboard_interactivity` and size
-        // are all requests layer-shell accepts on a live surface, so editing one must reload in
-        // place -- comparing whole specs would turn every one of these into a generation swap,
-        // respawning the process to nudge a bar 4px sideways.
+        // ADR-0038 decision 2: layer-shell accepts `margin`, exclusive zone,
+        // `keyboard_interactivity`, and size on a live surface. Comparing whole specs would swap
+        // generations for each, respawning just to move a bar 4px.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2297,7 +2188,7 @@ mod tests {
                 .collect(),
         );
 
-        // Every in-place field changed at once; every topology field left alone.
+        // Change every in-place field; leave topology unchanged.
         write_shell_lua(
             dir.path(),
             r#"return panel { id = "bar", layer = "Top", margin = { left = 40 }, keyboard_interactivity = "Exclusive", exclusive = true, height = 48 }"#,
@@ -2317,8 +2208,8 @@ mod tests {
 
     #[test]
     fn editing_only_the_namespace_reports_topology_changed() {
-        // `get_layer_surface` fixes the namespace at creation and no request changes it on a live
-        // surface, so a namespace edit needs a new surface, hence a new generation.
+        // `get_layer_surface` fixes namespace at creation; no live request changes it, so namespace
+        // edits need a new surface and generation.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -2342,8 +2233,7 @@ mod tests {
 
     #[test]
     fn set_instance_size_replaces_one_instances_available_size_and_marks_the_scene_dirty() {
-        // A `configure` reuses ADR-0044 decision 2's one dirty flag rather than adding a second
-        // "something changed" mechanism next to it.
+        // `configure` reuses ADR-0044 decision 2's one dirty flag, not a second change mechanism.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2390,8 +2280,8 @@ mod tests {
 
     #[test]
     fn one_surface_on_two_outputs_resolves_two_trees_against_two_different_sizes() {
-        // `monitor = "All"` across a laptop panel and a 4K external is two configured sizes, and
-        // one tree per declared surface could only ever serve one of them.
+        // `monitor = "All"` across laptop and 4K external means two configured sizes; one declared
+        // surface tree cannot serve both.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2448,7 +2338,7 @@ mod tests {
 
     #[test]
     fn handle_reevaluate_reports_a_topology_field_error_distinctly_from_a_top_level_return_error() {
-        // A topology-field type error (e.g. `anchor.top` not a boolean) used to be folded into
+        // A topology-field type error such as `anchor.top` not boolean used to become
         // `InvalidTopLevelReturn`'s fixed "must be a `panel` node or an array of them" message.
         let dir = tempfile::tempdir().unwrap();
         let path =
@@ -2483,8 +2373,7 @@ mod tests {
         assert!(client.scene.surface("bar@TEST").is_some());
         assert!(client.state.pending.is_none());
         assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
-        // The half that reaches the screen: the poll loop only repaints when `re_resolve_if_dirty`
-        // reports a change.
+        // The poll loop repaints only when `re_resolve_if_dirty` reports change.
         assert!(client.dirty.take(), "an applied in-place reload must mark the scene dirty");
     }
 
@@ -2503,11 +2392,9 @@ mod tests {
         assert!(client.state.pending.is_some(), "the still-current pending evaluation must survive a mismatched Apply");
     }
 
-    // ADR-0044 decision 2: a `StateSnapshot` push marks the scene dirty, and a dirty scene
-    // re-resolves against the last applied evaluation without running shell.lua again.
-    // `workspace` is used as the pushed capability throughout because it isn't in
-    // `shared::Capability::ALL`, so pushing it before `run_startup_evaluation` is what makes a
-    // `shell.lua` that references it bare (not `:get()`) evaluate at all.
+    // ADR-0044 decision 2: a `StateSnapshot` dirties the scene; dirty re-resolve uses the last
+    // applied evaluation without `shell.lua`. `workspace` is outside `shared::Capability::ALL`, so
+    // push it before `run_startup_evaluation` for a bare (not `:get()`) reference to evaluate.
 
     #[test]
     fn apply_state_snapshot_marks_the_scene_dirty() {
@@ -2544,8 +2431,7 @@ mod tests {
             "startup must have applied the pushed initial value"
         );
 
-        // Break the file so a real re-evaluation would fail: the re-resolve below must read the
-        // pushed value off the retained tree's live signal, never touching this file again.
+        // Break the file: re-resolve must read the retained tree's live signal, never disk.
         std::fs::write(&path, "this is not lua").unwrap();
 
         client
@@ -2591,9 +2477,9 @@ mod tests {
         assert!(!client.scene.surface("bar@TEST").unwrap().visible, "the first re-resolve must apply the pushed value");
         assert!(!client.dirty.take(), "re_resolve_if_dirty must clear the flag it consumed");
 
-        // Replace `applied_output` directly (bypassing the push path, which would re-mark dirty)
-        // with an evaluation that resolves `visible` to `true`. A true no-op leaves the scene
-        // exactly as the first resolve left it.
+        // Replace `applied_output` directly, bypassing the dirtying push path, with
+        // `visible = true`.
+        // A true no-op leaves the scene as the first resolve left it.
         let poisoned_path =
             write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", visible = true }"#);
         let (poisoned_output, _) = evaluate_and_specs(&client.loader, &poisoned_path).unwrap();
@@ -2608,8 +2494,8 @@ mod tests {
 
     #[test]
     fn a_burst_of_pushes_before_one_check_marks_the_flag_only_once() {
-        // ADR-0044 decision 2's "drain first, then re-resolve once": several pushes landing
-        // before one read must coalesce into a single dirty read, not one per push.
+        // ADR-0044 decision 2: "drain first, then re-resolve once"; several pushes before one read
+        // coalesce into one dirty read.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -2647,7 +2533,7 @@ mod tests {
         assert!(client.scene.surface("bar@TEST").unwrap().visible);
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
 
-        // `visible` requires a boolean; a table makes the re-resolve fail.
+        // `visible` requires boolean; a table makes re-resolve fail.
         client
             .apply_state_snapshot(StateSnapshot {
                 capability: "workspace".to_string(),
@@ -2671,9 +2557,9 @@ mod tests {
 
     #[test]
     fn a_config_binding_a_bare_rostered_signal_applies_at_startup_with_no_push_at_all() {
-        // ADR-0044 decision 1's nil rule: `run_startup_evaluation` runs before one inbound frame
-        // is drained, so every rostered capability still reads `nil`. A config that binds one bare
-        // must still apply, taking each parser's absent-property default.
+        // ADR-0044 decision 1: startup runs before an inbound frame drains, so rostered
+        // capabilities
+        // read `nil`; bare bindings still apply using each parser's absent-property default.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2698,8 +2584,8 @@ mod tests {
 
     #[test]
     fn a_text_node_bound_to_a_bare_rostered_signal_applies_at_startup_with_no_push_at_all() {
-        // ADR-0044's headline example: `text { content = oblisk.mpris.title }` must apply at boot
-        // even though `title` still reads `nil`, the same rule as `visible`/`children` above.
+        // ADR-0044 example: `text { content = oblisk.mpris.title }` applies at boot with `title`
+        // still nil, like `visible`/`children` above.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2727,8 +2613,8 @@ mod tests {
 
     #[test]
     fn a_push_arriving_before_the_first_successful_apply_is_not_consumed_and_lost() {
-        // `applied_output` is checked *before* the flag is taken: consuming the flag with nothing
-        // to re-resolve against would silently discard the push.
+        // Check `applied_output` before taking the flag; otherwise a push with nothing to resolve
+        // against is silently discarded.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (mut client, _outbound_rx) = test_client(&missing);
         run_startup(&mut client);
@@ -2751,10 +2637,9 @@ mod tests {
 
     #[test]
     fn repeated_re_resolves_that_retire_nodes_do_not_grow_the_lease_bag() {
-        // `Scene::apply` runs up to once per poll turn, and `retire_child_first` pushes every
-        // removed subtree onto `Scene::retiring`, which nothing in production drains
-        // (ADR-0023). A children signal that alternates its length would leak a
-        // `RetainedNode` at push cadence, in a process meant to run for a whole session.
+        // `Scene::apply` runs at most once per poll turn; `retire_child_first` adds removed
+        // subtrees to `Scene::retiring`, which production never drains (ADR-0023). Alternating a
+        // children signal would leak a `RetainedNode` at push cadence over a session.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2797,9 +2682,8 @@ mod tests {
 
     #[test]
     fn a_clean_startup_leaves_the_scene_flag_clear() {
-        // `set_rescue_state` writes through `rescue_handle`, which shares the one `DirtyFlag`, so
-        // a successful startup used to mark the scene dirty by clearing rescue that was already
-        // clear, costing a whole redundant `Scene::apply` on the first poll turn.
+        // `set_rescue_state` writes the shared `DirtyFlag`; startup used to dirty it while clearing
+        // already-clear rescue, costing a redundant first-poll `Scene::apply`.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2816,8 +2700,7 @@ mod tests {
         );
     }
 
-    /// `screens_payload`'s shape, hand-written here so these tests do not depend on
-    /// `crate::wayland` (which needs a live compositor to produce one).
+    /// `screens_payload` shape, hand-written so tests need no live compositor via `crate::wayland`.
     fn screens_json(names: &[&str]) -> serde_json::Value {
         serde_json::Value::Array(
             names
@@ -2829,8 +2712,8 @@ mod tests {
 
     #[test]
     fn a_config_looping_over_screens_declares_one_panel_per_connected_output() {
-        // ADR-0041 decision 1: no `variants` primitive, because Lua already has `for`. If
-        // the seed did not land before the evaluation, the loop would run zero times.
+        // ADR-0041 decision 1: no `variants`; Lua already has `for`. Without the pre-evaluation
+        // seed, this loop would run zero times.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2853,8 +2736,7 @@ mod tests {
 
     #[test]
     fn a_config_reading_screens_before_any_output_is_known_sees_an_empty_list_not_a_nil() {
-        // A `nil` here would make `ipairs` error and drop a config that never did anything wrong
-        // straight into rescue.
+        // `nil` would make `ipairs` error and put an innocent config in rescue.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2872,8 +2754,8 @@ mod tests {
 
     #[test]
     fn set_screens_repeating_the_same_list_reports_no_change_and_leaves_the_scene_clean() {
-        // `update_output` fires for changes `screens` does not carry, so an unchanged re-push must
-        // not buy a `Scene::apply` or a Supervisor round trip.
+        // `update_output` handles changes absent from `screens`; an unchanged push buys neither
+        // `Scene::apply` nor a Supervisor round trip.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
@@ -2912,9 +2794,8 @@ mod tests {
 
     #[test]
     fn seeding_screens_before_the_startup_apply_still_leaves_the_scene_flag_clear() {
-        // The seed marks the flag like any live-signal write, but the apply that immediately
-        // follows resolved against that very value, so entering the poll loop dirty would buy one
-        // redundant `Scene::apply` before anything is drawn.
+        // The seed marks the flag, but the immediate apply resolves that value; entering the poll
+        // loop dirty would add one redundant `Scene::apply` before drawing.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -2930,8 +2811,7 @@ mod tests {
 
     #[test]
     fn applied_surface_specs_returns_the_applied_declarations_without_reading_shell_lua_again() {
-        // What a monitor hotplug re-expands against (ADR-0038 decision 3). The file is
-        // deleted mid-test to prove it is never touched.
+        // Hotplug expansion source (ADR-0038 decision 3). Delete the file to prove it is untouched.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", monitor = "All" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
@@ -2947,15 +2827,15 @@ mod tests {
 
     #[test]
     fn applied_surface_specs_is_empty_when_no_evaluation_has_ever_applied() {
-        // A startup evaluation that failed declares nothing, so a hotplug adds no instance.
+        // Failed startup declared nothing, so hotplug adds no instance.
         let (client, _outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
         assert!(client.applied_surface_specs().is_empty());
     }
 
     #[test]
     fn request_reload_queues_the_frame_the_supervisor_starts_a_cycle_from() {
-        // ADR-0041 decision 4: `is_current_reload` would drop the report of any sequence the
-        // Supervisor did not itself send.
+        // ADR-0041 decision 4: `is_current_reload` would drop sequences the Supervisor did not
+        // send.
         let (client, mut outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
         client.request_reload();
         assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::RequestReload);
@@ -2963,10 +2843,9 @@ mod tests {
 
     #[test]
     fn a_topology_changed_reevaluate_leaves_the_scene_flag_clear() {
-        // A `TopologyChanged` verdict must leave this generation's scene alone entirely (a
-        // generation swap owns it instead), but the no-op `set_rescue_state(false, "")` on the
-        // success path used to leave the flag set, so the next poll turn re-applied
-        // `applied_output` to a scene that must not be mutated.
+        // `TopologyChanged` leaves this scene alone; a generation swap owns it. A no-op
+        // `set_rescue_state(false, "")` used to leave dirty set, so the next poll re-applied
+        // `applied_output` to a scene that must not change.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
@@ -2995,8 +2874,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, mut outbound_rx) = test_client(&path);
-        // A different applied topology so the fresh evaluation reads as changed -- proves the
-        // dispatch/queue path, not `handle_reevaluate`'s own classification logic.
+        // Different applied topology proves dispatch/queue, not `handle_reevaluate` classification.
         client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
             id: "other".to_string(),
             layer: LayerKind::Top,
@@ -3018,8 +2896,8 @@ mod tests {
 
     #[test]
     fn handle_frame_hands_an_activate_draw_nonce_back_to_the_wayland_loop() {
-        // Drawing needs `wayland::App`'s EGL and surface state, so the nonce goes back to the
-        // caller for `App::activate_draw`.
+        // Drawing needs `wayland::App`'s EGL/surface state, so return the nonce to
+        // `App::activate_draw`.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
@@ -3032,9 +2910,8 @@ mod tests {
 
     #[test]
     fn handle_frame_hands_a_set_session_lock_back_to_the_wayland_loop_in_both_directions() {
-        // Both directions matter: `locked = true` reaches the Wayland thread to be refused there
-        // when no `lock` surface is declared (ADR-0052 decision 3), and `locked = false` is
-        // the only path permitted to unlock at all (ADR-0042).
+        // Both directions matter: `locked = true` reaches Wayland for refusal without a `lock`
+        // surface (ADR-0052 decision 3); `locked = false` is the only unlock path (ADR-0042).
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
@@ -3065,8 +2942,7 @@ mod tests {
             })),
             FrameOutcome::Handled
         );
-        // A third, recognized frame to prove dispatch kept working after the two inert ones above
-        // -- the report's exact verdict isn't the point, only that a real response arrives at all.
+        // A third recognized frame proves dispatch still works; the exact verdict is irrelevant.
         assert_eq!(
             client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })),
             FrameOutcome::Handled
@@ -3083,8 +2959,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
-        // Register real out_cb/exit_cb through the real process.run global -- the id (0, the
-        // first call on a fresh registry) is what the inbound frames below address.
+        // Register real callbacks through `process.run`; fresh registry id 0 is what inbound frames
+        // address.
         client
             .loader
             .evaluate(
@@ -3112,8 +2988,8 @@ mod tests {
         assert_eq!(lua.get::<i64>("probe_code").unwrap(), 3);
     }
 
-    /// Queues `frame` for the socket thread and returns what [`pump`] actually wrote to the wire
-    /// for it. `pump`'s read half never produces anything here, so a timeout bounds the test.
+    /// Queues `frame`, returns what [`pump`] wrote. The read half produces nothing here, so timeout
+    /// bounds the test.
     async fn pumped_to_the_wire(frame: RendererFrame) -> RendererFrame {
         let (mut wire, server) = tokio::io::duplex(4096);
         let (mut server_read, mut server_write) = tokio::io::split(server);
@@ -3175,9 +3051,8 @@ mod tests {
 
     #[tokio::test]
     async fn pump_writes_a_secure_submit_frames_secret_to_the_wire_intact() {
-        // ADR-0005/ADR-0027: the wire frame carries the exact secret read out of the accumulated
-        // `SecureBuffer`. `pump` zeroizes the frame's plaintext copy the instant the write
-        // completes.
+        // ADR-0005/ADR-0027: wire carries the exact `SecureBuffer` secret; `pump` zeroizes its
+        // plaintext frame copy immediately after write.
         let written = pumped_to_the_wire(RendererFrame::SecureSubmit(SecureSubmit {
             generation_id: 4,
             capability: "polkit".to_string(),
@@ -3202,8 +3077,7 @@ mod tests {
         let (mut wire, server) = tokio::io::duplex(4096);
         let (mut server_read, mut server_write) = tokio::io::split(server);
 
-        // Write the frame and close the write half so `pump`'s *second* read hits EOF and
-        // returns after forwarding exactly one frame.
+        // Close the write half so `pump`'s *second* read hits EOF after forwarding one frame.
         write_json_frame(&mut wire, &SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })).await.unwrap();
         wire.shutdown().await.unwrap();
 
@@ -3215,9 +3089,8 @@ mod tests {
         assert_eq!(inbound_rx.try_recv(), Ok(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })));
     }
 
-    /// Advances `pumping` for up to `millis` and returns -- unless `pump` itself completes first,
-    /// always a bug in these tests: it means one of its two loops broke, not that it merely
-    /// yielded control back.
+    /// Advances `pumping` for up to `millis`. If `pump` completes first, a loop broke, which is a
+    /// test bug, not a normal yield.
     async fn let_pump_advance(mut pumping: std::pin::Pin<&mut impl std::future::Future<Output = ()>>, millis: u64) {
         tokio::select! {
             () = &mut pumping => unreachable!("pump must not return on its own in this test"),
@@ -3225,16 +3098,14 @@ mod tests {
         }
     }
 
-    /// `shared::framing::read_frame` does two sequential `read_exact` awaits, so partial progress
-    /// lives in the read future itself. The old `pump` raced one `read_json_frame` call against
-    /// one `outbound_rx.recv()` per `tokio::select!` iteration -- if the outbound branch won while
-    /// a read was stuck mid-payload, `select!` dropped the read future, losing the bytes already
-    /// consumed, and the next iteration read a length prefix out of the middle of a JSON payload.
-    ///
-    /// This drives exactly that race: an inbound frame's bytes arrive split across two writes,
-    /// with an outbound frame becoming available while the inbound read is stalled in between.
-    /// The fixed `pump` gives each direction its own long-lived loop, so the stalled read survives
-    /// the outbound activity intact.
+    /// `shared::framing::read_frame` does two sequential `read_exact`s, so partial progress lives
+    /// in its future.
+    /// Old `pump` raced one `read_json_frame` against `outbound_rx.recv()` per `select!`; outbound
+    /// could drop a stalled read, losing consumed bytes, and the next iteration read a length
+    /// prefix
+    /// from the middle of JSON. This reproduces the race with an inbound frame split across writes
+    /// and outbound activity between them. Fixed `pump` gives each direction a long-lived loop, so
+    /// the stalled read survives.
     #[tokio::test]
     async fn pump_survives_an_inbound_frame_split_around_an_outbound_frame() {
         let (mut wire, server) = tokio::io::duplex(4096);
@@ -3247,7 +3118,7 @@ mod tests {
         let payload = serde_json::to_vec(&inbound_frame).unwrap();
         let mut wire_bytes = (payload.len() as u32).to_be_bytes().to_vec();
         wire_bytes.extend_from_slice(&payload);
-        // Splits inside the payload, past the length prefix: stalls the *second* read_exact.
+        // Split past the length prefix, stalling the *second* `read_exact`.
         let split_at = wire_bytes.len() / 2;
         assert!(split_at > 4, "the split point must land inside the payload, not the length prefix");
 
@@ -3256,22 +3127,20 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             wire.write_all(&wire_bytes[..split_at]).await.unwrap();
-            // Let pump's reader consume the partial payload and block mid-`read_exact`.
+            // Consume the partial payload and block mid-`read_exact`.
             let_pump_advance(pumping.as_mut(), 20).await;
 
-            // Queue an outbound frame while the inbound read is stalled mid-frame -- exactly the
-            // race the old per-iteration `select!` lost.
+            // Queue outbound while inbound is stalled mid-frame, the old `select!` race.
             outbound_tx
                 .send(RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }))
                 .unwrap();
             let_pump_advance(pumping.as_mut(), 20).await;
 
-            // The write direction must not be starved by the stuck read.
+            // A stuck read must not starve writes.
             let written = read_json_frame::<_, RendererFrame>(&mut wire).await.unwrap();
             assert_eq!(written, RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }));
 
-            // Complete the inbound frame. If the earlier outbound activity had cancelled the read
-            // (the bug), this length prefix would land mid-payload instead of at a frame boundary.
+            // Complete inbound. If outbound cancelled the read, this prefix would land mid-payload.
             wire.write_all(&wire_bytes[split_at..]).await.unwrap();
             let_pump_advance(pumping.as_mut(), 20).await;
         })

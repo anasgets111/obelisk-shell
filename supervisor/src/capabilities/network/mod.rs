@@ -1,22 +1,18 @@
 //! NetworkManager D-Bus controller (`oblisk.network`; docs/oblisk-supervisor-services-dbus.md §4;
-//! ADR-0029). Mirrors `dbus::polkit`'s controller-holding-proxies structure rather than
-//! `audio::mixer`'s dedicated-thread pattern: NetworkManager's API is D-Bus-native, so its signal
-//! streams merge into `main.rs`'s top-level `tokio::select!` instead of needing a thread of their
-//! own (ADR-0029). D-Bus access goes through `rusty_network_manager` (ADR-0013, ADR-0029) rather
-//! than hand-written proxies.
+//! ADR-0029). It holds `rusty_network_manager` proxies (ADR-0013) and merges their signal streams
+//! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
+//! thread like `audio::mixer`.
 //!
-//! Four forwarder tasks feed one channel, one per interface that owns part of §2.5: the wireless
-//! interface's AP set and association, each device's state, and the manager's radio switches and
-//! default route. ADR-0082 says why the association half is not optional -- watching only the scan
-//! left a connected machine reading offline for minutes at a time.
+//! Four forwarder tasks feed one channel: wireless APs/association, each device's state, and the
+//! manager's radio switches/default route. ADR-0082: scan-only watching left connected machines
+//! reading offline for minutes.
 //!
-//! ponytail: the Wi-Fi/Ethernet device set is resolved once, at [`NetworkController::new`] time,
-//! never re-discovered, so a USB dongle plugged in after start needs a restart to be picked up.
-//! Upgrade path: subscribe to `NetworkManagerProxy::device_added`/`device_removed` and rescan.
+//! ponytail: Wi-Fi/Ethernet devices resolve once at [`NetworkController::new`]; a USB dongle added
+//! later needs a restart. Upgrade path: watch `device_added`/`device_removed` and rescan.
 //!
-//! ponytail: exactly one Wi-Fi device is tracked (the first `GetAllDevices` returns); multiple
-//! adapters would need `available_networks`/`scan`/`connect` to carry a device selector, which
-//! docs/oblisk-idl-api-specs.md §2.5's schema doesn't have yet.
+//! ponytail: only the first Wi-Fi device from `GetAllDevices` is tracked. Multiple adapters need a
+//! device selector in `available_networks`/`scan`/`connect`; `docs/oblisk-idl-api-specs.md §2.5`
+//! has none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,16 +36,15 @@ use connection::{
 };
 pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 
-/// One scanned access point, already resolved to what `network.available_networks` needs
-/// (docs/oblisk-idl-api-specs.md §2.5). `Serialize`: this is what ends up in a `StateSnapshot`'s
-/// `payload`, same convention as `audio::mixer::AppStream`.
+/// One scanned AP, resolved to `network.available_networks` (docs/oblisk-idl-api-specs.md §2.5)
+/// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
-    /// The network name; entries dedupe on this, keeping only the stronger of two radios.
+    /// Network name. Entries dedupe on it, keeping the stronger sighting.
     pub ssid: String,
     /// Signal strength, `0` to `100`.
     pub strength: u8,
-    /// A key is required: the AP advertises WEP privacy, or non-empty WPA1 or RSN key management.
+    /// A key is required: WEP privacy or non-empty WPA1/RSN key management.
     pub secure: bool,
     /// `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
     pub band: String,
@@ -57,121 +52,100 @@ pub struct AccessPointInfo {
     pub active: bool,
 }
 
-/// `oblisk.network`'s live push state: the whole §2.5 read schema, not just §4.2's scan results.
-/// Every field is re-derived from NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce,
-/// no incremental state).
+/// `oblisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
+/// NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ///
-/// The link fields exist because the AP list cannot answer "am I online". It says nothing about a
-/// wired link, and it cannot tell a powered-down radio from a powered one with nothing joined --
-/// both are simply an absence of [`AccessPointInfo::active`].
+/// The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
+/// down radio from a powered radio with no association.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NetworkState {
-    /// A scan is in flight. Flipped to `true` the moment `network:scan()` is accepted rather
-    /// than when NetworkManager confirms, so a spinner starts on the click, not a round trip
-    /// later.
+    /// A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms,
+    /// so the spinner starts on the click.
     pub scanning: bool,
-    /// Something is carrying the default route, from NetworkManager's `PrimaryConnection`. That
-    /// property names the active connection the default route belongs to, which is §2.5's "default
-    /// gateway interface is active" exactly; `/` means none, and means offline.
+    /// A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none,
+    /// hence offline.
     pub connected: bool,
-    /// The Wi-Fi SSID in use, or `"Ethernet"` when the default route is wired, or `nil` when
-    /// nothing is joined. Wired wins when both are up, matching which one `connected` is about.
-    /// It names an association, not a working route: a network still negotiating DHCP has an
-    /// `ssid` and a `connected` of `false`, which is what makes those two fields worth having
-    /// separately.
+    /// Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins
+    /// when both are up. An association negotiating DHCP has an `ssid` but `connected == false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssid: Option<String>,
-    /// The associated AP's signal strength, `0` to `100`, or `0` with no Wi-Fi association. Read
-    /// off the same merged entry the panel draws, so the bar and the list never disagree by a
-    /// point.
+    /// Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged
+    /// entry the panel draws, so the bar and list agree.
     pub strength: u8,
-    /// The Wi-Fi radio is powered, from `WirelessEnabled`. What separates "radio off" from
-    /// "radio on, joined to nothing", which the AP list alone cannot.
+    /// Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no
+    /// association.
     pub wifi_enabled: bool,
-    /// NetworkManager is managing networking at all, from `NetworkingEnabled`. `false` means
-    /// every other field here is a report about a stack that has been switched off.
+    /// Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the
+    /// other fields describe a switched-off stack.
     pub networking_enabled: bool,
-    /// A wired device is activated. §2.5 words this as the link carrier, but the carrier is up
-    /// whenever a cable is seated, which would leave `network:set_ethernet_enabled(false)` looking
-    /// like it did nothing; this is the read-back that the setter's own toggle needs.
+    /// A wired device is activated. This is the setter's read-back; carrier stays up when a cable
+    /// is
+    /// seated, so it would not reflect `network:set_ethernet_enabled(false)`.
     pub ethernet_enabled: bool,
-    /// The SSID a `network:connect` is currently trying to join, or `nil` when none is in flight.
-    /// What a spinner on one row reads, the same job `LockState::authenticating` does for the lock
-    /// -- and it names the row rather than being a bare flag, because a list needs to know which
-    /// one. Cleared when the attempt reaches a verdict, either way.
+    /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and
+    /// clears
+    /// when the attempt reaches either verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_ssid: Option<String>,
-    /// Why the last `network:connect` failed, in words fit to draw, or `nil` when the last one
-    /// worked or none has been tried. `AddAndActivateConnection2` returns before the radio has
-    /// tried anything, so this is filled in later, from the activation's own
-    /// `StateChanged(state, reason)`: a wrong password is only knowable there.
+    /// Display text for the last failed `network:connect`, or `nil` after success or before any
+    /// attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later
+    /// from the activation's `StateChanged(state, reason)`, where a wrong password is knowable.
     ///
-    /// Sticky until the next attempt, like `UpdatesState::check_error`: an error that cleared
-    /// itself on the next scan would be gone before it was read.
+    /// Sticky until the next attempt, like `UpdatesState::check_error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_error: Option<String>,
-    /// The SSID whose `network:connect` is waiting on a password, or `nil` when nothing is. Set by
-    /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) for the one case that
-    /// cannot proceed without one, and cleared by the attempt that consumes it or by
-    /// `network:cancel_connect`.
+    /// SSID whose `network:connect` waits for a password, or `nil`. Set by
+    /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) only when needed;
+    /// cleared by the consuming attempt or `network:cancel_connect`.
     ///
-    /// Here rather than derived in the config, because the fact it reports -- this machine has no
-    /// profile for that SSID -- lives in NetworkManager's settings, and a config could only guess
-    /// at it (ADR-0037). It is also what the shell binds `keyboard_interactivity` to: a bar that
-    /// takes the keyboard whenever it feels like it is a bar that steals it, so the surface claims
-    /// focus exactly while this names a network and gives it back the moment it stops.
+    /// Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037).
+    /// The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a
+    /// network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_ssid: Option<String>,
-    /// Access points from the last completed scan: deduplicated by SSID, the connected one first
-    /// and the rest strongest first, cut to 20, and kept as-is while [`NetworkState::scanning`] is
-    /// true so a panel doesn't blank. The connected network leads by construction, so a list can
-    /// be drawn in payload order without sorting it again.
+    /// Last completed scan: SSID-deduplicated, connected first, then strongest, capped at 20. Kept
+    /// while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready
+    /// to draw.
     pub available_networks: Vec<AccessPointInfo>,
 }
 
 /// A pending `network:connect(ssid, hidden)` intent, stashed in the controller (ADR-0037) with
-/// single-slot semantics like `pending_challenge` (ADR-0028), until the paired
-/// `secure_submit(network, connect)` arrives with the password bytes (ADR-0029).
+/// the same single-slot semantics the PAM one-shot protocol uses (ADR-0028), until paired
+/// `secure_submit(network, connect)` supplies password bytes (ADR-0029).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingNetworkConnect {
     pub ssid: String,
     pub hidden: bool,
 }
 
-/// What the forwarder tasks report back to `main.rs`'s top-level `select!`: just enough to know
-/// what kind of rebuild-and-push is needed, not the payload itself (that needs a fresh D-Bus round
-/// trip through [`NetworkController::build_state`]).
+/// What forwarders report to `main.rs`'s top-level `select!`; `build_state` makes the payload with
+/// a
+/// fresh D-Bus round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSignal {
-    /// Anything that can move a [`NetworkState`] field other than `scanning`: an access point
-    /// appearing or going, the association changing, a device changing state, a radio toggling.
-    /// One variant rather than one per source because every one of them ends in the same full
-    /// re-derive (ADR-0029), so telling them apart would buy nothing.
+    /// Any non-`scanning` field change: AP set, association, device state, or radio. All trigger
+    /// the
+    /// same full re-derive (ADR-0029), so one variant is enough.
     Changed,
-    /// `LastScan` changed, meaning a scan this Supervisor triggered has finished.
+    /// `LastScan` changed, so a Supervisor-triggered scan finished.
     ScanCompleted,
-    /// Sent by [`NetworkController::mark_scanning`], not a forwarder, so `scanning` flips `true`
-    /// before `RequestScan`'s round trip completes (§4.2). Routed through the same channel as the
-    /// real signals for FIFO ordering.
+    /// Sent by [`NetworkController::mark_scanning`] before `RequestScan` completes (§4.2), through
+    /// the same channel for FIFO ordering.
     ScanStarted,
 }
 
-/// How long [`NetworkController::watch_activation`] waits for a verdict before calling it a
-/// timeout. A backstop, not the mechanism: NetworkManager gives up on a Wi-Fi association well
-/// inside this and says so on `StateChanged`, so this only fires when the activation object stops
-/// answering altogether -- long enough not to pre-empt NM, short enough that a stuck spinner
-/// clears itself rather than waiting for the next attempt.
+/// [`NetworkController::watch_activation`]'s backstop timeout. NetworkManager normally gives up
+/// well inside 45s and reports `StateChanged`; this covers an activation object that stops
+/// answering without pre-empting NM or leaving a spinner stuck.
 const ACTIVATION_CEILING: std::time::Duration = std::time::Duration::from_secs(45);
 
 fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-/// `rusty_network_manager`'s hand-written `<Proxy>::new_from_path` helpers tie their return type's
-/// lifetime to the `&Connection` borrow, though the generated `builder()` they call clones the
-/// connection immediately and never holds it, making it impossible to store the proxy past the
-/// borrow's scope, which this controller needs. These five wrappers call `builder()` directly,
-/// binding the result to `'static`.
+/// The crate's hand-written `<Proxy>::new_from_path` ties the proxy lifetime to `&Connection`, even
+/// though its builder clones the connection. Call the builder directly so stored proxies are
+/// `'static`.
 async fn bind_device(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<DeviceProxy<'static>> {
     DeviceProxy::builder(connection).path(path)?.build().await
 }
@@ -187,18 +161,14 @@ async fn bind_access_point(
     AccessPointProxy::builder(connection).path(path)?.build().await
 }
 
-/// `org.freedesktop.NetworkManager.Connection.Active`, hand-written against ADR-0013's "go through
-/// `rusty_network_manager`" rule because that crate's binding for this one interface cannot work.
-/// 0.7.1 declares the signal `#[zbus(signal, name = "state_changed")]`, and zbus takes an explicit
-/// `name` verbatim rather than PascalCasing it, so `ActiveProxy::receive_active_state_changed`
-/// subscribes to a member NetworkManager never emits and the stream stays silent forever. Measured,
-/// not guessed: an activation that reached `ACTIVATED` in about a second produced no signal in 20.
-/// The sibling `Device` proxy spells the same attribute `name = "StateChanged"` and works, which is
-/// what makes this a typo upstream rather than a convention to follow.
+/// Hand-written `org.freedesktop.NetworkManager.Connection.Active` proxy. In crate 0.7.1,
+/// `ActiveProxy` declares `state_changed`; zbus uses that explicit name verbatim, so it subscribes
+/// to a member NetworkManager never emits. Twenty activations reaching `ACTIVATED` in about one
+/// second produced no signal. The sibling `Device` proxy uses `StateChanged` and works, proving an
+/// upstream typo rather than a convention (ADR-0013 still requires the crate where possible).
 ///
-/// Only the two members this controller needs, and `state` earns its place beyond convenience: a
-/// property named `state` alongside a signal named `state_changed` would collide on the generated
-/// `receive_state_changed`, which is how the upstream typo is an easy one to make.
+/// Only the needed members are declared. The `state` property also avoids a generated
+/// `receive_state_changed` collision with the signal.
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.Connection.Active",
     default_service = "org.freedesktop.NetworkManager",
@@ -232,9 +202,8 @@ async fn bind_settings_connection(
 async fn read_access_point(ap: &AccessPointProxy<'static>, active: bool) -> Option<AccessPointInfo> {
     let ssid_bytes = ap.ssid().await.ok()?;
     if ssid_bytes.is_empty() {
-        // ponytail: a hidden AP reports an empty SSID, no name to show or dedupe by, so including
-        // it would collapse every hidden AP into one bogus "" entry. Connecting still works via
-        // network:connect(ssid, hidden=true).
+        // ponytail: an empty hidden-AP SSID cannot be shown or deduped; including it collapses all
+        // hidden APs into one `""` row. Connect still works with `hidden=true`.
         return None;
     }
     let strength = ap.strength().await.ok()?;
@@ -251,10 +220,8 @@ async fn read_access_point(ap: &AccessPointProxy<'static>, active: bool) -> Opti
     })
 }
 
-/// One resolved Wi-Fi device: its own object path (needed as `AddAndActivateConnection2`'s
-/// `device` argument) alongside both proxies bound to it. `device` is separate from `wireless`
-/// because association state lives on `org.freedesktop.NetworkManager.Device` and the AP list on
-/// `...Device.Wireless`, two interfaces on the one object.
+/// One resolved Wi-Fi device: its path for `AddAndActivateConnection2`, plus the `Device` and
+/// `Device.Wireless` proxies. Association state and APs use those two interfaces on one object.
 #[derive(Clone)]
 struct WifiDevice {
     device_path: OwnedObjectPath,
@@ -262,27 +229,25 @@ struct WifiDevice {
     wireless: WirelessProxy<'static>,
 }
 
-/// One resolved Ethernet device. The path is what `ActivateConnection` wants; the proxy answers
-/// `ethernet_enabled` and feeds a state forwarder.
+/// One resolved Ethernet device. Its path feeds `ActivateConnection`; its proxy feeds state and
+/// `ethernet_enabled`.
 #[derive(Clone)]
 struct EthernetDevice {
     path: OwnedObjectPath,
     device: DeviceProxy<'static>,
 }
 
-/// One saved NetworkManager profile matched by SSID: its object path (what `ActivateConnection`
-/// takes), the proxy to act on it, and the settings dict it was matched on, kept rather than
-/// re-read because both callers already have a use for it.
+/// One saved profile matched by SSID: the path for `ActivateConnection`, its proxy, and the
+/// settings
+/// already read by both callers.
 struct SavedProfile {
     path: OwnedObjectPath,
     connection: SettingsConnectionProxy<'static>,
     settings: HashMap<String, HashMap<String, OwnedValue>>,
 }
 
-/// Holds every proxy `oblisk.network`'s write actions and AP survey need, resolved once at
-/// construction. `Clone` since every field is a cheap `zbus` handle, letting a clone move into a
-/// `tokio::spawn`ed write action without the caller losing its own (ADR-0029: writes spawn rather
-/// than await inline).
+/// Proxies needed by `oblisk.network`, resolved at construction. `Clone` is cheap for zbus handles,
+/// so writes can move a clone into `tokio::spawn` (ADR-0029).
 #[derive(Clone)]
 pub struct NetworkController {
     connection: zbus::Connection,
@@ -290,32 +255,26 @@ pub struct NetworkController {
     settings: SettingsProxy<'static>,
     wifi: Option<WifiDevice>,
     ethernet: Vec<EthernetDevice>,
-    /// Access-point proxies kept alive between rebuilds, keyed by object path. Not a cache of
-    /// values -- a cache of *proxies*, so zbus fills each one's property cache once and keeps it
-    /// filled from `PropertiesChanged` instead of the rebuild paying for a match rule, a `GetAll`
-    /// and an unsubscribe per access point per pass. Measured at 10 access points: 11.25ms a
-    /// rebuild before, 0.84ms after (ADR-0082).
+    /// AP proxies kept between rebuilds, keyed by object path. They retain zbus property caches fed
+    /// by `PropertiesChanged`, avoiding a match rule, `GetAll`, and unsubscribe per AP per pass.
+    /// At 10 APs, rebuild time fell from 11.25ms to 0.84ms (ADR-0082).
     ///
-    /// Pruned against the live path list on every rebuild rather than by watching
-    /// `AccessPointRemoved`, which is the same signal that asks for the rebuild anyway.
+    /// Pruned against the live path list on each rebuild; `AccessPointRemoved` already requests it.
     access_points: Arc<Mutex<HashMap<OwnedObjectPath, AccessPointProxy<'static>>>>,
-    /// `oblisk.network`'s own push state (ADR-0037), mutated only by
-    /// [`handle_signal`](Self::handle_signal). `Mutex` because the controller is `Clone`; never
-    /// held across an await.
+    /// `oblisk.network` push state (ADR-0037), mutated only by
+    /// [`handle_signal`](Self::handle_signal).
+    /// The cloned controller shares it; the mutex is never held across an await.
     state: Arc<Mutex<NetworkState>>,
     /// The single pending `network:connect` intent slot, see [`PendingNetworkConnect`].
     pending_connect: Arc<Mutex<Option<PendingNetworkConnect>>>,
-    /// Clone of the signal channel's sender: routes [`mark_scanning`](Self::mark_scanning)'s
-    /// immediate flip through the same FIFO as real signals, and keeps the channel open with no
-    /// Wi-Fi device.
+    /// Signal sender for [`mark_scanning`](Self::mark_scanning)'s FIFO event and for keeping the
+    /// channel open when no Wi-Fi device exists.
     events: UnboundedSender<NetworkSignal>,
 }
 
 impl NetworkController {
-    /// Connects to NetworkManager over `connection` (the Supervisor's system-bus connection),
-    /// resolves the Wi-Fi and Ethernet device sets, and spawns the forwarders feeding `events`
-    /// (ADR-0037). A device whose `DeviceType` can't be read is logged and skipped, not fatal to
-    /// startup.
+    /// Connects over the Supervisor's system-bus `connection`, resolves Wi-Fi/Ethernet devices,
+    /// and spawns `events` forwarders (ADR-0037). Unreadable `DeviceType`s are logged and skipped.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<NetworkSignal>) -> zbus::Result<Self> {
         let nm = NetworkManagerProxy::new(&connection).await?;
         let settings = SettingsProxy::new(&connection).await?;
@@ -383,14 +342,12 @@ impl NetworkController {
                 state.clone()
             }
             NetworkSignal::ScanCompleted | NetworkSignal::Changed => {
-                // Every D-Bus read happens before the lock is taken: it is a plain `Mutex` and is
-                // never held across an await.
+                // Read D-Bus before taking the plain mutex; never hold it across an await.
                 let mut next = self.build_state().await;
                 let mut state = self.state.lock().unwrap();
                 next.scanning = signal == NetworkSignal::Changed && state.scanning;
-                // Neither of these is derivable from NetworkManager -- they are a memory of an
-                // attempt, not a reading of the stack -- so they ride across the re-derive the
-                // way `scanning` does. Taken rather than cloned: `state` is overwritten below.
+                // These are attempt memory, not NetworkManager readings, so carry them across the
+                // re-derive like `scanning`. Take them because `state` is overwritten below.
                 next.connecting_ssid = state.connecting_ssid.take();
                 next.connect_error = state.connect_error.take();
                 next.password_ssid = state.password_ssid.take();
@@ -400,14 +357,13 @@ impl NetworkController {
         }
     }
 
-    /// Every §2.5 field except `scanning`, read fresh from NetworkManager. Each read falls back to
-    /// its `Default` on error rather than aborting the rebuild: one unreadable property should cost
-    /// its own field, not the whole snapshot.
+    /// Freshly reads every §2.5 field except `scanning`. Each property falls back to `Default` on
+    /// error, so one unreadable field does not abort the snapshot.
     async fn build_state(&self) -> NetworkState {
         let available_networks = self.build_available_networks().await;
         let associated = available_networks.iter().find(|ap| ap.active);
-        // `PrimaryConnection` is `/` when nothing holds the default route, and names the active
-        // connection that does otherwise -- so its type is what says whether "connected" is wired.
+        // `PrimaryConnection` is `/` without a default route; its type says whether the route is
+        // wired.
         let connected = self.nm.primary_connection().await.is_ok_and(|path| path.as_str() != "/");
         let wired = connected && self.nm.primary_connection_type().await.is_ok_and(|kind| kind == "802-3-ethernet");
         NetworkState {
@@ -427,8 +383,8 @@ impl NetworkController {
         }
     }
 
-    /// Whether any wired device reached `ACTIVATED`. Any, not all: one cable carrying traffic is
-    /// what a panel's Ethernet row is asking about, however many ports the machine has.
+    /// Whether any wired device reached `ACTIVATED`. One active cable is enough for the Ethernet
+    /// row, regardless of the number of ports.
     async fn ethernet_is_activated(&self) -> bool {
         for ethernet in &self.ethernet {
             match ethernet.device.state().await {
@@ -443,55 +399,49 @@ impl NetworkController {
         false
     }
 
-    /// The immediate half of `network:scan()`: queues [`NetworkSignal::ScanStarted`] so `scanning`
-    /// flips to `true` on initiation, not once `RequestScan` completes. Only when a Wi-Fi device
-    /// exists, since with none [`scan`](Self::scan) no-ops and `scanning` would stay stuck `true`.
+    /// Queues [`NetworkSignal::ScanStarted`] so `scanning` flips on initiation, before
+    /// `RequestScan`. Only does so with Wi-Fi hardware; otherwise [`scan`](Self::scan) no-ops and
+    /// `scanning` would stick at `true`.
     pub fn mark_scanning(&self) {
         if self.wifi.is_some() {
             let _ = self.events.send(NetworkSignal::ScanStarted);
         }
     }
 
-    /// Stashes a `network:connect(ssid, hidden)` intent until its paired
-    /// `secure_submit(network, connect)` arrives. Newest intent wins (single slot).
+    /// Stashes `network:connect(ssid, hidden)` until paired `secure_submit(network, connect)`.
+    /// Newest intent wins.
     pub fn stash_connect_intent(&self, pending: PendingNetworkConnect) {
         *self.pending_connect.lock().unwrap() = Some(pending);
     }
 
-    /// Takes the pending connect intent, if any: the `secure_submit(network, connect)` arm's
-    /// one consumer.
+    /// Takes the pending intent for the `secure_submit(network, connect)` consumer.
     pub fn take_connect_intent(&self) -> Option<PendingNetworkConnect> {
         self.pending_connect.lock().unwrap().take()
     }
 
-    /// Decides what a just-stashed `network:connect` intent still needs, and either completes it
-    /// or asks the shell for a password.
+    /// Decides whether a stashed `network:connect` can complete or needs a password.
     ///
-    /// Three outcomes, and they are `NetworkPanel.qml`'s own three. A network this machine already
-    /// has a profile for, and an open one, join on the click with nothing typed -- the QML joins a
-    /// `known` or unsecured access point with a bare `connectToSsid(ssid, "")` for the same reason.
-    /// Only a secured network with no profile has anything left to ask, and that one sets
-    /// [`NetworkState::password_ssid`] and waits for `secure_submit(network, connect)` to release
-    /// it.
+    /// A saved profile or open AP connects on click with no typed secret, matching
+    /// `NetworkPanel.qml`'s bare `connectToSsid(ssid, "")` for known/unsecured rows. Only a secured
+    /// network without a profile sets [`NetworkState::password_ssid`] and waits for
+    /// `secure_submit(network, connect)`.
     ///
-    /// Without the first two branches a click on such a row did nothing at all: `network:connect`
-    /// only ever stashes, so every one of them left an intent nothing would consume.
+    /// Without those branches, `network:connect` only stashes and every click leaves an intent
+    /// nothing consumes.
     ///
-    /// A hidden network takes the password branch however its security reads, because a hidden
-    /// SSID has no access point in range to read it off. `showPasswordInput` in the QML defaults
-    /// the same way (`?? true`), and the cost of guessing wrong is one keystroke on an open
-    /// network against an unjoinable secured one.
+    /// Hidden networks take the password branch because no in-range AP reports their security.
+    /// QML's `showPasswordInput` also defaults to `true` (`?? true`); guessing wrong costs one
+    /// keystroke on an open network, versus an unjoinable secured one.
     ///
-    /// The SSID is looked up here and again inside `activate_intent`, one extra `ListConnections`
-    /// walk of a handful of profiles. Threading the match down through `connect` would save a
-    /// millisecond and cost three signatures.
+    /// The SSID is looked up again in `activate_intent`, an extra `ListConnections` walk of a few
+    /// profiles. Passing the match through `connect` saves about a millisecond at the cost of three
+    /// signatures.
     pub async fn resolve_connect_intent(&self) {
         let Some(pending) = self.pending_connect.lock().unwrap().clone() else {
             return;
         };
         let saved = !self.saved_profiles_for_ssid(&pending.ssid, "connect").await.is_empty();
-        // An SSID with no access point in range is treated as secured for the same reason a hidden
-        // one is: nothing here can say otherwise.
+        // No in-range AP means secured, like a hidden SSID: nothing can say otherwise.
         let secure = pending.hidden
             || self
                 .state
@@ -502,24 +452,21 @@ impl NetworkController {
                 .find(|ap| ap.ssid == pending.ssid)
                 .is_none_or(|ap| ap.secure);
         if !saved && secure {
-            // Logged at the fork rather than inside the branches: this is the one decision that
-            // decides whether the shell asks for a password, and the two facts behind it come from
-            // different places (NetworkManager's saved profiles, the last scan's AP list), so a
-            // prompt that fails to appear is otherwise three guesses about which one was wrong.
+            // Log the fork: saved-profile and security facts come from different sources, so a
+            // missing prompt otherwise leaves three plausible causes.
             eprintln!("network: connect {:?}: saved={saved} secure={secure}, asking for a password", pending.ssid);
             self.request_password(&pending.ssid);
             return;
         }
         eprintln!("network: connect {:?}: saved={saved} secure={secure}, connecting directly", pending.ssid);
-        // Re-taken rather than assumed: a second `network:connect` may have replaced the intent
-        // while the lookup above was on the wire, and the newest one wins (single slot).
+        // Re-take it because another connect may have replaced it while the lookup was on the wire.
         if let Some(pending) = self.take_connect_intent() {
             self.connect(pending, Vec::new()).await;
         }
     }
 
-    /// Puts the shell into asking-for-a-password, and pushes so the prompt appears on the click.
-    /// The intent stays stashed: it is what `secure_submit(network, connect)` will consume.
+    /// Shows the password prompt and pushes it immediately. The intent stays stashed for
+    /// `secure_submit(network, connect)`.
     fn request_password(&self, ssid: &str) {
         {
             let mut state = self.state.lock().unwrap();
@@ -529,23 +476,20 @@ impl NetworkController {
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// `network:cancel_connect()`: drops the pending intent and stops asking for a password.
+    /// `network:cancel_connect()`: drops the pending intent and password prompt.
     ///
-    /// The way out of a prompt, and the only one -- Escape inside a `secure_submit` field clears
-    /// what was typed but stays in the field (`wayland::input`'s `SecureKeyAction::Clear`), so
-    /// without this a prompt raised by a mis-click would hold the bar's keyboard focus until
-    /// something else took it.
+    /// The prompt's way out. Escape in a `secure_submit` field only clears its text and stays in
+    /// the
+    /// field (`wayland::input`'s `SecureKeyAction::Clear`), so without this a mis-click would hold
+    /// bar keyboard focus.
     ///
-    /// ponytail: this does not touch an activation already in flight, though
-    /// `NetworkService.qml`'s `cancelConnect` disconnects the device when nothing else is live.
-    /// Once NetworkManager has the request, letting it finish and report costs a few seconds;
-    /// racing it costs a `Disconnect` that can land on a session that just came up.
+    /// ponytail: an activation already in flight is untouched, although `NetworkService.qml`'s
+    /// `cancelConnect` disconnects when nothing else is live. Letting NM finish costs seconds;
+    /// racing it can disconnect a session that just came up.
     ///
-    /// A no-op when there is nothing to cancel, and that is what makes it callable from a panel
-    /// close (`modules/shell/panel_host.lua`'s click-outside catcher) rather than only from the
-    /// prompt's own close button. Without the guard, every click that shut any panel would clear
-    /// `connect_error` -- wiping the one line that says why the last attempt failed, at the moment
-    /// the user closed the panel to go read it somewhere else -- and push a `Changed` for it.
+    /// No-op without a pending prompt, so `modules/shell/panel_host.lua` can call it on any panel
+    /// close. Without the guard, closing another panel would clear `connect_error` and push a
+    /// misleading `Changed`.
     pub fn cancel_connect(&self) {
         let pending = self.pending_connect.lock().unwrap().take();
         if pending.is_none() && self.state.lock().unwrap().password_ssid.is_none() {
@@ -560,26 +504,23 @@ impl NetworkController {
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// § 4.1: `NetworkingEnabled` is a NetworkManager read-only property; only
-    /// `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled` have setters. The only real way to toggle
-    /// it is the `Enable(bool)` method, deviating from the spec text's literal "sets the
-    /// `NetworkingEnabled` property".
+    /// § 4.1: `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
+    /// have setters. Toggle it with `Enable(bool)`, not the spec's literal property write.
     pub async fn set_networking_enabled(&self, enabled: bool) {
         if let Err(err) = self.nm.enable(enabled).await {
             eprintln!("network: failed to set networking_enabled={enabled}: {err}");
         }
     }
 
-    /// § 4.1: `WirelessEnabled` is a real read-write property.
+    /// § 4.1: `WirelessEnabled` is read-write.
     pub async fn set_wifi_enabled(&self, enabled: bool) {
         if let Err(err) = self.nm.set_wireless_enabled(enabled).await {
             eprintln!("network: failed to set wifi_enabled={enabled}: {err}");
         }
     }
 
-    /// § 4.1 / ADR-0029: `false` disconnects every wired device; `true` activates each device's
-    /// existing autoconnect profile, if any, and is a no-op for a device with none, since no NM
-    /// method fabricates a carrier connection without a profile already present.
+    /// § 4.1 / ADR-0029: `false` disconnects every wired device; `true` activates each existing
+    /// autoconnect profile. A device with none is a no-op; NM cannot fabricate a connection.
     pub async fn set_ethernet_enabled(&self, enabled: bool) {
         for ethernet in &self.ethernet {
             if enabled {
@@ -599,7 +540,7 @@ impl NetworkController {
             }
         };
         let Some(conn_path) = profile else {
-            // No profile exists for this device, nothing D-Bus can do about that (ADR-0029).
+            // No profile exists; D-Bus cannot create one here (ADR-0029).
             return;
         };
         if let Err(err) = self.nm.activate_connection(&conn_path, device_path, &root_object_path()).await {
@@ -634,8 +575,7 @@ impl NetworkController {
         Ok(None)
     }
 
-    /// § 4.2: dispatches `RequestScan({})` off the calling path. A missing Wi-Fi device is
-    /// logged, not a panic: a system with no wireless hardware still runs everything else.
+    /// § 4.2: dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
     pub async fn scan(&self) {
         let Some(wifi) = &self.wifi else {
             eprintln!("network: scan() requested but no Wi-Fi device is present");
@@ -646,8 +586,8 @@ impl NetworkController {
         }
     }
 
-    /// § 4.2: fully re-queries the Wi-Fi device's current AP list, deduplicated and capped at
-    /// the top 20 by strength (ADR-0029: no debounce). Empty, not an error, with no Wi-Fi device.
+    /// § 4.2: re-queries, deduplicates, and caps the current AP list at 20 by strength (ADR-0029:
+    /// no debounce). Returns empty, not an error, without Wi-Fi hardware.
     pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
         let Some(wifi) = &self.wifi else {
             return Vec::new();
@@ -671,12 +611,10 @@ impl NetworkController {
         dedup_and_top20(aps)
     }
 
-    /// Binds whichever of `paths` is not held yet, drops whatever is held and no longer in range,
-    /// and hands back the live proxies in `paths` order. The returned proxies are clones, which
-    /// share the held one's property cache rather than starting a cold one.
+    /// Binds missing `paths`, drops held paths no longer in range, and returns live proxies in path
+    /// order. Returned clones share each held proxy's property cache.
     ///
-    /// The lock is taken twice around the binding rather than once across it: it is a plain
-    /// `Mutex` and binding is an await.
+    /// Takes the lock around, not across, binding because it is a plain mutex and binding awaits.
     async fn warm_access_points(&self, paths: &[OwnedObjectPath]) -> Vec<(OwnedObjectPath, AccessPointProxy<'static>)> {
         let missing: Vec<OwnedObjectPath> = {
             let held = self.access_points.lock().unwrap();
@@ -697,17 +635,15 @@ impl NetworkController {
         paths.iter().filter_map(|path| Some((path.clone(), held.get(path)?.clone()))).collect()
     }
 
-    /// Supervisor services § 4: `pending`'s SSID/hidden flag plus `secret` (empty means open,
-    /// non-empty means WPA-PSK) become `AddAndActivateConnection2`'s connection dict.
-    /// `secret` is zeroized on every outcome (ADR-0005/ADR-0014): the caller already
-    /// `mem::take`s it out of the wire `SecureSubmit` frame, making this that plaintext's owner.
+    /// Supervisor services §4: turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
+    /// `AddAndActivateConnection2`'s dict. The caller `mem::take`s `secret` from the wire frame,
+    /// making this function its owner; every outcome zeroizes it (ADR-0005/ADR-0014).
     pub async fn connect(&self, pending: PendingNetworkConnect, mut secret: Vec<u8>) {
         self.begin_connect(&pending.ssid);
         let result = self.connect_inner(&pending, &secret).await;
         secret.zeroize();
         match result {
-            // NetworkManager has accepted the request, not completed it: the radio has not tried
-            // yet, so whether it works is only knowable from the activation that comes back.
+            // NM accepted the request, not completed it; the activation reports the verdict.
             Ok(active) => self.watch_activation(active, pending.ssid),
             Err(err) => {
                 eprintln!("network: connect(ssid={:?}) failed: {err}", pending.ssid);
@@ -716,27 +652,22 @@ impl NetworkController {
         }
     }
 
-    /// Marks an attempt in flight and clears the previous one's error, then pushes so a row can
-    /// start spinning on the click rather than a round trip later -- `mark_scanning`'s posture,
-    /// via the same channel for the same FIFO reason.
+    /// Marks an attempt, clears its previous error, and pushes through the same FIFO as scanning so
+    /// the row spins on the click.
     fn begin_connect(&self, ssid: &str) {
         {
             let mut state = self.state.lock().unwrap();
             state.connecting_ssid = Some(ssid.to_string());
             state.connect_error = None;
-            // The attempt is under way, so the prompt that raised it is answered. Clearing it here
-            // rather than in the `secure_submit` arm covers the branches that never prompted too,
-            // and is what drops the bar's keyboard focus the instant Enter is pressed.
+            // The attempt answers the prompt. Clear here, not only in `secure_submit`, so direct
+            // connects also drop bar keyboard focus on Enter.
             state.password_ssid = None;
         }
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// Records an attempt's verdict and pushes it.
-    ///
-    /// A verdict for an SSID that is no longer the one in flight is dropped. Two overlapping
-    /// attempts would otherwise let the older one's failure land on top of the newer one's
-    /// spinner, which is why `connect` needs no "one at a time" refusal to go with this.
+    /// Records and pushes an attempt's verdict. Drops a verdict for a different in-flight SSID, so
+    /// an older failure cannot land on a newer spinner; `connect` need not refuse overlap.
     fn finish_connect(&self, ssid: &str, error: Option<String>) {
         {
             let mut state = self.state.lock().unwrap();
@@ -749,7 +680,7 @@ impl NetworkController {
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// Watches one activation to its verdict in the background, off the caller's path.
+    /// Watches one activation in the background.
     fn watch_activation(&self, active: OwnedObjectPath, ssid: String) {
         let controller = self.clone();
         tokio::spawn(async move {
@@ -761,7 +692,7 @@ impl NetworkController {
         });
     }
 
-    /// `None` once the activation reaches `ACTIVATED`, the reason text if it deactivates instead.
+    /// `None` on `ACTIVATED`, reason text on deactivation.
     async fn activation_outcome(&self, active: &OwnedObjectPath) -> Option<String> {
         let generic = || Some("connection failed".to_string());
         let proxy = match bind_active_connection(&self.connection, active.clone()).await {
@@ -771,8 +702,7 @@ impl NetworkController {
                 return generic();
             }
         };
-        // The signal, not `receive_state_changed()` -- that is the `State` *property* stream, which
-        // says a connection went down without ever saying why.
+        // Use the signal, not `receive_state_changed()`: the property stream gives no reason.
         let mut changes = match proxy.receive_active_state_changed().await {
             Ok(changes) => changes,
             Err(err) => {
@@ -781,11 +711,11 @@ impl NetworkController {
             }
         };
 
-        // Subscribing happens after the activation call has already returned, so a verdict can land
-        // in the gap. Reading the property once closes it.
+        // Subscription follows activation, so a verdict can land in the gap. Read the property
+        // once.
         //
-        // ponytail: a failure that lands in that gap loses its reason and reports the generic line,
-        // since only the signal carries one. Success does not, which is the far likelier race.
+        // ponytail: a failure in that gap loses its reason and reports the generic line; only the
+        // signal carries it. Success does not, and is the likelier race.
         match proxy.state().await.map(NMActiveConnectionState::try_from) {
             Ok(Ok(NMActiveConnectionState::ACTIVATED)) => return None,
             Ok(Ok(NMActiveConnectionState::DEACTIVATED)) => return generic(),
@@ -800,7 +730,7 @@ impl NetworkController {
                 _ => {}
             }
         }
-        // The object was removed without ever reaching a terminal state.
+        // The object disappeared without a terminal state.
         generic()
     }
 
@@ -812,23 +742,18 @@ impl NetworkController {
         let wifi = self.wifi.as_ref().ok_or(ConnectError::NoWifiDevice)?;
         let mut intent = connection_intent(&pending.ssid, pending.hidden, secret)?;
         let result = self.activate_intent(&intent, wifi).await;
-        // intent.psk is the plaintext-password copy every dict below borrows from, zeroized
-        // explicitly here rather than left to Drop alone (ADR-0005/ADR-0014): each of those dicts
-        // is fully consumed by now, so this is the first point it's safe to mutate.
+        // Dicts borrow this plaintext PSK and are consumed now, so zeroize it explicitly
+        // (ADR-0005/ADR-0014) rather than relying on Drop.
         if let Some(psk) = intent.psk.as_mut() {
             psk.zeroize();
         }
         result
     }
 
-    /// Joins `intent`'s network, reusing a saved profile for the SSID when this machine has one.
-    ///
-    /// NetworkManager does not deduplicate profiles: `AddAndActivateConnection2` stores a new one
-    /// every call, and it accepts a second profile with the same id *and* the same SSID without
-    /// complaint. Creating unconditionally meant every re-join from the panel left another copy
-    /// behind, and a stale one that autoconnect might pick over the good one.
-    ///
-    /// Returns the activation's own object path, which is where its outcome is reported.
+    /// Joins `intent`'s network, reusing a saved profile when present. NM does not deduplicate:
+    /// `AddAndActivateConnection2` accepts another profile with the same id and SSID, so creating
+    /// unconditionally left stale duplicates that autoconnect could choose. Returns the activation
+    /// path where its outcome is reported.
     async fn activate_intent(
         &self,
         intent: &ConnectionIntent,
@@ -843,14 +768,11 @@ impl NetworkController {
             return Ok(active);
         };
 
-        // A password typed for a network that is already saved is a correction to the stored one,
-        // so it is written back rather than dropped on the floor -- otherwise a profile saved with
-        // the wrong key could never be fixed from the panel, only forgotten and re-added.
+        // A typed password corrects the saved key; otherwise a bad profile could only be forgotten
+        // and re-added.
         //
-        // ponytail: skipped for enterprise profiles. `GetSettings` omits secrets, so rebuilding
-        // one from its own read-back would drop the 802.1X password along with it; NM's saved copy
-        // is the better bet until there is a secret agent to answer for one (ADR-0029 leaves
-        // agents out of scope).
+        // ponytail: skip enterprise profiles. `GetSettings` omits secrets, so rebuilding would drop
+        // the 802.1X password; use NM's saved copy until a secret agent exists (ADR-0029).
         if let Some(psk) = &intent.psk
             && !saved.settings.contains_key("802-1x")
         {
@@ -859,12 +781,9 @@ impl NetworkController {
         Ok(self.nm.activate_connection(&saved.path, &wifi.device_path, &root_object_path()).await?)
     }
 
-    /// Every saved Wi-Fi profile for `ssid`, each paired with the settings dict it was matched on.
-    /// `context` names the caller in the log lines, since both callers reach here for different
-    /// reasons and a bare "failed to read settings" would not say which.
-    ///
-    /// Plural because §4.3's `forget` must delete them all; `connect` takes the first. One
-    /// `ListConnections` walk serves both, which is why the two do not each have their own.
+    /// Every saved Wi-Fi profile for `ssid`, paired with the settings dict that matched it.
+    /// `context` identifies the caller in logs. Plural because §4.3 `forget` deletes all while
+    /// `connect` takes the first; one `ListConnections` walk serves both.
     async fn saved_profiles_for_ssid(&self, ssid: &str, context: &str) -> Vec<SavedProfile> {
         let paths = match self.settings.list_connections().await {
             Ok(paths) => paths,
@@ -897,8 +816,7 @@ impl NetworkController {
         matches
     }
 
-    /// Supervisor services § 4: deletes every connection profile matching `ssid` (plural, per
-    /// spec, not just the first match).
+    /// Supervisor services §4: deletes every connection profile matching `ssid`.
     pub async fn forget(&self, ssid: &str) {
         for profile in self.saved_profiles_for_ssid(ssid, "forget").await {
             if let Err(err) = profile.connection.delete().await {
@@ -908,8 +826,8 @@ impl NetworkController {
     }
 }
 
-/// Every action `oblisk.network:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
+/// Actions accepted by `oblisk.network:invoke(...)`; matching variants in `dispatch` keeps the
+/// action table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAction {
@@ -922,9 +840,9 @@ pub enum NetworkAction {
     Forget,
 }
 
-/// `oblisk.network`'s action dispatch (ADR-0037). Write actions are `tokio::spawn`ed rather than
-/// awaited inline (ADR-0029); `connect` only stashes its intent until the paired
-/// `secure_submit(network, connect)` arrives.
+/// `oblisk.network` dispatch (ADR-0037). Writes spawn rather than await inline (ADR-0029);
+/// `connect`
+/// stashes its intent until paired `secure_submit(network, connect)`.
 pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<NetworkAction>(params) else { return };
@@ -973,8 +891,7 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
-        // Not spawned: it touches no D-Bus, and a cancel that lands a turn late is a prompt that
-        // reappears after the click that dismissed it.
+        // Not spawned: it touches no D-Bus, and a late cancel would resurrect the prompt.
         NetworkAction::CancelConnect => controller.cancel_connect(),
         NetworkAction::Forget => match parse_ssid_arg(&params.arguments) {
             Some(ssid) => {
@@ -988,21 +905,16 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
     }
 }
 
-/// Runs until `wireless`'s connection drops, forwarding the `org.freedesktop.NetworkManager
-/// .Device.Wireless` events to `events` as [`NetworkSignal`]s. Spawned once from
-/// [`NetworkController::new`] with its own `WirelessProxy` clone, keeping the borrow-heavy stream
-/// types local to this task rather than threading them through `main.rs`'s top-level `select!`. A
-/// dropped `events` receiver (shutdown) ends the task on its next forward attempt, the same
-/// posture every channel-forwarding task here takes.
+/// Forwards `org.freedesktop.NetworkManager.Device.Wireless` events to `events` until the
+/// connection drops. Spawned once by [`NetworkController::new`] so borrow-heavy streams stay out
+/// of `main.rs`'s top-level `select!`; a dropped receiver ends it on the next send.
 ///
-/// `ActiveAccessPoint` is here for the reason the other three are not enough: it is the only thing
-/// on this interface that moves when the radio joins or leaves a network. Watching only the AP set
-/// and `LastScan` left `connected` frozen at whatever the last scan happened to see, and a machine
-/// that associated after the bar started read offline until the next scan, minutes later.
+/// `ActiveAccessPoint` is the only watched property that moves when the radio joins or leaves.
+/// Watching only the AP set and `LastScan` left `connected` frozen, so an association after bar
+/// startup read offline until the next scan, minutes later.
 ///
-/// It also owns the associated AP's strength watch, re-targeted every time the association moves
-/// and aborted with the association it belonged to -- an orphaned one would keep asking for
-/// rebuilds on behalf of an AP nothing is connected to (ADR-0082).
+/// It owns the associated AP's strength watch, retargeted and aborted with each association.
+/// Otherwise an orphan would rebuild for an AP nothing is connected to (ADR-0082).
 fn spawn_wifi_forwarder(
     connection: zbus::Connection,
     wireless: WirelessProxy<'static>,
@@ -1025,9 +937,8 @@ fn spawn_wifi_forwarder(
         };
         let mut last_scan_changed = wireless.receive_last_scan_changed().await;
         let mut active_ap_changed = wireless.receive_active_access_point_changed().await;
-        // Set by the `active_ap_changed` arm below, including its first emission, which zbus sends
-        // when the property cache fills -- so an association that predates this task is watched
-        // without a startup read of its own.
+        // The first `active_ap_changed` emission fills the property cache, so an existing
+        // association is watched without a startup read.
         let mut strength: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
@@ -1054,16 +965,13 @@ fn spawn_wifi_forwarder(
     });
 }
 
-/// Forwards the associated access point's `Strength` as [`NetworkSignal::Changed`], so the bars on
-/// the bar drop as you walk away from the router rather than holding the last scan's number.
-/// `None` for the `/` path NetworkManager reports when nothing is associated.
+/// Forwards the associated AP's `Strength` as [`NetworkSignal::Changed`], keeping bars current
+/// between scans. `None` for NetworkManager's `/` path means no association.
 ///
-/// The associated AP only, not every AP in range, and that is a measured choice: over 180 seconds
-/// on real hardware the associated AP emitted 26 times (a 6-second poll that stays quiet while the
-/// number holds) against 76 across all 17 APs in range, one every 2.4 seconds indefinitely. A
-/// rebuild re-reads every AP's strength anyway, so watching the association alone keeps the whole
-/// list just as fresh on a third of the traffic -- which is also why this needs no debounce, the
-/// case ADR-0029 item 6 said to reconsider only against real numbers.
+/// Watch only the associated AP. On real hardware over 180s it emitted 26 times, a quiet 6-second
+/// poll, versus 76 events across 17 APs, one every 2.4s indefinitely. Rebuilds reread every AP,
+/// so the full list stayed as fresh at one third the traffic; ADR-0029 item 6 required this
+/// measured choice before adding debounce.
 fn spawn_strength_forwarder(
     connection: &zbus::Connection,
     path: OwnedObjectPath,
@@ -1090,12 +998,9 @@ fn spawn_strength_forwarder(
     }))
 }
 
-/// Forwards one device's `State` as [`NetworkSignal::Changed`]. Spawned per device, Wi-Fi and
-/// every Ethernet one alike, because that is what `ethernet_enabled` moves on and it is also how a
-/// Wi-Fi disconnect announces itself before `ActiveAccessPoint` catches up.
-///
-/// zbus emits a property stream's current value once when the cache first fills, so this also
-/// primes the very first snapshot without a separate startup read.
+/// Forwards each device's `State` as [`NetworkSignal::Changed`]. Per-device tasks cover
+/// `ethernet_enabled` and announce Wi-Fi disconnects before `ActiveAccessPoint` catches up.
+/// zbus emits the cached current value once, priming the first snapshot without a startup read.
 fn spawn_device_state_forwarder(device: DeviceProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     tokio::spawn(async move {
         let mut state_changed = device.receive_state_changed().await;
@@ -1107,10 +1012,9 @@ fn spawn_device_state_forwarder(device: DeviceProxy<'static>, events: UnboundedS
     });
 }
 
-/// Forwards the manager-wide properties `NetworkState` reads: the two radio switches and whatever
-/// holds the default route. A device forwarder cannot cover these -- switching networking off
-/// leaves the devices where they are, and the default route can move between two devices that both
-/// stay activated.
+/// Forwards manager-wide properties used by `NetworkState`: radio switches and the default route.
+/// Device tasks cannot cover them; networking can switch off while devices stay put, and the route
+/// can move between two activated devices.
 fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     tokio::spawn(async move {
         let mut wireless_enabled = nm.receive_wireless_enabled_changed().await;

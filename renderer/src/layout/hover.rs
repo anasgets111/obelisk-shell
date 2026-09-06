@@ -1,8 +1,6 @@
 //! Which `hover` signals a pointer position turns on, and which it turns off (ADR-0062).
 //!
-//! Pure, and a module rather than three functions inside `crate::wayland` for [`super::hit`]'s
-//! reason: everything else on the pointer path needs a live `wl_pointer` and a live `wl_surface`,
-//! and this is the part that decides what a hover *means*.
+//! Pure: this decides what a hover means without a live `wl_pointer` or `wl_surface`.
 
 use mlua::{Function, Value};
 
@@ -57,18 +55,14 @@ pub fn hover_writes(tree: &ResolvedNode, point: Option<LogicalPoint>) -> Vec<Hov
     writes
 }
 
-/// Pushes `node`'s hover signal, if it declares one, then recurses. Every node is visited: see
-/// [`hover_writes`] for why this is not gated on containment or visibility the way [`hit::hit_path`]
-/// is.
+/// Pushes `node`'s hover signal, if any, then recurses. Every node is visited so a hover can turn
+/// off after the pointer leaves or the node becomes invisible.
 fn collect(node: &ResolvedNode, path: &[&ResolvedNode], writes: &mut Vec<HoverWrite>) {
     if let Some(signal) = hover_signal(node) {
-        // Pointer identity, because both references index the same tree and a `ResolvedNode` has
-        // no id of its own to compare. `path` is one root-to-leaf chain bounded by
-        // `scene::MAX_TREE_DEPTH`, so this scan is 64 comparisons at worst.
+        // Both references index the same tree and `ResolvedNode` has no comparable id. The path
+        // is bounded by `scene::MAX_TREE_DEPTH`, so this scan is at most 64 comparisons.
         let depth = path.iter().position(|on_path| std::ptr::eq(*on_path, node));
-        // The prefix of the path ending at this node is what turns its parent-relative rect into an
-        // absolute one; `hit::absolute_rect` is the same recovery `on_click` makes for the same
-        // reason (ADR-0050 decision 3).
+        // The prefix turns this parent-relative rect into an absolute one (ADR-0050 decision 3).
         let rect = depth.and_then(|depth| hit::absolute_rect(&path[..=depth]));
         let on_hover = match node.properties.get("on_hover") {
             Some(Value::Function(callback)) => Some(callback.clone()),
@@ -81,13 +75,9 @@ fn collect(node: &ResolvedNode, path: &[&ResolvedNode], writes: &mut Vec<HoverWr
     }
 }
 
-/// The `Signal` behind a node's `hover` property, or `None` if it has none.
-///
-/// The property arrives unresolved because `layout::node::is_structural_property` says so
-/// (ADR-0062 decision 3), so what is in the slot is the handle itself. Anything else in it --
-/// a string, a bare boolean, a `state()` signal -- yields `None` here and is silently inert rather
-/// than an error: `crate::wayland`'s writer is the wrong place to fail a config, and
-/// `Signal::hover_handle` refuses the kinds this must not write anyway.
+/// The unresolved `Signal` handle behind `hover` (ADR-0062 decision 3). Other values, including a
+/// bare boolean or `state()` signal, are inert because `Signal::hover_handle` refuses them. The
+/// Wayland writer deliberately does not turn these unsupported values into config errors.
 fn hover_signal(node: &ResolvedNode) -> Option<Signal> {
     let Some(Value::UserData(ud)) = node.properties.get("hover") else {
         return None;
@@ -103,7 +93,6 @@ mod tests {
     use mlua::Lua;
     use std::collections::HashMap;
 
-    /// A `hover(name)` signal wrapped as the userdata a config would have put in the property.
     fn hover_userdata(lua: &Lua) -> (Signal, Value) {
         let (over, _rect) = Signal::new_hover(DirtyFlag::new(), Value::Nil);
         let ud = lua.create_userdata(over.clone()).unwrap();
@@ -143,8 +132,6 @@ mod tests {
         Some(LogicalPoint { x, y })
     }
 
-    /// `hover_writes` returns signals, which have no `PartialEq`; this reads each one's answer back
-    /// in the order the walk produced it.
     fn answers(writes: &[HoverWrite]) -> Vec<bool> {
         writes.iter().map(|write| write.hovered).collect()
     }

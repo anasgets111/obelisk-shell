@@ -1,29 +1,24 @@
--- The idle clock. `IdleService.qml`'s three `IdleMonitor`s and its `setDisplaysPowered`, as one
--- threshold and one handler.
+-- `IdleService.qml`'s three `IdleMonitor`s and `setDisplaysPowered`, as one threshold and handler.
 --
--- No surface, like `modules/global/power_events.lua`: this file is a registration and two
--- `on_change` handlers, and `shell.lua` requires it for the side effects. `lib/idle.lua` holds
--- everything it acts on, and holds it there so the bar can read the same facts without requiring
--- this file.
+-- No surface, like `modules/global/power_events.lua`. `shell.lua` requires this registration for
+-- side effects; `lib/idle.lua` holds shared facts so the bar need not require this file.
 --
--- ## Why the clock and not three thresholds
+-- ## Why the clock
 --
--- `lib/idle.lua`'s header has the argument. Short version: nothing can unregister a threshold, so
--- timeouts a panel edits have to be numbers rather than registrations.
+-- `lib/idle.lua` has the argument: thresholds cannot be unregistered, so editable timeouts must be
+-- numbers rather than registrations.
 --
--- ## What is not guarded here, and why that is the point
+-- ## What is not guarded here
 --
--- There is no `armed` check, no "is an inhibitor held" test, and no re-read of the manual toggle
--- inside the handler. A logind idle inhibitor -- ours, `systemd-inhibit`'s, anyone's -- makes the
--- Supervisor hold every threshold event and hand back a `Resumed` for anything already idle
--- (ADR-0139), so `on_resume` below runs on the way in, `idle.since` goes to zero, and the handler
--- returns on its first line for as long as the hold lasts. The one thing the framework cannot know
--- is the master switch, which is the one thing checked.
+-- No `armed` or inhibitor check, and no manual-toggle reread. Any logind inhibitor, including ours
+-- or `systemd-inhibit`'s, makes the Supervisor hold threshold events and return `Resumed` for work
+-- already idle (ADR-0139). `on_resume` zeros `idle.since`, so the handler returns while held. Only
+-- the master switch is unknown to the framework and checked here.
 --
--- ## Live-testing this
+-- ## Live testing
 --
--- Set the thresholds you are testing to their shortest option and leave `suspend` off. A stage that
--- suspends the machine thirty seconds after you stop typing is a stage you cannot watch fire.
+-- Set tested thresholds to their shortest option and leave `suspend` off. A stage suspending the
+-- machine thirty seconds after typing stops cannot be watched firing.
 local idle = require("lib.idle")
 local store = require("lib.store")
 
@@ -31,11 +26,9 @@ local function detached(cmd, args)
     process.run(cmd, args, function() end, function() end)
 end
 
--- `CompositorService.setDisplaysPowered`, which for niri is these two actions. Paired with the
--- keyboard backlight, `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen is
--- the tell that the blank did half its job. `backlight_pct` is `-1` on a machine with no backlight
--- device (§ 2.8), and setting it there is a write the capability drops, so there is nothing to
--- check first.
+-- `CompositorService.setDisplaysPowered` maps to these niri actions. Pair it with
+-- `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen means blanking stopped
+-- halfway. `backlight_pct` is `-1` without a device (§ 2.8); setting it is a dropped write.
 local function set_displays_powered(powered)
     if idle.blanked:get() == (not powered) then
         return
@@ -49,8 +42,8 @@ local ACTIONS = {
     dpms = function()
         set_displays_powered(false)
     end,
-    -- No "already locked?" guard, because `idle.armed` cannot hand this stage back while the lock
-    -- is up: that is the stage's own `done` predicate, and one answer to a question beats two.
+    -- No "already locked?" guard: `idle.armed` cannot return this stage while locked, its `done`
+    -- predicate.
     lock = function()
         oblisk.lock:invoke("lock")
     end,
@@ -59,35 +52,30 @@ local ACTIONS = {
     end,
 }
 
--- The one registration, at the top level, where `register_threshold`'s contract wants it: a
--- registration made inside a callback that fires more than once registers more than once, and
--- there is no way to take one back.
+-- Register once at top level. A registration inside a repeated callback duplicates it permanently.
 oblisk.idle:register_threshold(idle.TICK, function()
     local s = oblisk.system:get()
-    -- Back-dated by the threshold itself, so "idle 0:42" means forty-two seconds since the last
-    -- keystroke rather than since the notification about it.
+    -- Back-date by the threshold so "idle 0:42" means since the last keystroke, not the push.
     idle.since:set(((s and s.time) or 0) - idle.TICK)
 end, function()
-    -- Any input at all, whatever else is true. The mirror's own wake monitor is
-    -- `respectInhibitors: false` for exactly this: a screen that stays dark because something took
-    -- an inhibitor while it was off is a machine that looks broken.
+    -- Any input wakes it. The mirror uses `respectInhibitors: false`: an inhibitor taken while dark
+    -- must not leave the screen dark.
     set_displays_powered(true)
     idle.since:set(0)
     idle.armed_at:set({})
 end)
 
--- One tick, one pass. `oblisk.system` pushes once a second whatever else is happening -- the bar
--- clock and `power_menu.lua`'s countdown both ride it -- so this costs a comparison per second
--- while idle and an early return the rest of the time.
+-- One pass per `oblisk.system` tick, once a second; the bar clock and `power_menu.lua` countdown
+-- already use it. Cost is one comparison while idle and an early return otherwise.
 --
--- The shape is `IdleService.qml`'s, not a scheduler: work out which stage is armed *now*, stamp it
--- the first time it arms, and fire it its own delay after that stamp. Every stage that is not the
--- armed one has its stamp cleared, which is `IdleMonitor { enabled: false }` tearing a timer down.
+-- This is `IdleService.qml`'s shape, not a scheduler: find the stage armed *now*, stamp it once,
+-- and
+-- fire after its delay. Clear every other stamp, like `IdleMonitor { enabled: false }` tearing down
+-- a timer.
 --
--- That clearing is the whole reason the file is written this way. Unlocking makes the lock stage
--- undone, so it becomes the armed stage again and the stage behind it loses its stamp: the screen
--- stops being due to blank a minute after a lock the user has already answered. Nothing here
--- watches for an unlock; it falls out of asking the question every second instead of latching it.
+-- Clearing matters after unlock: the lock stage becomes armed again and its successor loses its
+-- stamp, so the screen does not blank a minute after a lock the user already answered. No unlock
+-- watcher is needed; the question is recomputed each second.
 oblisk.system:on_change(function(s)
     local since = idle.since:get()
     if since == 0 then
@@ -100,14 +88,13 @@ oblisk.system:on_change(function(s)
     local plan = idle.plan(settings, idle.profile_of(oblisk.power:get()))
     local armed = idle.armed(plan)
 
-    -- Rebuilt rather than mutated, `lib/ui_state.lua`'s rule: `set` compares a table by identity,
-    -- so a fresh one is both what makes the write land and what keeps the value under an unfinished
-    -- resolve from being mutated. One key at most survives, so this stays a two-entry table.
+    -- Rebuild rather than mutate (`lib/ui_state.lua`): `set` compares table identity, and a fresh
+    -- table cannot mutate a value under an unfinished resolve. At most one key survives.
     local stamps = idle.armed_at:get() or {}
     local next_stamps = {}
     if armed then
-        -- The stamp is the later of "when this armed" and "when the seat went idle": a stage armed
-        -- while the user was active must not count the time they were using the machine.
+        -- Use the later of "when this armed" and "when the seat went idle"; active time must not
+        -- count toward the stage.
         next_stamps[armed.key] = stamps[armed.key] or math.max(s.time, since)
     end
     idle.armed_at:set(next_stamps)
@@ -117,10 +104,9 @@ oblisk.system:on_change(function(s)
     end
 end)
 
--- The three things that can change the answer to "is something holding this awake" without anyone
--- clicking the bar button. The button's own edge goes through `idle.set_manual`, and a settings
--- write lands on `oblisk.storage` -- so turning "keep awake for media" off while a film is playing
--- drops the hold immediately rather than at the end of the film.
+-- Non-button changes to "is something holding this awake". The button uses `idle.set_manual`;
+-- settings
+-- land on `oblisk.storage`, so disabling "keep awake for media" drops the hold during playback.
 oblisk.privacy:on_change(idle.sync_inhibit)
 oblisk.mpris:on_change(idle.sync_inhibit)
 oblisk.storage:on_change(idle.sync_inhibit)

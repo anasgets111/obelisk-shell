@@ -1,21 +1,18 @@
--- Mirrors CenterSide.qml, which shows the media widget while something is playing and the focused
--- window's title otherwise.
+-- Mirrors CenterSide.qml: media while playing, the focused window title otherwise.
 --
--- One at a time. QML gets that from a `Loader` that is only `active` while
--- `MediaService.playbackAvailable`; here it is `visible`, which is the same thing to the layout
--- because an invisible child contributes nothing to its parent's size (`resolve_sizes` in
--- scene.rs).
+-- One at a time. QML uses a `Loader` active only while `MediaService.playbackAvailable`; here
+-- `visible` has the same layout effect because invisible children contribute no size
+-- (`resolve_sizes` in scene.rs).
 --
--- Content-sized between two `Fill` sides, so it is exactly as wide as whatever is showing and its
--- midpoint is the bar's midpoint whatever that turns out to be. `modules/bar/init.lua` has the
--- arithmetic that retired.
+-- Content-sized between two `Fill` sides keeps its midpoint at the bar's midpoint. The retired
+-- arithmetic is recorded in `modules/bar/init.lua`.
 local theme = require("config.theme")
 local media = require("modules.bar.indicators.media")
 local window_title_module = require("modules.bar.indicators.active_window")
 
--- `nil` is the pre-push state, not "nothing is playing", and both answer the same way here: no
--- player to show. The title takes the zone until `mpris` says otherwise, which is also what makes
--- the bar look right for the second before the first snapshot lands.
+-- `nil` is the pre-push state, not "nothing is playing"; both mean no player to show. The title
+-- takes the zone until `mpris` pushes its first snapshot, which makes the bar look right for the
+-- second before that snapshot lands.
 local function has_player(m)
     return m ~= nil and (m.players or {})[1] ~= nil
 end

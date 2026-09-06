@@ -1,19 +1,11 @@
-//! Typed property parsing for the layout engine (`docs/oblisk-idl-api-specs.md` § 5.1).
-//! `lua::nodes::VirtualNode` leaves every property as a raw `mlua::Value`; this module turns it
-//! into typed, validated properties.
-//! A `Value::UserData` holding a `Signal` (§ 1.2) is resolved rather than rejected (ADR-0044
-//! decision 1), and every such read happens in exactly one place, [`resolve_properties`], run once
-//! per node per pass. The parsers below take plain values and no `&Lua`, so two parsers reading
-//! the same property in the same pass see the same answer. That guarantee covers a `Signal` and
-//! nothing else: a plain Lua table with an `__index` metamethod is copied in as-is, and every
-//! `table.get` a parser makes still runs it afresh; see [`parse_edge_insets`]'s `ponytail:` for
-//! the hole this leaves. A signal resolving to another `Signal` is an error, not a second read:
-//! not a recursion bound, since a computed signal's getter returning fresh depth on every call
-//! recurses through `layout::scene::prepare` and `deserialize_lua_table` as deep as it wants.
-//! `layout::scene::MAX_TREE_DEPTH` caps that and raises [`LayoutError::TreeTooDeep`].
-//! [`SurfaceTopology`]'s five fields and every node's optional `id` (ADR-0045 decision 1) still
-//! reject a `Signal` outright; see [`reject_signal_in_structural_field`]. A `panel`'s remaining
-//! § 6 properties are not carve-outs, since layer-shell accepts each on a live surface.
+//! Typed, validated properties for `VirtualNode` (`docs/oblisk-idl-api-specs.md` § 5.1).
+//! `resolve_properties` reads each ordinary `Signal` once per node/pass (ADR-0044 decision 1);
+//! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals.
+//! A `panel`'s other § 6 properties are live fields, not exceptions. Plain tables remain
+//! metamethod-backed, so each `table.get` can still run `__index`; see `parse_edge_insets`'s
+//! `ponytail:`. A signal resolving
+//! to another signal errors rather than reading again, while `MAX_TREE_DEPTH` bounds recursive
+//! tree construction.
 
 mod content;
 mod paint_style;
@@ -22,8 +14,7 @@ mod style;
 mod surface;
 mod toplevel;
 
-// The paint-only parsers are imported, not re-exported: [`paint_style`] is now their only caller
-// (ADR-0068, replacing `layout::paint` itself), reached via `super::*` in `paint_style.rs`.
+// Paint-only parsers are imported, not re-exported; `paint_style` is their sole caller (ADR-0068).
 use content::{
     parse_elide, parse_fit, parse_font_size, parse_foreground, parse_icon_name, parse_image_source, parse_load,
     parse_mask_character, parse_max_lines, parse_optional_foreground, parse_placeholder, parse_text_align, parse_wrap,
@@ -95,10 +86,8 @@ pub enum Align {
     Stretch,
 }
 
-/// A parsed colour, four channels in `0.0..=1.0`. `f32`, not `u8`: femtovg's `Color` (read by
-/// `layout::paint`) already stores channels as `f32`. `Color::rgbaf` takes them as-is, while
-/// `Color::rgba` takes `u8` and divides by 255.0 to reach that form. Storing `f32` here means the
-/// drawing pass copies straight into `Color`, no `u8` round-trip to undo.
+/// A parsed colour in `0.0..=1.0`, stored as `f32` because femtovg's `Color::rgbaf` takes that
+/// form directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba {
     pub r: f32,
@@ -115,48 +104,36 @@ pub enum LayoutError {
     InvalidProperty { property: String, detail: String },
     #[error("`{0}` is a Signal handle, not a plain value -- read it via :get() before returning it from shell.lua")]
     UnsupportedSignalProperty(String),
-    /// `layout::scene::prepare`'s recursion, bounded at `layout::scene::MAX_TREE_DEPTH`. Covers
-    /// both a literal cyclic tree (`r.children = { r }`) and a computed `children` signal
-    /// generating fresh depth on every read, since both recurse through the same Rust call.
-    /// `max` is the number of levels actually admitted; `depth`, the 1-based level refused, is
-    /// always `max + 1`, so the message states the limit the code enforces, not one adjacent to it.
+    /// `prepare` exceeded `MAX_TREE_DEPTH`, from a literal cycle or a depth-generating signal.
+    /// `depth` is the 1-based refused level, always `max + 1`.
     #[error(
         "node tree exceeds the maximum depth of {max} levels (at `{kind}`, level {depth}) -- a node holding itself in `children`?"
     )]
     TreeTooDeep { kind: String, depth: u32, max: u32 },
-    /// One whole `Scene::apply` ran past `lua::signal`'s `LAYOUT_PASS_CAP`. Distinct from the
-    /// `InvalidProperty` a blown per-getter budget produces: only this one can be
-    /// reached with no `Signal` in the config at all, since a resolved table's `__index` metamethod
-    /// is Lua the pass runs outside any signal evaluation.
+    /// A whole `Scene::apply` exceeded `LAYOUT_PASS_CAP`. Unlike a getter's `InvalidProperty`,
+    /// this can happen with no `Signal`, through a resolved table's Lua `__index`.
     #[error(
         "the layout pass exceeded its CPU budget -- a property getter or an `__index` metamethod that does not return?"
     )]
     PassBudgetExceeded,
 }
 
-/// `pub(crate)` rather than private: `layout::scene`'s `Scene::apply_one_instance` raises an
-/// `id`-scoped error for an instance naming an undeclared surface, so every `InvalidProperty` in
-/// this crate is built here rather than by hand.
+/// Crate-visible for `layout::scene::Scene::apply_one_instance`; all crate `InvalidProperty`
+/// values use this helper.
 pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
     LayoutError::InvalidProperty { property: property.to_string(), detail: detail.into() }
 }
 
-/// Longest prefix of a rejected value's `Debug` form this file will ever put in an error message.
-/// 200 bytes, not `marshal::MAX_STRING_BYTES` (64KB): that cap answers how much of a *string
-/// property* is a legitimate value, while this one bounds a line of `rescue`'s `error_log`
-/// (§ 2.10), enough to recognize the value, not a paste buffer.
+/// Maximum rejected-value preview, separate from `marshal::MAX_STRING_BYTES`: 200 bytes bounds a
+/// `rescue` `error_log` line (§ 2.10) without limiting valid string properties.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 
-/// `pub(crate)` since `layout::scene`'s `list` node rejects a bad `source`/`itemfn`/`key` value
-/// from outside this module and needs the same bounded preview. Renders a `Value` for an
-/// [`invalid`] detail without ever formatting its `Debug` form in full first:
-/// `format!("{value:?}")` on an oversized `Value::String` allocates and escapes the whole thing
-/// before any truncation could run, so `rect { radius = string.rep("x", 20 * 1024 * 1024) }`
-/// would format 20 MB on the Wayland dispatch thread before the error reaches `rescue`.
-/// `marshal::check_string`'s 64KB cap never runs here; it lives in [`checked_string`], which a
-/// value rejected for the wrong *type* never reaches (only `Value::String` has unbounded `Debug`
-/// in mlua 0.12; everything else derives `Debug` over a fixed-width `ValueRef` pointer). Measured
-/// here, formatting a Lua string of each size against this function:
+/// Crate-visible because `layout::scene`'s `list` parser reports bad `source`, `itemfn`, or `key`
+/// values through it. Formats a rejected value for [`invalid`] without first formatting an
+/// oversized string in full:
+/// `rect { radius = string.rep("x", 20 * 1024 * 1024) }` would otherwise allocate and escape 20 MB
+/// on the Wayland dispatch thread. `marshal::check_string`'s 64KB cap does not apply because the
+/// wrong-type path never reaches [`checked_string`]. Measured against this function:
 ///
 /// | size | `format!("{value:?}")` | this function |
 /// |---|---|---|
@@ -164,41 +141,32 @@ const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 /// | 20 MB | 23.96 ms | 0.0057 ms |
 /// | 100 MB | 93.88 ms | 0.0061 ms |
 ///
-/// Cost is a function of the cap, not the input: 23.96 ms is more than a whole frame at 60fps,
-/// worth fixing while `layout::paint` still validated a `background` or `radius` while drawing.
-/// It no longer does (ADR-0068), so the cap buys a bounded `rescue` message, not a bounded frame.
-/// The regression test
-/// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` asserts a
-/// naive format-then-truncate cannot report the value's true length.
+/// Cost follows the cap, not input size: 23.96 ms exceeds one 60fps frame. Since paint no longer
+/// validates `background`/`radius` (ADR-0068), the cap bounds the `rescue` message, not a frame.
+/// `oversized_string_property_error_still_names_type_and_shows_a_recognizable_prefix` guards this.
 pub(crate) fn preview_for_error(value: &Value) -> String {
     let Value::String(s) = value else {
         return format!("{value:?}");
     };
-    // `as_bytes()` borrows the Lua string's own buffer, no copy or escaping, so measuring its
-    // length is an O(1) check that must run before any formatting decision.
+    // Borrow the Lua buffer and measure before formatting: this is O(1) and copies nothing.
     let bytes = s.as_bytes();
     let total_len = bytes.len();
     if total_len <= MAX_ERROR_VALUE_PREVIEW_BYTES {
         return format!("{value:?}");
     }
-    // Slice first, format second: only the bounded prefix reaches a `Debug`-style formatter, so a
-    // 20 MB string costs O(200 bytes), not O(len). Rendered lossily on purpose (a log preview, not
-    // an equality key): slicing raw bytes at a fixed offset can land mid-codepoint.
+    // Slice before formatting, so a 20 MB string costs O(200 bytes), not O(len). Lossy rendering
+    // is intentional: this is a log preview, and the byte boundary may split a codepoint.
     let prefix = String::from_utf8_lossy(&bytes[..MAX_ERROR_VALUE_PREVIEW_BYTES]);
     format!(
         "String({prefix:?}...) -- {total_len} bytes total, truncated to the first {MAX_ERROR_VALUE_PREVIEW_BYTES} here"
     )
 }
 
-/// Runs a numeric `Value` through the marshalling boundary (`lua::marshal`, ADR-0044 decision 1)
-/// before this parser's own range checks (e.g. `parse_size_mode`'s `[0, 8192]`), catching a
-/// NaN/Inf `f64` or an out-of-2^53-range `Integer`, whether literal or resolved via
-/// [`resolve_properties`]. `marshal::check_number` alone is not enough: a finite `f64` like
-/// `1e300` sails through it and overflows to `f32::INFINITY` on the narrowing cast below, and a
-/// caller with no further range check (e.g. `parse_spacing`) would hand that `Inf` straight into
-/// layout arithmetic. `inf * 0.0` is `NaN`, and `snap_to_physical`'s final `as i32` silently
-/// saturates a `NaN` rect to `0` instead of raising an error, so the finiteness check re-runs
-/// after the cast, on the `f32`, naming the same property a non-finite literal would.
+/// Applies the Lua numeric checks before parser ranges, then checks the narrowed `f32`. This covers
+/// literal and `resolve_properties`-resolved numbers, including integers outside `2^53`. A finite
+/// `1e300` passes `check_number` but becomes `f32::INFINITY`; without the second check, an
+/// unchecked property could reach layout arithmetic, where `inf * 0.0` is `NaN` and
+/// `snap_to_physical`'s `as i32` silently becomes 0 (ADR-0044 decision 1).
 fn value_as_f32(property: &str, value: &Value) -> Result<Option<f32>, LayoutError> {
     match value {
         Value::Integer(i) => {
@@ -220,8 +188,7 @@ fn value_as_f32(property: &str, value: &Value) -> Result<Option<f32>, LayoutErro
     }
 }
 
-/// Runs a Lua string through `marshal::check_string`'s 64KB cap and returns the owned `String`,
-/// same reasoning as [`value_as_f32`].
+/// Runs a Lua string through `marshal::check_string`'s 64KB cap and returns it owned.
 fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutError> {
     let s = s.to_string_lossy();
     marshal::check_string(&s).map_err(|e| invalid(property, e.to_string()))?;

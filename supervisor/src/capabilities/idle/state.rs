@@ -1,53 +1,46 @@
-//! What `oblisk.idle` publishes: whether anything is holding the session awake, and who.
+//! What `oblisk.idle` publishes: whether anything holds the session awake, and who.
 //!
-//! ADR-0139 built the gate and told Lua nothing about it, on the grounds that `register_threshold`
-//! takes callbacks that cannot cross the wire, so the roster would buy only push machinery. Push
-//! machinery turned out to be the whole point: a config drawing "nothing is holding this awake"
-//! while the Supervisor was holding every threshold event is a lie on screen, and the config had no
-//! way to know better. Observed live with `systemd-inhibit --what=idle --who=mpv`: the countdown
-//! stopped and nothing said why. ADR-0141 amends the rejection.
+//! ADR-0139 kept the gate out of Lua: a read-state roster would buy only push machinery because
+//! `register_threshold` callbacks cannot cross the wire. That hid why a countdown stopped while
+//! the Supervisor dropped every threshold event: observed live with `systemd-inhibit --what=idle
+//! --who=mpv`, the screen said nothing. ADR-0141 adds the roster.
 //!
-//! [`IdleState::inhibited`] is the gate's own answer, off `Manager.BlockInhibited`, and
-//! [`IdleState::inhibitors`] names the holders. The two are not redundant: this shell's own hold is
-//! excluded (see [`foreign_idle_inhibitors`]), so `inhibited` true with an empty list means "the
-//! only thing holding this awake is you", which the config can already explain in better words than
-//! the `why` it passed down.
+//! [`IdleState::inhibited`] comes from `Manager.BlockInhibited`; [`IdleState::inhibitors`] names
+//! holders. The shell's own hold is excluded (see [`foreign_idle_inhibitors`]), which config can
+//! explain better than the `why` it passed down. Thus `inhibited` true with an empty list means
+//! only this shell holds the session awake.
 
 use serde::Serialize;
 
-/// One logind inhibitor blocking idle, as a config would draw it.
+/// One logind inhibitor blocking idle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct IdleInhibitor {
-    /// The `who` the holder passed to `Inhibit`, e.g. `"mpv"`. Free text chosen by that program, so
-    /// it is a label to draw and never something to match on.
+    /// Free-text `who` passed to `Inhibit`, e.g. `"mpv"`; draw it as a label, never match it.
     pub who: String,
-    /// The `why` the holder passed, e.g. `"Playing video"`. Also free text, and often empty.
+    /// Free-text `why`, e.g. `"Playing video"`, often empty.
     pub why: String,
 }
 
-/// `oblisk.idle`'s payload (ADR-0141).
+/// `oblisk.idle` payload (ADR-0141).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct IdleState {
-    /// Anything at all is holding an idle inhibitor, this shell included. While true no threshold
-    /// event reaches the config, so a config's own countdown has to stop here rather than keep
-    /// running against events that will never arrive.
+    /// Any idle inhibitor is held, including this shell. While true, no threshold event reaches
+    /// config, so its countdown must stop.
     pub inhibited: bool,
-    /// The holders that are not this shell.
+    /// Idle-inhibitor holders other than this shell.
     pub inhibitors: Vec<IdleInhibitor>,
 }
 
-/// One row of `Manager.ListInhibitors`: `what`, `who`, `why`, `mode`, `uid`, `pid`.
+/// One `Manager.ListInhibitors` row: `what`, `who`, `why`, `mode`, `uid`, `pid`.
 pub(crate) type InhibitorRow = (String, String, String, String, u32, u32);
 
-/// The rows that actually block idling, minus this shell's own.
+/// Rows that block idling, excluding this shell.
 ///
-/// `mode` matters as much as `what`: a `delay` inhibitor asks for a grace period before a sleep and
-/// does not stop the seat idling, so counting one would report a hold that is not there. `what` goes
-/// through [`super::gate::blocks_idle`] rather than being re-parsed beside it, so the list this
-/// draws and the gate that acts cannot disagree about what counts.
+/// `delay` only requests grace before sleep; it does not stop seat idling, so only `block` counts.
+/// `what` uses [`super::gate::blocks_idle`], keeping the drawn list and gate's decision identical.
 ///
-/// `who` is compared against [`super::inhibit::INHIBIT_WHO`] rather than a pid, because the fd is
-/// held by the Supervisor and the pid logind records is this process either way.
+/// Compare `who` with [`super::inhibit::INHIBIT_WHO`], not pid: the Supervisor holds the fd and
+/// logind records this process's pid either way.
 pub(crate) fn foreign_idle_inhibitors(rows: Vec<InhibitorRow>) -> Vec<IdleInhibitor> {
     rows.into_iter()
         .filter(|(what, who, _, mode, _, _)| {

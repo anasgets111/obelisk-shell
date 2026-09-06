@@ -1,49 +1,26 @@
-//! Which `secure_submit` destinations a resolved tree declares, and whether a `lock` surface built
-//! from that tree can be authenticated out of (`CONTEXT.md`, **Secure submit**).
-//!
-//! Here, not in `crate::wayland::input` where these grew: everything here takes a
-//! [`ResolvedNode`](crate::layout::ResolvedNode) or a
-//! [`SecureSubmitTarget`](crate::layout::node::SecureSubmitTarget) and returns one, tree analysis
-//! that input routing consumes rather than performs. The three callers sit in three modules
-//! (`wayland::input` arms the keyboard, `wayland::lock` grants the lock, `crate::socket` vetoes a
-//! reload); under `wayland`, the last of those needed a fully-qualified path back into
-//! `crate::wayland` for a predicate the module re-exported upward for it alone.
+//! `secure_submit` tree analysis (`CONTEXT.md`, Secure submit). Kept here rather than
+//! `crate::wayland::input`, where these predicates grew; the last helper needed a fully-qualified
+//! path back into `crate::wayland`. Input routing consumes these predicates; `wayland::input` arms
+//! the keyboard, `wayland::lock` grants the lock, and `crate::socket` vetoes unsafe reloads.
 
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{self, SecureSubmitTarget};
 use crate::layout::{ResolvedNode, Scene};
 
-/// The `(capability, action)` pair that reaches PAM, and the only one that can ever end a session
-/// lock. `supervisor/src/main.rs` routes `SecureSubmit { capability: "lock", action:
-/// "authenticate" }` to the PAM worker and answers `PamOutcome::Success` with the one
-/// `SetSessionLock { locked: false }` this process will ever see; every other pair cannot unlock
-/// the session.
+/// The only pair reaching PAM and ending a session lock. `supervisor/src/main.rs` routes
+/// `("lock", "authenticate")` to PAM and only its success emits `SetSessionLock { locked: false }`.
 const UNLOCK_TARGET: (&str, &str) = ("lock", "authenticate");
 
-/// Whether this destination is the one that ends a session lock.
-///
-/// Named rather than compared inline: `wayland::lock`'s `lock_command` refuses a lock screen with
-/// no such field, and nothing else may quietly grow a second opinion about which pair unlocks.
-/// See [`UNLOCK_TARGET`].
+/// Whether this destination ends a session lock. `wayland::lock::lock_command` uses the same
+/// predicate when admitting a lock screen.
 fn unlocks_the_session(target: &SecureSubmitTarget) -> bool {
     (target.capability.as_str(), target.action.as_str()) == UNLOCK_TARGET
 }
 
-/// Every `secure_submit` destination a resolved tree declares, in document order.
-///
-/// Whole-tree, unlike `wayland::input`'s `focused_target`, which walks a hit path from one node
-/// for the innermost: these callers have no node to start from, asking what a surface offers
-/// before any event has arrived.
-///
-/// Reads `node::paint_style` already parsed, so there is no malformed case left to skip: an
-/// unparseable `secure_submit` fails `Scene::apply` first. `None` here is a `textfield` that
-/// declared no destination.
-///
-/// **Not the admission rule.** Asking whether *any* target here unlocks is the bug
-/// [`tree_can_authenticate`] exists to have fixed: it grants a lock the keyboard then arms nothing
-/// on, since the compositor does not unlock when the client dies. Admission and focus both read
-/// [`sole_secure_submit`] instead; this is `pub(crate)` only for `wayland::input`'s
-/// `focus_on_enter`, asking whether a field it already holds is still declared.
+/// Every declared destination in document order. It walks the whole tree because callers ask what
+/// a surface offers before an event supplies a hit node. Malformed targets already fail
+/// `Scene::apply`; `None` means a `textfield` declared no destination. This is not admission:
+/// `tree_can_authenticate` uses [`sole_secure_submit`] so focus and lock admission cannot diverge.
 pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarget> {
     let mut found = Vec::new();
     let mut stack = vec![tree];
@@ -56,28 +33,13 @@ pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarg
     found
 }
 
-/// The destination a keyboard-focus scope takes, when the whole scope declares exactly one, and
-/// which surface in the scope declares it.
-///
-/// Why keyboard focus focuses a field at all: without it, `focused_secure_submit` was set only by
-/// a pointer press, requiring a mouse click before a keystroke could reach `shared::SecureBuffer`
-/// on the one surface whose purpose is to accept a password. A lock surface must be typable the
-/// moment the compositor hands it keyboard focus.
-///
-/// Exactly one, deliberately: with two `secure_submit` fields there is no non-arbitrary answer to
-/// "whose password is this?", the guess `wayland::input`'s `submit_frame_for` already refuses to
-/// make (ADR-0050 decision 4). Zero is the same answer. Both cases leave focus alone for a
-/// press to decide, which buys the single-field case: every lock screen and password prompt.
-///
-/// **Why a scope and not a surface.** A key does not reach the surface that painted the field, it
-/// reaches whichever surface holds the keyboard, and an `xdg_popup` is not always that surface even
-/// while it is the thing on screen: niri hands a grabbing popup the keyboard only if its parent
-/// already held it when the popup mapped, so a `panel` that raises its `keyboard_interactivity`
-/// while its own popup is open keeps the keyboard on the panel. Scoped per surface, that made the
-/// network password prompt untypable at exactly the moment it was asking -- and typable after
-/// closing and reopening the panel, since the second map found the parent focused. `wayland::input`
-/// passes the focused surface plus every popup currently shown under it, so the rule is asked of
-/// what the keystroke can actually reach.
+/// The sole destination in the keyboard-focus scope, if exactly one is declared, with its surface
+/// id. Focus moved here from pointer-only `focused_secure_submit` so a lock field is typable as
+/// soon as the compositor grants keyboard focus. Two destinations have no non-arbitrary password
+/// owner (`submit_frame_for`, ADR-0050 decision 4), so zero or many leave focus for a press.
+/// Scope it over the focused surface and its shown popups: niri gives a grabbing popup the keyboard
+/// only when its parent already held it. Surface-only scope made the network password prompt
+/// untypable while its popup was open, then typable after reopening the panel.
 pub(crate) fn sole_secure_submit_in_scope<'a>(
     scope: &[(&'a str, &ResolvedNode)],
 ) -> Option<(&'a str, SecureSubmitTarget)> {
@@ -93,58 +55,25 @@ pub(crate) fn sole_secure_submit_in_scope<'a>(
     sole
 }
 
-/// [`sole_secure_submit_in_scope`] of one tree alone, for the callers that have a surface and no
-/// scope: the lock guard and its veto, which ask about a `lock` surface no popup can root under
-/// (`SurfaceInstance`'s `as_popup_parent` answers `None` for one).
-///
-/// Delegating rather than counting again, so widening the focus scope cannot leave the lock rules
-/// answering to an older version of "exactly one".
+/// [`sole_secure_submit_in_scope`] for a standalone lock surface, which cannot parent a popup
+/// (`SurfaceInstance::as_popup_parent` returns `None`).
 pub(crate) fn sole_secure_submit(tree: &ResolvedNode) -> Option<SecureSubmitTarget> {
     sole_secure_submit_in_scope(&[("", tree)]).map(|(_, target)| target)
 }
 
-/// Whether a `lock` surface's resolved tree can actually be authenticated out of -- the predicate
-/// `wayland::lock`'s `lock_command` reads as `can_authenticate`, and it is deliberately built out
-/// of [`sole_secure_submit`] rather than out of [`secure_submit_targets`].
-///
-/// The guard that grants the lock and the rule that arms the keyboard must be one predicate. They
-/// were two: admission asked whether any field in the tree unlocks, focus armed only a sole field.
-/// A lock screen with two `secure_submit` fields passed the guard, took the lock -- which the
-/// compositor will not release when the client dies -- and then armed nothing when the compositor
-/// handed the surface keyboard focus, leaving a VT switch as the only way back in.
-///
-/// Sole-and-unlocking is the right rule, not merely the stricter one: `any` is not implementable
-/// as a focus rule at all, since with two destinations there is no non-arbitrary answer to "whose
-/// password is this?" (the guess `wayland::input`'s `submit_frame_for` already refuses to make,
-/// ADR-0050 decision 4). So the focus rule stays, and admission moves to meet it.
+/// Whether a lock can authenticate out of its tree. Admission and keyboard arming must share this
+/// sole-and-unlocking rule: the old admission-`any`/focus-`sole` split let a two-field lock take
+/// the lock, arm nothing, and leave only a VT switch because the compositor does not unlock on
+/// client death (ADR-0050 decision 4).
 pub(crate) fn tree_can_authenticate(tree: &ResolvedNode) -> bool {
     sole_secure_submit(tree).as_ref().is_some_and(unlocks_the_session)
 }
 
-/// The veto `Scene::apply` runs on the finished scene while this process holds a session lock:
-/// the locked session must still be one the user can authenticate out of.
-///
-/// **Why this exists at all.** `layout::node::SurfaceFingerprint::Lock` carries only the `id`, so
-/// editing a lock's `child` -- and so its password field -- diffs as `Unchanged` and reloads in
-/// place, which the generation-swap gate does not police. Deleting the `textfield` while the lock
-/// screen is up would therefore apply immediately, and the compositor does not unlock when a
-/// lock client dies, so the way out would be a VT switch.
-///
-/// **It asks the apply what is on the glass, and holds no list of its own.** The arming side is
-/// one `bool` (`crate::socket::RendererClient`'s `holds_session_lock`); the `lock` instances are
-/// read out of the instance set this very apply is resolving. A remembered list could not survive
-/// a hotplug: [`Scene`] keeps a retired instance's tree, so a snapshot taken at grant time would
-/// vouch for a fossil nothing can paint while the live lock screen quietly lost its way out.
-///
-/// **`any`, not `all`, the same rule the grant used**, since a veto demanding all declared
-/// instances be typable would refuse every reload for the rest of a lock already granted. An
-/// empty set fails.
-///
-/// **Restyling a live lock screen must keep working**, which is why the veto asks the narrowest
-/// possible question rather than freezing the tree (ADR-0052 decision 2).
-///
-/// The predicate is [`tree_can_authenticate`], not a copy of it: a second opinion about what makes
-/// a lock screen usable is how a lock gets granted against a rule the keyboard does not follow.
+/// Vetoes a finished `Scene::apply` while the session is locked. Lock fingerprints contain only
+/// `id`, so changing `child` would reload in place and could delete the password field; the
+/// compositor would not unlock on client death. It reads the instances from this apply rather than
+/// a remembered list, which survives hotplug and avoids retired-tree fossils. `any` lock instance
+/// may authenticate, an empty set fails; restyling remains allowed (ADR-0052 decision 2).
 pub(crate) fn lock_stays_authenticatable(
     scene: &Scene,
     instances: &[SurfaceInstance],

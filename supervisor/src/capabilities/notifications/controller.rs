@@ -1,6 +1,5 @@
-//! [`NotificationsController`]: the D-Bus interface + write-action dispatcher and state owner
-//! (deliberately fused into one type -- see the module-level doc for why). Split from
-//! `dbus::notifications` -- see `dbus/notifications/mod.rs` for the module-level doc.
+//! [`NotificationsController`], the D-Bus interface, write dispatcher, and state owner. Split from
+//! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -9,8 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
-// `tokio`'s clock, not `std`'s: these are timer deadlines, and only this one moves with
-// `tokio::time::pause`, which is what makes the countdown testable without sleeping through it.
+// Use tokio's clock: deadlines move with `tokio::time::pause`, so countdowns test without sleeping.
 use tokio::time::Instant;
 use zbus::fdo::RequestNameFlags;
 use zbus::zvariant::Value;
@@ -34,39 +32,29 @@ use super::{
 };
 use crate::capabilities::system::controller::epoch_seconds;
 
-// -------------------------------------------------------------------------------------------
-// ActionInvoked reply encoding (TDD seam 4).
-// -------------------------------------------------------------------------------------------
-
-/// `ActionInvoked`'s `action_key` for a completed inline reply (ADR-0033: `"inline-reply::<text>"`).
+/// `ActionInvoked` key for a completed inline reply (ADR-0033).
 fn format_reply_action_key(text: &str) -> String {
     format!("inline-reply::{text}")
 }
 
-/// What `Notify`'s flat `[key1, label1, key2, label2, ...]` array splits into (ADR-0090). Three
-/// values that all come off one walk of the same array, returned together rather than as three
-/// passes each re-deciding what a key means.
+/// Results of one pass over `Notify`'s flat action array, returned together rather than as three
+/// passes that each re-decide what a key means (ADR-0090).
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct ParsedActions {
     pub actions: Vec<NotificationAction>,
-    /// A `"default"` key was present: the notification as a whole is activatable.
+    /// A `"default"` key was present; the notification is activatable.
     pub has_default: bool,
-    /// An `"inline-reply"` key was present -- §1.2's `x-kde-reply` convention rides on exactly
-    /// that key.
+    /// An `"inline-reply"` key was present, per §1.2's `x-kde-reply` convention.
     pub has_reply: bool,
 }
 
-/// Splits `Notify`'s `actions` into the buttons a config draws and the two keys that are not
-/// buttons (ADR-0090).
+/// Splits `Notify` actions into drawable buttons and the two non-button keys (ADR-0090).
 ///
-/// An odd-length array is a sender that sent a key with no label, which the base spec does not
-/// allow and which is not worth rejecting a whole notification over: the label reads as empty and
-/// the key stands in for it.
+/// Odd length means a key has no label. The base spec disallows it, but the notification survives:
+/// the key becomes its label.
 ///
-/// `action_icons` is the sender's hint that each key doubles as a theme icon name. An action is
-/// kept only if it can actually be drawn -- a label, or an icon to draw instead of one -- so a
-/// sender that offers `["", ""]` gets nothing rather than an unlabelled button that does something
-/// unguessable when pressed.
+/// With `action_icons`, keys may also be theme icon names. Keep an action only if it has a label or
+/// drawable icon; `["", ""]` produces no unlabelled, unpredictable button.
 pub(super) fn parse_actions(actions: &[String], action_icons: bool) -> ParsedActions {
     let mut parsed = ParsedActions::default();
     for pair in actions.chunks(2) {
@@ -85,8 +73,7 @@ pub(super) fn parse_actions(actions: &[String], action_icons: bool) -> ParsedAct
         if parsed.actions.len() >= MAX_ACTIONS {
             continue;
         }
-        // A theme name, never a path: `icon` accepts an absolute path too, so without this a
-        // sender could name any readable file on the machine and have the shell draw it.
+        // Theme name, never path: `icon` also accepts absolute paths, so this blocks file access.
         let icon_name = (action_icons && !key.contains('/')).then(|| key.clone());
         let label = pair.get(1).map(String::as_str).unwrap_or_default().trim();
         let label = if label.is_empty() && icon_name.is_none() { key.as_str() } else { label };
@@ -102,12 +89,6 @@ pub(super) fn parse_actions(actions: &[String], action_icons: bool) -> ParsedAct
     parsed
 }
 
-// -------------------------------------------------------------------------------------------
-// D-Bus interface + controller. `NotificationsController` is both the exported
-// `org.freedesktop.Notifications` object and the cheap-clone handle `main.rs` holds for
-// write-command dispatch -- unlike `dbus::tray`'s split, one type serves both roles here.
-// -------------------------------------------------------------------------------------------
-
 struct NotificationsQueueState {
     queue: VecDeque<Notification>,
     next_id: u32,
@@ -122,8 +103,7 @@ impl NotificationsQueueState {
     }
 }
 
-/// `NotificationClosed`'s `reason` argument (§1's base spec, plus ADR-0033's repurposing of the
-/// spec's undefined/reserved `4` for Oblisk's own FIFO-eviction cap).
+/// `NotificationClosed.reason`: §1 values plus ADR-0033's reserved `4` for FIFO eviction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum CloseReason {
@@ -139,27 +119,26 @@ impl From<CloseReason> for u32 {
     }
 }
 
+// `NotificationsController` is both the exported `org.freedesktop.Notifications` object and the
+// cheap-clone handle `main.rs` holds for write dispatch. Unlike `dbus::tray`'s split, one type
+// serves both roles here.
 #[derive(Clone)]
 pub struct NotificationsController {
-    /// `Some` only when this process actually owns `org.freedesktop.Notifications` on a live
-    /// session-bus connection -- `None` degrades every signal emission to a silent no-op, while
-    /// queue/DND/sound state stays fully functional either way.
+    /// Live connection only when this process owns `org.freedesktop.Notifications`; `None` makes
+    /// signals no-ops while queue/DND/sound state remains functional.
     connection: Option<zbus::Connection>,
     state: Arc<Mutex<NotificationsQueueState>>,
     events: UnboundedSender<NotificationsSignal>,
     sound_tx: SoundSender,
     trusted_roots: Arc<Vec<PathBuf>>,
-    /// The instant every pending expiry countdown is stopped until, or `None` when none is
-    /// (ADR-0094). A `watch` rather than a field in [`NotificationsQueueState`] because the
-    /// readers are the spawned countdowns, which need to be *woken* when it moves and not merely
-    /// to find the new value the next time they happen to look.
+    /// Deadline stopping all expiry countdowns, or `None` (ADR-0094). A `watch` wakes spawned
+    /// countdowns when it changes; a queue field would only be seen on their next check.
     expiry_hold: Arc<watch::Sender<Option<Instant>>>,
 }
 
 impl NotificationsController {
-    /// Requests `org.freedesktop.Notifications` with `DoNotQueue` set: a real desktop might
-    /// already have `mako`/`dunst` running and owning this name, a genuine "someone else already
-    /// provides this" outcome to degrade to inert for, not a race to queue behind (ADR-0033).
+    /// Requests the bus name with `DoNotQueue`: an existing `mako`/`dunst` owner degrades this
+    /// daemon to inert rather than queueing behind it (ADR-0033).
     pub async fn new(
         connection: zbus::Connection,
         events: UnboundedSender<NotificationsSignal>,
@@ -208,9 +187,8 @@ impl NotificationsController {
         controller
     }
 
-    /// Fully inert controller: no D-Bus connection, but a real, working queue/DND/sound-registry
-    /// state -- used when the session bus itself couldn't be reached at all. Every write command
-    /// still behaves sensibly; only signal emission and `Notify` arriving over D-Bus never happen.
+    /// No D-Bus connection but working queue/DND/sound state, used when the session bus is absent.
+    /// Writes still work; only signals and D-Bus `Notify` are unavailable.
     pub fn inert(events: UnboundedSender<NotificationsSignal>, sound_tx: SoundSender) -> Self {
         Self {
             connection: None,
@@ -246,13 +224,10 @@ impl NotificationsController {
         }
     }
 
-    /// Resolves `Notify`'s attached-picture precedence ([`resolve_image_input`]) into a final,
-    /// spooled/validated `image_path`. `image-data`/`icon_data` get bounds-checked and
-    /// PNG-encoded/spooled to SHM; `image-path` runs through the same [`validate_trusted_path`]
-    /// boundary body-markup images use.
-    ///
-    /// The positional `app_icon` argument is not in here any more: it is the application's own
-    /// icon rather than the picture it attached, and [`resolve_app_icon`] handles it (ADR-0091).
+    /// Resolves `Notify`'s attached-picture precedence ([`resolve_image_input`]) into a final path.
+    /// Raw image data is checked, PNG
+    /// encoded, and spooled to SHM; `image-path` uses the body-image trust boundary. The positional
+    /// application icon is separate and handled by [`resolve_app_icon`] (ADR-0091).
     async fn resolve_and_spool_image(
         &self,
         id: u32,
@@ -268,17 +243,11 @@ impl NotificationsController {
         }
     }
 
-    /// Fires once, at the end of the `Duration` a `notify()` call scheduled it for -- `id` and
-    /// `incarnation` together identify which `Notify` call's content this timer is for.
-    /// [`expire_entry`] is the recheck: if a `replaces_id` update already landed new content at
-    /// `id`, `incarnation` no longer matches and this is a silent no-op.
-    ///
-    /// Retires rather than removes (ADR-0100): the entry stays in the queue with `expired` set,
-    /// so the history keeps showing what happened after the popup has gone, and `dismiss` is what
-    /// removes it. The sender is told the same thing it always was -- `NotificationClosed(id,
-    /// reason=1)` -- because from its side the notification *has* closed: it will get no
-    /// `ActionInvoked` it can rely on and should not try to update the entry in place. A
-    /// `transient` entry is the exception and is removed the way every expiry used to be.
+    /// Fires after a scheduled duration. `id` plus `incarnation` identifies the `Notify` content;
+    /// [`expire_entry`] silently rejects stale replacement timers. Ordinary expiry retires the
+    /// entry for history (ADR-0100), emits `NotificationClosed(..., reason=1)`, and leaves
+    /// `dismiss` to remove it. The sender gets the same close signal as before, no reliable
+    /// `ActionInvoked`, and should not update the entry in place; `transient` entries are removed.
     async fn expire(&self, id: u32, incarnation: u64) {
         let outcome = {
             let mut state = self.state.lock().unwrap();
@@ -292,10 +261,8 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:dismiss(id)` (§3.2): removes the entry, cancels nothing explicitly (the
-    /// pending expiry task's own recheck-before-acting sees it's gone and no-ops), emits
-    /// `NotificationClosed(id, reason=Dismissed)`, and signals a fresh `StateSnapshot` push. A
-    /// logged no-op for an unknown id.
+    /// `notifications:dismiss(id)` (§3.2): removes the entry, lets its expiry task no-op on
+    /// recheck, emits `NotificationClosed(..., Dismissed)`, and pushes state. Unknown ids no-op.
     pub async fn dismiss(&self, id: u32) {
         let removed = {
             let mut state = self.state.lock().unwrap();
@@ -312,9 +279,8 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:reply(id, text)` (ADR-0033): confirms the notification `has_reply`, emits
-    /// `ActionInvoked(id, format_reply_action_key(text))`, and removes it -- a replied-to
-    /// notification is done. Logged no-ops for an unknown id or one with no reply.
+    /// `notifications:reply(id, text)` (ADR-0033) requires `has_reply`, emits the encoded
+    /// `ActionInvoked`, and removes the notification. Unknown/no-reply ids log/no-op.
     pub async fn reply(&self, id: u32, text: String) {
         let removed = {
             let mut state = self.state.lock().unwrap();
@@ -342,19 +308,10 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:invoke_action(id, key)` (ADR-0090): confirms the notification actually
-    /// declared `key`, emits `ActionInvoked(id, key)`, and then removes it unless the sender set
-    /// `hints["resident"]`.
-    ///
-    /// The key is checked rather than forwarded, for the same reason `reply` checks `has_reply`:
-    /// a key the sender never offered means nothing to it, and the round trip that discovers that
-    /// is a signal the application has to field and ignore. Logged no-ops for an unknown id or an
-    /// undeclared key.
-    ///
-    /// Removing afterwards is the base spec's default and `resident` is its own exception to it --
-    /// a media notification whose prev/next buttons closed the card on first press would be
-    /// useless. `NotificationClosed` is emitted alongside, because an action-invoked removal is a
-    /// close like any other and a sender tracking its own ids needs to hear about it.
+    /// `notifications:invoke_action(id, key)` (ADR-0090) validates that the sender declared
+    /// `key`, emits `ActionInvoked`, then removes unless `resident` is set. It checks rather than
+    /// forwards unknown keys because a key the sender never offered means nothing to it. Unknown
+    /// keys log/no-op; non-resident removal also emits `NotificationClosed`.
     pub async fn invoke_action(&self, id: u32, key: String) {
         let outcome = {
             let mut state = self.state.lock().unwrap();
@@ -386,9 +343,8 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:set_sound(urgency, path)` (ADR-0033): registers `path` for `urgency`'s tier
-    /// if it passes the same path-trust validator as icon references. An invalid/untrusted path
-    /// is a logged no-op.
+    /// `notifications:set_sound(urgency, path)` (ADR-0033) registers a trusted existing path if
+    /// it passes the same path-trust validator as icon references; invalid/untrusted paths log.
     pub fn set_sound(&self, urgency: Urgency, path: &str) {
         match validate_trusted_path(path, &self.trusted_roots) {
             Some(validated) => {
@@ -400,32 +356,21 @@ impl NotificationsController {
         }
     }
 
-    /// `notifications:set_dnd(enabled)` (ADR-0033): flips the Supervisor-global toggle. Gates
-    /// sound only -- `notifications.feed` keeps receiving everything regardless.
+    /// `notifications:set_dnd(enabled)` (ADR-0033) flips the global sound gate; feed is unchanged.
     pub fn set_dnd(&self, enabled: bool) {
         self.state.lock().unwrap().dnd = enabled;
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:hold_expiry(seconds)` (ADR-0094): stops every pending expiry countdown for
-    /// the next `seconds`, so a notification cannot vanish out from under someone reading it or
-    /// part-way through typing a reply into it. `0` releases the hold immediately.
-    ///
-    /// A deadline rather than a paused/resumed flag, and that is the whole point: a config that
-    /// pauses and never resumes -- because it reloaded, crashed, or simply missed an edge --
-    /// pins the feed for the rest of the session, and nothing in the Supervisor could tell that
-    /// state from a legitimately long one. A deadline lapses on its own, so the worst a bug can
-    /// do is bounded by [`MAX_EXPIRY_HOLD_SECS`], and the natural way to use it is to keep
-    /// re-placing a short one from an event that is already repeating (a reply field's
-    /// `on_change` fires per keystroke).
-    ///
-    /// Not in [`NotificationsState`]: the config is the only writer and already knows what it
-    /// asked for, and a readable one invites a second reader to make decisions from a value that
-    /// is stale the moment it is pushed.
+    /// `notifications:hold_expiry(seconds)` (ADR-0094) pauses all pending countdowns; `0` releases
+    /// them. A deadline avoids a paused flag: a config that reloads, crashes, or misses an edge
+    /// could otherwise pin the feed for the rest of the session. It self-releases, bounding the
+    /// missed edge by [`MAX_EXPIRY_HOLD_SECS`]; configs can refresh a short hold from repeating
+    /// events such as reply-field `on_change`.
+    /// Not in [`NotificationsState`]: the config is the only writer and already knows its request.
     pub fn hold_expiry(&self, seconds: u64) {
         let until = (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds.min(MAX_EXPIRY_HOLD_SECS)));
-        // Worth a line each way. A feed that has stopped expiring looks identical to a broken
-        // timer from the outside, and this is the one thing that tells them apart.
+        // Distinguish an intentional hold from a broken timer in logs.
         match until {
             Some(_) => eprintln!("notifications: expiry held for {}s", seconds.min(MAX_EXPIRY_HOLD_SECS)),
             None => eprintln!("notifications: expiry hold released"),
@@ -441,42 +386,29 @@ impl NotificationsController {
     }
 }
 
-/// The longest a single [`NotificationsController::hold_expiry`] call can stop the countdowns for.
-/// A hold asserts "somebody is interacting with this right now", and five minutes of continuous
-/// interaction with one notification is past anything real; the cap is what keeps a config that
-/// asks for a week from pinning the feed for the session.
+/// Maximum single hold. A hold means somebody is interacting now; five minutes of continuous
+/// interaction with one notification is past anything real. It bounds a config asking for a week.
 pub const MAX_EXPIRY_HOLD_SECS: u64 = 300;
 
-/// Sleeps out `remaining`, with the clock stopped for as long as a `hold_expiry` deadline is in
-/// force (ADR-0094).
-///
-/// The countdown lives here rather than as a deadline on the queue entry because that is all it
-/// is -- one task per expiring notification already existed, and giving it a pausable sleep costs
-/// no shared state, no re-arming on release, and no second place that has to agree with
-/// [`expire_entry`] about what is still pending.
-///
-/// Time already served is banked across a hold: a notification held at 2s of 5 has 3s left when
-/// the hold lapses, not 0. Restarting it would be wrong and expiring it immediately would be
-/// worse -- the card would vanish at the instant the pointer left it, which reads as the pointer
-/// having dismissed it.
+/// Sleeps `remaining`, pausing for an ADR-0094 hold. Each expiring notification already has one
+/// task, so pausing that sleep needs no queue deadline, shared state, re-arming, or second place
+/// agreeing with [`expire_entry`]. Served time is banked: a 5s countdown held at 2s has 3s left,
+/// not 0 or a restarted 5s.
 async fn sleep_past_holds(mut holds: watch::Receiver<Option<Instant>>, mut remaining: Duration) {
     loop {
         let held_until = (*holds.borrow_and_update()).filter(|until| *until > Instant::now());
         if let Some(until) = held_until {
-            // Stopped. Wake when the hold lapses, or sooner if one is placed or released, and
-            // decide again from the top rather than assuming which of the two happened.
+            // Wake on lapse, placement, or release, then re-evaluate.
             let _ = tokio::time::timeout_at(until, holds.changed()).await;
             continue;
         }
         let started = Instant::now();
         match tokio::time::timeout(remaining, holds.changed()).await {
-            // The countdown ran out with nothing interrupting it: the time is served.
+            // No hold change before timeout: duration is served.
             Err(_elapsed) => return,
             Ok(moved) => {
                 remaining = remaining.saturating_sub(started.elapsed());
-                // The sender is gone, which in a live Supervisor means the controller itself is,
-                // so there will never be another hold: serve the rest in one sleep instead of
-                // spinning on a channel that can only keep erroring.
+                // Controller gone: no future holds, so finish in one sleep instead of spinning.
                 if moved.is_err() {
                     tokio::time::sleep(remaining).await;
                     return;
@@ -486,8 +418,7 @@ async fn sleep_past_holds(mut holds: watch::Receiver<Option<Instant>>, mut remai
     }
 }
 
-/// Whether `notification` offered `key`, counting the `"default"` activation that
-/// [`parse_actions`] deliberately keeps out of the button list.
+/// Whether `notification` offered `key`, including the non-button `"default"` activation.
 fn declares_action(notification: &Notification, key: &str) -> bool {
     (key == "default" && notification.has_default_action) || notification.actions.iter().any(|a| a.key == key)
 }
@@ -670,38 +601,34 @@ impl NotificationsController {
     ) -> zbus::Result<()>;
 }
 
-// -------------------------------------------------------------------------------------------
-// Write-command argument parsers (§3.2, ADR-0033's added rows). set_dnd reuses
-// dbus::parse_bool_arg directly at the call site rather than a redundant wrapper here.
-// -------------------------------------------------------------------------------------------
+// Write-command argument parsers (§3.2, ADR-0033); set_dnd calls parse_bool_arg directly.
 
-/// `notifications:dismiss(id)`'s `arguments: [id]`.
+/// Parses `notifications:dismiss(id)`'s `[id]`.
 pub fn parse_dismiss_args(arguments: &[serde_json::Value]) -> Option<u32> {
     arguments.first()?.as_u64().and_then(|v| u32::try_from(v).ok())
 }
 
-/// `notifications:reply(id, text)`'s `arguments: [id, text]`.
+/// Parses `notifications:reply(id, text)`'s `[id, text]`.
 pub fn parse_reply_args(arguments: &[serde_json::Value]) -> Option<(u32, String)> {
     let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
     let text = arguments.get(1)?.as_str()?.to_string();
     Some((id, text))
 }
 
-/// `notifications:hold_expiry(seconds)`'s `arguments: [seconds]`. A negative or fractional number
-/// is malformed rather than rounded: `-1` in an expiry argument means "never" everywhere else in
-/// this spec, and quietly reading it as `0` would release a hold a config meant to place.
+/// Parses whole-number `[seconds]`. Reject negative/fractional values: elsewhere `-1` means
+/// "never", and coercing it to `0` would release a requested hold.
 pub fn parse_hold_expiry_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
 
-/// `notifications:invoke_action(id, key)`'s `arguments: [id, key]`.
+/// Parses `notifications:invoke_action(id, key)`'s `[id, key]`.
 pub fn parse_invoke_action_args(arguments: &[serde_json::Value]) -> Option<(u32, String)> {
     let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
     let key = arguments.get(1)?.as_str().filter(|key| !key.is_empty())?.to_string();
     Some((id, key))
 }
 
-/// `notifications:set_sound(urgency, path)`'s `arguments: [urgency, path]`.
+/// Parses `notifications:set_sound(urgency, path)`'s `[urgency, path]`.
 pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency, String)> {
     let urgency = parse_urgency_str(arguments.first()?.as_str()?)?;
     let path = arguments.get(1)?.as_str()?.to_string();
@@ -712,14 +639,10 @@ pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency,
 mod tests {
     use super::*;
 
-    // ---- format_reply_action_key (TDD seam 4) ----
-
     #[test]
     fn format_reply_action_key_embeds_the_text() {
         assert_eq!(format_reply_action_key("sounds good"), "inline-reply::sounds good");
     }
-
-    // ---- parse_actions (ADR-0090) ----
 
     fn keys(actions: &[String], action_icons: bool) -> Vec<String> {
         parse_actions(actions, action_icons).actions.into_iter().map(|a| a.key).collect()
@@ -729,9 +652,7 @@ mod tests {
         pairs.iter().flat_map(|(key, label)| [key.to_string(), label.to_string()]).collect()
     }
 
-    /// The two keys that are not buttons come out as their own flags and out of the list, because
-    /// drawing either as a button is wrong: `"default"` is the whole card, and `"inline-reply"`
-    /// is a text field.
+    /// `default` activates the card and `inline-reply` is a text field, so neither is a button.
     #[test]
     fn default_and_inline_reply_become_flags_rather_than_buttons() {
         let parsed =
@@ -751,24 +672,21 @@ mod tests {
         assert_eq!(parse_actions(&[], false), ParsedActions::default());
     }
 
-    /// Senders do send a key with no label. The key is what the button says rather than the
-    /// button vanishing, since the key is usually a word like "archive".
+    /// Senders omit labels; the usually-readable key becomes the button label.
     #[test]
     fn an_empty_label_falls_back_to_the_key() {
         let parsed = parse_actions(&flat(&[("archive", "")]), false);
         assert_eq!(parsed.actions[0].label, "archive");
     }
 
-    /// The base spec's odd case: a key with no label at all, which it does not allow and which is
-    /// not worth refusing the whole notification over.
+    /// Preserve the base spec's odd key-without-label case rather than rejecting the notification.
     #[test]
     fn an_odd_length_array_still_yields_its_last_action() {
         assert_eq!(keys(&["archive".to_string()], false), ["archive"]);
     }
 
-    /// Under `action-icons` the key names a theme icon, so it is carried as one -- unless it holds
-    /// a path separator, because `icon` also takes absolute paths and a sender must not be able to
-    /// point the shell at an arbitrary file.
+    /// Under `action-icons`, carry a key as a theme name unless it contains `/`; `icon` also takes
+    /// paths, so the separator check blocks arbitrary file access.
     #[test]
     fn action_icons_carries_the_key_as_an_icon_name_but_never_as_a_path() {
         let parsed = parse_actions(&flat(&[("mail-archive", "")]), true);
@@ -781,8 +699,7 @@ mod tests {
         assert_eq!(parsed.actions[0].icon_name, None, "without the hint the key is not an icon");
     }
 
-    /// An action that can be drawn neither as a label nor as an icon does nothing a user could
-    /// predict, so it is dropped rather than becoming a blank button.
+    /// Drop actions with neither a label nor an icon instead of making blank buttons.
     #[test]
     fn an_action_with_nothing_to_draw_is_dropped() {
         let parsed = parse_actions(&flat(&[("", ""), ("", "Orphan label")]), true);
@@ -800,10 +717,7 @@ mod tests {
         assert_eq!(parsed.actions[0].label.len(), MAX_ACTION_LABEL_BYTES);
     }
 
-    // ---- declares_action ----
-
-    /// The guard that keeps a config from emitting an `ActionInvoked` the sending application
-    /// cannot interpret. `"default"` counts even though it is not in the button list.
+    /// Guards `ActionInvoked` to sender-declared keys; `"default"` counts outside the button list.
     #[test]
     fn declares_action_covers_the_buttons_and_the_default_activation() {
         let mut notification = Notification {
@@ -837,8 +751,6 @@ mod tests {
         assert!(declares_action(&notification, "default"));
     }
 
-    // ---- parse_invoke_action_args ----
-
     #[test]
     fn parse_invoke_action_args_needs_an_id_and_a_nonempty_key() {
         use serde_json::json;
@@ -848,8 +760,6 @@ mod tests {
         assert_eq!(parse_invoke_action_args(&[json!("seven"), json!("archive")]), None);
     }
 
-    // ---- CloseReason (finding 5) ----
-
     #[test]
     fn close_reason_maps_to_the_documented_wire_values() {
         assert_eq!(u32::from(CloseReason::Expired), 1);
@@ -857,8 +767,6 @@ mod tests {
         assert_eq!(u32::from(CloseReason::ClosedByMethod), 3);
         assert_eq!(u32::from(CloseReason::Evicted), 4);
     }
-
-    // ---- write-command argument parsers ----
 
     #[test]
     fn parse_dismiss_args_reads_the_id() {
@@ -907,9 +815,7 @@ mod tests {
         assert_eq!(parse_hold_expiry_args(&[]), None);
     }
 
-    /// The countdown with nothing holding it: it serves its time and no more. `tokio::time::pause`
-    /// makes the clock jump to each timer rather than sleeping, so these run instantly and are
-    /// exact rather than timing-tolerant.
+    /// Paused tokio time makes this exact and instant: an unheld countdown serves its duration.
     #[tokio::test(start_paused = true)]
     async fn an_unheld_countdown_runs_for_exactly_its_duration() {
         let holds = watch::Sender::new(None);
@@ -918,8 +824,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(5));
     }
 
-    /// The reason this is a stopped clock and not a restart or an immediate expiry: a hold placed
-    /// at 2s of 5 must leave 3s to serve, so the card outlives the pointer that was resting on it.
+    /// A hold at 2s of 5 leaves 3s to serve, so the card outlives the pointer resting on it.
     #[tokio::test(start_paused = true)]
     async fn a_hold_stops_the_clock_and_the_time_already_served_is_banked() {
         let holds = Arc::new(watch::Sender::new(None));
@@ -932,12 +837,11 @@ mod tests {
         });
 
         sleep_past_holds(holds.subscribe(), Duration::from_secs(5)).await;
-        // 2 served, 60 held, 3 left to serve.
+        // 2 served, 60 held, 3 left.
         assert_eq!(started.elapsed(), Duration::from_secs(65));
     }
 
-    /// A hold released early ends the stop early: `hold_expiry(0)` is the config saying it is done,
-    /// and waiting out the original deadline anyway would make a release do nothing.
+    /// `hold_expiry(0)` releases early rather than waiting out the original deadline.
     #[tokio::test(start_paused = true)]
     async fn releasing_a_hold_resumes_the_countdown_at_once() {
         let holds = Arc::new(watch::Sender::new(Some(Instant::now() + Duration::from_secs(600))));
@@ -953,9 +857,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(9), "4 held, then the full 5 -- none was served first");
     }
 
-    /// Re-placing a hold while one is already in force is the shape a repeating event uses (a
-    /// reply field's `on_change`, once per keystroke), so the later deadline has to win rather
-    /// than the countdown resuming when the first one lapses.
+    /// Repeated events such as reply `on_change` extend the deadline; the later hold must win.
     #[tokio::test(start_paused = true)]
     async fn a_second_hold_extends_the_first() {
         let holds = Arc::new(watch::Sender::new(Some(Instant::now() + Duration::from_secs(10))));
@@ -971,8 +873,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(23), "8 + 10 held, then the full 5");
     }
 
-    /// A hold already lapsed by the time a countdown reads it is not a hold. Without the deadline
-    /// check the countdown would stop for a value nobody meant to still be in force.
+    /// An already-lapsed deadline is not a hold; without this check stale values would stop time.
     #[tokio::test(start_paused = true)]
     async fn a_lapsed_hold_does_not_stop_the_clock() {
         let holds = watch::Sender::new(Some(Instant::now() + Duration::from_millis(1)));
@@ -982,8 +883,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(5));
     }
 
-    /// The cap is what bounds a config bug: an absurd hold is clamped rather than honoured, so the
-    /// worst case is five minutes of a pinned feed and not the rest of the session.
+    /// An absurd hold clamps to five minutes, not the rest of the session.
     #[tokio::test(start_paused = true)]
     async fn a_hold_longer_than_the_cap_is_clamped_to_it() {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();

@@ -1,6 +1,5 @@
-//! Urgency/critical-bypass expiry logic, DND sound-gating logic, and queue mutation (FIFO
-//! eviction, replace/icon lifecycle). Split from `dbus::notifications` -- see
-//! `dbus/notifications/mod.rs` for the module-level doc.
+//! Urgency expiry, DND sound gating, and FIFO queue/icon lifecycle. Split from
+//! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -8,20 +7,15 @@ use std::time::Duration;
 
 use super::{DEFAULT_EXPIRE_MS, NOTIFICATION_FEED_VIEW, NOTIFICATION_QUEUE_CAP, Notification, Urgency};
 
-// -------------------------------------------------------------------------------------------
-// Urgency / critical-bypass expiry logic (TDD seam 5).
-// -------------------------------------------------------------------------------------------
-
-/// Whether, and after how long, a notification auto-expires.
+/// Whether a notification auto-expires, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExpiryPolicy {
     Never,
     After(Duration),
 }
 
-/// `expire_timeout`'s resolution (§1; ADR-0033): critical never expires regardless of what the
-/// sender requested; otherwise `0` means never, a negative value means "use the server default"
-/// ([`DEFAULT_EXPIRE_MS`], matching mako/dunst), and a positive value is that many milliseconds.
+/// Resolves `expire_timeout` (§1; ADR-0033): critical never expires; otherwise `0` means never,
+/// negative means [`DEFAULT_EXPIRE_MS`] (mako/dunst convention), and positive means milliseconds.
 pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPolicy {
     if urgency == Urgency::Critical {
         return ExpiryPolicy::Never;
@@ -33,13 +27,8 @@ pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPol
     }
 }
 
-// -------------------------------------------------------------------------------------------
-// DND sound-gating logic (TDD seam 6).
-// -------------------------------------------------------------------------------------------
-
-/// Whether a notification's sound should play (ADR-0033): never without a registered sound for
-/// its tier; never while do-not-disturb is on unless critical (the same bypass [`resolve_expiry`]
-/// applies to `expire_timeout`); otherwise yes.
+/// Whether sound plays (ADR-0033): it needs a registered tier sound and bypasses DND only for
+/// critical urgency.
 pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: bool) -> bool {
     if !sound_registered {
         return false;
@@ -50,12 +39,9 @@ pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: b
     true
 }
 
-/// Resolves which sound file (if any) a single `Notify` call plays -- the source-selection half
-/// [`should_play_sound`]'s DND/urgency gate doesn't need to know about. Resolution order
-/// (ADR-0033): `suppress` forces `None` unconditionally; else `client_sound_file` (already
-/// validated through the same path-trust boundary as `image-path`) plays instead of the tier
-/// default; else `tier_default` plays; else nothing. `hints["sound-name"]` never reaches this
-/// function -- it isn't honored.
+/// Selects one `Notify` sound (ADR-0033): `suppress` wins; otherwise `client_sound_file`, already
+/// validated through the same path-trust boundary as `image-path`, beats the tier default.
+/// `hints["sound-name"]` is not honored; DND/urgency is separate.
 pub(super) fn resolve_sound_path(
     suppress: bool,
     client_sound_file: Option<PathBuf>,
@@ -67,27 +53,18 @@ pub(super) fn resolve_sound_path(
     client_sound_file.or(tier_default)
 }
 
-// -------------------------------------------------------------------------------------------
-// Queue mutation (TDD seam 7): FIFO eviction and replace/icon lifecycle, pure `VecDeque`
-// mutations -- no filesystem I/O of their own, just reporting which icon file (if any) is now
-// orphaned so the caller deletes it in the same step.
-// -------------------------------------------------------------------------------------------
+// Queue mutation is pure `VecDeque` logic; callers delete reported orphaned icons.
 
-/// Allocates the next monotonic incarnation stamp for a piece of content being placed at some
-/// id. Every `Notify` call bumps this and stamps its [`Notification`] with the result, so a
-/// spawned expiry timer can capture the incarnation it was scheduled for and later tell whether
-/// a newer `Notify` call already superseded it ([`find_expiring_entry`]). No wraparound guard
-/// analogous to [`resolve_notification_id`]'s: a `u64` exhausting in one process's lifetime
-/// isn't a real scenario.
+/// Allocates a monotonic content stamp for expiry timers to compare against replacements
+/// ([`find_expiring_entry`]). No wraparound guard: exhausting `u64` in one process is unrealistic.
 pub(super) fn next_incarnation(counter: &mut u64) -> u64 {
     let value = *counter;
     *counter = counter.wrapping_add(1);
     value
 }
 
-/// `replaces_id == 0`'s id half: allocates the next id, monotonic and wrap-safe (never lands on
-/// `0`, which is reserved to mean "new" on the wire). `replaces_id != 0` passes through unchanged
-/// without bumping the allocator (base spec/ADR-0033: id reuse doesn't consume a fresh id).
+/// Resolves ids: `0` allocates monotonically and wraps to `1` (wire `0` means "new"); nonzero
+/// `replaces_id` passes through without consuming an id (base spec/ADR-0033).
 pub(super) fn resolve_notification_id(replaces_id: u32, next_id: &mut u32) -> u32 {
     if replaces_id != 0 {
         return replaces_id;
@@ -97,25 +74,20 @@ pub(super) fn resolve_notification_id(replaces_id: u32, next_id: &mut u32) -> u3
     id
 }
 
-/// What [`push_new`]/[`replace_or_push`] report needs cleaning up after a queue mutation --
-/// distinguishes a genuine FIFO eviction (a *different* notification fell off the back of the
-/// queue past [`NOTIFICATION_QUEUE_CAP`]; finding 3: this needs both an icon-file deletion and a
-/// `NotificationClosed(evicted_id, reason=Evicted)` signal, since the evicted id is now gone for
-/// good) from a same-id icon replacement (no signal -- the id itself is still very much present in
-/// the queue, just its old icon file is now orphaned).
+/// Cleanup after queue mutation. FIFO eviction needs icon deletion and
+/// `NotificationClosed(evicted_id, reason=Evicted)` (finding 3); same-id replacement needs only
+/// deletion because the id remains queued.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum QueueCleanup {
-    /// Same id, old icon path now orphaned by a `replaces_id` update that changed/cleared the icon.
+    /// Same id; a changed/cleared icon is orphaned by `replaces_id`.
     ReplacedImage(String),
-    /// A different notification fell off the back of the queue entirely.
+    /// A different notification fell off the queue.
     Evicted { id: u32, image_path: Option<String> },
 }
 
-/// Appends `notification` (a genuinely new arrival), evicting the oldest entry past
-/// [`NOTIFICATION_QUEUE_CAP`] and reporting it for the caller to clean up (ADR-0033: "a FIFO
-/// eviction past the 100-item cap deletes the evicted item's spooled file in the same step"; this
-/// round's finding 3 additionally requires the caller to emit `NotificationClosed(evicted_id,
-/// reason=Evicted)`, so the evicted id travels alongside its icon path here).
+/// Appends a new arrival, evicting past [`NOTIFICATION_QUEUE_CAP`]. FIFO eviction returns the
+/// evicted id/icon so the caller deletes its spooled file in the same step and emits finding 3's
+/// `NotificationClosed(..., reason=Evicted)` signal.
 fn push_new(queue: &mut VecDeque<Notification>, notification: Notification) -> Option<QueueCleanup> {
     queue.push_back(notification);
     if queue.len() > NOTIFICATION_QUEUE_CAP {
@@ -125,10 +97,9 @@ fn push_new(queue: &mut VecDeque<Notification>, notification: Notification) -> O
     }
 }
 
-/// A `replaces_id` update with no fresh image resolves to `(None, Some(old_path))` -- clears
-/// `image_path` and marks the old file for deletion, "rather than leaving a stale image attached to
-/// new text" (ADR-0033). A fresh image that differs from the old path also marks the old file for
-/// deletion; the same path reused (rare, but not impossible) deletes nothing.
+/// Resolves replacement images: no fresh image clears and deletes the old path rather than leaving
+/// a stale image attached to new text (ADR-0033); a different path also deletes old; reusing the
+/// same path deletes nothing.
 fn resolve_replacement_image(
     previous_image_path: Option<String>,
     fresh_image_path: Option<String>,
@@ -141,13 +112,8 @@ fn resolve_replacement_image(
     }
 }
 
-/// Inserts `notification`: replaces the matching queued entry in place (same position -- a replace
-/// is not treated as a fresh arrival for ordering) if `notification.id` is still present, otherwise
-/// falls back to [`push_new`] (the id was already dismissed/evicted, but `Notify`'s own id-reuse
-/// contract still applies regardless -- see [`resolve_notification_id`]). Returns what the caller
-/// needs to clean up ([`QueueCleanup`]) -- either the replaced entry's own old icon
-/// ([`resolve_replacement_image`], never a signal) or, on the fallback path, whatever [`push_new`]
-/// itself evicted (icon deletion *and* a `NotificationClosed` signal).
+/// Replaces a present id in place, preserving order; otherwise falls back to [`push_new`]. Returns
+/// the old icon cleanup or the fallback eviction (including its close signal).
 pub(super) fn replace_or_push(
     queue: &mut VecDeque<Notification>,
     mut notification: Notification,
@@ -164,11 +130,8 @@ pub(super) fn replace_or_push(
     }
 }
 
-/// The index of the queue entry that a timer captured for `(id, incarnation)` should still expire,
-/// or `None` if there isn't one -- either no entry with that id exists at all, or one does but its
-/// `incarnation` has moved on, meaning a newer `Notify` call (a `replaces_id` update) already
-/// superseded this timer. Both cases collapse to the same "this timer does nothing" outcome; the
-/// newer timer that replace spawned handles expiry correctly on its own schedule instead.
+/// Finds the entry a timer captured as `(id, incarnation)` for, or `None` when it was removed or a
+/// newer `replaces_id` superseded it. The newer timer handles expiry on its own schedule.
 pub(super) fn find_expiring_entry(queue: &VecDeque<Notification>, id: u32, incarnation: u64) -> Option<usize> {
     queue.iter().position(|entry| entry.id == id && entry.incarnation == incarnation)
 }
@@ -183,12 +146,11 @@ pub(super) enum Expiry {
     Removed { image_path: Option<String> },
 }
 
-/// The pure decision half of [`NotificationsController::expire`] (ADR-0100). Expiry used to remove
-/// the entry, which made the history panel a list of what was still popped up rather than of what
-/// had happened; now it flips `expired` and leaves the entry for `dismiss` to remove, except on a
-/// transient, whose sender asked for exactly the old behaviour. `None` when there is nothing left
-/// to expire ([`find_expiring_entry`]), and also when the entry has already expired, so a timer
-/// that somehow fires twice does not re-announce a close the sender already heard.
+/// Expiry decision for [`NotificationsController::expire`] (ADR-0100): expiry used to remove an
+/// entry, making history show what was still popped up rather than what had happened. Retire
+/// ordinary entries for history and let `dismiss` remove them; remove `transient` entries as
+/// before.
+/// `None` covers stale/missing or already-expired entries, preventing duplicate close signals.
 pub(super) fn expire_entry(queue: &mut VecDeque<Notification>, id: u32, incarnation: u64) -> Option<Expiry> {
     let index = find_expiring_entry(queue, id, incarnation)?;
     if queue[index].expired {
@@ -201,16 +163,14 @@ pub(super) fn expire_entry(queue: &mut VecDeque<Notification>, id: u32, incarnat
     Some(Expiry::Retired)
 }
 
-/// `dismiss(id)`/`reply(id, ...)`/`CloseNotification(id)`'s shared removal: pulls the matching
-/// entry out of the queue entirely (not just clearing a field), for the caller to delete its icon
-/// file (if any) and emit the appropriate `NotificationClosed`/`ActionInvoked` signal.
+/// Shared removal for `dismiss`, `reply`, and `CloseNotification`; callers delete any icon and
+/// emit the appropriate signal.
 pub(super) fn remove_by_id(queue: &mut VecDeque<Notification>, id: u32) -> Option<Notification> {
     let index = queue.iter().position(|entry| entry.id == id)?;
     queue.remove(index)
 }
 
-/// `notifications.feed`'s truncated view (ADR-0033): the newest [`NOTIFICATION_FEED_VIEW`] entries,
-/// most recent first.
+/// Newest [`NOTIFICATION_FEED_VIEW`] entries for `notifications.feed` (ADR-0033), newest first.
 pub(super) fn feed_view(queue: &VecDeque<Notification>) -> Vec<Notification> {
     queue.iter().rev().take(NOTIFICATION_FEED_VIEW).cloned().collect()
 }
@@ -219,8 +179,6 @@ pub(super) fn feed_view(queue: &VecDeque<Notification>) -> Vec<Notification> {
 mod tests {
     use super::super::test_support::text;
     use super::*;
-
-    // ---- resolve_expiry (TDD seam 5) ----
 
     #[test]
     fn resolve_expiry_critical_never_expires_regardless_of_timeout() {
@@ -246,8 +204,6 @@ mod tests {
         assert_eq!(resolve_expiry(Urgency::Low, 100), ExpiryPolicy::After(Duration::from_millis(100)));
     }
 
-    // ---- should_play_sound (TDD seam 6) ----
-
     #[test]
     fn should_play_sound_is_false_when_nothing_is_registered() {
         assert!(!should_play_sound(false, Urgency::Normal, false));
@@ -270,8 +226,6 @@ mod tests {
         assert!(should_play_sound(false, Urgency::Normal, true));
         assert!(should_play_sound(false, Urgency::Low, true));
     }
-
-    // ---- resolve_sound_path (sound-file/suppress-sound hint precedence) ----
 
     #[test]
     fn resolve_sound_path_suppress_always_wins_to_none() {
@@ -305,8 +259,6 @@ mod tests {
         assert_eq!(resolve_sound_path(false, None, None), None);
     }
 
-    // ---- resolve_notification_id ----
-
     #[test]
     fn resolve_notification_id_allocates_monotonically_when_replaces_id_is_zero() {
         let mut next_id = 1u32;
@@ -329,9 +281,6 @@ mod tests {
         assert_eq!(next_id, 1, "must wrap to 1, never 0 -- 0 is reserved to mean \"new\" on the wire");
     }
 
-    // ---- queue mutation: push_new / replace_or_push / remove_by_id / feed_view (TDD seam 7 +
-    //      FIFO eviction) ----
-
     fn sample_notification(id: u32, image_path: Option<&str>) -> Notification {
         Notification {
             id,
@@ -353,8 +302,6 @@ mod tests {
             incarnation: 0,
         }
     }
-
-    // ---- expire_entry (ADR-0100) ----
 
     #[test]
     fn expiring_an_ordinary_notification_retires_it_and_keeps_it_in_the_queue() {
@@ -402,9 +349,8 @@ mod tests {
             push_new(&mut queue, sample_notification(i, None));
         }
         let evicted = push_new(&mut queue, sample_notification(9999, Some("/tmp/evicted.png")));
-        // The 101st insert evicts the oldest (id 0, no icon) -- finding 3: the evicted *id* must
-        // come back too (not just its icon path), so the caller can emit
-        // NotificationClosed(0, reason=Evicted) even though there's no icon file to delete.
+        // The 101st insert evicts id 0. Finding 3 requires returning its id even without an icon,
+        // so the caller can emit NotificationClosed(0, reason=Evicted).
         assert_eq!(evicted, Some(QueueCleanup::Evicted { id: 0, image_path: None }));
         assert_eq!(queue.len(), NOTIFICATION_QUEUE_CAP);
         assert_eq!(queue.front().unwrap().id, 1, "the oldest entry (id 0) must have been evicted");
@@ -490,8 +436,7 @@ mod tests {
         for i in 0..NOTIFICATION_QUEUE_CAP as u32 {
             push_new(&mut queue, sample_notification(i, None));
         }
-        // id 9999 isn't queued, so this falls back to push_new -- which, at the cap, evicts the
-        // oldest entry (id 0) and must report it the same way push_new itself would.
+        // Missing id falls back to push_new, which evicts id 0 at the cap.
         let cleanup = replace_or_push(&mut queue, sample_notification(9999, None));
         assert_eq!(cleanup, Some(QueueCleanup::Evicted { id: 0, image_path: None }));
     }
@@ -539,8 +484,6 @@ mod tests {
         assert_eq!(view.first().unwrap().id, NOTIFICATION_QUEUE_CAP as u32 - 1, "the newest entry must be first");
     }
 
-    // ---- next_incarnation / find_expiring_entry (finding 2: stale-expiry-timer race) ----
-
     #[test]
     fn next_incarnation_is_monotonic() {
         let mut counter = 1u64;
@@ -569,12 +512,8 @@ mod tests {
         assert_eq!(find_expiring_entry(&queue, 999, 5), None);
     }
 
-    /// The exact race finding 2 describes: id=7 created (incarnation 1, timer A captures
-    /// incarnation 1); before timer A fires, `replaces_id=7` lands new content (incarnation 2,
-    /// timer B captures incarnation 2). Timer A firing must find nothing to expire -- incarnation 1
-    /// no longer describes what's queued at id 7, so it must not remove the replacement 29 seconds
-    /// early. Timer B firing later, against the incarnation that's actually still there, must find
-    /// and expire it normally.
+    /// Finding 2's race: after `replaces_id=7` moves incarnation 1 to 2, timer A must not remove
+    /// the replacement 29 seconds early; timer B must still expire incarnation 2 normally.
     #[test]
     fn find_expiring_entry_ignores_a_stale_timer_superseded_by_a_replace() {
         let mut queue = VecDeque::new();
@@ -582,19 +521,18 @@ mod tests {
         notification.incarnation = 1;
         queue.push_back(notification);
 
-        // The replace lands: same id, a fresh incarnation, in place (mirrors what notify() does
-        // via replace_or_push -- the id stays queued, just its incarnation moves on).
+        // Replace in place: id stays queued while its incarnation advances.
         let mut replacement = sample_notification(7, None);
         replacement.incarnation = 2;
         queue[0] = replacement;
 
-        // Timer A (captured incarnation 1 at spawn time) must find nothing: superseded.
+        // Timer A's incarnation is superseded.
         assert_eq!(
             find_expiring_entry(&queue, 7, 1),
             None,
             "a stale timer for the pre-replace incarnation must be a no-op"
         );
-        // Timer B (captured incarnation 2, the replacement's own) must find the real entry.
+        // Timer B carries the replacement's incarnation.
         assert_eq!(
             find_expiring_entry(&queue, 7, 2),
             Some(0),

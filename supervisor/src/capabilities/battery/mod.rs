@@ -1,10 +1,8 @@
-//! `oblisk.battery` capability: the system battery's presence, percentage, charge state and
-//! time estimates (docs/oblisk-idl-api-specs.md § 2.2), read off UPower's `DisplayDevice`.
-//! Read-only -- no write actions, so no `dispatch` function here.
+//! `oblisk.battery` reports presence, percentage, charge state, and time estimates from UPower's
+//! `DisplayDevice` (docs/oblisk-idl-api-specs.md § 2.2). Read-only, with no `dispatch`.
 //!
-//! It read `/sys/class/power_supply` behind a udev watch until ADR-0080: that watch never
-//! fired for a capacity change on this hardware, and sysfs has no word for "the charge limit is
-//! reached" that a config could tell apart from "you are on battery".
+//! The former `/sys/class/power_supply` udev watch missed capacity changes on this hardware and
+//! could not distinguish a reached charge limit from running on battery (ADR-0080).
 
 pub mod controller;
 

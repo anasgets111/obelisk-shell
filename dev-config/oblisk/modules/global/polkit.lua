@@ -1,10 +1,9 @@
--- Mirrors Modules/Global/PolkitDialog.qml: the prompt polkitd raises when something wants to be
--- authorised (ADR-0114). Reading `oblisk.polkit` is what registers this shell as the session's
--- authentication agent (ADR-0070).
+-- Mirrors Modules/Global/PolkitDialog.qml: polkitd's authorization prompt (ADR-0114). Reading
+-- `oblisk.polkit` registers this shell as the session agent (ADR-0070).
 --
--- Not mirrored: Escape-to-cancel, because a masked field's Escape clears and stays (ADR-0092), and
--- the `●` mask, because `mask_character` is one byte. The Authenticate button is `submit = true`:
--- the password lives in a native buffer no callback may read, so the button *is* Enter.
+-- Dropped: Escape-to-cancel, because masked-field Escape clears and stays (ADR-0092), and the `●`
+-- mask, because `mask_character` is one byte. `submit = true` makes Authenticate equal Enter; the
+-- password remains in a native buffer no callback can read.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -30,8 +29,8 @@ return panel {
     width = "Fill",
     height = "Fill",
     visible = active,
-    -- Exclusive while open: the one `secure_submit` field on this surface is armed the moment the
-    -- surface takes the keyboard, so it is typable with no click (see `modules/global/lock.lua`).
+    -- Exclusive while open: the sole `secure_submit` field is armed on keyboard focus, so no click
+    -- is needed (see `modules/global/lock.lua`).
     keyboard_interactivity = active:map(function(open)
         return open and "Exclusive" or "None"
     end),
@@ -85,8 +84,8 @@ return panel {
                         },
                     },
                 },
-                -- "Authentication Failed" in the mirror; ours carries PAM's reason in the lock
-                -- screen's words. Nothing animates, so "checking" is the line a spinner would be.
+                -- The mirror says "Authentication Failed"; ours carries PAM's reason. With no
+                -- animation, "checking" is the spinner's text.
                 cell(read(function(p)
                     return p.authenticating and "checking..." or p.error
                 end), oblisk.polkit:map(function(p)

@@ -1,15 +1,9 @@
-//! Sound playback: WAV decode (testable) + a dedicated one-shot PipeWire playback thread.
-//! Split from `dbus::notifications` -- see `dbus/notifications/mod.rs` for the module-level doc.
+//! Testable WAV decode plus a dedicated one-shot PipeWire playback thread. Split from
+//! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
 
 use pipewire as pw;
-
-// -------------------------------------------------------------------------------------------
-// Sound playback: WAV decode (testable) + a dedicated one-shot PipeWire playback thread
-// (live-test-only, no unit tests of its own -- see the module doc comment and this section's own
-// doc comments for why).
-// -------------------------------------------------------------------------------------------
 
 pub type SoundSender = std::sync::mpsc::Sender<PathBuf>;
 
@@ -45,12 +39,10 @@ impl From<hound::Error> for SoundDecodeError {
     }
 }
 
-/// ponytail: WAV only, and only 16-bit integer or 32-bit float samples -- `hound` is a small,
-/// pure-Rust WAV decoder with no transitive bloat, matching what every reference notification
-/// daemon checked actually needs (short, simple UI sounds). A general audio-decode dependency
-/// (MP3/OGG/FLAC) isn't justified until a real Lua config registers something else; other bit
-/// depths fail cleanly via [`SoundDecodeError::UnsupportedFormat`] rather than silently
-/// mis-decoding.
+/// ponytail: WAV only, with 16-bit integer or 32-bit float samples. `hound` is a small pure-Rust
+/// decoder with no transitive bloat, enough for reference daemons' short UI sounds; defer
+/// MP3/OGG/FLAC until a Lua config needs one. Other depths fail via
+/// [`SoundDecodeError::UnsupportedFormat`].
 fn decode_wav_samples(path: &Path) -> Result<DecodedWav, SoundDecodeError> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
@@ -65,19 +57,15 @@ fn decode_wav_samples(path: &Path) -> Result<DecodedWav, SoundDecodeError> {
     Ok(DecodedWav { channels: u32::from(spec.channels), sample_rate: spec.sample_rate, samples })
 }
 
-/// Runs until `requests` closes, decoding and playing each requested sound file's WAV
-/// ([`decode_wav_samples`]) through a fresh, one-shot PipeWire playback stream per request
-/// (ADR-0033: "a small one-shot player... no cancellation-handle system, no Lua/wire round-trip
-/// for the trigger itself"). Blocks the calling thread -- call from a dedicated
-/// `std::thread::spawn`, same "pipewire-rs's loop is `!Send`" reasoning `audio::mixer::run`
-/// already established (a different pipewire-rs API surface, though: `pw::stream::Stream` writing
-/// audio out, not `pw::registry` listening for nodes).
+/// Decodes and plays each request through a fresh one-shot PipeWire stream (ADR-0033: no
+/// cancellation handles or Lua/wire round trip). Blocks its caller; run it in a dedicated
+/// `std::thread::spawn` because this `pw::stream::Stream` loop is `!Send`, as `audio::mixer::run`
+/// established for the same `pipewire-rs` loop constraint. This is a different API surface:
+/// `pw::stream::Stream` writes audio, while `pw::registry` listens for nodes.
 ///
-/// ponytail: real PipeWire stream I/O against a real audio device is fundamentally live-test-only,
-/// same category as idle's raw Wayland dispatch (ADR-0032) -- this function and
-/// [`play_one_wav`] have no unit tests of their own. [`decode_wav_samples`] (the WAV-decode
-/// boundary) and [`should_play_sound`] (the DND/urgency gate deciding whether this ever gets
-/// triggered) are the tested seams either side of it.
+/// ponytail: real PipeWire I/O is live-test-only, like idle's raw Wayland dispatch (ADR-0032); this
+/// and [`play_one_wav`] have no unit tests. [`decode_wav_samples`] and [`should_play_sound`] are
+/// the tested seams around it.
 pub fn run_sound_player(requests: std::sync::mpsc::Receiver<PathBuf>) {
     while let Ok(path) = requests.recv() {
         if let Err(err) = play_one_wav(&path) {
@@ -203,8 +191,6 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- decode_wav_samples (the sound-playback testable boundary) ----
 
     fn write_test_wav(path: &Path, spec: hound::WavSpec, samples: &[i16]) {
         let mut writer = hound::WavWriter::create(path, spec).unwrap();

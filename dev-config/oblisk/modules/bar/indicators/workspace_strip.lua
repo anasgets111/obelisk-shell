@@ -1,29 +1,25 @@
--- Mirrors `WorkspaceStrip.qml`: the mirror's `ExpandingPill` of workspaces. Collapsed it is one
--- circle, the active workspace; under the pointer it widens into one circle per workspace, each
--- drawing the icon of what runs there or its number when nothing does, and narrows back when the
--- pointer leaves. The same pattern as `modules/bar/panels/power_menu.lua`: `hover` on the row
--- holding the circles, since a hover region answers containment and a pointer crossing the gap
--- between two circles never leaves the row. An earlier strip here was twelve always-open dots on
--- the belief that collapsing needed a timer; it needed the row.
+-- Mirrors `WorkspaceStrip.qml`: one collapsed circle for the active workspace, expanding under the
+-- pointer to one circle per workspace, then narrowing on exit. `hover` belongs on the containing
+-- row, as in `modules/bar/panels/power_menu.lua`, so crossing gaps does not leave the region. The
+-- earlier twelve always-open dots assumed collapsing needed a timer; it needed the row.
 --
--- The ground says what a workspace holds (ADR-0117): accent when active, glass when populated,
--- `DISABLED` at half opacity when empty, `IconButton.qml`'s colours through
--- `computeWorkspaceColor`. The glyph is the standing window's icon when `oblisk.applications`
--- knows its `app_id`, else `idx`, never `name`: a named workspace elided into a circle draws three
--- dots and no information, and the number is what the keybind uses anyway.
+-- Ground: accent when active, glass when populated, `DISABLED` at half opacity when empty
+-- (ADR-0117,
+-- `IconButton.qml`/`computeWorkspaceColor`). Use the standing window's icon when applications knows
+-- its `app_id`, else `idx`, never `name`: an elided name draws three dots, while the number is the
+-- keybind's target.
 --
--- The collapsed slot is the first output's `active_workspace` rather than the mirror's focused one:
--- every output has an active workspace and only one output holds focus, so a strip on the other
--- monitor would otherwise collapse to nothing. On the focused output the two are the same.
+-- Collapse to the first output's `active_workspace`, not the focused workspace. Every output has an
+-- active workspace but only one has focus, so another monitor would otherwise collapse to nothing.
 --
--- On Hyprland the strip pads to ten slots (ADR-0119), `WorkspaceArrangement.qml`'s
--- `fillEmptySlots`: Hyprland has no empty workspaces to list, a numbered one exists only while a
--- window is on it, and focusing a number creates it. A padded slot is a dimmed number whose click
--- focuses that number, which is what the strip shows on niri anyway, where the compositor keeps a
--- trailing empty workspace of its own and nothing is padded. The payload carries only workspaces
--- that exist; the padding is this strip's policy, keyed on `compositor`.
+-- Hyprland pads to ten slots (ADR-0119, `WorkspaceArrangement.qml`'s `fillEmptySlots`): it lists no
+-- empty workspaces, creates a numbered one on focus, and gets dimmed padded numbers here. Each
+-- padded slot is a dimmed number whose click focuses that number. Niri
+-- keeps
+-- a trailing empty workspace and needs no padding. The payload lists only existing workspaces;
+-- padding is this strip's `compositor`-keyed policy.
 --
--- Not mirrored: the width animation and the opacity fade, which the engine has no way to draw.
+-- Not mirrored: width animation and opacity fade; the engine cannot draw them.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -60,8 +56,9 @@ local pill_hovered = hover("workspace-pill")
 
 local function workspace_button(ws)
     local id = ws.id
-    -- Read off the snapshot rather than the `ws` this was built from: the list reconciles by
-    -- key, so a workspace whose windows come and go keeps its button and this is what changes.
+    -- Read the current snapshot, not the `ws` used to build the button. Key reconciliation keeps
+    -- the
+    -- button while its windows change.
     local entry = oblisk.workspaces:map(function(w)
         for _, candidate in ipairs(workspaces_of(w)) do
             if candidate.id == id then
@@ -132,8 +129,8 @@ local function workspace_button(ws)
     }
 end
 
--- The row is the pill: it carries the hover and nothing else, no ground of its own, since the
--- mirror's circles sit straight on the bar.
+-- The row is the pill's hover region and has no ground; the mirror's circles sit directly on the
+-- bar.
 return row {
     height = theme.item_height,
     align_v = "Center",

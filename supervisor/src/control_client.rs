@@ -1,9 +1,8 @@
-//! The client half of `oblisk set` and `oblisk toggle` (ADR-0112): one connection to the running
-//! Supervisor's control socket, a handshake, one [`shared::SetState`] frame, and out.
+//! Client half of `oblisk set` and `oblisk toggle` (ADR-0112): connect to the running Supervisor,
+//! send a handshake and one [`shared::SetState`] frame, then disconnect.
 //!
-//! Here rather than in `socket.rs`, which is the listener: this is the only code in the workspace
-//! that *connects* to that socket from outside a Renderer, and it runs in a process that has no
-//! runtime, no config directory and no D-Bus -- a compositor keybind's `spawn`.
+//! Separate from `socket.rs`, the listener: this is the only external connector, running from a
+//! compositor keybind's `spawn` with no runtime, config directory, or D-Bus.
 
 use std::error::Error;
 
@@ -12,10 +11,9 @@ use shared::{CONTROL_CLIENT_GENERATION, ConnectionHandshake, RendererFrame, SetS
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
-/// Delivers `set` to the shell, or says why it could not. The Supervisor forwards it to the
-/// generation on screen, which applies it or refuses it by name on its own stderr; nothing comes
-/// back here, since a keybind has nowhere to show an answer and the only failure this process can
-/// see is the shell not running.
+/// Delivers `set` to the shell or reports connection failure. The Supervisor forwards it to the
+/// onscreen generation, which applies or refuses it by name on its stderr. No reply returns here:
+/// keybinds have nowhere to show one, and this process can only observe that the shell is absent.
 pub fn send(set: SetState) -> Result<(), Box<dyn Error>> {
     let path = shared::control_socket_path()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

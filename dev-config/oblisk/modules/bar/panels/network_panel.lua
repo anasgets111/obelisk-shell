@@ -1,18 +1,15 @@
--- Mirrors NetworkPanel.qml: a masthead that says what the link is, two tiles for the two radios,
--- and the access points in range, the joined one first and ringed.
+-- Mirrors NetworkPanel.qml: masthead, two radio tiles, and access points with the joined one first.
 --
--- Laid out as the mirror lays it out, which it was not until now. This opened with a grey
--- "network" word, a switch labelled "wi-fi", and rows whose subtitle spelled "45% 5 GHz lock --
--- connected" -- four facts the mirror draws instead of writing: the bars of the glyph are the
--- strength, a small coloured "5G" beside it is the band, a lock badge is the security, and the
--- accent ring is the connection. What the words were doing is now done by shape and colour, and
--- the row is left with the one word a row needs, the SSID.
+-- The old header opened with a grey `network` word and a `wi-fi` switch. Its rows wrote "45% 5 GHz
+-- lock -- connected". The mirror draws those facts as signal bars, a coloured "5G" band label, a
+-- lock badge, and an accent ring; the row keeps only the SSID.
 --
--- Not carried over from the mirror: the "Hidden network..." row (it needs a name typed into a plain
--- field, and this surface asks for the keyboard only while a password is pending -- see
--- `modules/shell/panel_host.lua`), the IP address in the wi-fi tile (`NetworkState` does not carry
--- one), and Saved/Available sections (no `saved` flag on an access point). A connected network is
--- saved by construction, so its forget action is offered there.
+-- Dropped: "Hidden network..." (it needs a typed name, while this surface asks for the keyboard
+-- only
+-- for a pending password; see `modules/shell/panel_host.lua`), the IP address (`NetworkState` lacks
+-- it), and Saved/Available sections (no `saved` flag). A connected network is saved by
+-- construction,
+-- so its forget action is offered there.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -28,9 +25,8 @@ local panel_empty_state = require("components.panel_empty_state")
 local KIND = "network"
 local SCROLL = scroll("network_aps")
 
--- Payload order is already connected-first then descending signal (§ 2.5), so this copied the
--- list and re-sorted it on every rebuild to arrive back where it started. Reading it straight is
--- the whole function now.
+-- Payload order is connected-first, then descending signal (§ 2.5). The old copy-and-sort returned
+-- to that same order on every rebuild; reading it straight is enough.
 local function access_points(n)
     return (n and n.available_networks) or {}
 end
@@ -39,7 +35,7 @@ local function radio_on(n)
     return n ~= nil and n.networking_enabled and n.wifi_enabled
 end
 
--- Four bars' worth of glyph, which is what a strength percentage actually reads as.
+-- Four bars, which is what a strength percentage needs to say.
 local function strength_glyph(strength)
     local percent = strength or 0
     if percent >= 75 then
@@ -52,9 +48,8 @@ local function strength_glyph(strength)
     return icons.wifi[1]
 end
 
--- `Theme.networkBandColor`: the band as a colour on the glyph and a short label beside it, so the
--- two 5 GHz networks and the 2.4 GHz one are told apart without reading. `band` arrives as
--- `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"` (§ 2.5); the number is what is drawn.
+-- `Theme.networkBandColor`: band colour plus a short label. `band` is `"2.4 GHz"`, `"5 GHz"`, or
+-- `"6 GHz"` (§ 2.5), so two 5 GHz networks remain distinguishable.
 local BAND_COLOR = { ["2.4"] = theme.YELLOW, ["5"] = theme.ACCENT, ["6"] = theme.GREEN }
 
 local function band_of(ap)
@@ -65,8 +60,7 @@ local function band_of(ap)
     return number == "2.4" and "2.4" or (number .. "G"), BAND_COLOR[number] or theme.FG
 end
 
--- The header's second line, the mirror's `subtitle` chain, one state at a time in the order that
--- matters: a stack that is off says so before anything about radios does.
+-- Header subtitle, in priority order: an off stack speaks before its radios.
 local function state_line(n)
     if not n.networking_enabled then
         return "off"
@@ -96,11 +90,9 @@ local function header_glyph(n)
     return n.wifi_enabled and icons.wifi[4] or icons.wifi_off
 end
 
--- The rows, with the two per-row facts the payload does not put on the access point: whether this
--- is the one being joined, and whether another one is, in which case this row is blocked (the
--- mirror's `blockedByOtherConnection`). Rebuilt per push, which is what a `list` does anyway
--- (`parse_list_children` calls `itemfn` on every element every pass), so an enriched item costs
--- nothing the plain one did not.
+-- Enrich each row with joined state and `blockedByOtherConnection`. Rebuilding per push costs no
+-- more than the list already does: `parse_list_children` calls `itemfn` for every element each
+-- pass.
 local rows = oblisk.network:map(function(n)
     local out = {}
     local connecting = n and n.connecting_ssid
@@ -138,15 +130,14 @@ local function access_point_row(entry)
         slot = "network-ap-" .. tostring(ap.ssid),
         leading = row { align_v = "Center", children = leading },
         title = ap.ssid or "?",
-        -- The one subtitle a network row carries, and only while it is true. The old row wrote
-        -- strength, band, security and connection here; each of those is now drawn.
+        -- The only row subtitle, shown while true. Strength, band, security, and connection are
+        -- drawn instead of written.
         subtitle = entry.connecting and "connecting…" or nil,
         selected = ap.active,
         opacity = entry.blocked and theme.opacity.disabled or nil,
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
         on_activate = clickable and function()
-            -- `hidden` is a required second argument (§ 3.2), and every entry in
-            -- `available_networks` was found by a scan, so none of them is hidden.
+            -- `hidden` is required (§ 3.2); scanned `available_networks` entries are not hidden.
             oblisk.network:invoke("connect", ap.ssid, false)
         end or nil,
     }
@@ -161,10 +152,9 @@ local body = {
         end),
         subtitle = util.label(oblisk.network, state_line),
         trailing = {
-            -- Rescan, lit while a scan is in flight: the mirror swaps the icon for a spinner, and
-            -- this bar has no spinner, so the same ground-lights-up rule the do-not-disturb and
-            -- bluetooth-scan buttons follow says "running" here. `scanning` flips on the click
-            -- (§ 2.5), so the light is immediate.
+            -- Rescan is lit while scanning. The mirror uses a spinner; this has none, so the same
+            -- lit-ground rule as DND and Bluetooth scan says "running". `scanning` flips on click
+            -- (§ 2.5), making the light immediate.
             icon_button(icons.refresh, function()
                 oblisk.network:invoke("scan")
             end, {
@@ -176,9 +166,8 @@ local body = {
                 end),
                 visible = util.shown_when(oblisk.network, radio_on),
             }),
-            -- The master switch, `NetworkService.setNetworkingEnabled`. The whole stack, not one
-            -- radio: with it off the tiles below hide, because a radio switch under a stack that
-            -- is off would be a control that does nothing.
+            -- `NetworkService.setNetworkingEnabled` controls the whole stack; off hides the tiles,
+            -- avoiding a radio control that does nothing.
             toggle(oblisk.network, function(n)
                 return n.networking_enabled
             end, function(new_value)
@@ -186,8 +175,7 @@ local body = {
             end),
         },
     },
-    -- The two radios as tiles. The wi-fi tile's detail is the joined network's strength and band,
-    -- where the mirror shows its address and band; there is no address in `NetworkState`.
+    -- Two radio tiles. Wi-Fi shows joined strength and band; `NetworkState` has no address.
     row {
         width = "Fill",
         spacing = theme.spacing.xs,
@@ -232,9 +220,8 @@ local body = {
             },
         },
     },
-    -- The mirror's error `PanelCard`: what the last attempt said, in red on a red-tinted ground.
-    -- `connect_error` is sticky until the next attempt (§ 2.5) and there is no command that clears
-    -- it alone, so this has no dismiss; the next click on a row is the dismiss.
+    -- Mirror error card, red on a red-tinted ground. `connect_error` is sticky until the next
+    -- attempt (§ 2.5), with no clear command; the next row click dismisses it.
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -252,26 +239,22 @@ local body = {
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
         },
     },
-    -- The password prompt, raised by the Supervisor rather than by this file: `network:connect` on
-    -- a secured network with no saved profile is the one case that cannot proceed on the click
-    -- alone, and `password_ssid` is how it says so (§ 2.5). Nothing here decides when to ask,
-    -- because whether a profile exists is NetworkManager's fact, not a config's.
+    -- The Supervisor raises this when `network:connect` hits a secured network without a saved
+    -- profile; `password_ssid` says so (§ 2.5). NetworkManager, not this config, knows whether to
+    -- ask.
     --
-    -- Typed characters never reach this VM. `mask_character` plus `secure_submit` sends every
-    -- keystroke into a native buffer on the Renderer's Wayland thread, out as a
-    -- `("network", "connect")` envelope, and nowhere else -- the same pair `modules/global/lock.lua`
-    -- uses and for the same reason (ADR-0005/ADR-0027). So there is no `on_change` and no
-    -- `on_submit`: either would be the hole the design exists to close.
+    -- Typed characters never reach this VM. `mask_character` plus `secure_submit` stores keystrokes
+    -- in a native buffer on the Renderer's Wayland thread and sends a `("network", "connect")`
+    -- envelope, as in `modules/global/lock.lua` (ADR-0005/ADR-0027). Hence no `on_change` or
+    -- `on_submit` callback can reopen that hole.
     --
-    -- It is the only `secure_submit` field on `panel_host`, across all five panels, and that is
-    -- load-bearing rather than incidental: the engine focuses a surface's *sole* such field when
-    -- the compositor hands the surface keyboard focus, and refuses to guess between two. A second
-    -- one anywhere in this popup would leave this field needing a click that `modules/bar/init.lua`
-    -- cannot arrange -- and would take the lock screen's own rule with it if it landed there.
+    -- It is the only `secure_submit` field across `panel_host`'s five panels. The engine focuses a
+    -- surface's *sole* such field on keyboard focus and refuses to guess between two; a second here
+    -- would require a click that `modules/bar/init.lua` cannot arrange, and would violate the lock
+    -- screen's own sole-field rule if placed there.
     --
-    -- Declared always, hidden mostly: an invisible node leaves the layout entirely (`resolve_sizes`
-    -- in scene.rs) but stays in the tree, so this costs a row of nothing while it is not asking and
-    -- keeps "exactly one" true by construction rather than by a rule about when it is built.
+    -- Always declared, usually hidden. Invisible nodes leave layout (`resolve_sizes` in scene.rs)
+    -- but stay in the tree, keeping "exactly one" structural.
     column {
         width = "Fill",
         spacing = theme.spacing.xs,
@@ -279,8 +262,7 @@ local body = {
             return n.password_ssid ~= nil
         end),
         children = {
-            -- The mirror's sheet title, `Connect to "%1"`, so the field says which network it is
-            -- for before anything is typed into it.
+            -- Mirror title `Connect to "%1"`, identifying the network before typing.
             cell(util.label(oblisk.network, function(n)
                 return string.format("connect to “%s”", n.password_ssid or "")
             end), theme.FG, theme.font.sm, { width = "Fill" }),
@@ -297,9 +279,8 @@ local body = {
                         secure_submit = { capability = "network", action = "connect" },
                         font_size = theme.font.sm,
                     },
-                    -- The only way out. Escape inside a `secure_submit` field clears what was typed
-                    -- and stays in the field, so without this a prompt raised by a mis-click would
-                    -- hold the bar's keyboard focus until something else took it.
+                    -- The only way out: Escape clears a `secure_submit` field and stays in it, so
+                    -- this closes a prompt raised by a mis-click and releases the bar's focus.
                     icon_button(icons.close, function()
                         oblisk.network:invoke("cancel_connect")
                     end, { slot = "network-password-cancel", size = theme.control.md, foreground = theme.RED }),
@@ -307,7 +288,7 @@ local body = {
             },
         },
     },
-    -- As tall as its rows up to the cap, then a scrolling viewport (ADR-0110): the mirror's
+    -- Rows up to the cap, then a scrolling viewport (ADR-0110), matching
     -- `Math.min(networkList.contentHeight, Theme.itemHeight * 7)`.
     list {
         width = "Fill",

@@ -1,27 +1,23 @@
--- One row of a panel list: a leading icon, a title with an optional subtitle under it, and a
--- trailing slot for whatever the row does. `Components/PanelRow.qml` is this shape, and it is what
--- every list in every bar panel is made of -- an access point, a bluetooth device, a notification.
---
--- The title column takes `width = "Fill"`, so the trailing slot sits against the right edge and the
--- title elides into whatever is left instead of pushing it out. That is the same one property
--- `components/panel_header.lua` spends and needed the same `Fill` fix in `scene.rs`.
---
--- `selected` is the mirror's `selected`: an accent ring and a tinted ground on the row the list is
--- "on" -- the joined network, the connected device -- with the title in accent. The row used to say
--- this with a coloured title alone, and a coloured word in a list of white ones reads as a
--- different kind of row, not as the chosen one.
---
--- `on_activate` is optional. A row with none is a `rect`, not a `button`: a button that does nothing
--- still takes the pointer and still reads as clickable, which is worse than a plain line. Both
--- shapes take the same look, so a selected row that cannot be clicked (a connected device, whose
--- actions are its two trailing icons) still wears the ring.
+-- Panel-list row matching `Components/PanelRow.qml`: leading icon, title, optional subtitle, and a
+-- trailing action slot. Every bar-panel list uses it for access points, bluetooth devices,
+-- and notifications.
+-- The title column's `width = "Fill"` leaves the trailing slot at the right edge and elides the
+-- title into the remaining space. `components/panel_header.lua` uses the same property and
+-- `scene.rs` fix.
+-- `selected` matches the mirror: accent ring, tinted ground, and accent title for the joined
+-- network
+-- or connected device. A coloured title alone looked like a different row, not the selected one.
+-- Without `on_activate`, return a `rect`, not a no-op `button` that takes the pointer and looks
+-- clickable. Both shapes share the look, so an unclickable selected device row still wears its
+-- ring;
+-- its actions are the two trailing icons.
 local theme = require("config.theme")
 local cell = require("components.cell")
 
--- Annotated for the same reason `components/cell.lua` is: this is the hop where a payload field
--- becomes text, and `title`/`subtitle` are handed straight to a `cell`. Without the shapes below
--- an `any` from a `list`'s `itemfn` passes through untouched, which is how a notification's span
--- array reached `text.content`.
+-- Annotated like `components/cell.lua`: payload fields become text here and `title`/`subtitle` go
+-- straight to `cell`. Without these shapes, `list` `itemfn`'s `any` reached `text.content`
+-- unchanged,
+-- including a notification span array.
 ---@class PanelRowOpts
 ---@field title string|Bound
 ---@field subtitle? string|Bound
@@ -55,10 +51,10 @@ return function(opts)
     if opts.leading then
         children[#children + 1] = opts.leading
     elseif opts.icon then
-        -- A glyph, not a themed icon, for `components/icon_button.lua`'s reason: `Components/
-        -- PanelRow.qml` tints its leading icon by state (a connected device accent, a failed one
-        -- red) and `PaintStyle::Icon` carries no tint. `opts.art` takes a themed icon name instead,
-        -- for the rows that show something the config did not choose -- an application's own icon.
+        -- A glyph, not a themed icon: `PanelRow.qml` tints it by state (connected accent, failed
+        -- red),
+        -- but `PaintStyle::Icon` has no tint. `opts.art` is for unchosen artwork such as an
+        -- application's icon.
         children[#children + 1] = cell(opts.icon, opts.icon_color or title_color, theme.icon.md, { align_v = "Center" })
     elseif opts.art then
         children[#children + 1] = icon { name = opts.art, size = theme.icon.md, align_v = "Center" }
@@ -95,7 +91,7 @@ return function(opts)
         end)
     end
 
-    -- One look for both shapes; only the handler decides which constructor takes it.
+    -- One look for both shapes; only the handler chooses the constructor.
     local shell = {
         hover = hovered,
         width = "Fill",

@@ -1,19 +1,17 @@
--- Mirrors MediaIndicator.qml's readable half: the transport state as a glyph and the track beside
--- it. The mirror draws a live cava spectrum behind that, which needs a fragment shader and a
--- per-frame push; neither exists here and neither is worth an ADR to add for a bar widget.
+-- Mirrors MediaIndicator.qml's readable half: transport glyph and track. Its live cava spectrum
+-- needs a fragment shader and per-frame pushes, neither available or worth an ADR for a bar widget.
 --
--- No pill. This sits in the centre zone, where the mirror paints on the bar itself.
+-- No pill, matching the mirror's centre-zone treatment.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- A codepoint budget, not a box, and `lib/util.lua`'s `truncate` says why this one module gets to
--- count characters. The centre zone is content-sized between two `Fill` sides, so its midpoint is
--- the bar's midpoint only while its content is its own width; a fixed box put the glyph at the box
--- edge and the title in the box middle, with a hand of empty space between them.
+-- A codepoint budget, not a box. `lib/util.lua`'s `truncate` is appropriate because the centre zone
+-- is content-sized between two `Fill` sides; a fixed box would put the glyph at its edge and the
+-- title at its middle, leaving empty space between them.
 --
--- 44 is about 300px at `font.sm`, which the zone test's own snapshots feed it past.
+-- 44 is about 300px at `font.sm`, which the zone test's snapshots exceed.
 local TITLE_LIMIT = 44
 
 local function player_of(m)

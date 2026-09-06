@@ -7,36 +7,28 @@ mod text;
 mod wake;
 mod wayland;
 
-/// Two OS threads, two channels (ADR-0039). `wayland::run` owns the
-/// main thread: the Wayland dispatch loop, EGL, the Lua VM, the retained `Scene`, and the live
-/// signals all live there, because `mlua::Lua` is `!Send` and the scene has to be reachable from
-/// the thread that holds the GL context. `socket::spawn_client` owns one dedicated I/O thread with
-/// its own current-thread tokio runtime and does nothing but framed I/O with the Supervisor's
-/// control socket:
-/// - inbound: every decoded `SupervisorFrame` is forwarded over a `std::sync::mpsc` channel and
-///   drained by `wayland::run`'s loop, which the socket thread wakes through `wake::Waker`'s
-///   eventfd after each frame (ADR-0124).
-/// - outbound: every `RendererFrame` the Wayland thread produces is queued on a
-///   `tokio::sync::mpsc` channel and written to the wire by the socket thread.
-///   `UnboundedSender::send` is synchronous and non-blocking, so the Wayland thread can call it
-///   directly without bridging.
+/// Two OS threads, two channels (ADR-0039). `wayland::run` owns Wayland dispatch, EGL, the Lua VM,
+/// retained `Scene`, and live signals because `mlua::Lua` is `!Send` and the scene must reach the
+/// GL-context thread. `socket::spawn_client` owns a dedicated I/O thread with a current-thread
+/// Tokio runtime and only does framed control-socket I/O:
+/// - inbound `SupervisorFrame`s cross `std::sync::mpsc`; `wayland::run` drains them and the socket
+///   thread wakes its eventfd after each frame (ADR-0124).
+/// - outbound `RendererFrame`s queue on `tokio::sync::mpsc` and go to the wire there.
+///   `UnboundedSender::send` is synchronous and non-blocking, so Wayland sends directly.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Before any allocation worth the name (ADR-0123). glibc serves an allocation above its mmap
-    // threshold from a fresh mapping, returned to the kernel on free, and everything under it
-    // from the heap, which only shrinks from the top. The threshold is dynamic by default: freeing
-    // a mapped 10 MB decode buffer raises it to 10 MB, so the *next* decode's buffers land on the
-    // heap and stay resident after they are freed, under whatever small allocation came after.
-    // Six wallpaper changes measured 22 MB to 64 MB of heap that way. Pinning the threshold
-    // turns the dynamic behaviour off, so every image decode, SVG raster and the like is a
-    // mapping that comes and goes; the cost is one `mmap` per allocation over a megabyte, which
-    // nothing here does per frame.
+    // Before meaningful allocation (ADR-0123), pin glibc's mmap threshold. Above it, glibc maps
+    // allocations and returns them on free; below it, heap memory only shrinks from the top. The
+    // default threshold rises after freeing a mapped 10 MB decode, putting the next decode on the
+    // heap under later small allocations. Six wallpaper changes measured 22 MB -> 64 MB heap.
+    // Pinning it makes image decodes and SVG rasters transient mappings; cost: one `mmap` per
+    // allocation over 1 MB, not a per-frame path.
     //
     // SAFETY: a plain FFI call with two integers, before any thread exists.
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
     }
-    // `oblisk check` re-execs this binary rather than duplicating the loader in the Supervisor,
-    // which has no `mlua`. Before any Wayland connection, because the point is that it needs none.
+    // `oblisk check` re-execs this binary because the Supervisor has no `mlua`, before any Wayland
+    // connection because checking needs none.
     if std::env::var_os(shared::CHECK_ENV).is_some() {
         let config_dir = shared::config_dir()?;
         return match check::run(&config_dir) {
@@ -51,14 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     }
 
-    // Not a command. Without the Supervisor this process has no control socket to connect to, no
-    // generation id, no capability pushes and nobody to reap it, so it would map a bar that never
-    // updates and never exits. Refusing here turns that into one line instead of a socket error
-    // from a thread the user cannot see.
+    // Not a command. Without the Supervisor there is no socket, generation id, capability push, or
+    // reaper; this would map a bar that never updates or exits. Refuse with one visible line.
     //
-    // The env var rather than the socket, because the check has to happen before the connection is
-    // attempted, and `OBLISK_GENERATION_ID` is what `process::spawn_group_leader` sets on every
-    // Renderer the Supervisor starts, boot and generation swap alike.
+    // Check the env var before connecting. `process::spawn_group_leader` sets
+    // `OBLISK_GENERATION_ID` on every Renderer, at boot and generation swap.
     if std::env::var_os(shared::GENERATION_ID_ENV).is_none() {
         eprintln!(
             "oblisk-renderer is not a command. The Supervisor starts it, one process per renderer \
@@ -70,8 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<shared::SupervisorFrame>();
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<shared::RendererFrame>();
 
-    // Read once, handed to both threads: stamped into the connection handshake and into every
-    // outbound `CommandEnvelope`/`SecureSubmit`.
+    // Read once for both threads: stamp the handshake and every outbound
+    // `CommandEnvelope`/`SecureSubmit`.
     let generation_id = socket::generation_id_from_env();
 
     let waker = wake::Waker::new()?;

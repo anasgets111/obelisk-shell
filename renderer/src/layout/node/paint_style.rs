@@ -1,31 +1,12 @@
-//! Every paint property of one node, parsed once.
-//!
-//! Here rather than in `layout::paint` because this is parsing, and `node` is where parsing lives:
-//! `layout::scene` calls [`paint_style`] while it resolves a node, and `layout::paint` reads the
-//! result. Putting the type in `paint` would make `scene` depend on the module that depends on it.
-//!
-//! ## Why not at paint time, where it was
-//!
-//! `layout::paint::build` runs for every mapped surface on every dirty turn, because comparing the
-//! display list is *how* a surface declines a repaint (ADR-0063 decision 1). So the parse was
-//! the price of finding out that nothing had changed, at ADR-0044 decision 2's cadence rather than
-//! the once-per-config-edit one it was written for.
-//!
-//! The failure rule moved with it, and that is the bigger half. Paint logged a malformed
-//! `background` and substituted the absent-key default, every frame, forever. Geometry one line
-//! away already failed the apply, rolled the scene back and reached `oblisk.rescue`. One resolved
-//! property map with two opinions about what a broken value means is the thing this deletes: a
-//! config whose `background` is an integer now says so once, loudly, the way a bad `align_v`
-//! always did.
-//!
-//! ## What stays at paint time
-//!
-//! Anything that needs an input this pass does not have. `icon`/`image` need the physical scale to
-//! turn a logical edge into a pixel count, and a `textfield` needs to know whether it holds the
-//! keyboard focus. Both are arithmetic over already-parsed data, not parsing.
-//!
-//! An `icon`'s `size` is absent here on purpose: it is the node's geometry, read by
-//! `layout::scene`'s measure callback, and the drawn pixel count comes from the resolved rect.
+//! Paint properties are parsed during `Scene::apply`, not in `layout::paint`: keeping this type
+//! here avoids making `scene` depend on a module that already depends on it. Display-list builds
+//! run every dirty turn because list equality controls repaint (ADR-0063 decision 1), while
+//! applies run at capability-push cadence (ADR-0044 decision 2). This also makes malformed values
+//! fail once through `oblisk.rescue` instead of painting with a default every frame. Geometry
+//! already fails `apply` and reaches `oblisk.rescue`; one resolved map cannot give paint a second
+//! opinion on malformed values. Paint-time
+//! work remains arithmetic needing scale or focus; `icon.size` stays geometry for the scene's
+//! measure callback.
 
 use std::collections::HashMap;
 
@@ -35,34 +16,21 @@ use crate::image::{Fit, Load};
 
 use super::*;
 
-/// One node's paint properties, with every `mlua::Value` already gone.
-///
-/// The variants are the kinds that draw something. Everything else parses to `None`, which is the
-/// same set `layout::paint::build_node`'s match arm bounds: a kind added to
-/// `layout::scene::ensure_supported_kind` without a decision here draws nothing, on purpose.
-///
-/// Holds no Lua value, for ADR-0063 decision 2's reason. That ADR is about `Draw`, but the
-/// trap is the same one: mlua compares tables by identity, so a property whose signal resolves to
-/// a table would compare unequal every pass and repaint forever.
+/// Parsed paint properties with no `mlua::Value`. A kind admitted by
+/// `layout::scene::ensure_supported_kind` but absent here draws nothing. Lua tables compare by
+/// identity, so keeping one here would make a signal-resolved table repaint forever (ADR-0063).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaintStyle {
-    /// `rect`/`row`/`column`/`button` and all four surface roles: the fill, then the border.
-    ///
-    /// `clip` is here with `radius` rather than off in `LayoutStyle` because it is the property
-    /// that decides what `radius` means to everything underneath this node, and the two are read
-    /// together. It draws nothing itself: `layout::paint::build_node` is its only reader.
+    /// Box fill/border for containers and all four surface roles. `clip` travels with `radius`
+    /// because it changes how the node's shape clips descendants.
     Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets, clip: ClipShape },
-    /// `content` is the string as the config wrote it up to `Scene::finish`, which rewrites it to
-    /// what actually fits: an ellipsized prefix under `elide`, or the wrapped lines joined by
-    /// `\n` under `wrap`. So by display-list time this may hold newlines and
-    /// `text::atlas::TextPainter::draw_text` draws one run per line.
-    ///
-    /// `elide`, `wrap` and `max_lines` are carried past the parse for that rewriter's benefit and
-    /// are dead to `layout::paint`, which is why it destructures them away.
+    /// Text before/after `Scene::finish` rewrites it to an ellipsized prefix under `elide` or
+    /// wrapped lines joined by `\n`; display-list paint
+    /// may therefore receive `\n`-joined lines. `elide`, `wrap`, and `max_lines` survive for that
+    /// rewrite but are dead to `layout::paint`.
     Text {
         content: String,
-        /// The styled stretches of `content` (ADR-0104), remapped by `layout::scene` whenever it
-        /// rewrites `content` to fit. Empty for plain text.
+        /// Styled stretches of `content`, remapped when the scene rewrites it (ADR-0104).
         runs: Vec<StyleRun>,
         font_size: f32,
         color: Rgba,
@@ -71,14 +39,11 @@ pub enum PaintStyle {
         wrap: Wrap,
         max_lines: Option<usize>,
     },
-    /// The theme *name*, not the resolved path: `layout::paint::execute` does the
-    /// `image::icons::resolve` lookup, so neither this pass nor the display-list build touches the
-    /// icon theme.
+    /// Theme name; `layout::paint::execute` resolves it, keeping filesystem access out of parsing
+    /// and display-list building.
     Icon {
         name: String,
-        /// § 5.1's `foreground`, which for an icon means what CSS `color` means: the value a
-        /// `currentColor` fill resolves to (ADR-0072). `None` leaves the file's own colours
-        /// alone, which is every full-colour app icon.
+        /// § 5.1's `foreground` for `currentColor` fills (ADR-0072); `None` preserves file colours.
         color: Option<Rgba>,
     },
     Image {
@@ -87,10 +52,8 @@ pub enum PaintStyle {
         /// `async = true` (ADR-0122): decode on the pool and draw nothing until it lands.
         load: Load,
     },
-    /// `target` is `None` when the field declares no `secure_submit` at all. A malformed one is an
-    /// error now, unlike before: `layout::secure_submit::secure_submit_targets` used to skip it
-    /// silently on the grounds that the press path would log it, and the press path was the only
-    /// other reader.
+    /// `target` is `None` when no `secure_submit` is declared. Malformed targets fail here instead
+    /// of being skipped until the press path (`layout::secure_submit` used to do that).
     TextField {
         target: Option<SecureSubmitTarget>,
         placeholder: String,
@@ -101,16 +64,10 @@ pub enum PaintStyle {
     },
 }
 
-/// Parses `kind`'s paint properties out of an already-resolved property map.
-///
-/// `Ok(None)` for a kind that draws nothing. An `Err` fails the whole apply, which is the point:
-/// see the module doc comment.
+/// Parses an already-resolved kind. `Ok(None)` means the kind draws nothing; an error fails apply.
 pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<PaintStyle>, LayoutError> {
     let style = match kind {
-        // row/column/button have no paint properties of their own beyond the base `rect` ones
-        // (`oblisk-idl-api-specs.md` § 5.2), and a surface root paints exactly like a rect. All
-        // four surface roles, not just `panel`: § 6 gives a `window`, a `popup`
-        // and a `lock` the same § 5.1 base properties as a `panel`.
+        // All containers and surface roles use the base box properties (§ 5.2; § 6).
         "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => PaintStyle::Box {
             background: parse_background(properties)?,
             radius: parse_radius(properties)?,
@@ -160,9 +117,6 @@ mod tests {
 
     use crate::lua::nodes::deserialize_lua_table;
 
-    /// Through `deserialize_lua_table`, the way production reaches these parsers: it is what strips
-    /// `kind` back out of the property map, so a hand-built `HashMap` here would feed
-    /// [`paint_style`] a map no `Scene::apply` ever produces.
     fn style(lua: &Lua, lua_src: &str) -> Result<Option<PaintStyle>, LayoutError> {
         let table: mlua::Table = lua.load(lua_src).eval().unwrap();
         let node = deserialize_lua_table(&table).unwrap();
@@ -187,7 +141,6 @@ mod tests {
         assert_eq!(style(&lua, "return { kind = 'list', direction = 'row' }").unwrap(), None);
     }
 
-    /// The behaviour change this module exists for. `layout::paint` logged this and painted on.
     #[test]
     fn a_malformed_background_fails_the_pass_instead_of_defaulting() {
         let lua = Lua::new();
@@ -203,17 +156,12 @@ mod tests {
         assert_eq!(target, None);
     }
 
-    /// `wayland::input::focused_target` used to hold this guarantee and log the failure against the
-    /// surface. It cannot any more: a tree carrying a `secure_submit` this rejects never reaches a
-    /// pointer event, because the pass that would have built it failed here.
     #[test]
     fn a_malformed_secure_submit_names_no_capability_and_fails_the_pass() {
         let lua = Lua::new();
         assert!(style(&lua, "return { kind = 'textfield', secure_submit = 'polkit' }").is_err());
     }
 
-    /// Both surface roles and plain containers take the same arm, so a `lock`'s background is the
-    /// same parse a `rect`'s is.
     #[test]
     fn every_surface_role_parses_the_same_box_properties_a_rect_does() {
         let lua = Lua::new();

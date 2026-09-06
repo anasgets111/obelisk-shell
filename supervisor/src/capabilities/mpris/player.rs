@@ -1,6 +1,5 @@
-//! Per-player registry: binds a discovered MPRIS bus name, hydrates and keeps live one
-//! [`PlayerState`] entry via its own resync loop. Split from `dbus::mpris`, see
-//! `dbus/mpris/mod.rs` for the module-level doc.
+//! Per-player registry: bind a discovered MPRIS name, hydrate one live [`PlayerState`] entry,
+//! and maintain it in a resync loop. Split from `dbus::mpris`; see `dbus/mpris/mod.rs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,69 +17,65 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PlayerState {
-    /// Bus name with `org.mpris.MediaPlayer2.` stripped, e.g. `"spotify"`; what `mpris:`
-    /// commands use to name a player.
+    /// Bus-name suffix after `org.mpris.MediaPlayer2.`, e.g. `"spotify"`; used by `mpris:`
+    /// commands.
     pub id: String,
-    /// `MediaPlayer2.Identity`, the player's display name, e.g. `"Spotify"`; empty if unanswered.
+    /// `MediaPlayer2.Identity`, e.g. `"Spotify"`; empty if unanswered.
     pub identity: String,
-    /// `"Playing"`, `"Paused"` or `"Stopped"`; keeps its previous value rather than fabricating
-    /// `"Stopped"` if the player fails to answer.
+    /// `"Playing"`, `"Paused"`, or `"Stopped"`; retains the previous value if the player fails.
     pub play_state: String,
-    /// `xesam:title`; empty when the player publishes no metadata, the normal state between tracks.
+    /// `xesam:title`; empty when metadata is absent, normal between tracks.
     pub title: String,
-    /// `xesam:artist`, joined with `", "` when there is more than one. Empty when absent.
+    /// `xesam:artist`, joined with `", "`; empty when absent.
     pub artist: String,
-    /// An absolute path to the artwork, or empty. `mpris:artUrl` counts only as a `file://` URL
-    /// that canonicalizes to an existing file, so a remote or stale URL both arrive empty rather
-    /// than a path that fails to load; held across a same-track update so the cover doesn't blink.
+    /// Absolute artwork path, or empty. `mpris:artUrl` must be a `file://` URL canonicalizing to
+    /// an existing file; remote/stale URLs become empty. Held across same-track updates so covers
+    /// do not blink.
     pub album_art_path: String,
-    /// Playback offset in microseconds, correct as of [`PlayerState::position_updated_at`] and
-    /// not after; nothing polls it while playing, so a progress bar must add elapsed time itself.
+    /// Playback offset in microseconds, valid at [`PlayerState::position_updated_at`]. Nothing
+    /// polls it while playing; progress bars add elapsed time.
     pub position: i64,
-    /// `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read. Monotonic, not
-    /// wall clock, so it survives a clock adjustment; subtract from a monotonic `now` for elapsed.
+    /// `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read; subtract from a
+    /// monotonic `now` for elapsed time and survive wall-clock adjustments.
     pub position_updated_at: i64,
-    /// `-1` when `mpris:length` is absent or malformed: a live stream, or a player that simply
-    /// doesn't report it. A genuine unavailable, not a fabricated zero (ADR-0036).
+    /// `-1` when `mpris:length` is absent or malformed, as for a live stream; unavailable is not
+    /// fabricated as zero (ADR-0036).
     pub length: i64,
-    /// `xesam:url`, the track's own location: a `file://` path for a local file, an `https://`
-    /// page for a browser. Empty when the player publishes none, which is normal for a stream.
+    /// `xesam:url`, such as a local `file://` path or browser `https://` page; empty when absent,
+    /// normal for a stream.
     ///
-    /// Carried for ADR-0137: telling a video from a song is a list of video sites, a list of music
-    /// sites and a list of file extensions, and every one of those is taste. This is the fact
-    /// underneath, which a config cannot reach any other way.
+    /// Carried for ADR-0137: configs cannot reliably classify video versus song from site lists or
+    /// extensions, which are taste-dependent.
     pub url: String,
-    /// `MediaPlayer2.DesktopEntry`, the basename of the player's `.desktop` file, e.g. `"mpv"` or
-    /// `"firefox"`. Empty when the player does not publish one, which several do not.
+    /// `MediaPlayer2.DesktopEntry`, the `.desktop` basename, e.g. `"mpv"` or `"firefox"`; empty
+    /// when unpublished.
     ///
-    /// The stable name for a player. `identity` is a display string a player may localise or
-    /// decorate; this is what an app-matching rule should be written against.
+    /// Stable player name for app matching. `identity` is a display string that may localize or
+    /// decorate.
     pub desktop_entry: String,
 }
 
-/// Hands out [`PlayerEntry::registered`], on the same terms as the tray's own counter.
+/// Allocates [`PlayerEntry::registered`] on the same terms as the tray counter.
 static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct PlayerEntry {
     pub(super) player: MprisPlayerProxy<'static>,
     pub(super) last_known: PlayerState,
-    /// When this player was first seen; the order [`ordered_players`] uses. A `HashMap`'s order
-    /// used to leak into `mpris.players`, letting `players[1]` swap tracks on an unrelated tick.
+    /// First-seen order used by [`ordered_players`]. HashMap order once leaked into
+    /// `mpris.players`, letting `players[1]` swap on an unrelated tick.
     registered: u64,
     track_identity: TrackIdentity,
-    /// `mpris:trackid`, cached for `SetPosition`'s required `TrackId` argument (ADR-0036); not
-    /// an IDL-declared `PlayerState` field, so it isn't pushed to Lua.
+    /// Cached `mpris:trackid` for `SetPosition` (ADR-0036); internal, not pushed to Lua.
     pub(super) cached_trackid: Option<String>,
-    /// `None` only between this entry's insert and its forwarder's spawn completing, since the
-    /// forwarder's first resync can fire immediately on subscribe (insert always comes first).
+    /// `None` only between insertion and forwarder spawn; the first resync can fire immediately on
+    /// subscribe, so insertion always comes first.
     forwarder: Option<JoinHandle<()>>,
 }
 
 pub(super) type PlayerRegistry = Arc<Mutex<HashMap<String, PlayerEntry>>>;
 
-/// `mpris.players`, longest-running first: appearance order, not a sort on [`PlayerState::id`],
-/// since a config reaching for `players[1]` means "the one that has been there", not the
-/// browser tab an alphabetical sort would hand it after it just started playing.
+/// `mpris.players`, longest-running first by appearance, not [`PlayerState::id`]: `players[1]`
+/// means the player that has been there, not a newly playing tab after an alphabetical reorder.
 pub(super) fn ordered_players(registry: &PlayerRegistry) -> Vec<PlayerState> {
     let guard = registry.lock().expect("mpris registry mutex poisoned");
     let mut entries: Vec<&PlayerEntry> = guard.values().collect();
@@ -88,9 +83,9 @@ pub(super) fn ordered_players(registry: &PlayerRegistry) -> Vec<PlayerState> {
     entries.into_iter().map(|entry| entry.last_known.clone()).collect()
 }
 
-/// `CLOCK_MONOTONIC` microseconds, cross-process comparable unlike opaque `std::time::Instant`,
-/// matching the IDL's "Monotonic clock timestamp in microseconds" for `position_updated_at`.
-/// Known gap (ADR-0036): `system.time` (§2.11, unbuilt) is 1Hz, not comparable at this resolution.
+/// Cross-process-comparable `CLOCK_MONOTONIC` microseconds, matching the IDL's timestamp field;
+/// opaque `std::time::Instant` would not. Known gap (ADR-0036): unbuilt `system.time` (§2.11) is
+/// 1Hz, too coarse for this resolution.
 pub(super) fn monotonic_micros() -> i64 {
     let now: std::time::Duration = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
         .map(std::time::Duration::from)
@@ -98,17 +93,17 @@ pub(super) fn monotonic_micros() -> i64 {
     i64::try_from(now.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// Re-reads every field `PlayerState` needs from `player`/`root`, folding in `previous`
-/// (track-identity caching for `album_art_path`/`length`, ADR-0036); always succeeds, since
-/// each property degrades to `previous`'s last value on failure, never the whole entry.
+/// Re-reads every `PlayerState` field from `player`/`root`, folding in `previous` for track
+/// identity caching (`album_art_path`/`length`, ADR-0036). Always succeeds; failed properties
+/// retain their previous values.
 struct Resynced {
     state: PlayerState,
     identity: TrackIdentity,
     trackid: Option<String>,
 }
 
-/// What `resync` falls back to when a round's reads fail: `PlayerEntry`'s three cached fields
-/// relevant to degradation, not `player`/`forwarder`, which `resync` never touches.
+/// `resync`'s fallback fields: the three cached values relevant to degradation, not
+/// `player`/`forwarder`, which it never changes.
 struct Previous<'a> {
     state: &'a PlayerState,
     identity: &'a TrackIdentity,
@@ -130,16 +125,14 @@ async fn resync(
             previous.as_ref().map(|p| p.state.play_state.clone()).unwrap_or_default()
         }
     };
-    // `player_identity` is `MediaPlayer2.Identity`, unrelated to `TrackIdentity`
-    // (`identity`/`new_identity` below), the composite key this function tracks.
+    // `player_identity` is MediaPlayer2.Identity, not the TrackIdentity key below.
     let player_identity = root.identity().await.unwrap_or_default();
-    // Optional in the real spec and genuinely absent on several players, so an error here is the
-    // player answering "I have none", not a failure worth keeping a previous value for.
+    // Optional and absent on several players: an error means "I have none", not a stale value.
     let desktop_entry = root.desktop_entry().await.unwrap_or_default();
     let position = player.position().await.unwrap_or(0);
 
-    // A full Metadata read failure (GetAll erroring, not one key absent) means metadata-derived
-    // fields keep their previous value instead of resetting to empty (a spurious track change).
+    // A full Metadata read failure keeps metadata-derived fields instead of resetting them and
+    // causing a spurious track change.
     let Ok(metadata) = player.metadata().await else {
         eprintln!(
             "mpris: Metadata read failed for {bus_name}; keeping the last known title/artist/art/length/trackid this round"
@@ -188,8 +181,8 @@ async fn resync(
         position,
         position_updated_at: monotonic_micros(),
         length,
-        // Held across a same-track update for `album_art_path`'s reason: players are observed to
-        // drop metadata keys on later updates for a track they already described in full.
+        // Keep artwork across same-track updates; players may drop metadata keys after a full
+        // description.
         url: match parsed.url {
             Some(url) => url,
             None if same_track => previous.as_ref().map(|p| p.state.url.clone()).unwrap_or_default(),
@@ -200,13 +193,13 @@ async fn resync(
     Resynced { state, identity: new_identity, trackid }
 }
 
-/// Binds `bus_name`'s player/root proxies, runs one initial [`resync`], inserts the resulting
-/// entry, then spawns its live forwarder. Returns early (logged) if the bind fails or `CanControl`
-/// is `false`: uncontrollable sources aren't useful in a status bar (ADR-0036).
+/// Binds `bus_name`, runs [`resync`], inserts the entry, then starts its forwarder. Logs and
+/// returns on bind failure or `CanControl == false`; uncontrollable sources are not useful in a
+/// status bar (ADR-0036).
 ///
-/// Insert-then-spawn, not the reverse: zbus's `receive_*_changed` streams replay their cached value
-/// on subscribe, so the forwarder's first `select!` could resolve before insertion, find nothing to
-/// write to, and freeze the player. Confirmed live on a fresh session's first player.
+/// Insert before spawn: zbus `receive_*_changed` streams replay cached values, so a forwarder
+/// could otherwise run before insertion, find nothing to update, and freeze the player. Confirmed
+/// live for the first player in a fresh session.
 pub(super) async fn register_player(
     connection: &zbus::Connection,
     registry: &PlayerRegistry,
@@ -264,17 +257,16 @@ pub(super) async fn register_player(
     let forwarder = spawn_player_forwarder(bus_name.clone(), player, root, registry.clone(), events.clone());
     match registry.lock().unwrap().get_mut(&bus_name) {
         Some(entry) => entry.forwarder = Some(forwarder),
-        // Unregistered (a real NameOwnerChanged departure) between the insert above and here:
-        // abort the just-spawned forwarder rather than leaking it untracked and un-abortable.
+        // A real NameOwnerChanged departure raced insertion; abort the new forwarder rather than
+        // leak an untracked, un-abortable task.
         None => forwarder.abort(),
     }
     let _ = events.send(MprisSignal::Changed);
 }
 
-/// Runs until `PlaybackStatus`/`Metadata`'s `receive_*_changed` streams and `Seeked` all end,
-/// re-running [`resync`] on each and updating the registry entry in place: no debounce, no
-/// incremental patching. `Position` has no such trigger (freedesktop excludes it from
-/// `PropertiesChanged`, too high-frequency), so `Seeked` alone signals a position change.
+/// Re-runs [`resync`] on each `PlaybackStatus`/`Metadata` change or `Seeked`, updating the entry in
+/// place with no debounce or incremental patching. `Position` is excluded from
+/// `PropertiesChanged` as too high-frequency, so only `Seeked` signals position changes.
 fn spawn_player_forwarder(
     bus_name: String,
     player: MprisPlayerProxy<'static>,
@@ -322,9 +314,8 @@ fn spawn_player_forwarder(
     })
 }
 
-/// Removes `bus_name`'s registry entry (a player that dropped off the bus: `NameOwnerChanged`
-/// with an empty new owner), aborting its forwarder task. No-op if never tracked, e.g.
-/// `playerctld` or a non-controllable source `register_player` already skipped.
+/// Removes a departed `bus_name` (`NameOwnerChanged` with an empty new owner) and aborts its
+/// forwarder. No-op if untracked, including skipped `playerctld` or uncontrollable sources.
 pub(super) fn unregister_player(registry: &PlayerRegistry, bus_name: &str, events: &UnboundedSender<MprisSignal>) {
     let removed = registry.lock().unwrap().remove(bus_name);
     if let Some(entry) = removed {
@@ -340,8 +331,8 @@ mod ordering_tests {
     use super::*;
     use crate::capabilities::test_support::p2p_pair;
 
-    /// An entry with everything but the two fields the ordering depends on stubbed out. Binding a
-    /// proxy makes no call, so a p2p pair with nobody answering is enough.
+    /// An entry with only the two ordering fields. Binding a proxy makes no call, so a p2p pair
+    /// with nobody answering is enough.
     async fn entry(connection: &zbus::Connection, id: &str, registered: u64) -> PlayerEntry {
         PlayerEntry {
             player: super::super::proxies::bind_player(connection, "org.mpris.MediaPlayer2.probe")
@@ -355,14 +346,14 @@ mod ordering_tests {
         }
     }
 
-    /// A `HashMap`'s iteration order is seeded per process, so this used to be whatever the seed
-    /// said: a config reaching for `players[1]` could get a different player between two pushes
-    /// over the same set, with nothing about that set having changed.
+    /// HashMap iteration is process-seeded; without ordering, `players[1]` changed between pushes
+    /// over the same set.
     #[tokio::test]
     async fn the_list_is_in_appearance_order_whatever_the_map_says() {
         let (connection, _peer) = p2p_pair().await;
         let registry: PlayerRegistry = Arc::new(Mutex::new(HashMap::new()));
-        // Built before the lock: holding a guard across an await is `clippy::await_holding_lock`.
+        // Build before locking; holding a guard across await triggers clippy's
+        // `await_holding_lock` lint.
         let third = entry(&connection, "third", 2).await;
         let first = entry(&connection, "first", 0).await;
         let second = entry(&connection, "second", 1).await;
@@ -376,7 +367,7 @@ mod ordering_tests {
         assert_eq!(ids, ["first", "second", "third"], "an alphabetical sort would answer the other way");
     }
 
-    /// A player that keeps pushing position updates must not move under a config holding its index.
+    /// Position updates must not move a player under a config holding its index.
     #[tokio::test]
     async fn a_player_that_resyncs_holds_its_place() {
         let (connection, _peer) = p2p_pair().await;
@@ -389,7 +380,7 @@ mod ordering_tests {
             guard.insert("firefox".to_string(), firefox);
         }
         let mut replacement = entry(&connection, "spotify-again", 999).await;
-        // What `register_player` does when a live bus name registers again: keep the sequence.
+        // Re-registration of a live bus name keeps its sequence, as `register_player` does.
         replacement.registered = registry.lock().unwrap().get("spotify").expect("just inserted").registered;
         registry.lock().unwrap().insert("spotify".to_string(), replacement);
 

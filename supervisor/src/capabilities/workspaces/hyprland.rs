@@ -1,37 +1,30 @@
-//! `workspaces`' second implementor: Hyprland, over the two sockets in its instance directory
-//! (ADR-0118). Built to Hyprland's documented IPC and not live-tested, the way `keyboard`'s
-//! `HyprlandLink` was: this dev machine runs niri.
+//! `workspaces`' second implementor: Hyprland over its two instance-directory sockets (ADR-0118).
+//! Built to documented IPC, not live-tested because this machine runs niri.
 //!
-//! Hyprland has no event stream carrying state. `.socket2.sock` pushes `event>>payload` lines
-//! that say *that* something changed, and the state is read back over `.socket.sock` with the
-//! same JSON `hyprctl -j` prints. So the loop is: wait for a line naming a workspace, monitor or
-//! window event, re-read `workspaces`, `monitors`, `clients` and `activewindow`, reduce, publish.
-//! Every event in a burst re-reads (a window opening sends four or five), and `StatePublisher`
-//! drops the equal results; four local socket round trips per event is not worth a coalescing
-//! timer until someone measures it.
+//! Hyprland has no state event stream. `.socket2.sock` sends `event>>payload` lines; `.socket.sock`
+//! returns the `hyprctl -j` JSON. On a workspace/monitor/window event, re-read
+//! `workspaces`/`monitors`/`clients`/`activewindow`, reduce, and publish. Bursts re-read every
+//! event (a window opening sends four or five); `StatePublisher` drops equal results, so four
+//! local round trips per event remain until measured data justifies coalescing.
 //!
 //! How Hyprland's model lands on `WorkspaceRow`:
 //!
-//! - `id` is Hyprland's workspace number, which is also what `dispatch workspace N` takes, so
-//!   `workspaces:focus(id)` keeps its one meaning and focusing a number no workspace has yet
-//!   creates it. That number is `idx` too: Hyprland has no per-monitor position, the number *is*
-//!   the slot a user's keybind means, and a strip labelling `idx` reads right. `name` is set only
-//!   when Hyprland's differs from the number, which for a numbered workspace it never does.
-//! - Active per output is the monitor's `activeWorkspace`; focused is the active workspace of the
-//!   one monitor with `focused: true`. That is niri's `is_active`/`is_focused` split exactly.
-//! - `populated` is the workspace's own `windows` count. `app_id` is the `class` of the client
-//!   with the lowest `focusHistoryID` there (`0` is the focused window, higher is older), which
-//!   is ADR-0117's "focused, else first" with a real order behind "first".
-//! - The focused window is `activewindow`, which is `{}` while a layer surface holds focus.
-//!   `clients[].focusHistoryID == 0` would name the last toplevel instead, wrongly.
-//! - Workspaces with an id of zero or below are not rows. Specials (`special` and `special:` names,
-//!   ids from -99 down) become the payload's `special` list (ADR-0119), identified by name, shown
-//!   on the monitor whose `specialWorkspace` names them; `toggle_special` is
-//!   `dispatch togglespecialworkspace <name without the prefix>`. Named workspaces (the negatives
-//!   above them) are dropped: they fit neither a `u64` id nor a number-keyed focus. While a special
-//!   is shown on the focused monitor the focused row is still that monitor's regular workspace.
-//! - `is_fullscreen` is `fullscreen` on the active window: an int since Hyprland 0.42 (`0` none,
-//!   `1` maximized, `2` fullscreen) and a bool before, and only the real thing counts.
+//! - `id` is Hyprland's number and `dispatch workspace N` argument, so focusing a new number
+//!   creates it. It is also `idx`: Hyprland has no per-monitor position. `name` is set only when
+//!   it differs from the number.
+//! - Per-output active is `activeWorkspace`; focused is the active workspace of the monitor with
+//!   `focused: true`, matching niri's `is_active`/`is_focused` split.
+//! - `populated` is `windows`; `app_id` is the `class` of the lowest `focusHistoryID` (`0` focused,
+//!   higher older), giving ADR-0117's "focused, else first" a real order.
+//! - Focused window is `activewindow`, `{}` while a layer surface has focus. Using
+//!   `clients[].focusHistoryID == 0` would incorrectly name the last toplevel.
+//! - Drop ids <= 0. Specials (`special`/`special:` names, ids <= -99) become `special` (ADR-0119),
+//!   shown on the monitor naming them in `specialWorkspace`; toggle with
+//!   `dispatch togglespecialworkspace <name without prefix>`. Other negative named workspaces
+//!   drop because neither `u64` ids nor number focus can represent them. A shown special does not
+//!   replace the focused monitor's regular workspace.
+//! - `is_fullscreen` is active-window `fullscreen`: int since Hyprland 0.42 (`0` none, `1`
+//!   maximized, `2` fullscreen), bool before; only the real value counts.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -42,8 +35,8 @@ use serde::Deserialize;
 use super::controller::{FocusedWindow, SpecialWorkspace, StatePublisher, WorkspaceRow};
 use crate::compositor::hyprland_socket_path;
 
-/// One entry of `j/workspaces`. `windows` is Hyprland's own count, so an empty workspace needs
-/// no client scan.
+/// One `j/workspaces` entry. Hyprland's `windows` count identifies empty workspaces without a
+/// client scan.
 #[derive(Debug, Clone, Deserialize)]
 struct HyprlandWorkspace {
     id: i64,
@@ -55,20 +48,20 @@ struct HyprlandWorkspace {
     windows: u32,
 }
 
-/// One entry of `j/monitors`: the connector name, what it shows, and whether it holds focus.
+/// One `j/monitors` entry: connector, shown workspace, and focus.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HyprlandMonitor {
     name: String,
     active_workspace: WorkspaceRef,
-    /// `{ "id": 0, "name": "" }` while no special is shown here.
+    /// `{ "id": 0, "name": "" }` when no special is shown here.
     #[serde(default)]
     special_workspace: WorkspaceRef,
     #[serde(default)]
     focused: bool,
 }
 
-/// `{ "id": 3, "name": "3" }`, how a monitor and a client name the workspace they are on.
+/// `{ "id": 3, "name": "3" }`, the monitor/client workspace reference.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorkspaceRef {
     id: i64,
@@ -76,9 +69,8 @@ struct WorkspaceRef {
     name: String,
 }
 
-/// One entry of `j/clients`, and the whole of `j/activewindow`. `mapped` defaults to `true`
-/// because `activewindow` does not print it; a client that is not mapped yet has no surface and
-/// cannot stand for a workspace.
+/// One `j/clients` entry or `j/activewindow`. `mapped` defaults to `true` because `activewindow`
+/// omits it; an unmapped client has no surface to represent a workspace.
 #[derive(Debug, Clone, Deserialize)]
 struct HyprlandClient {
     #[serde(default)]
@@ -100,7 +92,7 @@ fn yes() -> bool {
     true
 }
 
-/// `fullscreen` as either wire shape (module doc): a bool as itself, an int as "is `2`".
+/// `fullscreen` in either wire shape: bool as itself, int as "is `2`".
 fn fullscreen_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
     Ok(match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::Bool(flag) => flag,
@@ -109,7 +101,7 @@ fn fullscreen_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<
     })
 }
 
-/// The client standing for a workspace: mapped, with a class, most recently focused.
+/// Workspace representative: mapped, classed, and most recently focused.
 fn standing_app_id(clients: &[HyprlandClient], workspace_id: i64) -> Option<String> {
     clients
         .iter()
@@ -118,7 +110,7 @@ fn standing_app_id(clients: &[HyprlandClient], workspace_id: i64) -> Option<Stri
         .map(|client| client.class.clone())
 }
 
-/// The three lists reduced to the reduction's input. See the module doc for each mapping.
+/// The three lists reduced to the input rows; see the module doc for mappings.
 fn workspace_rows(
     workspaces: &[HyprlandWorkspace],
     monitors: &[HyprlandMonitor],
@@ -134,7 +126,7 @@ fn workspace_rows(
             let app_id = standing_app_id(clients, workspace.id);
             let number = workspace.id.to_string();
             WorkspaceRow {
-                // A `u64` in the payload because ids are; the filter above keeps this positive.
+                // Payload ids are `u64`; the filter above keeps this positive.
                 id: workspace.id as u64,
                 idx: u8::try_from(workspace.id).unwrap_or(u8::MAX),
                 name: (workspace.name != number && !workspace.name.is_empty()).then(|| workspace.name.clone()),
@@ -148,8 +140,8 @@ fn workspace_rows(
         .collect()
 }
 
-/// The specials, by name. Hyprland's rule: a workspace is special when its name says so, and its
-/// id is then at or below -99; the name is the test since it is what everything else keys on.
+/// Specials by name. Hyprland marks them by name and gives them ids <= -99; name is the stable
+/// test used by the rest of the adaptor.
 fn special_list(
     workspaces: &[HyprlandWorkspace],
     monitors: &[HyprlandMonitor],
@@ -170,9 +162,8 @@ fn special_list(
         .collect()
 }
 
-/// `j/activewindow`'s reply, `{}` when no toplevel holds focus. A reply that is neither a client
-/// nor empty is a protocol change, said once per occurrence rather than swallowed as "nothing
-/// focused".
+/// `j/activewindow` reply: `{}` without a focused toplevel. Any other non-client shape is a
+/// protocol change, logged once per occurrence rather than treated as no focus.
 fn focused_window(json: &str) -> Option<FocusedWindow> {
     let value: serde_json::Value = match serde_json::from_str(json) {
         Ok(value) => value,
@@ -200,10 +191,9 @@ fn focused_window(json: &str) -> Option<FocusedWindow> {
     }
 }
 
-/// The events after which the state is re-read, by name (the part before `>>`, with a `v2`
-/// suffix dropped since every v2 event ships beside its v1). A table, not "every event": the
-/// socket also carries `activelayout`, `submap`, `screencast` and the like, none of which move a
-/// workspace, and `keyboard` already answers the first.
+/// Event names that trigger a state read: prefix before `>>`, with `v2` removed because each v2
+/// ships beside v1. Excludes `activelayout`, `submap`, `screencast`, and similar events that do
+/// not move workspaces; `keyboard` already handles its own state.
 const TRIGGERS: &[&str] = &[
     "workspace",
     "focusedmon",
@@ -228,7 +218,7 @@ fn is_trigger(line: &str) -> bool {
     TRIGGERS.contains(&name)
 }
 
-/// One command over `.socket.sock`: Hyprland answers a single request per connection and closes.
+/// One `.socket.sock` command; Hyprland answers once per connection and closes it.
 fn request(socket_path: &PathBuf, command: &str) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket_path)?;
     stream.write_all(command.as_bytes())?;
@@ -237,8 +227,8 @@ fn request(socket_path: &PathBuf, command: &str) -> std::io::Result<String> {
     Ok(reply)
 }
 
-/// The four reads, parsed. `None` logs which one failed and leaves the previous publish standing,
-/// so one dropped request under a burst costs a stale frame, not the rest of the run.
+/// Four parsed reads. `None` logs the failed read and leaves the previous publish, so one dropped
+/// request costs a stale frame, not the run.
 type State = (Vec<WorkspaceRow>, Option<FocusedWindow>, Vec<SpecialWorkspace>);
 
 fn read_state(socket_path: &PathBuf) -> Option<State> {
@@ -281,9 +271,9 @@ fn signature() -> Option<String> {
     (!signature.is_empty()).then_some(signature)
 }
 
-/// Connects to the event socket first and reads the state second, so a change between the two
-/// is a line still to come rather than one missed. Then one OS thread (blocking reads, as the
-/// niri reader) re-reads after every trigger line until the socket ends or nobody listens.
+/// Connects to the event socket before the first state read, so an intervening change remains a
+/// line to process. One OS thread then re-reads after every trigger until socket end or no
+/// listener.
 pub fn spawn_reader(mut publisher: StatePublisher) {
     let Some(signature) = signature() else {
         eprintln!(
@@ -328,8 +318,8 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
     });
 }
 
-/// One `dispatch` on its own thread. Hyprland answers `ok`, or a sentence saying why not, and
-/// anything but `ok` is printed with the command.
+/// One `dispatch` on its own thread. Hyprland answers `ok` or a reason; anything else is printed
+/// with the command.
 fn dispatch(what: String) {
     let Some(signature) = signature() else {
         eprintln!("workspaces: `dispatch {what}` requested but HYPRLAND_INSTANCE_SIGNATURE is unset; ignored");
@@ -345,16 +335,15 @@ fn dispatch(what: String) {
     });
 }
 
-/// `workspaces:focus(id)` as `dispatch workspace N`: the id is the number (module doc), and a
-/// number with no workspace yet makes one, which is how an empty slot a strip pads in is entered.
+/// `workspaces:focus(id)` as `dispatch workspace N`; a new number creates the empty slot a strip
+/// can pad into.
 pub fn focus(id: u64) {
     dispatch(format!("workspace {id}"));
 }
 
-/// `workspaces:toggle_special(name)` as `dispatch togglespecialworkspace <arg>`, where the
-/// dispatcher's argument is the part after `special:` and nothing at all for the unnamed
-/// `special`: it prepends the prefix itself, so passing the full name would toggle
-/// `special:special:term`.
+/// `workspaces:toggle_special(name)` as `dispatch togglespecialworkspace <arg>`. Strip
+/// `special:`; the unnamed `special` passes an empty arg. The dispatcher adds the prefix, so a
+/// full name would become `special:special:term`.
 pub fn toggle_special(name: &str) {
     dispatch(match special_argument(name) {
         "" => "togglespecialworkspace".to_string(),
@@ -370,11 +359,9 @@ fn special_argument(name: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// Fixtures follow the shape `hyprctl -j` documents (the wiki's "Using hyprctl" page) with
-    /// the fields this adaptor reads and a sample of the ones it ignores, written by hand: no
-    /// Hyprland session was available to capture from. A field Hyprland renames breaks these
-    /// tests only once a capture replaces them, which is the first thing to do on a Hyprland
-    /// machine.
+    /// Handwritten fixtures follow the wiki's "Using hyprctl" page and documented `hyprctl -j`
+    /// shapes, with read fields and ignored samples; no Hyprland session was available. On
+    /// Hyprland, replace them with a capture first if a renamed field breaks the tests.
     fn workspaces(json: serde_json::Value) -> Vec<HyprlandWorkspace> {
         serde_json::from_value(json).unwrap()
     }
@@ -447,8 +434,7 @@ mod tests {
 
     #[test]
     fn the_number_is_the_id_and_the_idx_and_a_numbered_workspace_has_no_name() {
-        // Workspaces 1 and 7 with nothing between: `idx` must read 7, not "second on this
-        // monitor", because 7 is what the user's keybind and `dispatch workspace 7` mean.
+        // Workspaces 1 and 7: `idx` is 7, not second-on-monitor, because keybinds dispatch 7.
         let rows = workspace_rows(
             &workspaces(serde_json::json!([workspace(7, "7", "DP-1", 0), workspace(1, "1", "DP-1", 1)])),
             &monitors(serde_json::json!([monitor("DP-1", 1, true)])),

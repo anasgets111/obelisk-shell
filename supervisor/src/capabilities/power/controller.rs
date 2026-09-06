@@ -1,5 +1,5 @@
-//! [`PowerController`]: the `oblisk.power` state owner and its one write action.
-//! Split from `power` -- see `power/mod.rs` for the module-level doc.
+//! [`PowerController`] owns `oblisk.power` and its write action.
+//! See `power/mod.rs` for why the payload has four optional fields.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,39 +9,35 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedValue;
 
-/// `oblisk.power`'s full payload (§ 2.13). Every field is `Option`, omitted from the JSON
-/// rather than serialized as `null`, so a config reads `nil` for anything this host cannot
-/// answer. See `power/mod.rs` for why this is four optional fields, not one on/off capability.
+/// `oblisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
+/// host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
-    /// The active platform profile, e.g. `"balanced"`. What `power:set_profile` sets. `nil` on a
-    /// host with no power-profiles-daemon, which is why every field here is optional.
+    /// Active platform profile, e.g. `"balanced"`, set by `power:set_profile`; `nil` without
+    /// power-profiles-daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile: Option<String>,
-    /// Every profile this hardware offers, in the daemon's own order, e.g.
-    /// `{"performance", "balanced", "power-saver"}`. `nil` when the daemon is absent. Drive a
-    /// selector off this rather than off a hardcoded list: not every machine has all three.
+    /// Profiles in daemon order, e.g. `{"performance", "balanced", "power-saver"}`; `nil` when
+    /// power-profiles-daemon is absent. Drive selectors from this list because machines differ.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiles: Option<Vec<String>>,
-    /// Running on battery rather than mains, from UPower. `nil` when UPower is absent. This is the
-    /// mains question; whether the battery is filling is `oblisk.battery`'s `state`.
+    /// Running on battery rather than mains, from UPower; `nil` without UPower. This is the mains
+    /// question; charge direction is `oblisk.battery.state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_battery: Option<bool>,
-    /// UPower's `EnergyRate` in watts, passed through unchanged. Positive in both directions, so it
-    /// is the magnitude and [`PowerState::on_battery`] is the sign. `nil` when UPower is absent.
+    /// UPower's `EnergyRate` in watts, unchanged. It is positive in both directions, so
+    /// [`PowerState::on_battery`] supplies the sign; `nil` without UPower.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy_rate: Option<f64>,
 }
 
-/// One shared signal, `Changed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerSignal {
     Changed,
 }
 
-/// `OnBattery` is on the manager object, not on any device: it is the system-wide answer
-/// across every power supply UPower knows about. A laptop in a dock with two mains adapters
-/// is the case that separates system-wide from per-device, and UPower aggregates it for free.
+/// `OnBattery` is a manager-wide answer across all UPower supplies, not a device property. This
+/// matters for a docked laptop with two mains adapters; UPower aggregates it.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower",
     default_service = "org.freedesktop.UPower",
@@ -52,10 +48,9 @@ trait UPower {
     fn on_battery(&self) -> zbus::Result<bool>;
 }
 
-/// The composite `DisplayDevice`, not a specific `battery_BAT0`: UPower already sums every
-/// battery on the machine into this one object. `EnergyRate` is a magnitude in Watts, positive
-/// while charging and discharging alike; § 2.13 asks for the rate with no direction, so this
-/// reports the rate -- a config needing direction reads `oblisk.battery.state`.
+/// The composite `DisplayDevice`, not `battery_BAT0`: UPower sums every battery there.
+/// `EnergyRate` is a positive watt magnitude while charging or discharging; § 2.13 wants no
+/// direction, so configs needing it read `oblisk.battery.state`.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.Device",
     default_service = "org.freedesktop.UPower",
@@ -66,10 +61,9 @@ trait DisplayDevice {
     fn energy_rate(&self) -> zbus::Result<f64>;
 }
 
-/// power-profiles-daemon. `ActiveProfile` is a writable property, not a method, so zbus
-/// generates the setter from the getter below. `Profiles` is an array of dictionaries, not
-/// strings: each entry has a `Profile` key holding its name plus driver details this capability
-/// doesn't use, so [`profile_names`] pulls the `Profile` values out.
+/// power-profiles-daemon. `ActiveProfile` is a writable property, so zbus generates its setter
+/// from the getter. `Profiles` contains dictionaries with a `Profile` name plus unused driver
+/// details; [`profile_names`] extracts the names.
 #[zbus::proxy(interface = "org.freedesktop.UPower.PowerProfiles", assume_defaults = false)]
 trait PowerProfiles {
     #[zbus(property)]
@@ -80,9 +74,8 @@ trait PowerProfiles {
     fn profiles(&self) -> zbus::Result<Vec<HashMap<String, OwnedValue>>>;
 }
 
-/// The daemon renamed itself from `net.hadess.PowerProfiles` to
-/// `org.freedesktop.UPower.PowerProfiles` in 0.20 and kept the old name working, so both are
-/// tried, newest first.
+/// The daemon renamed `net.hadess.PowerProfiles` to `org.freedesktop.UPower.PowerProfiles` in
+/// 0.20 while keeping the old name; try both, newest first.
 const POWER_PROFILES_ENDPOINTS: [(&str, &str, &str); 2] = [
     (
         "org.freedesktop.UPower.PowerProfiles",
@@ -92,9 +85,8 @@ const POWER_PROFILES_ENDPOINTS: [(&str, &str, &str); 2] = [
     ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"),
 ];
 
-/// Pulls § 2.13's array of profile names out of power-profiles-daemon's array of profile
-/// descriptions. An entry with no `Profile` key, or a non-string one, is skipped: this list is
-/// what `power:set_profile(p)` validates against.
+/// Extracts § 2.13's profile names from daemon descriptions. Missing or non-string `Profile`
+/// entries are skipped; `power:set_profile(p)` validates against this list.
 fn profile_names(profiles: &[HashMap<String, OwnedValue>]) -> Vec<String> {
     profiles
         .iter()
@@ -104,14 +96,12 @@ fn profile_names(profiles: &[HashMap<String, OwnedValue>]) -> Vec<String> {
         .collect()
 }
 
-/// `power:set_profile(p)`'s `arguments: [p]`. Shape check only: power-profiles-daemon rejects
-/// an unknown name itself, so there is no second copy of the profile list to validate against.
+/// `power:set_profile(p)`'s `arguments: [p]`. Checks shape only; the daemon rejects unknown names,
+/// avoiding a second profile-list copy.
 pub fn parse_set_profile_args(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
 }
 
-/// `Clone`: `main.rs`'s `power:set_profile` dispatch needs a cheap `Arc`-backed copy to hand
-/// to the `tokio::spawn`ed task the D-Bus write runs in.
 #[derive(Clone)]
 pub struct PowerController {
     state: Arc<Mutex<PowerState>>,
@@ -119,8 +109,8 @@ pub struct PowerController {
 }
 
 impl PowerController {
-    /// Returns immediately; every proxy is built inside the spawned task, since building one
-    /// is an async round trip an awaiting constructor would make `main.rs`'s startup serial in.
+    /// Returns immediately; proxies build inside the spawned task because construction is an async
+    /// round trip that would serialize `main.rs` startup.
     pub fn new(system_bus: zbus::Connection, events: UnboundedSender<PowerSignal>) -> Self {
         let state = Arc::new(Mutex::new(PowerState::default()));
         tokio::spawn(run_power_task(system_bus.clone(), Arc::clone(&state), events));
@@ -131,10 +121,9 @@ impl PowerController {
         self.state.lock().expect("power state mutex poisoned").clone()
     }
 
-    /// `power:set_profile(p)`. Builds the proxy fresh: this runs when a user clicks a profile,
-    /// not on a hot path, and a cached proxy would have to survive a daemon restart that a
-    /// fresh one simply reconnects across. No optimistic local update -- the real state change
-    /// arrives on `ActiveProfile`'s own property-changed stream, which also catches an external switch.
+    /// `power:set_profile(p)`. Build a fresh proxy per click, not a cached one that must survive a
+    /// daemon restart. Do not update locally; `ActiveProfile`'s property stream reports both this
+    /// write and external switches.
     pub async fn set_profile(&self, profile: &str) {
         let Some(proxy) = connect_power_profiles(&self.system_bus).await else {
             eprintln!("power: set_profile({profile}) called but no power-profiles-daemon is reachable; ignored");
@@ -146,9 +135,8 @@ impl PowerController {
     }
 }
 
-/// Tries each [`POWER_PROFILES_ENDPOINTS`] triple in order and returns the first that answers a
-/// real property read. Building a proxy alone proves nothing (zbus never contacts the service
-/// to build one), so the probe is `active_profile()`.
+/// Tries [`POWER_PROFILES_ENDPOINTS`] in order; a proxy counts only after `active_profile()` reads
+/// successfully because zbus contacts no service while building it.
 async fn connect_power_profiles(system_bus: &zbus::Connection) -> Option<PowerProfilesProxy<'static>> {
     for (service, path, interface) in POWER_PROFILES_ENDPOINTS {
         let built = PowerProfilesProxy::builder(system_bus)
@@ -172,10 +160,8 @@ async fn connect_power_profiles(system_bus: &zbus::Connection) -> Option<PowerPr
     None
 }
 
-/// Reads every field this host can answer. A property read that fails leaves its field `None`
-/// rather than keeping the last known value: a daemon that stopped answering is a fact worth
-/// showing, and a stale number that looks live is the failure mode this codebase has now been
-/// bitten by three times.
+/// Reads every available field. Failed reads become `None`, not stale values: a stopped daemon is
+/// worth showing, and this codebase has hit the live-looking stale-number failure three times.
 async fn read_state(
     upower: Option<&UPowerProxy<'static>>,
     device: Option<&DisplayDeviceProxy<'static>>,
@@ -195,8 +181,8 @@ async fn read_state(
     state
 }
 
-/// `select!` needs every arm to hold a future; a future that never completes stands in for a
-/// half of this capability the host lacks -- the arm never wins, and the loop runs on the rest.
+/// `select!` needs a future per arm. A never-completing future represents a missing service; its
+/// arm never wins while the other half runs.
 async fn next_change<S: Stream + Unpin>(stream: &mut Option<S>) -> Option<S::Item> {
     match stream {
         Some(stream) => stream.next().await,
@@ -204,11 +190,11 @@ async fn next_change<S: Stream + Unpin>(stream: &mut Option<S>) -> Option<S::Ite
     }
 }
 
-/// Reads once, pushes, then follows all three property-changed streams. Every wake re-reads
-/// the whole payload rather than patching the one field that fired.
+/// Reads once, pushes, then follows all three property streams. Every wake re-reads the payload
+/// instead of patching one field.
 ///
-/// A host with neither UPower nor power-profiles-daemon never sends a signal, so `oblisk.power`
-/// stays `nil` (ADR-0037), and the task exits instead of parking on a stream that never fires.
+/// With neither service, no signal is sent, `oblisk.power` stays `nil` (ADR-0037), and the task
+/// exits instead of parking on a dead stream.
 async fn run_power_task(
     system_bus: zbus::Connection,
     state: Arc<Mutex<PowerState>>,
@@ -241,9 +227,8 @@ async fn run_power_task(
         return;
     }
 
-    // Subscribed before the first read, not after: each `receive_*_changed` is its own D-Bus
-    // round trip, and a charger unplugged during that window would land between a read and a
-    // not-yet-existing subscription. Subscribing first closes the window in the harmless direction.
+    // Subscribe before the first read. A charger unplugged during the round trip must not land
+    // between a read and a subscription that does not exist yet.
     let mut on_battery_changed = match upower.as_ref() {
         Some(proxy) => Some(proxy.receive_on_battery_changed().await),
         None => None,
@@ -275,8 +260,7 @@ async fn run_power_task(
                 if change.is_none() { active_profile_changed = None; }
             }
         }
-        // Every stream ended, so nothing left can wake this task and the `select!` above would
-        // park forever. Dropping out releases the proxies and their connection references.
+        // All streams ended; parking would leak the proxies and their connection references.
         if on_battery_changed.is_none() && energy_rate_changed.is_none() && active_profile_changed.is_none() {
             eprintln!("power: every property stream ended; power will no longer update this run");
             return;
@@ -303,11 +287,8 @@ mod tests {
         pairs.iter().map(|(key, value)| (key.to_string(), OwnedValue::try_from(value.clone()).unwrap())).collect()
     }
 
-    // ---- profile_names ----
-
     #[test]
     fn profile_names_pulls_the_profile_key_out_of_each_description_and_keeps_the_order() {
-        // The shape power-profiles-daemon actually publishes: other keys name drivers, none of which § 2.13 asks for.
         let raw = vec![
             entry(&[("Profile", Value::from("power-saver")), ("Driver", Value::from("intel_pstate"))]),
             entry(&[("Profile", Value::from("balanced")), ("Driver", Value::from("intel_pstate"))]),
@@ -319,7 +300,6 @@ mod tests {
 
     #[test]
     fn profile_names_skips_an_entry_with_no_profile_key_or_a_non_string_one() {
-        // A shorter list is recoverable: `power:set_profile` hands a name straight to the daemon, which would reject a fabricated placeholder anyway.
         let raw = vec![
             entry(&[("Driver", Value::from("placeholder"))]),
             entry(&[("Profile", Value::from(3i32))]),
@@ -334,8 +314,6 @@ mod tests {
         assert_eq!(profile_names(&[]), Vec::<String>::new());
     }
 
-    // ---- parse_set_profile_args ----
-
     #[test]
     fn parse_set_profile_args_reads_the_first_argument_as_a_profile_name() {
         assert_eq!(parse_set_profile_args(&[serde_json::json!("performance")]), Some("performance".to_string()));
@@ -347,11 +325,8 @@ mod tests {
         assert_eq!(parse_set_profile_args(&[serde_json::json!(2)]), None);
     }
 
-    // ---- PowerState serialization ----
-
     #[test]
     fn a_field_this_host_cannot_answer_is_absent_from_the_json_rather_than_null() {
-        // The whole point of `power/mod.rs`'s optional-field rule: partial hardware reports partial fields.
         let state = PowerState { on_battery: Some(false), energy_rate: Some(0.0), ..PowerState::default() };
 
         let json = serde_json::to_value(&state).unwrap();
