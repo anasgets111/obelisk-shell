@@ -32,9 +32,18 @@ pub(crate) fn push_snapshot(
     let revision = bump_revision(revisions, capability);
     match serde_json::to_value(state) {
         Ok(payload) => {
-            let snapshot = shared::StateSnapshot { capability: capability.to_string(), revision, payload };
-            send_frame_logged(registry, generation_id, &SupervisorFrame::StateSnapshot(snapshot.clone()));
-            last_snapshots.insert(capability.to_string(), snapshot);
+            // Move the snapshot through the frame and take it back out. `send_frame_logged`
+            // borrows, so the obvious spelling deep-clones the whole `payload` tree -- the largest
+            // thing on this path -- on every signal, purely to keep a copy.
+            let frame = SupervisorFrame::StateSnapshot(shared::StateSnapshot {
+                capability: capability.to_string(),
+                revision,
+                payload,
+            });
+            send_frame_logged(registry, generation_id, &frame);
+            if let SupervisorFrame::StateSnapshot(snapshot) = frame {
+                last_snapshots.insert(capability.to_string(), snapshot);
+            }
         }
         Err(err) => eprintln!("failed to serialize {capability} StateSnapshot: {err}"),
     }
