@@ -29,7 +29,6 @@ pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
 /// Reads `tempN_input` sensors whose paired `tempN_label` matches `Core \d+`, converting to Celsius
 /// and sorting by core index. Excludes package aggregates and unlabeled sensors.
 pub fn read_cores(chip_dir: &Path) -> Vec<i64> {
-    let core_label = regex::Regex::new(r"^Core (\d+)$").expect("static regex must compile");
     let Ok(entries) = std::fs::read_dir(chip_dir) else {
         return Vec::new();
     };
@@ -41,8 +40,16 @@ pub fn read_cores(chip_dir: &Path) -> Vec<i64> {
         let Some(rest) = file_name.strip_suffix("_input") else { continue };
         let label_path = chip_dir.join(format!("{rest}_label"));
         let Ok(label) = std::fs::read_to_string(&label_path) else { continue };
-        let Some(captures) = core_label.captures(label.trim()) else { continue };
-        let Ok(core_index) = captures[1].parse::<u32>() else { continue };
+        // `^Core (\d+)$` without the regex. The digit check is what keeps `parse` from accepting
+        // the leading `+` that `\d+` rejects; an empty remainder fails `parse` on its own.
+        let Some(core_index) = label
+            .trim()
+            .strip_prefix("Core ")
+            .filter(|index| index.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|index| index.parse::<u32>().ok())
+        else {
+            continue;
+        };
         let Ok(value) = std::fs::read_to_string(entry.path()) else { continue };
         let Ok(milli_c) = value.trim().parse::<i64>() else { continue };
         cores.push((core_index, milli_c));
