@@ -180,6 +180,17 @@ pub struct Scene {
     next_id: u64,
 }
 
+/// Adds `node` and its descendants to the running node and property totals. Shared by
+/// [`Scene::census`] and [`Scene::census_by_surface`] so the per-surface figures always sum to the
+/// total the same report prints beside them.
+fn census_walk(node: &RetainedNode, nodes: &mut usize, properties: &mut usize) {
+    *nodes += 1;
+    *properties += node.properties.len();
+    for child in &node.children {
+        census_walk(child, nodes, properties);
+    }
+}
+
 impl Scene {
     pub fn new() -> Self {
         Self::default()
@@ -386,28 +397,41 @@ impl Scene {
         self.retiring.clear();
     }
 
+    /// Node count per retained surface, largest first, for `crate::wayland::memory_profile`. The
+    /// total from [`Self::census`] says the scene is growing; only this says which of eighteen
+    /// trees is doing it, which is the difference between a finding and a number.
+    pub fn census_by_surface(&self) -> Vec<(String, usize)> {
+        let mut per_surface: Vec<(String, usize)> = self
+            .surfaces
+            .iter()
+            .map(|(key, tree)| {
+                let mut nodes = 0;
+                let mut properties = 0;
+                census_walk(tree, &mut nodes, &mut properties);
+                (key.clone(), nodes)
+            })
+            .collect();
+        // Biggest first: a growing tree is the one worth naming, and the report prints only the
+        // head of this list.
+        per_surface.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        per_surface
+    }
+
     /// Surfaces, total nodes across every retained tree, live `properties` values, and the lease
     /// bag's depth, for `crate::wayland::memory_profile`. Counts `properties` because that map is
     /// the one place a retained tree holds `mlua::Value`s, so it is where scene growth shows up in
     /// the Lua heap rather than the Rust one. Walks every tree, which is why the profile calls it
     /// once per report window and never per turn.
     pub fn census(&self) -> (usize, usize, usize, usize) {
-        fn walk(node: &RetainedNode, nodes: &mut usize, properties: &mut usize) {
-            *nodes += 1;
-            *properties += node.properties.len();
-            for child in &node.children {
-                walk(child, nodes, properties);
-            }
-        }
         let mut nodes = 0;
         let mut properties = 0;
         for tree in self.surfaces.values() {
-            walk(tree, &mut nodes, &mut properties);
+            census_walk(tree, &mut nodes, &mut properties);
         }
         // Retired subtrees keep their own `properties` until `release_all_retired`, so they are
         // counted too: an apply caught mid-flight must not read as a drop in live nodes.
         for (_, tree) in &self.retiring {
-            walk(tree, &mut nodes, &mut properties);
+            census_walk(tree, &mut nodes, &mut properties);
         }
         (self.surfaces.len(), nodes, properties, self.retiring.len())
     }

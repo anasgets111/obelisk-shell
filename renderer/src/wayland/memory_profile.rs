@@ -88,6 +88,11 @@ pub struct Census {
     pub malloc: Malloc,
 }
 
+/// The biggest retained trees by node count, largest first. Separate from [`Census`] because it
+/// owns `String`s and so cannot be `Copy` alongside the counters the report diffs.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Surfaces(pub Vec<(String, usize)>);
+
 /// Accumulates nothing: each report is one instant's reading beside the previous one, because
 /// every counter here is a level rather than a rate.
 pub struct MemoryProfile {
@@ -118,17 +123,18 @@ impl MemoryProfile {
 
     /// Reports when the window is up, reading `collect` only then. The turn loop calls this every
     /// turn, so the closure keeps a whole-scene walk off the idle path.
-    pub fn maybe_report(&mut self, collect: impl FnOnce() -> Census) {
+    pub fn maybe_report(&mut self, collect: impl FnOnce() -> (Census, Surfaces)) {
         if self.window_started.elapsed() < self.interval {
             return;
         }
-        let census = collect();
+        let (census, surfaces) = collect();
         let malloc = Malloc::now();
         let census = Census { malloc, ..census };
         eprintln!(
             "[oblisk-renderer] {}",
             render(self.started.elapsed(), &census, self.previous.as_ref(), self.first.as_ref())
         );
+        eprintln!("[oblisk-renderer] {}", render_surfaces(self.started.elapsed(), &surfaces));
         self.first.get_or_insert(census);
         self.previous = Some(census);
         self.window_started = Instant::now();
@@ -170,6 +176,13 @@ fn render(uptime: Duration, now: &Census, previous: Option<&Census>, first: Opti
         line.push_str(&format!(" | since_start {}", deltas(now, first)));
     }
     line
+}
+
+/// The heaviest trees on their own line, so a growing total can be attributed without re-running.
+/// Five is enough: the shipped config's remaining surfaces are single-digit node stubs.
+fn render_surfaces(uptime: Duration, surfaces: &Surfaces) -> String {
+    let listed: Vec<String> = surfaces.0.iter().take(5).map(|(name, nodes)| format!("{name}={nodes}")).collect();
+    format!("memory t={:.0}s: top surfaces {}", uptime.as_secs_f64(), listed.join(" "))
 }
 
 /// The four numbers worth watching over time, signed, in KiB because the interesting steps are
@@ -225,6 +238,14 @@ mod tests {
         // Subtracting `u64`s directly would make a freed megabyte read as 16 exabytes.
         let line = deltas(&census(1024 * 1024, 0), &census(3 * 1024 * 1024, 0));
         assert!(line.contains("in_use=-2048"), "{line}");
+    }
+
+    #[test]
+    fn the_surface_line_names_the_heaviest_trees_and_stops_at_five() {
+        let surfaces = Surfaces((1..=8).map(|n| (format!("s{n}"), n * 10)).rev().collect::<Vec<_>>());
+        let line = render_surfaces(Duration::from_secs(60), &surfaces);
+        assert!(line.contains("top surfaces s8=80 s7=70 s6=60 s5=50 s4=40"), "{line}");
+        assert!(!line.contains("s3="), "only the head of the list is worth printing: {line}");
     }
 
     #[test]

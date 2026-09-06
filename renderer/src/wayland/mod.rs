@@ -516,11 +516,11 @@ impl ShmHandler for App {
 /// columns are comparable. `malloc` is left default: `MemoryProfile` reads `mallinfo2` itself,
 /// after this returns, so the arena totals include whatever this walk allocated rather than
 /// missing it.
-fn census(app: &App) -> memory_profile::Census {
+fn census(app: &App) -> (memory_profile::Census, memory_profile::Surfaces) {
     let (image_bytes, ready, pending, failed, evicted, landed) = app.image_cache.census();
     let (shape_entries, shape_bytes) = app.shaping.census();
     let (surfaces, nodes, properties, retiring) = app.client.scene().census();
-    memory_profile::Census {
+    let census = memory_profile::Census {
         image_bytes: image_bytes as u64,
         image_ready: ready as u64,
         image_pending: pending as u64,
@@ -535,5 +535,6 @@ fn census(app: &App) -> memory_profile::Census {
         scene_properties: properties as u64,
         scene_retiring: retiring as u64,
         malloc: memory_profile::Malloc::default(),
-    }
+    };
+    (census, memory_profile::Surfaces(app.client.scene().census_by_surface()))
 }
