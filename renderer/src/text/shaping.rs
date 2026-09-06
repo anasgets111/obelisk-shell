@@ -291,6 +291,30 @@ impl ShapingHandle {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
+    /// Entry count and a byte floor for `wayland::memory_profile`, which reports rather than
+    /// decides: no branch may read this, for `cached_len`'s reason. Sums the
+    /// heap each entry owns — the key's text and font runs, the result's lines and ranges — and
+    /// not the `HashMap`'s own table, so it under-reports and is labelled `approx` in the report.
+    /// `Arc` contents count once per entry even when two entries share one, which cannot
+    /// happen here: `shape` builds a fresh `ShapeResult` per miss.
+    pub fn census(&self) -> (usize, usize) {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let bytes: usize = cache
+            .iter()
+            .map(|(key, result)| {
+                let key_bytes = key.text.len() + key.runs.len() * std::mem::size_of::<FontRun>();
+                let line_bytes: usize = result.lines.iter().map(String::len).sum();
+                let range_bytes = result.line_ranges.len() * std::mem::size_of::<Range<usize>>();
+                std::mem::size_of::<ShapeKey>()
+                    + std::mem::size_of::<ShapeResult>()
+                    + key_bytes
+                    + line_bytes
+                    + range_bytes
+            })
+            .sum();
+        (cache.len(), bytes)
+    }
+
     /// Returns the loaded font chain's shared bytes, in chain order. Femtovg has no system font
     /// discovery of its own; it loads these via `add_shared_font_with_index` so paint rasterizes
     /// with the exact chain cosmic-text shaped against (`text::atlas::TextPainter::new`). Cloning

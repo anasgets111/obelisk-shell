@@ -386,6 +386,32 @@ impl Scene {
         self.retiring.clear();
     }
 
+    /// Surfaces, total nodes across every retained tree, live `properties` values, and the lease
+    /// bag's depth, for `crate::wayland::memory_profile`. Counts `properties` because that map is
+    /// the one place a retained tree holds `mlua::Value`s, so it is where scene growth shows up in
+    /// the Lua heap rather than the Rust one. Walks every tree, which is why the profile calls it
+    /// once per report window and never per turn.
+    pub fn census(&self) -> (usize, usize, usize, usize) {
+        fn walk(node: &RetainedNode, nodes: &mut usize, properties: &mut usize) {
+            *nodes += 1;
+            *properties += node.properties.len();
+            for child in &node.children {
+                walk(child, nodes, properties);
+            }
+        }
+        let mut nodes = 0;
+        let mut properties = 0;
+        for tree in self.surfaces.values() {
+            walk(tree, &mut nodes, &mut properties);
+        }
+        // Retired subtrees keep their own `properties` until `release_all_retired`, so they are
+        // counted too: an apply caught mid-flight must not read as a drop in live nodes.
+        for (_, tree) in &self.retiring {
+            walk(tree, &mut nodes, &mut properties);
+        }
+        (self.surfaces.len(), nodes, properties, self.retiring.len())
+    }
+
     /// Ids currently held in the lease bag, in child-first insertion order. A diagnostic/future
     /// consumer accessor, not needed by `apply`/`release` themselves.
     ///

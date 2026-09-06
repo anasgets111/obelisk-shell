@@ -55,6 +55,7 @@ mod idle_profile;
 mod input;
 mod layer;
 mod lock;
+mod memory_profile;
 mod output;
 mod surface;
 mod xdg_shell;
@@ -322,6 +323,8 @@ pub fn run(
 
     // `None` unless `OBLISK_PROFILE_IDLE` is set; see `idle_profile`.
     let mut profile = idle_profile::IdleProfile::from_env();
+    // `None` unless `OBLISK_PROFILE_MEMORY` is set; see `memory_profile`.
+    let mut memory = memory_profile::MemoryProfile::from_env();
 
     // Mostly-static surfaces may receive no Wayland event after `ActivateDraw`, so poll
     // `inbound_rx` with bounded latency instead of blocking on the Wayland fd. Non-Candidates still
@@ -430,6 +433,11 @@ pub fn run(
                 phases,
             );
         }
+        if let Some(memory) = memory.as_mut() {
+            // The closure keeps the scene walk and the cache locks off every turn but the one
+            // that reports; see `memory_profile`.
+            memory.maybe_report(|| census(&app));
+        }
         // Disarm after the turn, not only when active: `dispatch_pending` armed this serial and
         // `apply_resolved_surface_state` is its only reader. This enforces ADR-0049's one-turn
         // real-input window.
@@ -501,5 +509,31 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
+    }
+}
+
+/// Reads every subsystem that owns heap into one [`memory_profile::Census`], at one instant so the
+/// columns are comparable. `malloc` is left default: `MemoryProfile` reads `mallinfo2` itself,
+/// after this returns, so the arena totals include whatever this walk allocated rather than
+/// missing it.
+fn census(app: &App) -> memory_profile::Census {
+    let (image_bytes, ready, pending, failed, evicted, landed) = app.image_cache.census();
+    let (shape_entries, shape_bytes) = app.shaping.census();
+    let (surfaces, nodes, properties, retiring) = app.client.scene().census();
+    memory_profile::Census {
+        image_bytes: image_bytes as u64,
+        image_ready: ready as u64,
+        image_pending: pending as u64,
+        image_failed: failed as u64,
+        image_evicted: evicted as u64,
+        image_landed: landed as u64,
+        shape_entries: shape_entries as u64,
+        shape_bytes: shape_bytes as u64,
+        lua_bytes: app.client.lua().used_memory() as u64,
+        scene_surfaces: surfaces as u64,
+        scene_nodes: nodes as u64,
+        scene_properties: properties as u64,
+        scene_retiring: retiring as u64,
+        malloc: memory_profile::Malloc::default(),
     }
 }

@@ -243,6 +243,23 @@ impl ImageCache {
         }
     }
 
+    /// Resident bytes and slot counts for `wayland::memory_profile`. Counts slots rather than
+    /// reading `resident_bytes` alone: bytes flat against a rising `pending` is a decode queue
+    /// backing up, which the byte total cannot show.
+    pub fn census(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let mut ready = 0;
+        let mut pending = 0;
+        let mut failed = 0;
+        for entry in self.entries.values() {
+            match entry.slot {
+                Slot::Ready(..) => ready += 1,
+                Slot::Pending => pending += 1,
+                Slot::Failed => failed += 1,
+            }
+        }
+        (self.resident_bytes, ready, pending, failed, self.evicted.len(), self.landed.len())
+    }
+
     /// Frees last frame's evictions. `layout::paint::paint_tree` calls this before walking because
     /// femtovg resolves `ImageId` at `flush`, not `fill_path`; mid-walk deletion unbinds a texture
     /// a recorded command still names, drawing blank.
