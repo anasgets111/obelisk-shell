@@ -936,14 +936,14 @@ impl App {
     /// Set the cursor chosen by [`layout::hit::cursor_under`] (ADR-0107) only when it changes;
     /// motion arrives per pixel and each `set_shape` would add compositor work. `Leave` clears the
     /// cache because the shape is bound to the next enter serial.
-    fn sync_cursor(&mut self, index: usize, position: (f64, f64)) {
+    fn sync_cursor(&mut self, tree: Option<&layout::ResolvedNode>, position: (f64, f64)) {
         let Some(pointer) = self.pointer.as_ref() else {
             return;
         };
-        let shape = match self.client.scene().surface(&self.surfaces[index].surface_id) {
+        let shape = match tree {
             Some(tree) => {
                 let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
-                layout::hit::cursor_under(&layout::hit::hit_path(&tree, point), point, &self.shaping)
+                layout::hit::cursor_under(&layout::hit::hit_path(tree, point), point, &self.shaping)
             }
             None => cursor_icon::CursorIcon::Default,
         };
@@ -971,26 +971,39 @@ impl App {
         let Some(index) = self.surfaces.iter().position(|tracked| tracked.surface_id == surface_id) else {
             return;
         };
-        self.sync_hover(index, Some(position), false);
+        let tree = self.client.scene().surface(&surface_id);
+        self.sync_hover(index, tree.as_ref(), Some(position), false);
     }
 
     /// Write all `hover` signals, or clear them for `None` (ADR-0062). Collect writes before
     /// `set_changed` because the tree borrow must end; only moved values dirty the scene (decision
     /// 4), so a stationary pointer inside one button re-resolves nothing while device-rate motion
     /// continues (ADR-0044 decision 2). `fire` enables `on_hover` only for motion/leave, not enter-
-    /// motion or re-layout. ponytail: `Scene::surface` deep-clones a retained tree, a few hundred
-    /// `HashMap`s per motion on the dispatch thread. Upgrade: borrowing `&RetainedNode` accessor.
-    fn sync_hover(&mut self, index: usize, position: Option<(f64, f64)>, fire: bool) {
+    /// motion or re-layout.
+    ///
+    /// Takes the tree rather than fetching it: `Scene::surface` deep-clones a retained tree, and a
+    /// motion event needs it here *and* in [`Self::sync_cursor`]. Fetching in each was two clones
+    /// per motion, twice the one the ceiling below accepts.
+    ///
+    /// ponytail: one deep clone per motion on the dispatch thread, a few hundred `HashMap`s.
+    /// Upgrade: a borrowing `&RetainedNode` accessor, which removes the clone rather than sharing
+    /// it.
+    fn sync_hover(
+        &mut self,
+        index: usize,
+        tree: Option<&layout::ResolvedNode>,
+        position: Option<(f64, f64)>,
+        fire: bool,
+    ) {
         // Skip the expensive tree walk when no config registered `hover(name)`.
         if !crate::lua::signal::any_hover_registered(self.client.lua()) {
             return;
         }
-        let surface_id = &self.surfaces[index].surface_id;
-        let Some(tree) = self.client.scene().surface(surface_id) else {
+        let Some(tree) = tree else {
             return;
         };
         let point = position.map(|(x, y)| layout::hit::LogicalPoint { x: x as f32, y: y as f32 });
-        let writes = layout::hover::hover_writes(&tree, point);
+        let writes = layout::hover::hover_writes(tree, point);
         let lua = self.client.lua();
         for write in writes {
             // Non-hover signals stay untouched, so `hover = oblisk.network` cannot overwrite a
@@ -1270,7 +1283,8 @@ impl PointerHandler for App {
                     self.armed = None;
                     self.cursor_shown = None;
                     self.pointer_at = None;
-                    self.sync_hover(index, None, true);
+                    let tree = self.client.scene().surface(&self.surfaces[index].surface_id);
+                    self.sync_hover(index, tree.as_ref(), None, true);
                 }
                 // Motion off the armed rect does not disarm; return and release still click. Enter
                 // and Motion update hover, but only Motion fires `on_hover` (ADR-0112 amendment):
@@ -1283,8 +1297,10 @@ impl PointerHandler for App {
                     if moved {
                         self.fire_on_drag(&instance_id, event.position, "move");
                     }
-                    self.sync_hover(index, Some(event.position), moved);
-                    self.sync_cursor(index, event.position);
+                    // Fetched once for both: each wants this tree and `Scene::surface` clones it.
+                    let tree = self.client.scene().surface(&self.surfaces[index].surface_id);
+                    self.sync_hover(index, tree.as_ref(), Some(event.position), moved);
+                    self.sync_cursor(tree.as_ref(), event.position);
                 }
                 // Wheel (ADR-0069); use the event's own position.
                 PointerEventKind::Axis { horizontal, vertical, .. } => {
