@@ -128,10 +128,19 @@ enum Request {
 /// How many measured strings [`ShapingHandle`] remembers before it drops the lot. Sized against
 /// the working set (the shipped dev config resolves about twenty text nodes, the largest list
 /// this engine carries is a few hundred) with room for churn: a clock shapes a string nobody asks
-/// for again every second, so an unbounded map would grow by 86,400 dead entries a day; this cap
-/// clears roughly hourly instead. Full, the map holds on the order of 400KB (4096 short `String`
-/// entries plus four integers and two floats, plus `HashMap` overhead), under one percent of
-/// ADR-0043's 50MB-per-monitor budget.
+/// for again, so an unbounded map would grow for the life of the session. Full, the map holds on
+/// the order of 400KB (4096 short `String` entries plus four integers and two floats, plus
+/// `HashMap` overhead), under one percent of ADR-0043's 50MB-per-monitor budget.
+///
+/// Measured 2026-09-06 against the shipped dev config, idle: **3.2 to 4.3 new entries a minute**,
+/// so the cap is reached in roughly **sixteen hours**, not the hour an earlier draft of this
+/// comment claimed. That estimate assumed a clock ticking seconds; this config's shows minutes, and
+/// the churn that does exist comes from elsewhere. Nothing about the sizing changes -- a cache that
+/// turns over daily rather than hourly holds fewer dead entries, not more -- but the number is
+/// worth stating correctly, because it is the one that says whether 4096 is generous or tight.
+///
+/// Note that `HashMap::clear` keeps the table it has grown, so after the first fill the bucket
+/// array is a floor for the rest of the session rather than something the clear gives back.
 const SHAPE_CACHE_CAPACITY: usize = 4096;
 
 /// What a measurement is keyed by: every field of a [`ShapeRequest`]. Keying on a subset would be
