@@ -541,8 +541,11 @@ pub fn run(
                     .wake(idle_profile::Wake { wayland: wayland_ready, waker: woke && fds[1].any().unwrap_or(false) });
             }
             if woke {
-                if wayland_ready {
-                    guard.read()?;
+                if wayland_ready && let Err(wayland_client::backend::WaylandError::Io(err)) = guard.read() {
+                    // The read side, and the one a killed compositor actually reaches first: `poll`
+                    // reports the fd readable because the peer closed it, and the read that follows
+                    // is what sees the broken pipe.
+                    exit_because_the_compositor_is_gone("reading from the Wayland connection", &err);
                 }
                 // Drain before the turn; a wake arriving during the turn remains counted.
                 waker.drain();
