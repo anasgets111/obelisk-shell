@@ -3,8 +3,9 @@
 //! with
 //! dependency values, not handles, so its body does not call `:get()` on declared deps.
 //!
-//! ponytail: `computed`/`map` recompute on every `get`, with no memoization or invalidation graph.
-//! The Watcher must decide when cached values go stale.
+//! ponytail: `computed`/`map` recompute on every outermost `get`, with no invalidation graph across
+//! gets. [`EvaluationMemo`] collapses repeats *within* one evaluation; nothing caches *between*
+//! them, so the Watcher still decides when a value goes stale.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -78,7 +79,13 @@ const CHECK_EVERY_N_INSTRUCTIONS: u32 = 1000;
 const MAX_SIGNAL_NESTING_DEPTH: usize = 32;
 
 /// Shared error for hook and [`CpuBudget::check_not_exceeded`] gates.
-const CPU_CAP_EXCEEDED: &str = "computed/map exceeded its 5ms CPU budget";
+///
+/// Deliberately names no construct. [`CpuBudget`] also wraps
+/// `capability::CapabilityHandle::notify_change`'s handlers, so the old "computed/map exceeded ..."
+/// wording made an `on_change` handler report itself as a `map` it never called. Each call site
+/// already prefixes what it was doing ("Signal getter failed: ...", "`on_change` handler raised,
+/// ignoring it: ..."), and the hook cannot tell which of them it interrupted.
+const CPU_CAP_EXCEEDED: &str = "exceeded the 5ms CPU budget for one evaluation";
 
 /// Distinct pass-budget error so config knows which limit it hit. Plain `__index` without a signal
 /// reaches it, the hole this budget closes.
@@ -336,19 +343,31 @@ impl Signal {
             SignalKind::Scroll { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Computed { deps, func } => {
+                // A repeat within this evaluation costs one hash lookup and no Lua. Checked before
+                // `CpuBudget::enter` on purpose: a hit does no work, so it must not spend a nesting
+                // level either, or a wide diamond would hit `MAX_SIGNAL_NESTING_DEPTH` on cache
+                // hits alone.
+                let key = EvaluationMemo::key(deps);
+                if let Some(hit) = EvaluationMemo::get(lua, key) {
+                    return Ok(hit);
+                }
+
                 // Enter before dependency resolution, not only `func.call`, so nesting depth also
                 // bounds dependency chains.
                 let budget = CpuBudget::enter(lua)?;
+                // Opened by whichever `Computed` is outermost and dropped when it returns, so the
+                // memo spans exactly one evaluation. It deliberately does not span a
+                // `capability::CapabilityHandle::notify_change` handler: that handler may `:set()`
+                // between its own `:get()` calls and has to observe its own writes.
+                let _memo = EvaluationMemo::enter(lua);
 
-                // ponytail: no memoization (ADR-0044 decision 3) makes diamond depth N evaluate
-                // `s` 2^N
-                // times, 1,048,575 calls at N=20. Upgrade by memoizing each dependency per get.
                 let mut args = Vec::with_capacity(deps.len());
                 for dep in deps.iter() {
                     args.push(dep.get_value(lua)?);
                 }
                 let value = func.call::<Value>(MultiValue::from_vec(args))?;
                 budget.check_not_exceeded()?;
+                EvaluationMemo::insert(lua, key, &value);
                 Ok(value)
             }
         }
@@ -521,6 +540,73 @@ struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 /// open panel to top (ADR-0069 decision 2).
 #[derive(Default)]
 struct ScrollRegistry(HashMap<String, Signal>);
+
+/// One `Computed`'s identity for [`EvaluationMemo`]. `computed()` and [`Signal::mapped`] each
+/// allocate a fresh `Rc<Vec<Signal>>`, so the address separates every distinct computed; only
+/// `Signal::clone` shares one, and a clone is the same computed with the same `func`. Two computeds
+/// therefore cannot collide unless one is dropped and another allocated at that address *inside a
+/// single evaluation*, which needs a closure that builds and discards a computed mid-pass.
+type MemoKey = *const Vec<Signal>;
+
+/// Values already produced during the current outermost [`Signal::get_value`].
+#[derive(Default)]
+struct MemoTable(HashMap<MemoKey, Value>);
+
+/// One evaluation's memo, closing ADR-0044 decision 3's ceiling: without it a shared dependency is
+/// re-run once per path that reaches it, so `dev-config`'s launcher ran its whole application
+/// filter twice for every row's `background` (`results` directly and again through `web_shown`),
+/// and a diamond of depth N evaluated its root 2^N times.
+///
+/// Scoped to one evaluation, never across them: between two `get`s a `state`/`Live` cell may have
+/// changed, and nothing here observes that. Within one evaluation the memo also makes an impure
+/// closure (`os.clock()`, `math.random`) answer consistently on every path instead of differing by
+/// which dependency edge reached it.
+///
+/// ponytail: one evaluation is one property of one node, because `node::resolve_properties` calls
+/// [`Signal::get_value`] per property. The launcher's `results` therefore still runs once for
+/// `background`, once for `border_color`, and once for the label colour of every row, rather than
+/// once for the pass. Widening it to [`LayoutPassBudget`]'s scope is the next rung and would make
+/// that one call per pass; it is not taken here because `layout::scene` writes a `Scroll` cell
+/// mid-pass (`set_without_dirtying` for the clamp), so a pass-wide memo changes when a derived
+/// readout sees a clamp, and that wants measuring against a real config first.
+struct EvaluationMemo<'lua> {
+    lua: &'lua Lua,
+    /// Only the outermost holder installs and removes the table.
+    owner: bool,
+}
+
+impl<'lua> EvaluationMemo<'lua> {
+    fn key(deps: &Rc<Vec<Signal>>) -> MemoKey {
+        Rc::as_ptr(deps)
+    }
+
+    fn enter(lua: &'lua Lua) -> Self {
+        let owner = lua.app_data_ref::<MemoTable>().is_none();
+        if owner {
+            lua.set_app_data(MemoTable::default());
+        }
+        Self { lua, owner }
+    }
+
+    /// `None` outside an evaluation, which is the outermost `Computed`'s own first look.
+    fn get(lua: &Lua, key: MemoKey) -> Option<Value> {
+        lua.app_data_ref::<MemoTable>()?.0.get(&key).cloned()
+    }
+
+    fn insert(lua: &Lua, key: MemoKey, value: &Value) {
+        if let Some(mut table) = lua.app_data_mut::<MemoTable>() {
+            table.0.insert(key, value.clone());
+        }
+    }
+}
+
+impl Drop for EvaluationMemo<'_> {
+    fn drop(&mut self) {
+        if self.owner {
+            self.lua.remove_app_data::<MemoTable>();
+        }
+    }
+}
 
 /// RAII claim on the 5ms budget for dependency resolution plus closure call. Deadlines stack in
 /// `app_data` because computed dependencies, body reads, and self/mutual cycles re-enter; a single
@@ -834,6 +920,82 @@ mod tests {
         let signal = Signal::try_new_direct(value).unwrap();
         lua.globals().set(name, signal).unwrap();
         lua
+    }
+
+    /// `dev-config`'s launcher shape, the one that spent its whole 5ms budget in the field:
+    /// `results` filters every application, `web_shown` reads `results`, `effective_selected` reads
+    /// both, and each row's `background` reads that. One read of `background` used to run the
+    /// filter twice; the memo makes the second reach `results` a lookup.
+    #[test]
+    fn a_dependency_reached_by_two_paths_runs_once_per_evaluation() {
+        let (lua, _dirty) = lua_with_state();
+        let runs: bool = lua
+            .load(
+                r#"
+                local runs = 0
+                local query = state("q", "fi")
+                local results = computed({ query }, function(text)
+                    runs = runs + 1
+                    return { text }
+                end)
+                local web_shown = computed({ results }, function(found) return #found == 0 end)
+                local selected = computed({ results, web_shown }, function(found, web)
+                    return (web and "web") or found[1]
+                end)
+                local background = computed({ selected }, function(id) return id end)
+                background:get()
+                return runs == 1
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(runs, "`results` is reached by two paths and has to run once, not twice");
+    }
+
+    /// The memo is one evaluation wide, not a cache. A `state` written between two `get`s has to
+    /// show through, or a config would read its own writes stale.
+    #[test]
+    fn a_write_between_two_gets_is_not_served_from_the_previous_evaluation() {
+        let (lua, _dirty) = lua_with_state();
+        let (before, after): (i64, i64) = lua
+            .load(
+                r#"
+                local n = state("n", 1)
+                local doubled = computed({ n }, function(v) return v * 2 end)
+                local before = doubled:get()
+                n:set(21)
+                return before, doubled:get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((before, after), (2, 42));
+    }
+
+    /// A wide diamond must not spend nesting levels on cache hits: the memo is checked before
+    /// `CpuBudget::enter`, so 40 readers of one dependency stay under `MAX_SIGNAL_NESTING_DEPTH`
+    /// even though 40 > 32.
+    #[test]
+    fn cache_hits_do_not_consume_signal_nesting_depth() {
+        let (lua, _dirty) = lua_with_state();
+        let total: i64 = lua
+            .load(
+                r#"
+                local leaf = state("leaf", 1)
+                local shared = computed({ leaf }, function(v) return v end)
+                local deps = {}
+                for _ = 1, 40 do deps[#deps + 1] = shared end
+                local wide = computed(deps, function(...)
+                    local sum = 0
+                    for _, v in ipairs({ ... }) do sum = sum + v end
+                    return sum
+                end)
+                return wide:get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(total, 40);
     }
 
     /// VM whose `state` marks the flag `RendererClient` drains.
@@ -1367,12 +1529,12 @@ mod tests {
     }
 
     #[test]
-    fn a_diamond_dependency_graph_is_cut_off_by_the_shared_cpu_budget() {
-        // ADR-0044 decision 3 no-memoization: 20 diamond levels made 2^20-1 calls, completed in
-        // 1.9s with
-        // `Ok(1048576)` before resolution was budgeted. Now the outer deadline fires around 3,200
-        // calls. Building is exponential and dominates wall clock. Build separately because
-        // cloning makes a 2^20-node tree, not shared DAG.
+    fn a_diamond_dependency_graph_costs_one_call_per_level_not_two_to_the_level() {
+        // History, because this assertion inverted twice. 20 diamond levels first made 2^20-1 calls
+        // and returned `Ok(1048576)` in 1.9s; budgeting resolution then cut it off around 3,200
+        // calls, and this test asserted the cut-off. [`EvaluationMemo`] removes the blow-up
+        // instead: the second edge into each level is a lookup, so the graph is 20 calls, finishes,
+        // and still answers 2^20 -- the same number the slow version reached the long way.
         let lua = lua_with_signal("a", Value::Integer(1));
         lua.load("for _ = 1, 20 do a = computed({a, a}, function(x, y) return x + y end) end").exec().unwrap();
 
@@ -1380,8 +1542,11 @@ mod tests {
         let result: mlua::Result<i64> = lua.load("return a:get()").eval();
         let elapsed = start.elapsed();
 
-        assert!(result.is_err(), "an exponential diamond graph must be cut off, not returned: {result:?}");
-        assert!(elapsed < Duration::from_millis(100), "the shared 5ms budget must cut it off early, took {elapsed:?}");
+        assert_eq!(result.unwrap(), 1_048_576, "a shared dependency must still be summed once per edge");
+        assert!(
+            elapsed < Duration::from_millis(5),
+            "20 memoized levels must not approach the budget, took {elapsed:?}"
+        );
     }
 
     #[test]
