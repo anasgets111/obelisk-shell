@@ -192,13 +192,29 @@ pub struct App {
 /// Renderer main thread: Wayland, EGL, Lua, the retained `Scene`, and live signals (ADR-0039).
 /// `inbound_rx` carries socket-decoded `SupervisorFrame`s; `outbound_tx` carries every frame this
 /// thread sends back, including replies, readiness, presentation evidence, and lock reports.
+/// Ends the process on a dead Wayland connection, like the `EXIT_SUPERVISOR_GONE` arm below and for
+/// the same reason: `std::process::exit` skips destructors. Returning an error instead unwinds
+/// `App`, whose EGL surfaces and `wl_surface`s talk to the compositor that just left, which is how a
+/// log out became a `khronos-egl` `unwrap()` panic and exit code 101.
+fn exit_because_the_compositor_is_gone(what_failed: &str, err: &dyn std::fmt::Display) -> ! {
+    eprintln!("[oblisk-renderer] {what_failed} failed ({err}); there is no compositor to talk to, so exiting");
+    std::process::exit(shared::EXIT_COMPOSITOR_GONE);
+}
+
 pub fn run(
     generation_id: u32,
     mut inbound_rx: tokio::sync::mpsc::Receiver<SupervisorFrame>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
     waker: crate::wake::Waker,
 ) -> Result<(), Box<dyn Error>> {
-    let conn = Connection::connect_to_env()?;
+    // A missing socket is not a failure to report up: at session end the Supervisor outlives the
+    // compositor briefly and respawns into a session that is already gone, which is where the three
+    // `Error: NoCompositor` generations came from. Nothing is built yet, so there is nothing to
+    // skip unwinding past; this is the same answer for the same reason.
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(err) => exit_because_the_compositor_is_gone("connecting to the Wayland display", &err),
+    };
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn)?;
     let qh = event_queue.handle();
 
@@ -340,7 +356,16 @@ pub fn run(
     loop {
         // `then` leaves the clock unread while the profile is off, as `idle_profile` promises.
         let dispatch_started = profile.is_some().then(thread_cpu_time).flatten();
-        let dispatched = event_queue.dispatch_pending(&mut app)? > 0;
+        let dispatched = match event_queue.dispatch_pending(&mut app) {
+            Ok(count) => count > 0,
+            // Only an I/O failure means the connection itself is gone. A `BadMessage` or a
+            // `Protocol` error is this Renderer's own bug against a compositor that is still there,
+            // so it keeps propagating and stays a reportable crash.
+            Err(wayland_client::DispatchError::Backend(wayland_client::backend::WaylandError::Io(err))) => {
+                exit_because_the_compositor_is_gone("dispatching Wayland events", &err)
+            }
+            Err(err) => return Err(err.into()),
+        };
         if let Some(started) = dispatch_started
             && let Some(ended) = thread_cpu_time()
             && let Some(profile) = profile.as_mut()
@@ -496,7 +521,11 @@ pub fn run(
         if app.exit {
             break;
         }
-        event_queue.flush()?;
+        // This is the flush that actually caught the log out: it propagated, `run` returned, and
+        // `App`'s destructor then drove EGL into a compositor that was gone.
+        if let Err(wayland_client::backend::WaylandError::Io(err)) = event_queue.flush() {
+            exit_because_the_compositor_is_gone("flushing the Wayland queue", &err);
+        }
         if let Some(guard) = event_queue.prepare_read() {
             let fd = guard.connection_fd();
             // No timeout (ADR-0124): Wayland events use the connection fd; Supervisor frames,

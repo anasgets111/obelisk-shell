@@ -43,6 +43,14 @@ pub const GENERATION_ID_ENV: &str = "OBLISK_GENERATION_ID";
 /// Set when `oblisk check` re-execs the Renderer to evaluate a config without a display.
 pub const CHECK_ENV: &str = "OBLISK_CHECK";
 
+/// Renderer exit code for a Wayland connection that is gone: a log out, a reboot, or a compositor
+/// crash. Shared because the Supervisor reads it as "the session is over" and stops rather than
+/// respawning into a compositor that is not there.
+///
+/// Distinct from `0` (clean), `1` (a `?` failure) and `101` (a panic), and from the Renderer's `70`
+/// for a gone Supervisor.
+pub const EXIT_COMPOSITOR_GONE: i32 = 71;
+
 /// `~/.config/oblisk/` by precedence: `$OBLISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/oblisk`, the
 /// debug-only dev config, then `$HOME/.config/oblisk`.
 ///

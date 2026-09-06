@@ -311,6 +311,14 @@ impl Supervisor {
         eprintln!("{}", departure_report(departure, self.authoritative.generation_id, was_locked));
         self.renderer_departed = true;
 
+        // Before the brake: the session ended under the whole shell, so every replacement would
+        // find the same missing compositor and trip the brake three deaths later, blaming a config
+        // that did nothing. Stop the way a SIGTERM does, because it means the same thing.
+        if matches!(departure, RendererDeparture::Failed { code } if code == shared::EXIT_COMPOSITOR_GONE) {
+            eprintln!("the compositor is gone, so there is nothing to respawn into; shutting down");
+            return Some(Shutdown::Requested);
+        }
+
         // Check before spawning (ADR-0058 decision 3), covering the case where every spawn succeeds
         // but each Renderer dies on the same config.
         if !self.restart_brake.allow(std::time::Instant::now()) {
