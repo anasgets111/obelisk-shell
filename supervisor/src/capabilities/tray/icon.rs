@@ -47,11 +47,21 @@ pub(super) enum IconSource {
     None,
 }
 
+/// The longest path this can usefully build. `theme_path` is a raw string from the application and
+/// nothing in SNI bounds it; past `PATH_MAX` no `join` can name a file, so building and stat-ing
+/// the candidates only allocates the oversized string three more times to be told `ENAMETOOLONG`.
+const MAX_THEME_PATH_BYTES: usize = 4096;
+
 /// Finds `icon_name` in the item's `IconThemePath`, trying the bare name, `.png`, then `.svg`.
 /// The spec says only "a directory of icons" and leaves layout to the application. Rejects `/`
 /// and `\`; a name containing `/` or `..` could reach outside it.
 pub(super) fn theme_path_file(theme_path: &str, icon_name: &str) -> Option<String> {
-    if theme_path.is_empty() || icon_name.is_empty() || icon_name.contains('/') || icon_name.contains('\\') {
+    if theme_path.is_empty()
+        || theme_path.len() > MAX_THEME_PATH_BYTES
+        || icon_name.is_empty()
+        || icon_name.contains('/')
+        || icon_name.contains('\\')
+    {
         return None;
     }
     let dir = std::path::Path::new(theme_path);
@@ -261,5 +271,12 @@ mod tests {
 
         // PNG stores R, G, B, A, so the encoder must reorder ARGB.
         assert_eq!(rgba, &[0x22, 0x33, 0x44, 0x11]);
+    }
+
+    /// `IconThemePath` is a raw application string with no bound in SNI. Past `PATH_MAX` it cannot
+    /// name a file, so it is refused before three candidate paths are built from it.
+    #[test]
+    fn a_theme_path_longer_than_path_max_is_refused_without_touching_the_filesystem() {
+        assert_eq!(theme_path_file(&"x".repeat(MAX_THEME_PATH_BYTES + 1), "my-app"), None);
     }
 }

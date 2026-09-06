@@ -9,7 +9,8 @@ use zbus::zvariant::Value;
 use crate::capabilities::shm_icons::{self, PngEncodeError};
 
 use super::markup::parse_markup;
-use super::{MAX_APP_ICON_NAME_BYTES, MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan, truncate_utf8_bytes};
+use super::{MAX_APP_ICON_NAME_BYTES, MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan};
+use crate::capabilities::truncate_utf8_bytes;
 
 /// ADR-0033's trusted icon roots, with `$HOME` resolved at runtime. Tests inject fixture roots.
 pub(super) fn default_trusted_icon_roots() -> Vec<PathBuf> {

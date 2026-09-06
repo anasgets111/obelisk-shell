@@ -73,6 +73,22 @@ pub fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(entry_dir.join(name)).ok().map(|text| text.trim().to_string())
 }
 
+/// Truncates to `max_bytes`, backing off to a UTF-8 boundary (bytes, not chars).
+///
+/// Every capability that copies a string out of a third party's D-Bus reply caps it here, so the
+/// rule lives once: notifications for `Notify`'s properties (§1.1) and tray for the
+/// `StatusNotifierItem` and DBusMenu text an arbitrary application supplies.
+pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    input[..end].to_string()
+}
+
 /// Parses the first JSON boolean in `arguments: [en]` for `*:set_*_enabled(en)` actions.
 pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
     arguments.first()?.as_bool()
@@ -677,5 +693,31 @@ mod tests {
         assert_eq!(Capability::from_name("process"), None);
         assert_eq!(Capability::from_name("screens"), None);
         assert_eq!(Capability::from_name(""), None);
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_is_a_no_op_under_the_cap() {
+        assert_eq!(truncate_utf8_bytes("hello", 64), "hello");
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_truncates_ascii_at_the_exact_cap() {
+        assert_eq!(truncate_utf8_bytes("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_never_splits_a_multibyte_char() {
+        // "héllo" -- 'é' is 2 bytes (0xc3 0xa9); a byte cap landing mid-character must back off.
+        let input = "héllo";
+        assert_eq!(input.len(), 6);
+        // Cap of 2 bytes lands right in the middle of 'é' (byte 1 is not a char boundary).
+        let truncated = truncate_utf8_bytes(input, 2);
+        assert_eq!(truncated, "h");
+        assert!(truncated.len() <= 2);
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_handles_a_cap_of_zero() {
+        assert_eq!(truncate_utf8_bytes("hello", 0), "");
     }
 }

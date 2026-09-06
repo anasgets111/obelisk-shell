@@ -4,10 +4,12 @@
 use serde::Serialize;
 use zbus::names::OwnedUniqueName;
 
+use super::MAX_TRAY_TEXT_BYTES;
 use super::icon::{IconPixmap, IconSource, largest_valid_pixmap, resolve_icon_source, write_icon_png};
 use super::menu::MenuItem;
 use super::proxies::StatusNotifierItemProxy;
 use super::registration::sanitize_unique_name;
+use crate::capabilities::truncate_utf8_bytes;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
@@ -44,6 +46,11 @@ pub struct TrayItem {
     pub menu: Option<Vec<MenuItem>>,
 }
 
+/// [`MAX_TRAY_TEXT_BYTES`] applied to one application-supplied property.
+fn capped(value: String) -> String {
+    truncate_utf8_bytes(&value, MAX_TRAY_TEXT_BYTES)
+}
+
 /// Resolves `TrayItem.name`: `Title`, falling back to `Id` when empty (ADR-0031).
 fn resolve_display_name(title: &str, id: &str) -> String {
     if title.is_empty() { id.to_string() } else { title.to_string() }
@@ -65,17 +72,22 @@ pub(super) async fn fetch_tray_item_base(
     item: &StatusNotifierItemProxy<'static>,
     unique_name: &OwnedUniqueName,
 ) -> TrayItem {
-    let id_prop = item.id().await.unwrap_or_default();
-    let title = item.title().await.unwrap_or_default();
-    let status = item.status().await.unwrap_or_default();
+    // Every string below is whatever application owns this item; cap each on the way in
+    // (`MAX_TRAY_TEXT_BYTES`) rather than trusting SNI, which bounds none of them.
+    let id_prop = capped(item.id().await.unwrap_or_default());
+    let title = capped(item.title().await.unwrap_or_default());
+    let status = capped(item.status().await.unwrap_or_default());
     let item_is_menu = item.item_is_menu().await.unwrap_or(false);
     let tooltip = item.tool_tip().await.ok();
-    // Read once for all three icon variants; the directory belongs to the item (ADR-0074).
+    // Read once for all three icon variants; the directory belongs to the item (ADR-0074). Not
+    // capped with the rest: a path cut short names a *different* directory rather than none, so
+    // `theme_path_file` bounds it at `PATH_MAX` where it is used instead.
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
 
     let sanitized = sanitize_unique_name(unique_name.as_str());
     let name = resolve_display_name(&title, &id_prop);
-    let tooltip_flat = tooltip.and_then(|(_, _, tt_title, tt_text)| flatten_tooltip(&tt_title, &tt_text));
+    let tooltip_flat =
+        tooltip.and_then(|(_, _, tt_title, tt_text)| flatten_tooltip(&capped(tt_title), &capped(tt_text)));
 
     let (icon_name, icon_path) = resolve_variant(
         item.icon_name().await.unwrap_or_default(),
@@ -128,7 +140,9 @@ fn resolve_variant(
 ) -> (Option<String>, Option<String>) {
     let pixmaps: Vec<IconPixmap> =
         pixmaps_raw.into_iter().map(|(width, height, bytes)| IconPixmap { width, height, bytes }).collect();
-    match resolve_icon_source(&icon_name_prop, &pixmaps, theme_path) {
+    // Capped here rather than at the three call sites, so no `{X}IconName` can reach a `TrayItem`
+    // uncapped by being passed in from a fourth one later.
+    match resolve_icon_source(&capped(icon_name_prop), &pixmaps, theme_path) {
         IconSource::ThemePathFile(path) => (None, Some(path)),
         IconSource::Name(name) => (Some(name), None),
         IconSource::Pixmap => match largest_valid_pixmap(&pixmaps) {

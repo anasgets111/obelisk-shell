@@ -28,9 +28,10 @@ use super::{
     MAX_ACTION_LABEL_BYTES, MAX_ACTIONS, MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME,
     NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
     NotificationsState, Urgency, desktop_entry_from_hint, parse_urgency_str, reply_placeholder_from_hint,
-    truncate_utf8_bytes, urgency_from_hint_byte,
+    urgency_from_hint_byte,
 };
 use crate::capabilities::system::controller::epoch_seconds;
+use crate::capabilities::truncate_utf8_bytes;
 
 /// `ActionInvoked` key for a completed inline reply (ADR-0033).
 fn format_reply_action_key(text: &str) -> String {

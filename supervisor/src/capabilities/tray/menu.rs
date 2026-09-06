@@ -5,6 +5,8 @@ use serde::Serialize;
 use zbus::zvariant::Value;
 
 use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
+use super::{MAX_MENU_NODES, MAX_TRAY_TEXT_BYTES};
+use crate::capabilities::truncate_utf8_bytes;
 
 /// One DBusMenu layout node, resolved to `tray.items[].menu` (docs/oblisk-idl-api-specs.md §2.14).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -41,9 +43,12 @@ fn unwrap_variant<'a>(value: &'a Value<'_>) -> &'a Value<'a> {
     }
 }
 
-fn value_as_str<'a>(value: &'a Value<'_>) -> Option<&'a str> {
+/// The only way this module reads a node's string, so [`MAX_TRAY_TEXT_BYTES`] cannot be forgotten
+/// on one property. DBusMenu bounds none of the four and the application owns them all, so an
+/// uncapped reader sitting beside this one would only be waiting to be picked by mistake.
+fn capped_str(value: &Value<'_>) -> Option<String> {
     match unwrap_variant(value) {
-        Value::Str(s) => Some(s.as_str()),
+        Value::Str(s) => Some(truncate_utf8_bytes(s.as_str(), MAX_TRAY_TEXT_BYTES)),
         _ => None,
     }
 }
@@ -79,7 +84,15 @@ const MAX_MENU_DEPTH: u32 = 32;
 ///
 /// `depth` is this node's depth (`0` at the root). At [`MAX_MENU_DEPTH`], this node still parses,
 /// but children become empty and the truncation is logged.
-pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem> {
+///
+/// `budget` is the shared [`MAX_MENU_NODES`] allowance for the whole reply, decremented once per
+/// node parsed. Depth alone leaves breadth unbounded, and it is breadth an application reaches for
+/// by accident: one level of a million siblings sits well inside [`MAX_MENU_DEPTH`].
+pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32, budget: &mut usize) -> Option<MenuItem> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
     let structure = match unwrap_variant(value) {
         Value::Structure(structure) => structure,
         _ => return None,
@@ -99,18 +112,18 @@ pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem>
         for (key, val) in dict.iter() {
             match dict_str_key(key) {
                 Some("type") => {
-                    if let Some(s) = value_as_str(val) {
-                        menu_type = s.to_string();
+                    if let Some(s) = capped_str(val) {
+                        menu_type = s;
                     }
                 }
-                Some("label") => label = value_as_str(val).map(str::to_string),
+                Some("label") => label = capped_str(val),
                 Some("enabled") => {
                     if let Some(b) = value_as_bool(val) {
                         enabled = b;
                     }
                 }
-                Some("icon-name") => icon_name = value_as_str(val).filter(|s| !s.is_empty()).map(str::to_string),
-                Some("toggle-type") => toggle_type = value_as_str(val).filter(|s| !s.is_empty()).map(str::to_string),
+                Some("icon-name") => icon_name = capped_str(val).filter(|s| !s.is_empty()),
+                Some("toggle-type") => toggle_type = capped_str(val).filter(|s| !s.is_empty()),
                 Some("toggle-state") => toggle_state_raw = value_as_i32(val),
                 _ => {}
             }
@@ -125,7 +138,7 @@ pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem>
         Vec::new()
     } else {
         match unwrap_variant(children_field) {
-            Value::Array(array) => array.iter().filter_map(|child| parse_menu_node(child, depth + 1)).collect(),
+            Value::Array(array) => array.iter().filter_map(|child| parse_menu_node(child, depth + 1, budget)).collect(),
             _ => Vec::new(),
         }
     };
@@ -136,7 +149,15 @@ pub(super) fn parse_menu_node(value: &Value<'_>, depth: u32) -> Option<MenuItem>
 pub(super) async fn fetch_menu_via(menu: &DBusMenuProxy<'static>) -> zbus::Result<Vec<MenuItem>> {
     let (_, raw_root) = menu.get_layout(0, -1, &[]).await?;
     let root_value = raw_menu_layout_to_value(raw_root);
-    Ok(parse_menu_node(&root_value, 0).map(|root| root.children).unwrap_or_default())
+    // The root is one of the budgeted nodes, so the reply as a whole cannot exceed the cap.
+    let mut budget = MAX_MENU_NODES;
+    let items = parse_menu_node(&root_value, 0, &mut budget).map(|root| root.children).unwrap_or_default();
+    // Reported here rather than at the node that ran out: exhaustion stops every remaining sibling
+    // and ancestor alike, so warning inside the recursion means one line per ancestor for one reply.
+    if budget == 0 {
+        eprintln!("tray: GetLayout reply hit the {MAX_MENU_NODES}-node cap; the rest of the menu was dropped");
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -144,6 +165,11 @@ mod tests {
     use zbus::zvariant::{Array, Dict, Signature, Str, StructureBuilder};
 
     use super::*;
+
+    /// Parses with the full node allowance, which is what every test but the cap's own wants.
+    fn parse(value: &Value<'_>, depth: u32) -> Option<MenuItem> {
+        parse_menu_node(value, depth, &mut { MAX_MENU_NODES })
+    }
 
     // ---- parse_menu_node ----
 
@@ -178,7 +204,7 @@ mod tests {
             vec![],
         );
 
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.id, 7);
         assert_eq!(item.menu_type, "standard");
         assert_eq!(item.label, Some("Quit".to_string()));
@@ -192,7 +218,7 @@ mod tests {
     #[test]
     fn parse_menu_node_defaults_type_to_standard_and_enabled_to_true_when_absent() {
         let value = menu_node_value(1, vec![], vec![]);
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.menu_type, "standard");
         assert!(item.enabled);
         assert_eq!(item.label, None);
@@ -201,14 +227,14 @@ mod tests {
     #[test]
     fn parse_menu_node_parses_a_separator() {
         let value = menu_node_value(2, vec![("type", Value::Str(Str::from("separator")))], vec![]);
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.menu_type, "separator");
     }
 
     #[test]
     fn parse_menu_node_respects_enabled_false() {
         let value = menu_node_value(3, vec![("enabled", Value::Bool(false))], vec![]);
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert!(!item.enabled);
     }
 
@@ -219,7 +245,7 @@ mod tests {
             vec![("toggle-type", Value::Str(Str::from("checkmark"))), ("toggle-state", Value::I32(1))],
             vec![],
         );
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.toggle_type, Some("checkmark".to_string()));
         assert_eq!(item.toggle_state, Some(1));
     }
@@ -227,7 +253,7 @@ mod tests {
     #[test]
     fn parse_menu_node_defaults_toggle_state_to_negative_one_when_toggle_type_present_but_state_absent() {
         let value = menu_node_value(5, vec![("toggle-type", Value::Str(Str::from("radio")))], vec![]);
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.toggle_type, Some("radio".to_string()));
         assert_eq!(item.toggle_state, Some(-1));
     }
@@ -235,7 +261,7 @@ mod tests {
     #[test]
     fn parse_menu_node_parses_icon_name() {
         let value = menu_node_value(6, vec![("icon-name", Value::Str(Str::from("edit-cut")))], vec![]);
-        let item = parse_menu_node(&value, 0).expect("must parse a well-formed node");
+        let item = parse(&value, 0).expect("must parse a well-formed node");
         assert_eq!(item.icon_name, Some("edit-cut".to_string()));
     }
 
@@ -245,7 +271,7 @@ mod tests {
         let child_b = menu_node_value(12, vec![("label", Value::Str(Str::from("Paste")))], vec![]);
         let root = menu_node_value(0, vec![], vec![child_a, child_b]);
 
-        let item = parse_menu_node(&root, 0).expect("must parse a well-formed node");
+        let item = parse(&root, 0).expect("must parse a well-formed node");
         assert_eq!(item.children.len(), 2);
         assert_eq!(item.children[0].id, 11);
         assert_eq!(item.children[0].label, Some("Copy".to_string()));
@@ -259,14 +285,14 @@ mod tests {
         let child = menu_node_value(11, vec![("label", Value::Str(Str::from("Submenu")))], vec![grandchild]);
         let root = menu_node_value(0, vec![], vec![child]);
 
-        let item = parse_menu_node(&root, 0).expect("must parse a well-formed node");
+        let item = parse(&root, 0).expect("must parse a well-formed node");
         assert_eq!(item.children[0].children[0].id, 21);
         assert_eq!(item.children[0].children[0].label, Some("Deep".to_string()));
     }
 
     #[test]
     fn parse_menu_node_rejects_a_non_structure_value() {
-        assert_eq!(parse_menu_node(&Value::I32(42), 0), None);
+        assert_eq!(parse(&Value::I32(42), 0), None);
     }
 
     #[test]
@@ -284,7 +310,7 @@ mod tests {
         let root = deep_chain(MAX_MENU_DEPTH + 20, 0);
 
         // Must complete without panic or stack overflow and return the truncated tree.
-        let item = parse_menu_node(&root, 0).expect("the root node itself must still parse");
+        let item = parse(&root, 0).expect("the root node itself must still parse");
 
         let mut current = &item;
         let mut depth = 0;
@@ -296,5 +322,57 @@ mod tests {
             depth, MAX_MENU_DEPTH,
             "parsing must truncate children exactly at the depth cap, not keep recursing into the deeper levels the raw tree actually has"
         );
+    }
+
+    /// Depth is not the only way a reply gets large, and breadth is the one an application reaches
+    /// for: these siblings all sit at depth 1.
+    #[test]
+    fn a_reply_wider_than_the_node_budget_is_truncated_rather_than_built() {
+        let children: Vec<Value<'_>> =
+            (0..MAX_MENU_NODES * 2).map(|id| menu_node_value(id as i32, Vec::new(), Vec::new())).collect();
+        let root = menu_node_value(0, Vec::new(), children);
+
+        let mut budget = MAX_MENU_NODES;
+        let parsed = parse_menu_node(&root, 0, &mut budget).expect("the root itself must still parse");
+
+        // The root spends one, so the survivors are the rest of the allowance.
+        assert_eq!(parsed.children.len(), MAX_MENU_NODES - 1);
+        assert_eq!(budget, 0, "the budget is what stopped it");
+    }
+
+    /// The budget spans the whole reply, not one node's children, so nesting cannot spend more than
+    /// breadth would.
+    #[test]
+    fn the_node_budget_is_shared_across_the_whole_tree_not_per_level() {
+        let mut node = menu_node_value(0, Vec::new(), Vec::new());
+        for id in 1..10 {
+            node = menu_node_value(id, Vec::new(), vec![node]);
+        }
+
+        let mut budget = 4;
+        parse_menu_node(&node, 0, &mut budget).expect("the root must parse");
+        assert_eq!(budget, 0, "ten nested nodes must not spend more than the four allowed");
+    }
+
+    /// DBusMenu bounds no property, and the application owns every one of them.
+    #[test]
+    fn an_over_long_label_is_capped_rather_than_carried() {
+        let long = "x".repeat(MAX_TRAY_TEXT_BYTES * 4);
+        let value = menu_node_value(
+            1,
+            vec![
+                ("label", Value::Str(Str::from(long.as_str()))),
+                ("type", Value::Str(Str::from(long.as_str()))),
+                ("icon-name", Value::Str(Str::from(long.as_str()))),
+                ("toggle-type", Value::Str(Str::from(long.as_str()))),
+            ],
+            Vec::new(),
+        );
+
+        let item = parse(&value, 0).expect("a well-formed node with long text still parses");
+        assert_eq!(item.label.as_deref().map(str::len), Some(MAX_TRAY_TEXT_BYTES));
+        assert_eq!(item.menu_type.len(), MAX_TRAY_TEXT_BYTES);
+        assert_eq!(item.icon_name.as_deref().map(str::len), Some(MAX_TRAY_TEXT_BYTES));
+        assert_eq!(item.toggle_type.as_deref().map(str::len), Some(MAX_TRAY_TEXT_BYTES));
     }
 }

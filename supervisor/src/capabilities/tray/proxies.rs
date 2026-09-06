@@ -180,7 +180,8 @@ mod tests {
         let root = RawMenuLayout { id: 0, properties, children: vec![OwnedValue::try_from(child_value).unwrap()] };
 
         let root_value = raw_menu_layout_to_value(root);
-        let item = parse_menu_node(&root_value, 0).expect("must parse a reconstructed layout");
+        let item = parse_menu_node(&root_value, 0, &mut { crate::capabilities::tray::MAX_MENU_NODES })
+            .expect("must parse a reconstructed layout");
 
         assert_eq!(item.id, 0);
         assert_eq!(item.label, Some("Quit".to_string()));

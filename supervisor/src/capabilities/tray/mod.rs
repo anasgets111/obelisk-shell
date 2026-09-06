@@ -26,6 +26,26 @@ const DEFAULT_ITEM_OBJECT_PATH: &str = "/StatusNotifierItem";
 /// Maximum accepted ARGB pixmap dimension (§2.1, ADR-0031).
 const MAX_PIXMAP_DIMENSION: i32 = 128;
 
+/// Cap on every string an item supplies: `Title`, `Id`, `Status`, both `ToolTip` halves, the three
+/// `IconName`s, and each DBusMenu node's `label`, `type`, `icon-name` and `toggle-type`.
+///
+/// SNI and DBusMenu bound none of these, and a tray item is any application on the session bus, so
+/// without a cap one `GetLayout` reply or one `Title` change sizes an allocation in a Supervisor
+/// that never restarts. `notifications` already caps all seven of its own client-supplied fields
+/// (`MAX_SUMMARY_BYTES` and neighbours); this is the same rule for the same reason, one number
+/// because tray strings are all short display text rather than seven distinct kinds.
+///
+/// Truncating rather than dropping is safe even for the identifiers: an `IconName` cut short names
+/// no icon and draws nothing, which is what dropping it would do anyway.
+const MAX_TRAY_TEXT_BYTES: usize = 256;
+
+/// Total [`menu::MenuItem`]s one `GetLayout` reply may produce.
+///
+/// `menu::MAX_MENU_DEPTH` bounds nesting but not breadth, so a single level of a million
+/// siblings is within it. Real menus hold tens of entries; a thousand is already far past any
+/// application's intent, and past it the reply is truncated rather than allocated.
+const MAX_MENU_NODES: usize = 1024;
+
 /// `IconPixmap`'s D-Bus wire shape (`a(iiay)`): width, height, raw ARGB32 bytes.
 type RawIconPixmap = (i32, i32, Vec<u8>);
 /// `ToolTip`'s D-Bus wire shape (`(sa(iiay)ss)`): icon name, icon pixmaps, title, text.
