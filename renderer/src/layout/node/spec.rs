@@ -109,6 +109,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     };
     let mut children = Vec::new();
     for entry in table.sequence_values::<mlua::Table>() {
+        if children.len() == MAX_ARRAY_ELEMENTS {
+            return Err(invalid("children", format!("more than {MAX_ARRAY_ELEMENTS} children in one node")));
+        }
         let entry = entry.map_err(|e| invalid("children", e.to_string()))?;
         let node = deserialize_lua_table(&entry).map_err(|e| invalid("children", e.to_string()))?;
         children.push(node);
@@ -147,6 +150,9 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
     let mut children = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
     for element in source.sequence_values::<Value>() {
+        if children.len() == MAX_ARRAY_ELEMENTS {
+            return Err(invalid("source", format!("more than {MAX_ARRAY_ELEMENTS} items in one list")));
+        }
         let element = element.map_err(|e| invalid("source", e.to_string()))?;
 
         let built = itemfn.call::<Value>(element.clone()).map_err(|e| invalid("itemfn", e.to_string()))?;
@@ -466,5 +472,41 @@ mod tests {
         assert_eq!(spec.declared_id(), "screen-lock");
         assert_eq!(spec.fingerprint(), SurfaceFingerprint::Lock("screen-lock".to_string()));
         assert_ne!(spec.fingerprint(), SurfaceFingerprint::Window("screen-lock".to_string()));
+    }
+
+    /// Depth was capped and breadth was not, and the pass budget cannot cover the gap: filling this
+    /// array is a Rust loop with no Lua in it, so the deadline hook never runs.
+    #[test]
+    fn a_children_array_wider_than_the_cap_is_a_config_error_rather_than_an_allocation() {
+        let lua = mlua::Lua::new();
+        crate::lua::nodes::register_node_constructors(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"
+                local kids = {}
+                for i = 1, 10001 do kids[i] = rect { width = 1, height = 1 } end
+                return kids
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let mut properties = HashMap::new();
+        properties.insert("children".to_string(), Value::Table(table));
+
+        let err = parse_children(&properties).expect_err("past the cap this must be refused");
+        assert!(format!("{err:?}").contains("more than"), "the error has to say what to fix: {err:?}");
+    }
+
+    /// The cap must not be in the way of anything a real config builds.
+    #[test]
+    fn an_ordinary_children_array_is_unaffected() {
+        let lua = mlua::Lua::new();
+        crate::lua::nodes::register_node_constructors(&lua).unwrap();
+        let table: mlua::Table =
+            lua.load(r#"return { rect { width = 1, height = 1 }, rect { width = 2, height = 2 } }"#).eval().unwrap();
+        let mut properties = HashMap::new();
+        properties.insert("children".to_string(), Value::Table(table));
+
+        assert_eq!(parse_children(&properties).unwrap().len(), 2);
     }
 }

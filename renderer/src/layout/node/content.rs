@@ -85,6 +85,9 @@ fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError
     let mut content = String::new();
     let mut styles = Vec::new();
     for (position, run) in runs.clone().sequence_values::<Value>().enumerate() {
+        if styles.len() == MAX_ARRAY_ELEMENTS {
+            return Err(invalid("content", format!("more than {MAX_ARRAY_ELEMENTS} runs in one text node")));
+        }
         let index = position + 1;
         let run = run.map_err(|e| invalid("content", format!("run {index}: {e}")))?;
         let Value::Table(run) = run else {

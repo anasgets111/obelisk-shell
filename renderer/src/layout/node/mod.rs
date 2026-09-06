@@ -124,6 +124,19 @@ pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError 
     LayoutError::InvalidProperty { property: property.to_string(), detail: detail.into() }
 }
 
+/// Elements accepted from one config-supplied array: a node's `children`, a `list`'s `source`, and
+/// a `text`'s style runs.
+///
+/// `scene::MAX_TREE_DEPTH` bounds depth; this bounds width, which nothing else does. The layout
+/// pass budget does not cover it: that deadline is enforced through a Lua hook, and filling a
+/// `children` array is a Rust loop with no Lua in it, so it never fires. Reachable without malice
+/// -- a generator that does not terminate, or a `list` over a longer array than anyone expected.
+///
+/// ponytail: this bounds one node's fan-out, not the whole tree, so depth 64 times this is still
+/// far more nodes than any real config builds. A total per-pass node budget is the upgrade, and is
+/// what `capabilities::tray`'s `MAX_MENU_NODES` does for the one tree that already needed it.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 10_000;
+
 /// Maximum rejected-value preview, separate from `marshal::MAX_STRING_BYTES`: 200 bytes bounds a
 /// `rescue` `error_log` line (§ 2.10) without limiting valid string properties.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
