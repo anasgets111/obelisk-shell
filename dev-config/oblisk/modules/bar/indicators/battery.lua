@@ -13,6 +13,7 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local tooltip = require("components.tooltip")
 
 local SLOT = "battery"
@@ -77,7 +78,7 @@ local readout = row {
     align_v = "Center",
     spacing = theme.spacing.xs,
     children = {
-        cell(oblisk.battery:map(battery_glyph), READOUT, theme.icon.md, { align_v = "Center" }),
+        glyph(oblisk.battery:map(battery_glyph), READOUT, theme.icon.md, { align_v = "Center" }),
         cell(util.label(oblisk.battery, function(b)
             if not b.present then
                 return "ac"

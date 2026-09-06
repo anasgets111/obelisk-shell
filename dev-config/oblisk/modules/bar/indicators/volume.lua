@@ -13,6 +13,7 @@ local theme = require("config.theme")
 local util = require("lib.util")
 local ui_state = require("lib.ui_state")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local slider = require("components.slider")
 
 local SLOT = "volume"
@@ -92,7 +93,7 @@ return slider {
         align_v = "Center",
         spacing = theme.spacing.xs,
         children = {
-            cell(oblisk.audio:map(util.volume_glyph), foreground_past(0.25), theme.icon.lg, { align_v = "Center" }),
+            glyph(oblisk.audio:map(util.volume_glyph), foreground_past(0.25), theme.icon.lg, { align_v = "Center" }),
             -- A hidden percentage costs no width or spacing: `layout::scene` sums visible child
             -- footprints and multiplies spacing by their count.
             cell(util.label(oblisk.audio, function(a)

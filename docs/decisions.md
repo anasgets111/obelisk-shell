@@ -2475,3 +2475,47 @@ ordinary ownership drops unmatched nodes while the independent rollback snapshot
 working scene through admission and budget checks. Supersedes the lease clauses of ADR-0023,
 ADR-0045, ADR-0077 and ADR-0130; keep node identity and design deferred retention only when an
 actual animation or resource owner needs it.
+
+## 0144. A `text` node names its own font family, because per-glyph fallback cannot choose between two families that both have the glyph
+
+`fonts { ... }` is one ordered chain and the codepoint picks the face, which is the right model
+until two installed families carry the same codepoint and draw it differently. A Nerd-Font-patched
+body family is exactly that case: `CaskaydiaCove Nerd Font Propo` and `JetBrainsMono Nerd Font Mono`
+both cover the private-use icon block, the body family wins fallback every time because it leads the
+chain, and its `Propo` icons sit proportionally spaced and fill most of the em where the `Mono` ones
+fit one cell. At the same `theme.icon.*` size those are visibly different icons and no chain ordering
+reaches the second one.
+
+Add `font = "<family>"` to `text`. The family leads, and the declared chain stays behind it, so CJK
+and emoji still resolve under a node that named a display face. `fonts { ... }` keeps its job as the
+default and as everyone's fallback tail.
+
+A family name rather than a fixed set of roles. An earlier draft of this decision added a second
+declared chain and a `font = "Body" | "Icon"` enum, mirroring the reference QML shell's
+`Theme.fontFamily` / `Theme.iconFontFamily` pair. That is the same mechanism with the general case
+nailed shut: a config wanting a heading face or a monospaced readout would need a third chain and a
+third enum variant, each one more IDL. Naming the family costs no more and the icon case falls out
+of it -- the config keeps the pair as `theme.icon_font`, which is where it belonged.
+
+Resolution is lazy and happens once, on the shaping worker, through the same `fc-match` path
+`fonts { ... }` already uses, into the same `fontdb::Database`. That is what keeps this from being
+the second independent font discovery ADR-0043 decision 2 closed: there is still one resolver, and
+paint consumes exactly the face list it produces. The worker bumps a generation counter when the
+loaded set changes and `wayland::surface` re-registers the new faces with femtovg before drawing the
+list that names them -- one atomic load per frame, and an actual sync only on the few frames where a
+family first appears. Both outcomes are memoized, so a family nothing on the system answers costs one
+`fc-match` rather than one per measurement.
+
+The family is part of the measurement cache key, because a box measured in one family is not usable
+by another.
+
+The name is not validated at parse time. Parsing sees the property, not the loaded font set, and the
+set is not fixed at parse time. An unresolvable family draws in the declared chain and says so once
+on stderr -- the bargain `fonts { ... }` already makes for an entry nothing answers, and the engine
+cannot tell a typo from an uninstalled font anyway. An empty string is refused, since that would read
+as "no family named" with nothing to point at.
+
+A named family is never coverage for the declared chain, though the declared family is coverage for
+every named one. Plain text must not drift into whichever family some unrelated node happened to
+name; a node that named a display font and then drew prose in it should still get glyphs that font
+lacks.

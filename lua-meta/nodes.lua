@@ -95,6 +95,7 @@
 ---@class TextProps: NodeBase
 ---@field content? string|TextRun[]|Bound One string, or an array of runs whose texts are joined and drawn in one paragraph, wrapping and eliding together (ADR-0104). Default `""`, so a text bound to a capability renders empty until the first push rather than failing at boot.
 ---@field font_size? integer|Bound Default `12`.
+---@field font? string|Bound Font family for this node, e.g. `"JetBrainsMono Nerd Font Mono"` (ADR-0144). Absent draws in the `fonts` chain, which is most nodes. The family leads and that chain stays behind it, so CJK and emoji still resolve. Resolved on first sight through fontconfig, exactly as a `fonts` entry is; a family nothing on the system answers draws in the declared chain and says so once on stderr, since the engine cannot tell a typo from an uninstalled font.
 ---@field foreground? Color|Bound Default opaque white.
 ---@field elide? "None"|"End"|Bound `"End"` drops trailing characters until the run plus an ellipsis fits. A no-op on a `Content`-sized box, which was measured from this same string. Default `"None"`. Under `wrap = "Word"` it applies to the last line kept rather than to the whole run.
 ---@field wrap? "None"|"Word"|Bound `"Word"` breaks an over-wide run onto further lines, at a word boundary where there is one and mid-word for a word wider than the box. Default `"None"`, one line however long. A `Content`-sized box has no width to break against, so wrapping needs an explicit `width`, a `"Fill"`, or a stretched cross axis.

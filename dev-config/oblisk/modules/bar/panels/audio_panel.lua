@@ -12,6 +12,7 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local icon_button = require("components.icon_button")
 local panel_action_icon = require("components.panel_action_icon")
 local panel_header = require("components.panel_header")
@@ -89,7 +90,7 @@ local function audio_control(opts)
     local is_muted = oblisk.audio:map(function(a)
         return a ~= nil and opts.muted(a)
     end)
-    local glyph = is_muted:map(function(m)
+    local mute_glyph = is_muted:map(function(m)
         return m and opts.glyph_off or opts.glyph_on
     end)
     local tint = is_muted:map(function(m)
@@ -102,7 +103,7 @@ local function audio_control(opts)
             spacing = theme.spacing.sm,
             align_v = "Center",
             children = {
-                cell(glyph, tint, theme.icon.lg, { align_v = "Center" }),
+                glyph(mute_glyph, tint, theme.icon.lg, { align_v = "Center" }),
                 column {
                     width = "Fill",
                     align_v = "Center",
@@ -116,7 +117,7 @@ local function audio_control(opts)
                 cell(util.label(oblisk.audio, function(a)
                     return percent(opts.volume(a))
                 end), tint, theme.font.sm, { align_v = "Center" }),
-                icon_button(glyph, function()
+                icon_button(mute_glyph, function()
                     oblisk.audio:invoke(opts.toggle_mute)
                 end, {
                     slot = "audio-mute-" .. opts.name,
@@ -189,7 +190,7 @@ local function device_picker(opts)
                         icon = device_glyph(device, opts.default_glyph),
                         title = device_name(device) or "?",
                         selected = device.active,
-                        trailing = cell(icons.check, device.active and theme.ACCENT or "#00000000", theme.font.sm),
+                        trailing = glyph(icons.check, device.active and theme.ACCENT or "#00000000", theme.font.sm),
                         on_activate = function()
                             oblisk.audio:invoke(opts.set_default, device.id)
                             opts.open:set(false)
@@ -210,7 +211,7 @@ local function stream_row(app)
     local name = app.name or app.process_name or "unknown"
     local entry = util.app_entry(oblisk.applications:get(), app.process_name or app.name)
     local leading = entry and entry.icon and icon { name = entry.icon, size = theme.icon.md, align_v = "Center" }
-        or cell(icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
+        or glyph(icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
     local tint = app.muted and theme.TEXT_OFF or theme.ACCENT
     return column {
         width = "Fill",

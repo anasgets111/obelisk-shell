@@ -35,6 +35,10 @@ pub const DEFAULT_CHAIN: &[&str] = &["sans-serif", "Noto Sans CJK JP", "Noto Col
 pub struct ResolvedFonts {
     pub db: Database,
     pub primary_family: String,
+    /// Every file already in `db`, so a family loaded later by [`load_family`] can tell a new file
+    /// from one the declared chain already mapped (ADR-0144). Carried out of resolution rather
+    /// than rebuilt from `db.faces()`, which would have to re-derive it on every runtime load.
+    pub loaded_paths: HashSet<PathBuf>,
 }
 
 /// Resolves `chain` in order and loads every entry that hits into one `Database`.
@@ -47,8 +51,37 @@ pub struct ResolvedFonts {
 /// user diagnoses "why is my bar drawing in the wrong font" without reaching for a debugger.
 pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
     let mut db = Database::new();
-    let mut primary_family: Option<String> = None;
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
+    match load_chain(&mut db, chain, &mut loaded_paths, true) {
+        Some(primary_family) => ResolvedFonts { db, primary_family, loaded_paths },
+        None => system_fallback(chain),
+    }
+}
+
+/// Loads one family a node named by hand into an already-built database, and returns the family
+/// name shaping should ask cosmic-text for (ADR-0144).
+///
+/// The counterpart to `resolve_chain` for `text { font = "..." }`: same `fc_match`, same
+/// hit-versus-substitution check, same bold/italic variant load, into the database the declared
+/// chain already filled. Reusing that one database is what keeps the declared chain's CJK and
+/// emoji faces working as fallback behind a named family, and what keeps this from being a second
+/// independent font discovery -- the divergence ADR-0043 decision 2 closed.
+///
+/// `None` for a family nothing on the system answers. The caller draws in the declared chain and
+/// says so once; a missing font is a diagnostic, not a dead node.
+pub fn load_family(db: &mut Database, name: &str, loaded_paths: &mut HashSet<PathBuf>) -> Option<String> {
+    load_chain(db, &[name], loaded_paths, true)
+}
+
+/// Loads every entry of one chain into `db` and returns the first that hit, which is that chain's
+/// primary family. `with_variants` asks for the primary's bold, italic and bold-italic files too.
+fn load_chain(
+    db: &mut Database,
+    chain: &[&str],
+    loaded_paths: &mut HashSet<PathBuf>,
+    with_variants: bool,
+) -> Option<String> {
+    let mut primary_family: Option<String> = None;
 
     for &name in chain {
         let Some((path, resolved_family)) = fc_match(name) else {
@@ -72,15 +105,14 @@ pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
         }
 
         if primary_family.is_none() {
-            load_variants(&mut db, name, &resolved_family, &mut loaded_paths);
+            if with_variants {
+                load_variants(db, name, &resolved_family, loaded_paths);
+            }
             primary_family = Some(resolved_family);
         }
     }
 
-    match primary_family {
-        Some(primary_family) => ResolvedFonts { db, primary_family },
-        None => system_fallback(chain),
-    }
+    primary_family
 }
 
 /// Loads the primary family's bold, italic and bold-italic files, when fontconfig has them, so a
@@ -136,7 +168,9 @@ fn system_fallback(chain: &[&str]) -> ResolvedFonts {
         .expect("fontdb has no loaded faces at all, system fallback exhausted");
     let primary_family =
         db.face(id).expect("queried id must be in the database that produced it").families[0].0.clone();
-    ResolvedFonts { db, primary_family }
+    // Every face in the database came from the scan rather than a named file, so nothing here has
+    // a path a later `load_family` could collide with.
+    ResolvedFonts { db, primary_family, loaded_paths: HashSet::new() }
 }
 
 /// Runs `fc-match` for `name` and returns the file it resolved to plus the family fontconfig
@@ -239,6 +273,65 @@ mod tests {
         let resolved = resolve_chain(&["ZZ No Such Family 9184", TEST_FAMILY]);
         assert_eq!(resolved.primary_family, TEST_FAMILY);
         assert!(!resolved.db.is_empty(), "the real hit's own face should have loaded");
+    }
+
+    /// The point of naming a family on a node: it lands in the database the declared chain already
+    /// filled, so the chain's own faces stay available as fallback behind it.
+    #[test]
+    fn a_named_family_loads_into_the_chains_own_database() {
+        if !fc_match_available() {
+            eprintln!("fc-match not available, skip");
+            return;
+        }
+        let named = ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]
+            .into_iter()
+            .find(|family| family_installed(family) && *family != TEST_FAMILY);
+        let (Some(named), true) = (named, family_installed(TEST_FAMILY)) else {
+            eprintln!("no two distinct families installed to tell apart, skip");
+            return;
+        };
+        let mut resolved = resolve_chain(&[TEST_FAMILY]);
+        let before = resolved.db.faces().count();
+
+        let hit = load_family(&mut resolved.db, named, &mut resolved.loaded_paths);
+        assert_eq!(hit.as_deref(), Some(named), "the named family resolves to itself, not a substitute");
+        assert!(resolved.db.faces().count() > before, "its faces joined the same database");
+        for family in [TEST_FAMILY, named] {
+            assert!(
+                resolved.db.faces().any(|face| face.families.iter().any(|(name, _)| name == family)),
+                "{family:?} should be loaded alongside the other"
+            );
+        }
+    }
+
+    /// A family nothing on the system answers is a diagnostic, not a failure: the node draws in the
+    /// declared chain, so the database must come back untouched rather than half-loaded.
+    #[test]
+    fn a_named_family_nothing_answers_leaves_the_database_alone() {
+        if !fc_match_available() || !family_installed(TEST_FAMILY) {
+            eprintln!("fc-match or {TEST_FAMILY:?} not available, skip");
+            return;
+        }
+        let mut resolved = resolve_chain(&[TEST_FAMILY]);
+        let before = resolved.db.faces().count();
+        assert_eq!(load_family(&mut resolved.db, "ZZ No Such Family 9184", &mut resolved.loaded_paths), None);
+        assert_eq!(resolved.db.faces().count(), before);
+    }
+
+    /// Naming a family the chain already loaded must not map its file a second time.
+    #[test]
+    fn naming_a_family_the_chain_already_loaded_reuses_its_file() {
+        if !fc_match_available() || !family_installed(TEST_FAMILY) {
+            eprintln!("fc-match or {TEST_FAMILY:?} not available, skip");
+            return;
+        }
+        let mut resolved = resolve_chain(&[TEST_FAMILY]);
+        let before = resolved.db.faces().count();
+        assert_eq!(
+            load_family(&mut resolved.db, TEST_FAMILY, &mut resolved.loaded_paths).as_deref(),
+            Some(TEST_FAMILY)
+        );
+        assert_eq!(resolved.db.faces().count(), before, "the same file must not load twice");
     }
 
     #[test]

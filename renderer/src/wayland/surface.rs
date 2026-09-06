@@ -682,11 +682,13 @@ impl App {
 
         if self.text_painter.is_none() {
             let font_chain = self.shaping.font_chain_data();
+            let generation = self.shaping.font_generation();
             match TextPainter::new(
                 |s| egl.instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
                 width,
                 height,
                 &font_chain,
+                generation,
             ) {
                 Ok(painter) => self.text_painter = Some(painter),
                 Err(e) => {
@@ -699,6 +701,14 @@ impl App {
 
         if let Some(painter) = self.text_painter.as_mut() {
             painter.resize(width, height);
+            // A family a node named for the first time was resolved on the shaping worker while
+            // this list was being measured; femtovg has to be given those faces before the list
+            // that names them is drawn (ADR-0144). One atomic load on the frames where nothing
+            // changed, which is all of them after startup.
+            let generation = self.shaping.font_generation();
+            if generation != painter.font_generation() {
+                painter.sync(&self.shaping.font_chain_data(), generation);
+            }
             layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
         }
 

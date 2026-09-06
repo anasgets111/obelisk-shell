@@ -558,7 +558,16 @@ fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Optio
 /// can return [`LayoutError`]; the measure callback returns only `Size<f32>`.
 enum Measure {
     /// Shaped extent; `wrap` and `max_lines` change geometry, not only paint.
-    Text { content: String, runs: Vec<StyleRun>, font_size: f32, wrap: node::Wrap, max_lines: Option<usize> },
+    Text {
+        content: String,
+        runs: Vec<StyleRun>,
+        font_size: f32,
+        /// The family the box is measured against, so the reserved width is the one the same
+        /// family will paint into (ADR-0144).
+        font: Option<std::sync::Arc<str>>,
+        wrap: node::Wrap,
+        max_lines: Option<usize>,
+    },
     /// § 5.1's `icon` `size`, the same number on both axes.
     Square(f32),
 }
@@ -806,13 +815,14 @@ fn prepare(
         // another kind here, so the arm is total, the same shape as `children_of`'s
         // `unreachable!`.
         "text" => {
-            let Some(PaintStyle::Text { content, runs, font_size, wrap, max_lines, .. }) = paint.as_ref() else {
+            let Some(PaintStyle::Text { content, runs, font_size, font, wrap, max_lines, .. }) = paint.as_ref() else {
                 unreachable!("a `text` node always carries a `PaintStyle::Text`")
             };
             Some(Measure::Text {
                 content: content.clone(),
                 runs: runs.clone(),
                 font_size: *font_size,
+                font: font.clone(),
                 wrap: *wrap,
                 max_lines: *max_lines,
             })
@@ -1036,7 +1046,7 @@ fn solve(
                 };
                 match measure {
                     Measure::Square(size) => taffy::Size { width: *size, height: *size },
-                    Measure::Text { content, runs, font_size, wrap, max_lines } => {
+                    Measure::Text { content, runs, font_size, font, wrap, max_lines } => {
                         // The wrap boundary: the width this box is already known to have, or the
                         // width on offer when it is not. `MaxContent`/`MinContent` mean taffy is
                         // asking what the string wants rather than offering it a box, and an
@@ -1060,6 +1070,7 @@ fn solve(
                             line_height,
                             max_width,
                             runs: node::font_runs(runs),
+                            font: font.clone(),
                         });
                         let lines = max_lines.map_or(shaped.lines.len(), |cap| shaped.lines.len().min(cap));
                         taffy::Size { width: shaped.width, height: lines as f32 * line_height }
@@ -1185,21 +1196,30 @@ fn scroll_offset(properties: &HashMap<String, Value>, content_main: f32, total_m
 /// design. Does nothing for a run that neither wraps nor elides, and nothing on a `Content`-sized
 /// node under `elide` alone, whose box came from measuring this same string and so always fits it.
 fn fit_text_to_box(paint: &mut Option<PaintStyle>, content_width: f32, shaping: &ShapingHandle) {
-    let Some(PaintStyle::Text { content, runs, font_size, elide, wrap, max_lines, .. }) = paint.as_mut() else {
+    let Some(PaintStyle::Text { content, runs, font_size, font, elide, wrap, max_lines, .. }) = paint.as_mut() else {
         return;
     };
+    // Before the early returns below, and before any measurement: taffy's `compute_leaf_layout`
+    // returns early when a node's width and height are both known, so a fully-sized `text` is never
+    // handed to the measure callback, and without `elide` or `wrap` it never reaches the shaping
+    // below either. Nothing would then load its family, and it would paint in the declared chain
+    // (ADR-0144).
+    if let Some(family) = font.as_ref() {
+        shaping.ensure_family(family);
+    }
     if content.is_empty() || content_width <= 0.0 {
         return;
     }
+    let face = Face { size: *font_size, family: font.clone() };
     // The output is taken off the builder before the borrow of `content` ends, which is what lets
     // the same two fields be overwritten below.
     let fitted: Option<(String, Vec<StyleRun>)> = match wrap {
         // The measured-width check is the fast path, not politeness: most strings fit, and
         // skipping the binary search below is the difference on a list of them.
         node::Wrap::None => {
-            if *elide == node::Elide::End && measured_width(content, runs, *font_size, shaping) > content_width {
+            if *elide == node::Elide::End && measured_width(content, runs, &face, shaping) > content_width {
                 let mut fitted = Fitted::new(content, runs);
-                let cut = elide_cut(content, runs, 0..content.len(), *font_size, content_width, shaping);
+                let cut = elide_cut(content, runs, 0..content.len(), &face, content_width, shaping);
                 fitted.push_source(0..cut);
                 fitted.push_ellipsis(cut);
                 Some((fitted.text, fitted.runs))
@@ -1208,7 +1228,7 @@ fn fit_text_to_box(paint: &mut Option<PaintStyle>, content_width: f32, shaping: 
             }
         }
         node::Wrap::Word => {
-            let fitted = wrapped_to_fit(content, runs, *font_size, *elide, *max_lines, content_width, shaping);
+            let fitted = wrapped_to_fit(content, runs, &face, *elide, *max_lines, content_width, shaping);
             Some((fitted.text, fitted.runs))
         }
     };
@@ -1295,7 +1315,7 @@ impl<'s> Fitted<'s> {
 fn wrapped_to_fit<'s>(
     content: &'s str,
     runs: &'s [StyleRun],
-    font_size: f32,
+    face: &Face,
     elide: node::Elide,
     max_lines: Option<usize>,
     content_width: f32,
@@ -1303,10 +1323,11 @@ fn wrapped_to_fit<'s>(
 ) -> Fitted<'s> {
     let shaped = shaping.shape(ShapeRequest {
         text: content.to_string(),
-        font_size,
-        line_height: shaping::line_height(font_size),
+        font_size: face.size,
+        line_height: shaping::line_height(face.size),
         max_width: Some(content_width),
         runs: node::font_runs(runs),
+        font: face.family.clone(),
     });
     let mut fitted = Fitted::new(content, runs);
     let Some(cap) = max_lines.filter(|cap| *cap < shaped.line_ranges.len()) else {
@@ -1328,7 +1349,7 @@ fn wrapped_to_fit<'s>(
     let last = &shaped.line_ranges[cap - 1];
     if elide == node::Elide::End {
         let rest = last.start..shaped.line_ranges.last().map_or(last.end, |range| range.end);
-        let cut = elide_cut(content, runs, rest.clone(), font_size, content_width, shaping);
+        let cut = elide_cut(content, runs, rest.clone(), face, content_width, shaping);
         fitted.push_source_flattened(rest.start..cut, true);
         fitted.push_ellipsis(cut);
     } else {
@@ -1337,15 +1358,25 @@ fn wrapped_to_fit<'s>(
     fitted
 }
 
+/// What a string is measured in: how big, and in which family (ADR-0144). The two travel together
+/// through every fitting helper, and a measurement taken under one pair says nothing about the
+/// other.
+#[derive(Clone)]
+struct Face {
+    size: f32,
+    family: Option<std::sync::Arc<str>>,
+}
+
 /// One string's unconstrained width, the question `elide` is a search over.
-fn measured_width(text: &str, runs: &[StyleRun], font_size: f32, shaping: &ShapingHandle) -> f32 {
+fn measured_width(text: &str, runs: &[StyleRun], face: &Face, shaping: &ShapingHandle) -> f32 {
     shaping
         .shape(ShapeRequest {
             text: text.to_string(),
-            font_size,
-            line_height: shaping::line_height(font_size),
+            font_size: face.size,
+            line_height: shaping::line_height(face.size),
             max_width: None,
             runs: node::font_runs(runs),
+            font: face.family.clone(),
         })
         .width
 }
@@ -1367,7 +1398,7 @@ fn elide_cut(
     text: &str,
     runs: &[StyleRun],
     region: Range<usize>,
-    font_size: f32,
+    face: &Face,
     width: f32,
     shaping: &ShapingHandle,
 ) -> usize {
@@ -1383,7 +1414,7 @@ fn elide_cut(
         let mut candidate = Fitted::new(text, runs);
         candidate.push_source_flattened(region.start..cut, true);
         candidate.push_ellipsis(cut);
-        measured_width(&candidate.text, &candidate.runs, font_size, shaping) <= width
+        measured_width(&candidate.text, &candidate.runs, face, shaping) <= width
     };
     // Largest index whose prefix plus an ellipsis fits; zero is always admissible.
     let (mut low, mut high) = (0usize, cuts.len() - 1);

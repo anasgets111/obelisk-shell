@@ -11,9 +11,11 @@
 //! missed that alias, falling back to the first face in scan order and measuring a `text` node's
 //! box roughly 30% narrower than the glyphs painted into it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
@@ -44,6 +46,10 @@ pub struct ShapeRequest {
     /// character boundaries -- `layout` builds them that way. Empty for plain text, which is every
     /// request but a notification body's.
     pub runs: Vec<FontRun>,
+    /// The family this node named, exactly as the config wrote it (ADR-0144). `None` is the
+    /// declared chain, which is every node that says nothing. A measurement is only usable by the
+    /// paint that draws the same family, which is why this is part of the cache key too.
+    pub font: Option<Arc<str>>,
 }
 
 /// The measured result of shaping a request: its tight bounding box in logical pixels, plus the
@@ -92,18 +98,44 @@ pub fn line_height(font_size: f32) -> f32 {
 #[derive(Clone)]
 pub struct FontData(std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
 
+/// What job one loaded face does, which is what tells the painter which chain to put it in
+/// (ADR-0104, ADR-0144).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FaceRole {
+    /// The declared chain's own family: regular, and whichever of bold, italic and bold italic
+    /// `fonts::resolve_chain` found. The painter picks among them per styled run.
+    Declared,
+    /// Leads the chain for nodes that named this family by hand, under the name they wrote rather
+    /// than the one fontconfig resolved -- the painter keys on what the node asked for.
+    Named(Arc<str>),
+    /// Coverage for codepoints no leading family carries. Leads no chain and takes part in every
+    /// one of them unchanged.
+    Fallback,
+}
+
 /// One face femtovg should load: its file's shared bytes, which face of the file, and what job it
-/// does in the chain (ADR-0104). `primary` faces are the declared family's own -- regular, and
-/// whichever of bold, italic and bold italic `fonts::resolve_chain` found -- and the painter picks
-/// among them per styled run; every other face is fallback coverage and takes part in every
-/// variant's chain unchanged.
+/// does (ADR-0104, ADR-0144).
 #[derive(Clone)]
 pub struct FontFace {
     pub data: FontData,
     pub index: u32,
-    pub primary: bool,
+    pub role: FaceRole,
     pub bold: bool,
     pub italic: bool,
+}
+
+impl FontData {
+    /// The address of the shared mapping behind this face, which identifies it across rebuilds of
+    /// the chain list. `fontdb::Database::make_shared_face_data` hands back the *same* `Arc` for a
+    /// face it has already shared (its `Source::SharedFile` arm is a `data.clone()`), so two
+    /// `FontFace`s built from one file in two `font_chain_data` calls compare equal here.
+    ///
+    /// What `text::atlas` keys its femtovg registrations on: femtovg's `add_shared_font_with_index`
+    /// mints a fresh `FontId` on every call and never dedups by bytes, so re-registering a face it
+    /// already holds parses the file again and leaks the old entry (ADR-0144).
+    pub fn addr(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as *const () as usize
+    }
 }
 
 impl AsRef<[u8]> for FontData {
@@ -119,6 +151,12 @@ enum Request {
     /// (ADR-0043 decision 2). Replies once the new `FontSystem` is live, so the next
     /// `font_chain_data` call answers with the new faces.
     SetChain(Vec<String>, mpsc::Sender<()>),
+    /// Resolve a family without measuring anything (ADR-0144). A `text` node with an explicit
+    /// width *and* height is never handed to taffy's measure callback (`compute_leaf_layout`
+    /// returns early when both are known) and, without `elide` or `wrap`, never reaches
+    /// `fit_text_to_box`'s shaping either -- so nothing would ever resolve its family and it would
+    /// paint in the declared chain.
+    EnsureFamily(Arc<str>, mpsc::Sender<()>),
     // Test-only (`#[cfg(test)]`, not `#[allow(dead_code)]`): nothing outside a test binary sends
     // this. `fonts::resolve_chain`'s own `eprintln!` is the production diagnostic.
     #[cfg(test)]
@@ -156,6 +194,7 @@ struct ShapeKey {
     line_height: u32,
     max_width: Option<u32>,
     runs: Vec<FontRun>,
+    font: Option<Arc<str>>,
 }
 
 /// A handle to a dedicated shaping worker thread and its warm font cache. `Clone` clones only the
@@ -169,6 +208,12 @@ struct ShapeKey {
 pub struct ShapingHandle {
     requests: mpsc::Sender<Request>,
     cache: Arc<Mutex<HashMap<ShapeKey, ShapeResult>>>,
+    /// See [`ShapingHandle::font_generation`].
+    generation: Arc<AtomicU64>,
+    /// Families [`ShapingHandle::ensure_family`] has already asked the worker about, so the common
+    /// case costs a hash lookup instead of a channel round trip. Mirrors the worker's own memo
+    /// rather than replacing it: the worker still has to answer a family this side never saw.
+    ensured: Arc<Mutex<HashSet<Arc<str>>>>,
 }
 
 impl ShapingHandle {
@@ -176,43 +221,49 @@ impl ShapingHandle {
     /// rather than moved into it, so this doesn't require `FontSystem: Send`.
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel::<Request>();
+        // Bumped by the worker whenever the loaded face set changes, read by the painter to know
+        // its femtovg font registry is stale (ADR-0144). An atomic rather than another request:
+        // paint asks once a frame and must not pay a channel round trip to hear "nothing changed".
+        let generation = Arc::new(AtomicU64::new(0));
+        let handle_generation = Arc::clone(&generation);
         thread::Builder::new()
             .name("oblisk-text-shaping".into())
             .spawn(move || {
-                let ResolvedFonts { mut db, mut primary_family } = fonts::resolve_chain(fonts::DEFAULT_CHAIN);
-                // Mapped once, before the `Database` reaches cosmic-text, so the mappings stay
-                // *in* the database instead of being mapped twice.
-                let mut chain_data = font_chain_data(&mut db, &primary_family);
-                let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
+                let mut fonts = WorkerFonts::new(fonts::DEFAULT_CHAIN);
                 while let Ok(request) = rx.recv() {
                     match request {
                         Request::Shape(req, reply) => {
+                            let family = fonts.family_for(req.font.as_ref(), &generation);
                             // A dropped receiver just means the result is discarded.
-                            let _ = reply.send(shape(&mut font_system, &primary_family, &req));
+                            let _ = reply.send(shape(&mut fonts.font_system, &family, &req));
+                        }
+                        Request::EnsureFamily(asked, reply) => {
+                            fonts.family_for(Some(&asked), &generation);
+                            let _ = reply.send(());
                         }
                         Request::FontChainData(reply) => {
-                            let _ = reply.send(chain_data.clone());
+                            let _ = reply.send(fonts.chain_data.clone());
                         }
                         Request::SetChain(chain, reply) => {
-                            // Rebuilt rather than respawned: a new worker would drop the mapped
-                            // faces the caller's cache clear already accounts for.
                             let borrowed: Vec<&str> = chain.iter().map(String::as_str).collect();
-                            let ResolvedFonts { db: mut new_db, primary_family: new_primary } =
-                                fonts::resolve_chain(&borrowed);
-                            chain_data = font_chain_data(&mut new_db, &new_primary);
-                            font_system = FontSystem::new_with_locale_and_db(detect_locale(), new_db);
-                            primary_family = new_primary;
+                            fonts = WorkerFonts::new(&borrowed);
+                            generation.fetch_add(1, Ordering::Release);
                             let _ = reply.send(());
                         }
                         #[cfg(test)]
                         Request::ResolvedPrimaryFamily(reply) => {
-                            let _ = reply.send(primary_family.clone());
+                            let _ = reply.send(fonts.primary_family.clone());
                         }
                     }
                 }
             })
             .expect("failed to spawn oblisk-text-shaping thread");
-        Self { requests: tx, cache: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            requests: tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            generation: handle_generation,
+            ensured: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     /// Measures `request`, from [`SHAPE_CACHE_CAPACITY`]'s memo when asked before and from the
@@ -236,6 +287,7 @@ impl ShapingHandle {
             line_height: request.line_height.to_bits(),
             max_width: request.max_width.map(f32::to_bits),
             runs: request.runs,
+            font: request.font,
         };
         // A poisoned lock is recovered rather than propagated: this map is a pure memo, so no
         // invariant can break, and an unrelated thread's death shouldn't kill text measurement.
@@ -252,6 +304,7 @@ impl ShapingHandle {
                     line_height: f32::from_bits(key.line_height),
                     max_width: key.max_width.map(f32::from_bits),
                     runs: key.runs.clone(),
+                    font: key.font.clone(),
                 },
                 reply_tx,
             ))
@@ -286,6 +339,9 @@ impl ShapingHandle {
             return;
         }
         self.cache.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        // The worker drops its own family memo with the database those families resolved against,
+        // so this side must forget them too or `ensure_family` would skip re-resolving one.
+        self.ensured.lock().unwrap_or_else(PoisonError::into_inner).clear();
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests
             .send(Request::SetChain(chain.to_vec(), reply_tx))
@@ -334,6 +390,39 @@ impl ShapingHandle {
         reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
     }
 
+    /// Resolves `family` without measuring anything, so a node that names one is drawn in it even
+    /// when nothing ever measures that node (ADR-0144).
+    ///
+    /// Needed because measurement is not guaranteed. A `text` with an explicit width *and* height
+    /// never reaches taffy's measure callback, and without `elide` or `wrap` never reaches
+    /// `layout::scene::fit_text_to_box`'s shaping either -- so its family would never be loaded and
+    /// paint would fall back to the declared chain. `layout::scene` calls this for every named
+    /// family it prepares.
+    ///
+    /// One channel round trip per distinct family for the life of a chain, and a hash lookup after
+    /// that; `set_chain` clears the memo along with the worker's.
+    pub fn ensure_family(&self, family: &Arc<str>) {
+        if self.ensured.lock().unwrap_or_else(PoisonError::into_inner).contains(family) {
+            return;
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.requests
+            .send(Request::EnsureFamily(Arc::clone(family), reply_tx))
+            .expect("oblisk-text-shaping worker thread died");
+        let _ = reply_rx.recv();
+        self.ensured.lock().unwrap_or_else(PoisonError::into_inner).insert(Arc::clone(family));
+    }
+
+    /// How many times the loaded face set has changed (ADR-0144). The painter records this
+    /// alongside the faces it registered with femtovg and re-syncs when the two differ, which is
+    /// what makes a family first named at runtime reach paint as well as measurement.
+    ///
+    /// Read once a frame, so it is an atomic rather than a request: hearing "nothing changed"
+    /// must not cost a channel round trip and a worker wake-up.
+    pub fn font_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Returns the font chain's resolved primary family: the same name `shape()` asks
     /// cosmic-text for via `Family::Name`. Test-only. See `Request::ResolvedPrimaryFamily`.
     #[cfg(test)]
@@ -341,6 +430,58 @@ impl ShapingHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests.send(Request::ResolvedPrimaryFamily(reply_tx)).expect("oblisk-text-shaping worker thread died");
         reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
+    }
+}
+
+/// Everything the worker thread knows about fonts: the declared chain's database and primary, the
+/// families nodes have named so far, and the face list femtovg is handed.
+///
+/// One value rather than five locals in the loop, because replacing the chain has to replace all of
+/// them together: a `families` map kept across a `set_chain` would point at faces that went down
+/// with the old database.
+struct WorkerFonts {
+    font_system: FontSystem,
+    primary_family: String,
+    /// What each family a node named resolved to, or `None` for one nothing answered. Both
+    /// outcomes are remembered, so a font that is simply not installed costs one `fc-match` rather
+    /// than one per measurement.
+    families: HashMap<Arc<str>, Option<String>>,
+    /// Every file already loaded, so `load_family` can tell a new one from a repeat.
+    loaded_paths: HashSet<PathBuf>,
+    /// What `font_chain_data` last produced: the faces `TextPainter` registers with femtovg.
+    chain_data: Vec<FontFace>,
+}
+
+impl WorkerFonts {
+    fn new(chain: &[&str]) -> Self {
+        let ResolvedFonts { mut db, primary_family, loaded_paths } = fonts::resolve_chain(chain);
+        // Mapped once, before the `Database` reaches cosmic-text, so the mappings stay *in* the
+        // database instead of being mapped twice.
+        let families = HashMap::new();
+        let chain_data = font_chain_data(&mut db, &primary_family, &families);
+        let font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
+        Self { font_system, primary_family, families, loaded_paths, chain_data }
+    }
+
+    /// The family name to shape `asked` under, resolving it on first sight (ADR-0144).
+    ///
+    /// A new family is loaded into the database the declared chain already filled, so that chain's
+    /// CJK and emoji faces stay available as fallback behind it, and `generation` is bumped so the
+    /// painter knows to register the new faces before drawing with them.
+    ///
+    /// A family nothing on the system answers resolves to the declared chain's own primary. That is
+    /// what makes a typo draw the text in the wrong face rather than not at all.
+    fn family_for(&mut self, asked: Option<&Arc<str>>, generation: &AtomicU64) -> String {
+        let Some(asked) = asked else {
+            return self.primary_family.clone();
+        };
+        if !self.families.contains_key(asked) {
+            let hit = fonts::load_family(self.font_system.db_mut(), asked, &mut self.loaded_paths);
+            self.families.insert(Arc::clone(asked), hit);
+            self.chain_data = font_chain_data(self.font_system.db_mut(), &self.primary_family, &self.families);
+            generation.fetch_add(1, Ordering::Release);
+        }
+        self.families[asked].clone().unwrap_or_else(|| self.primary_family.clone())
     }
 }
 
@@ -451,78 +592,105 @@ fn rich_spans<'t, 'a>(text: &'t str, runs: &[FontRun], base: &Attrs<'a>) -> Vec<
 /// A face whose mapping cannot be established is skipped rather than fatal, matching
 /// `resolve_chain`'s own treatment of an entry it can't honor: losing the emoji font is a missing
 /// glyph, not a dead shell.
-fn font_chain_data(db: &mut fontdb::Database, primary_family: &str) -> Vec<FontFace> {
+fn font_chain_data(
+    db: &mut fontdb::Database,
+    primary_family: &str,
+    families: &HashMap<Arc<str>, Option<String>>,
+) -> Vec<FontFace> {
     struct Candidate {
         id: fontdb::ID,
-        path: Option<std::path::PathBuf>,
-        primary: bool,
+        path: Option<PathBuf>,
+        families: Vec<String>,
         weight: u16,
         italic: bool,
     }
     // Collected first: `make_shared_face_data` needs `&mut db`, so nothing may be borrowing it.
     let faces: Vec<Candidate> = db
         .faces()
-        .map(|face| {
-            let path = match &face.source {
+        .map(|face| Candidate {
+            id: face.id,
+            path: match &face.source {
                 fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
                 fontdb::Source::Binary(_) => None,
-            };
-            let primary = face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(primary_family));
-            Candidate { id: face.id, path, primary, weight: face.weight.0, italic: face.style != fontdb::Style::Normal }
+            },
+            families: face.families.iter().map(|(family, _)| family.clone()).collect(),
+            weight: face.weight.0,
+            italic: face.style != fontdb::Style::Normal,
         })
         .collect();
+    let carries = |face: &Candidate, wanted: &str| face.families.iter().any(|f| f.eq_ignore_ascii_case(wanted));
 
-    // The primary family's face for each of the four variants: the right slant, then the weight
-    // nearest the one asked for. A variant the family does not ship resolves to the same face as
-    // one it does (usually the regular), and is dropped as a duplicate below -- the painter falls
-    // back to the regular chain for a variant it was not given.
-    let mut chosen: Vec<(fontdb::ID, bool, bool)> = Vec::new();
-    for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
-        let target_weight: u16 = if bold { 700 } else { 400 };
-        let best = faces
-            .iter()
-            .filter(|face| face.primary && face.italic == italic)
-            .min_by_key(|face| face.weight.abs_diff(target_weight))
-            .or_else(|| {
-                faces.iter().filter(|face| face.primary).min_by_key(|face| face.weight.abs_diff(target_weight))
-            });
-        if let Some(best) = best
-            && !chosen.iter().any(|(id, _, _)| *id == best.id)
-        {
-            chosen.push((best.id, bold, italic));
+    // Every chain that leads, in emission order: the declared family, then each family a node
+    // named. Resolution runs name -> faces, never face -> name: two names can resolve to one
+    // family (`"monospace"` beside the literal family it expands to), and a face cannot say which
+    // of them it belongs to. Both get their own entries, and `text::atlas`'s registration map
+    // makes the shared file cost one hash lookup rather than a second parse.
+    //
+    // Sorted, because `families` is a `HashMap`: unordered iteration would vary the face list
+    // between runs, and the painter's chains with it.
+    let mut named: Vec<(&Arc<str>, &String)> =
+        families.iter().filter_map(|(asked, resolved)| resolved.as_ref().map(|hit| (asked, hit))).collect();
+    named.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let leaders: Vec<(FaceRole, &str)> = std::iter::once((FaceRole::Declared, primary_family))
+        .chain(named.into_iter().map(|(asked, resolved)| (FaceRole::Named(Arc::clone(asked)), resolved.as_str())))
+        .collect();
+
+    // Each leading family's face for each of the four variants: the right slant, then the weight
+    // nearest the one asked for (ADR-0104). A variant the family does not ship resolves to the same
+    // face as one it does (usually the regular) and is dropped as a duplicate -- the painter falls
+    // back to that family's regular chain for a variant it was not given.
+    let mut emit: Vec<(FaceRole, fontdb::ID, bool, bool)> = Vec::new();
+    for (role, resolved) in &leaders {
+        let mut taken: Vec<fontdb::ID> = Vec::new();
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let target_weight: u16 = if bold { 700 } else { 400 };
+            let of_family = || faces.iter().filter(|face| carries(face, resolved));
+            let best = of_family()
+                .filter(|face| face.italic == italic)
+                .min_by_key(|face| face.weight.abs_diff(target_weight))
+                .or_else(|| of_family().min_by_key(|face| face.weight.abs_diff(target_weight)));
+            if let Some(best) = best
+                && !taken.contains(&best.id)
+            {
+                taken.push(best.id);
+                emit.push((role.clone(), best.id, bold, italic));
+            }
         }
     }
 
-    let mut data = Vec::new();
-    let mut seen_paths = std::collections::HashSet::new();
+    // Then coverage: the first face of each file no leading family already claimed. One entry per
+    // file, as it always was -- nothing selects a weight in CJK or emoji coverage, and a
+    // `Noto Sans CJK` bold is another 16MB mapping for no visible glyph.
+    let mut seen_paths: HashSet<&PathBuf> = emit
+        .iter()
+        .filter_map(|(_, id, _, _)| faces.iter().find(|face| face.id == *id).and_then(|face| face.path.as_ref()))
+        .collect();
     for face in &faces {
-        let variant = chosen.iter().find(|(id, _, _)| *id == face.id).map(|(_, bold, italic)| (*bold, *italic));
-        let wanted = match (face.primary, variant) {
-            (true, Some(_)) => true,
-            (true, None) => false,
-            // Fallback coverage: the first face of each file, as it always was.
-            (false, _) => face.path.as_ref().is_none_or(|path| !seen_paths.contains(path)),
-        };
-        if !wanted {
+        if emit.iter().any(|(_, id, _, _)| *id == face.id) {
             continue;
         }
-        if let Some(path) = &face.path {
-            seen_paths.insert(path.clone());
+        if let Some(path) = &face.path
+            && !seen_paths.insert(path)
+        {
+            continue;
         }
+        emit.push((FaceRole::Fallback, face.id, false, false));
+    }
+
+    // Emission order is the painter's order -- the declared family regular first, its variants,
+    // then each named family, then coverage -- so no sort follows.
+    let mut data = Vec::with_capacity(emit.len());
+    for (role, id, bold, italic) in emit {
         // SAFETY: mapping a font file the process does not own, as the doc comment above spells
         // out. A rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
         // already makes for every font it renders.
-        match unsafe { db.make_shared_face_data(face.id) } {
+        match unsafe { db.make_shared_face_data(id) } {
             Some((bytes, face_index)) => {
-                let (bold, italic) = variant.unwrap_or((false, false));
-                data.push(FontFace { data: FontData(bytes), index: face_index, primary: face.primary, bold, italic });
+                data.push(FontFace { data: FontData(bytes), index: face_index, role, bold, italic })
             }
-            None => eprintln!("font chain: face {:?} could not be mapped, skipped", face.id),
+            None => eprintln!("font chain: face {id:?} could not be mapped, skipped"),
         }
     }
-    // Primary faces first, regular ahead of its variants, so `fonts[0]` is still the face the
-    // chain was declared for and a painter given the list in order can rely on that.
-    data.sort_by_key(|face| (!face.primary, face.bold, face.italic));
     data
 }
 
@@ -556,10 +724,242 @@ mod tests {
             line_height: line_height(font_size),
             max_width: None,
             runs: Vec::new(),
+            font: None,
         }
     }
 
-    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
+    /// [`req`] in a named family, for the tests that need to tell two apart.
+    fn req_in(text: &str, font_size: f32, family: Option<&str>) -> ShapeRequest {
+        ShapeRequest { font: family.map(Arc::from), ..req(text, font_size) }
+    }
+
+    /// Two families both installed on this machine, so a test can tell one from the other. `None`
+    /// when the machine has only one, which is a skip rather than a failure.
+    fn two_families() -> Option<(&'static str, &'static str)> {
+        if !fonts::fc_match_available() {
+            return None;
+        }
+        let (declared, named) = ("Noto Sans", "Noto Sans Mono");
+        (fonts::family_installed(declared) && fonts::family_installed(named)).then_some((declared, named))
+    }
+
+    /// The named family's face has to be tagged, in the one list femtovg is handed, under the name
+    /// the node wrote -- the painter keys on that, not on what fontconfig resolved.
+    #[test]
+    fn a_family_named_by_a_node_is_tagged_apart_from_the_declared_one() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        // Nothing is loaded for a family until a node asks for it.
+        assert!(
+            handle.font_chain_data().iter().all(|face| !matches!(face.role, FaceRole::Named(_))),
+            "a family nobody named must not be loaded"
+        );
+
+        handle.shape(req_in("hello", 20.0, Some(named)));
+        let faces = handle.font_chain_data();
+        assert!(
+            faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
+            "the named family should now lead a chain of its own"
+        );
+        assert!(
+            matches!(faces[0].role, FaceRole::Declared) && !faces[0].bold && !faces[0].italic,
+            "the declared regular still leads the list"
+        );
+        // Declared faces first, then named, then fallbacks -- the order the painter relies on.
+        let named_at = faces.iter().position(|face| matches!(face.role, FaceRole::Named(_))).unwrap();
+        assert!(
+            faces[..named_at].iter().all(|face| matches!(face.role, FaceRole::Declared)),
+            "nothing but declared faces may precede a named one"
+        );
+    }
+
+    /// Two names for one family: `fc-match` resolves a generic alias to a real family, so a config
+    /// can reach one file under two names. Both must get a chain. Before this was resolved
+    /// name-to-faces, a face guessed which of them it belonged to by scanning a `HashMap`, so one
+    /// name won at random and the other silently drew in the declared family.
+    #[test]
+    fn two_names_that_resolve_to_one_family_each_get_their_own_chain() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        // The literal family and whatever generic alias resolves to it, if this machine has one.
+        handle.ensure_family(&Arc::from(named));
+        handle.ensure_family(&Arc::from("monospace"));
+
+        let faces = handle.font_chain_data();
+        for asked in [named, "monospace"] {
+            let hit = faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(asked)));
+            // "monospace" may resolve to a family this machine does not have; only assert the
+            // literal name unconditionally.
+            if asked == named {
+                assert!(hit, "{asked:?} must lead a chain of its own");
+            }
+        }
+        // Whatever both resolved to, neither may have been dropped in favour of the other.
+        assert!(
+            faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
+            "the literal family name must survive alongside any alias for it"
+        );
+    }
+
+    /// The face list feeds the painter's chains, so an unordered `HashMap` walk would reshuffle
+    /// them between runs of the same config.
+    #[test]
+    fn the_face_list_is_the_same_on_every_build_for_the_same_families() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        for asked in [named, "monospace", "serif", "cursive"] {
+            handle.ensure_family(&Arc::from(asked));
+        }
+        let roles = |faces: Vec<FontFace>| faces.into_iter().map(|face| face.role).collect::<Vec<_>>();
+        let first = roles(handle.font_chain_data());
+        assert_eq!(first, roles(handle.font_chain_data()), "the order must not depend on hash iteration");
+        assert!(matches!(first[0], FaceRole::Declared), "and the declared regular still leads");
+    }
+
+    /// The hole `ensure_family` exists for: a node whose box is fully specified is never measured,
+    /// so nothing would resolve its family and paint would fall back to the declared chain.
+    #[test]
+    fn a_family_can_be_resolved_without_measuring_anything_in_it() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        let before = handle.font_generation();
+
+        handle.ensure_family(&Arc::from(named));
+
+        assert!(handle.font_generation() > before, "the painter has to hear about the face");
+        assert!(
+            handle.font_chain_data().iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
+            "and the face has to be in the list femtovg is handed"
+        );
+        assert_eq!(handle.cached_len(), 0, "resolving a family measures nothing");
+    }
+
+    /// The client-side memo must not outlive the database its families resolved against, or a
+    /// `set_chain` would leave `ensure_family` skipping a family the worker has forgotten.
+    #[test]
+    fn replacing_the_chain_makes_ensure_family_resolve_again() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        handle.ensure_family(&Arc::from(named));
+
+        handle.set_chain(&[declared.to_string()]);
+        let after_reset = handle.font_generation();
+        handle.ensure_family(&Arc::from(named));
+
+        assert!(handle.font_generation() > after_reset, "the family must be loaded into the new database");
+        assert!(
+            handle.font_chain_data().iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
+            "or a node naming it would paint in the declared chain after a chain change"
+        );
+    }
+
+    /// Loading a family the painter has not registered yet is only safe because the painter is
+    /// told to catch up; the generation is how it finds out.
+    #[test]
+    fn resolving_a_new_family_bumps_the_generation_and_resolving_it_again_does_not() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        let before = handle.font_generation();
+
+        handle.shape(req_in("hello", 20.0, Some(named)));
+        let after_first = handle.font_generation();
+        assert!(after_first > before, "the painter has to hear about a face it does not hold");
+
+        handle.shape(req_in("different text entirely", 20.0, Some(named)));
+        assert_eq!(handle.font_generation(), after_first, "a family already resolved is not reloaded");
+    }
+
+    /// Measuring the same string in two families has to reach different faces, or the box a node
+    /// reserves is the declared family's width and the glyphs it draws will not fit it.
+    #[test]
+    fn a_named_family_measures_differently_from_the_declared_one() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        // Proportional against monospaced: "iiii" is much narrower in a sans than in a mono, which
+        // no amount of cache-key confusion could produce on its own.
+        let plain = handle.shape(req_in("iiii", 32.0, None)).width;
+        let mono = handle.shape(req_in("iiii", 32.0, Some(named))).width;
+        assert!(mono > plain, "monospaced {named:?} at {mono} should be wider than {declared:?} at {plain}");
+    }
+
+    /// The family is part of the cache key, so the first measurement cannot answer for another
+    /// family. Without it whichever node measured first would poison every other family's box.
+    #[test]
+    fn a_measurement_in_one_family_is_not_served_to_another() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        let plain = handle.shape(req_in("iiii", 32.0, None));
+        let mono = handle.shape(req_in("iiii", 32.0, Some(named)));
+        assert_eq!(handle.cached_len(), 2, "the two families are separate entries, not one");
+        assert_ne!(plain.width, mono.width);
+    }
+
+    /// A family nothing on the system answers draws in the declared chain rather than as nothing,
+    /// and is resolved once -- an `fc-match` subprocess per frame for a missing font would sit on
+    /// the measurement path.
+    #[test]
+    fn a_family_nothing_answers_measures_in_the_declared_chain_and_is_only_looked_up_once() {
+        let handle = ShapingHandle::spawn();
+        let missing = Some("ZZ No Such Family 9184");
+        assert_eq!(handle.shape(req_in("Oblisk", 20.0, missing)).width, handle.shape(req("Oblisk", 20.0)).width);
+        let generation = handle.font_generation();
+        handle.shape(req_in("Oblisk Shell", 20.0, missing));
+        assert_eq!(handle.font_generation(), generation, "a miss is remembered, not retried");
+    }
+
+    /// Replacing the chain invalidates the families resolved against the old database, or a node
+    /// keeps pointing at faces that went down with it.
+    #[test]
+    fn replacing_the_chain_forgets_the_families_resolved_against_the_old_one() {
+        let Some((declared, named)) = two_families() else {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        };
+        let handle = ShapingHandle::spawn();
+        handle.set_chain(&[declared.to_string()]);
+        handle.shape(req_in("hello", 20.0, Some(named)));
+        assert!(handle.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Named(_))));
+
+        handle.set_chain(&[named.to_string()]);
+        assert!(
+            handle.font_chain_data().iter().all(|face| !matches!(face.role, FaceRole::Named(_))),
+            "the new database holds no family the old one had resolved"
+        );
+    }
+
+    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
     /// looks like it worked. Uses the two families the shipped dev config names, and skips rather
     /// than fails on a machine that has neither installed.
     #[test]
@@ -597,7 +997,10 @@ mod tests {
             "a one-family chain loads that family's faces, got {}",
             after.len()
         );
-        assert!(handle.font_chain_data().iter().all(|face| face.primary), "and nothing but that family");
+        assert!(
+            handle.font_chain_data().iter().all(|face| matches!(face.role, FaceRole::Declared)),
+            "and nothing but that family"
+        );
         assert_ne!(after, before, "the bytes femtovg would load must be the new font's, not the old chain's");
         assert!(after[0] > 0, "and they are real bytes, not an empty mapping");
     }
@@ -610,14 +1013,20 @@ mod tests {
     fn the_chain_leads_with_the_primary_familys_regular_face() {
         let handle = ShapingHandle::spawn();
         let faces = handle.font_chain_data();
-        assert!(faces[0].primary && !faces[0].bold && !faces[0].italic, "first face must be the primary regular");
-        assert_eq!(faces.iter().filter(|face| face.primary && !face.bold && !face.italic).count(), 1);
+        assert!(
+            matches!(faces[0].role, FaceRole::Declared) && !faces[0].bold && !faces[0].italic,
+            "first face must be the primary regular"
+        );
+        assert_eq!(
+            faces.iter().filter(|face| matches!(face.role, FaceRole::Declared) && !face.bold && !face.italic).count(),
+            1
+        );
     }
 
     #[test]
     fn a_bold_run_measures_wider_than_the_same_text_regular() {
         let handle = ShapingHandle::spawn();
-        if !handle.font_chain_data().iter().any(|face| face.primary && face.bold) {
+        if !handle.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Declared) && face.bold) {
             eprintln!("skip: the default chain's family has no bold face installed");
             return;
         }
@@ -641,6 +1050,7 @@ mod tests {
             line_height: line_height(14.0),
             max_width: Some(90.0),
             runs: Vec::new(),
+            font: None,
         });
         assert_eq!(result.lines.len(), result.line_ranges.len());
         assert!(result.lines.len() >= 3, "the first paragraph wraps and the second is its own line");
@@ -696,6 +1106,7 @@ mod tests {
                     line_height: 15.6,
                     max_width: None,
                     runs: Vec::new(),
+                    font: None,
                 },
             ),
             (
@@ -706,6 +1117,7 @@ mod tests {
                     line_height: 15.6,
                     max_width: None,
                     runs: Vec::new(),
+                    font: None,
                 },
             ),
             (
@@ -716,6 +1128,7 @@ mod tests {
                     line_height: 40.0,
                     max_width: None,
                     runs: Vec::new(),
+                    font: None,
                 },
             ),
             (
@@ -726,6 +1139,7 @@ mod tests {
                     line_height: 15.6,
                     max_width: Some(10.0),
                     runs: Vec::new(),
+                    font: None,
                 },
             ),
         ] {
@@ -782,6 +1196,7 @@ mod tests {
             line_height: 18.0,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
         assert!(result.width > 0.0, "expected nonzero width, got {}", result.width);
         assert_eq!(result.height, 18.0);
@@ -796,6 +1211,7 @@ mod tests {
             line_height: 18.0,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
         assert_eq!(result.width, 0.0);
     }
@@ -809,6 +1225,7 @@ mod tests {
             line_height: 18.0,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
         let long = handle.shape(ShapeRequest {
             text: "Oblisk Shell".into(),
@@ -816,6 +1233,7 @@ mod tests {
             line_height: 18.0,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
         assert!(long.width > short.width);
     }
@@ -897,6 +1315,7 @@ mod tests {
             line_height: 28.8,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         };
         let proportional = shape(&mut font_system, "Noto Sans", &request);
         let monospace = shape(&mut font_system, "Noto Sans Mono", &request);
@@ -930,6 +1349,7 @@ mod tests {
             line_height: line_height(14.0),
             max_width: Some(unconstrained.width / 2.0),
             runs: Vec::new(),
+            font: None,
         });
         assert!(wrapped.lines.len() > 1, "expected a break, got {:?}", wrapped.lines);
         assert_eq!(
@@ -951,6 +1371,7 @@ mod tests {
             line_height: 18.0,
             max_width: Some(40.0),
             runs: Vec::new(),
+            font: None,
         });
         assert_eq!(result.height, result.lines.len() as f32 * 18.0);
     }
@@ -973,6 +1394,7 @@ mod tests {
             line_height: 18.0,
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
         let wrapped = handle.shape(ShapeRequest {
             text: "Oblisk Shell Renderer".into(),
@@ -980,6 +1402,7 @@ mod tests {
             line_height: 18.0,
             max_width: Some(unconstrained.width / 2.0),
             runs: Vec::new(),
+            font: None,
         });
         assert!(wrapped.height > unconstrained.height, "wrapping onto more lines must grow the measured height");
         assert!(wrapped.width <= unconstrained.width, "a wrapped line can't be wider than the unconstrained text");

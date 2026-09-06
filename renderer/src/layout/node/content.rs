@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use mlua::Value;
 
@@ -227,6 +228,38 @@ pub enum TextAlign {
     Start,
     Center,
     End,
+}
+
+/// `font` (§ 5.2 item 4): the font family this node measures and paints in, as the config wrote it
+/// (ADR-0144). Absent -- which is most nodes -- means the chain `fonts { ... }` declared.
+///
+/// A family name rather than a fixed set of roles, because a Nerd-Font-patched body family carries
+/// the private-use icon block itself and always wins per-glyph fallback: no chain ordering reaches
+/// a second family that also has those codepoints, so the node has to name one. The same mechanism
+/// then covers a heading face or a monospaced readout without new IDL.
+///
+/// `Arc<str>` rather than `String`: this is cloned into a measurement cache key, a display-list
+/// command and a paint call for every text node every pass, and the string is a theme constant
+/// repeated across dozens of nodes.
+///
+/// The name is not validated here. Parsing sees the property, not the loaded font set -- and the
+/// set is not fixed at parse time, since a family is resolved on first sight. An unresolvable name
+/// draws in the declared chain and says so once on stderr, the same bargain `fonts { ... }` already
+/// makes for a chain entry nothing on the system answers.
+pub fn parse_font_family(properties: &HashMap<String, Value>) -> Result<Option<Arc<str>>, LayoutError> {
+    let Some(value) = properties.get("font") else {
+        return Ok(None);
+    };
+    let Value::String(s) = value else {
+        return Err(invalid("font", format!("must be a family name string, got {}", preview_for_error(value))));
+    };
+    let family = checked_string("font", s)?;
+    // An empty string is a config bug that would otherwise look like "no family named", and the
+    // node would silently draw in the declared chain with nothing to point at.
+    match family.is_empty() {
+        true => Err(invalid("font", "must be a family name, got an empty string".to_string())),
+        false => Ok(Some(Arc::from(family.as_str()))),
+    }
 }
 
 /// What to do with text too wide for its box.

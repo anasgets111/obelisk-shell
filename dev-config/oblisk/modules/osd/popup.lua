@@ -5,6 +5,7 @@
 -- compositor identity; otherwise a volume change during a toggle would overlap at one position.
 local theme = require("config.theme")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local meter = require("components.meter")
 local osd = require("modules.osd.service")
 
@@ -31,7 +32,7 @@ local level_row = row {
         return e.level ~= nil
     end),
     children = {
-        cell(read("glyph"), theme.ACCENT, theme.font.xxl, { align_v = "Center" }),
+        glyph(read("glyph"), theme.ACCENT, theme.font.xxl, { align_v = "Center" }),
         meter(osd.entry, function(e)
             return e.level or 0
         end, osd.entry:map(function(e)
@@ -73,7 +74,7 @@ local fact_row = row {
                 height = "Fill",
                 align_h = "Center",
                 align_v = "Center",
-                children = { cell(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
+                children = { glyph(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
             } },
         },
         text {

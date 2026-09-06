@@ -14,6 +14,7 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local toggle = require("components.toggle")
 local icon_button = require("components.icon_button")
 local panel_header = require("components.panel_header")
@@ -110,7 +111,7 @@ local function access_point_row(entry)
     local ap = entry.ap
     local band, color = band_of(ap)
 
-    local leading = { cell(strength_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
+    local leading = { glyph(strength_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
     if band then
         leading[#leading + 1] = cell({ { text = band, bold = true } }, color, theme.font.xs, { align_v = "End" })
     end
@@ -122,7 +123,7 @@ local function access_point_row(entry)
         end, { slot = "network-forget-" .. tostring(ap.ssid), tint = theme.RED })
     end
     if ap.secure then
-        trailing[#trailing + 1] = cell(icons.lock, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
+        trailing[#trailing + 1] = glyph(icons.lock, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
     end
 
     local clickable = not ap.active and not entry.blocked
@@ -233,7 +234,7 @@ local body = {
             return n.connect_error ~= nil and n.connecting_ssid == nil
         end),
         children = {
-            cell(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
+            glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
             cell(util.label(oblisk.network, function(n)
                 return n.connect_error or ""
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),

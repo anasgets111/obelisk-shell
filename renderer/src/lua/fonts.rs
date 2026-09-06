@@ -7,10 +7,12 @@
 //! This stays out of `lua::signal`: those registries share `SignalKind`, write gating, and the
 //! dirty flag; this is a plain, non-reactive list read once.
 //!
-//! **Process-wide, not per node.** `femtovg` and `cosmic-text` fall back through one ordered chain
-//! per glyph, so Nerd Font private-use glyphs can sit beside a sans body face; the codepoint picks.
-//! Per-node `font_family` is separate and harder because measurement and paint select faces through
-//! different mechanisms; `text::shaping` records the cost when they disagree.
+//! **The declared chain, not the only font.** This is the fallback chain every node uses unless it
+//! names a family itself: `femtovg` and `cosmic-text` fall back through it per glyph, so CJK and
+//! emoji coverage sits behind a sans body face and the codepoint picks the face. A `text` node that
+//! sets `font = "<family>"` leads with that family instead and keeps this chain behind it as
+//! coverage (ADR-0144); the family is resolved on first sight, through this module's own
+//! `fc-match` path, into the same database -- so there is still one font discovery, not two.
 
 use mlua::Lua;
 
@@ -56,8 +58,7 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
                     )));
                 }
             }
-            let families: Vec<String> = indexed.into_iter().map(|(_, family)| family).collect();
-            lua.set_app_data(FontRegistry(families));
+            lua.set_app_data(FontRegistry(indexed.into_iter().map(|(_, family)| family).collect()));
             Ok(())
         })?,
     )

@@ -27,13 +27,14 @@ local theme = require("config.theme")
 ---@param content string|TextRun[]|Bound
 ---@param color? Color|Bound
 ---@param size? integer
----@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound, wrap?: "None"|"Word"|Bound, max_lines?: integer|Bound, on_link?: fun(href: string) }
+---@param opts? { width?: integer|"Fill", align?: "Start"|"Center"|"End", align_v?: "Start"|"Center"|"End", visible?: boolean|Bound, wrap?: "None"|"Word"|Bound, max_lines?: integer|Bound, on_link?: fun(href: string), font?: "Body"|"Icon"|Bound }
 return function(content, color, size, opts)
     opts = opts or {}
     return text {
         content = content,
         foreground = color or theme.FG,
         font_size = size or theme.font.md,
+        font = opts.font,
         width = opts.width,
         align_v = opts.align_v,
         align_h = opts.align,

@@ -6,6 +6,7 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 
 -- A codepoint budget, not a box. `lib/util.lua`'s `truncate` is appropriate because the centre zone
 -- is content-sized between two `Fill` sides; a fixed box would put the glyph at its edge and the
@@ -23,7 +24,7 @@ return row {
     align_v = "Center",
     spacing = theme.spacing.sm,
     children = {
-        cell(oblisk.mpris:map(function(m)
+        glyph(oblisk.mpris:map(function(m)
             local player = player_of(m)
             return (player ~= nil and player.play_state == "Playing") and icons.play or icons.pause
         end), theme.ACCENT, theme.icon.md, { align_v = "Center" }),

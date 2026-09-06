@@ -138,6 +138,8 @@ return function(glyph, on_activate, opts)
             -- after its
             -- 24px base passes through scaling.
             font_size = opts.icon_size or theme.icon.lg,
+            -- The same family `components/glyph.lua` names (ADR-0144).
+            font = theme.icon_font,
             align_h = "Center",
             align_v = "Center",
         } },

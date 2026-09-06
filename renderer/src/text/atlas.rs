@@ -13,8 +13,11 @@ use std::ffi::c_void;
 use femtovg::renderer::OpenGl;
 use femtovg::{Align, Canvas, Color, FontId, Paint, Path, TextContext};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::layout::node::{Rgba, StyleRun, TextAlign, segments};
-use crate::text::shaping::FontFace;
+use crate::text::shaping::{FaceRole, FontFace};
 
 use super::snap::{LogicalRect, snap_to_physical};
 
@@ -22,10 +25,28 @@ use super::snap::{LogicalRect, snap_to_physical};
 /// font chain loaded and ready to draw with.
 pub struct TextPainter {
     canvas: Canvas<OpenGl>,
-    /// One chain per face variant, indexed by [`variant`]: the primary family's face for that
+    /// One chain per face variant, indexed by [`variant`]: the declared family's face for that
     /// variant (or its regular face, for a variant it does not ship) followed by every fallback
     /// face, so per-glyph fallback works the same in bold as in regular (ADR-0104).
     fonts: [Vec<FontId>; 4],
+    /// The same four chains for each family a node named by hand, keyed by the name the node
+    /// wrote (ADR-0144). A name that is absent -- never asked for, or asked for and unresolvable
+    /// -- falls back to `fonts`, so a typo draws in the declared family rather than as nothing.
+    named: HashMap<Arc<str>, [Vec<FontId>; 4]>,
+    /// The shaping worker's face-set generation this was built from, so [`TextPainter::sync`] can
+    /// tell in one atomic load whether femtovg's registry is behind.
+    generation: u64,
+    /// femtovg's font registry, kept so a family first named at runtime can be added without
+    /// rebuilding the canvas and losing its warm glyph atlas.
+    text_context: TextContext,
+    /// The `FontId` already registered for each `(FontData::addr, face index)`, so
+    /// [`TextPainter::sync`] adds only what femtovg does not hold yet.
+    ///
+    /// Not an optimisation: `add_shared_font_with_index` is `self.fonts.insert(font)` into a
+    /// `SlotMap`, which mints a new key every call and never dedups by bytes. Re-registering the
+    /// whole list would re-parse every face, strand the previous entries in the slot map for the
+    /// life of the surface, and call femtovg's `clear_caches` once per face (ADR-0144).
+    registered: HashMap<(usize, u32), FontId>,
 }
 
 /// What [`TextPainter::draw_text`] draws, apart from where: one `Draw::Text` command's worth,
@@ -34,13 +55,78 @@ pub struct TextDraw<'a> {
     pub text: &'a str,
     pub runs: &'a [StyleRun],
     pub font_size: f32,
+    /// The family this node named (ADR-0144), the same one the box was measured under. `None` is
+    /// the declared chain.
+    pub font: Option<&'a str>,
     pub color: Rgba,
     pub align: TextAlign,
 }
 
-/// Which of the four chains a run draws with.
+/// Which of a family's four chains a run draws with.
 fn variant(bold: bool, italic: bool) -> usize {
     usize::from(bold) | (usize::from(italic) << 1)
+}
+
+/// Registers `font_chain` with femtovg and builds the declared family's four variant chains plus
+/// one set of four per family a node named (ADR-0104, ADR-0144).
+///
+/// Every chain leads with its own family's face for the variant, then the shared fallback
+/// coverage, then -- for a named family -- the declared family's regular face, so a node that
+/// named a display font and then drew ordinary prose in it still gets glyphs that font lacks.
+///
+/// Not the mirror of that: a named family is never coverage for the declared chain. Plain text
+/// must not drift into whichever family some unrelated node happened to name, and the declared
+/// chain carries its own CJK and emoji fallbacks already.
+/// `registered` carries the `FontId` femtovg minted for each face across calls, because it mints a
+/// new one every time it is asked (see [`TextPainter::registered`]).
+type Chains = ([Vec<FontId>; 4], HashMap<Arc<str>, [Vec<FontId>; 4]>);
+fn build_chains(
+    text_context: &TextContext,
+    registered: &mut HashMap<(usize, u32), FontId>,
+    font_chain: &[FontFace],
+) -> Result<Chains, Box<dyn Error>> {
+    let mut declared: [Option<FontId>; 4] = [None; 4];
+    let mut named_faces: HashMap<Arc<str>, [Option<FontId>; 4]> = HashMap::new();
+    let mut fallbacks = Vec::new();
+    for face in font_chain {
+        let id = match registered.get(&(face.data.addr(), face.index)) {
+            Some(id) => *id,
+            None => {
+                let id = text_context.add_shared_font_with_index(face.data.clone(), face.index)?;
+                registered.insert((face.data.addr(), face.index), id);
+                id
+            }
+        };
+        match &face.role {
+            FaceRole::Declared => declared[variant(face.bold, face.italic)] = Some(id),
+            FaceRole::Named(asked) => {
+                named_faces.entry(Arc::clone(asked)).or_insert([None; 4])[variant(face.bold, face.italic)] = Some(id)
+            }
+            FaceRole::Fallback => fallbacks.push(id),
+        }
+    }
+
+    let fonts = std::array::from_fn(|which| {
+        let mut chain = Vec::with_capacity(fallbacks.len() + 1);
+        chain.extend(declared[which].or(declared[0]));
+        chain.extend(fallbacks.iter().copied());
+        chain
+    });
+
+    let named = named_faces
+        .into_iter()
+        .map(|(asked, variants)| {
+            let chains = std::array::from_fn(|which| {
+                let mut chain = Vec::with_capacity(fallbacks.len() + 2);
+                chain.extend(variants[which].or(variants[0]));
+                chain.extend(fallbacks.iter().copied());
+                chain.extend(declared[0]);
+                chain
+            });
+            (asked, chains)
+        })
+        .collect();
+    Ok((fonts, named))
 }
 
 /// Which femtovg alignment to set, and what x to hand `fill_text` under it.
@@ -78,6 +164,7 @@ impl TextPainter {
         width: u32,
         height: u32,
         font_chain: &[FontFace],
+        generation: u64,
     ) -> Result<Self, Box<dyn Error>> {
         if font_chain.is_empty() {
             return Err("TextPainter::new requires at least one loaded font".into());
@@ -90,22 +177,41 @@ impl TextPainter {
         let text_context = TextContext::default();
         let mut canvas = Canvas::new_with_text_context(renderer, text_context.clone())?;
         canvas.set_size(width, height, 1.0);
-        let mut primary: [Option<FontId>; 4] = [None; 4];
-        let mut fallbacks = Vec::new();
-        for face in font_chain {
-            let id = text_context.add_shared_font_with_index(face.data.clone(), face.index)?;
-            match face.primary {
-                true => primary[variant(face.bold, face.italic)] = Some(id),
-                false => fallbacks.push(id),
-            }
+        let mut registered = HashMap::new();
+        let (fonts, named) = build_chains(&text_context, &mut registered, font_chain)?;
+        Ok(Self { canvas, fonts, named, generation, text_context, registered })
+    }
+
+    /// The shaping-worker face-set generation this painter's femtovg registry is built from.
+    pub fn font_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Registers any faces the shaping worker has loaded since this painter was built, and
+    /// rebuilds the chains around them (ADR-0144).
+    ///
+    /// The point of the whole runtime path: a family a node names for the first time is resolved
+    /// on the shaping worker, and paint has to reach the same faces or it measures in one family
+    /// and draws in another. Called once a frame from `wayland::surface`, and a no-op on the
+    /// generation it was built from -- which is every frame but the few where a new family lands.
+    ///
+    /// Chains are rebuilt, but faces are registered only once: `self.registered` is what keeps
+    /// this from re-parsing every face and stranding femtovg's previous `Font` entries. The canvas
+    /// itself -- and its warm glyph atlas -- is kept either way.
+    pub fn sync(&mut self, font_chain: &[FontFace], generation: u64) {
+        if generation == self.generation || font_chain.is_empty() {
+            return;
         }
-        let fonts = std::array::from_fn(|which| {
-            let mut chain = Vec::with_capacity(fallbacks.len() + 1);
-            chain.extend(primary[which].or(primary[0]));
-            chain.extend(fallbacks.iter().copied());
-            chain
-        });
-        Ok(Self { canvas, fonts })
+        match build_chains(&self.text_context, &mut self.registered, font_chain) {
+            Ok((fonts, named)) => {
+                self.fonts = fonts;
+                self.named = named;
+                self.generation = generation;
+            }
+            // Keep the chains that work rather than dropping to none. A font that failed to
+            // register is a node drawing in the declared family, not a dead surface.
+            Err(e) => eprintln!("font chain: femtovg refused a face after a runtime load, keeping the old chains: {e}"),
+        }
     }
 
     /// Updates the canvas's viewport to match the surface's current size. Cheap and idempotent --
@@ -136,6 +242,22 @@ impl TextPainter {
         &self.fonts[variant(bold, italic)]
     }
 
+    /// The chain a named family leads, or `None` when nothing on the system answered that name --
+    /// the test seam for checking a named family gets a chain of its own.
+    #[cfg(test)]
+    pub fn named_fonts(&self, family: &str) -> Option<&[FontId]> {
+        self.named.get(family).map(|chains| &chains[0][..])
+    }
+
+    /// The chain a node draws with (ADR-0144): the family it named when that family resolved, and
+    /// the declared chain's matching variant otherwise. A name nothing answered is absent from the
+    /// map, and answering that with the declared chain is what makes a typo'd family draw the text
+    /// in the wrong face rather than not at all.
+    fn chain_for(&self, font: Option<&str>, bold: bool, italic: bool) -> &[FontId] {
+        font.and_then(|family| self.named.get(family))
+            .map_or(&self.fonts[variant(bold, italic)], |chains| &chains[variant(bold, italic)])
+    }
+
     /// Draws `text` with its snapped top-left corner at `rect`'s origin, in `color`, one
     /// `fill_text` per line. Does not flush or swap buffers: `layout::paint`'s tree walk draws a
     /// whole surface's worth of nodes onto this same canvas and flushes once at the end.
@@ -151,14 +273,14 @@ impl TextPainter {
     /// by femtovg's own measurement of it -- and the alignment is computed from the pieces' total,
     /// since femtovg's `set_text_align` can only place one run.
     pub fn draw_text(&mut self, line: TextDraw<'_>, rect: LogicalRect, scale: f32) {
-        let TextDraw { text, runs, font_size, color, align } = line;
+        let TextDraw { text, runs, font_size, font, color, align } = line;
         let physical = snap_to_physical(rect, scale);
         // `Rgba`'s four `f32` fields exist so `Color::rgbaf` takes them with no conversion.
         let mut paint = Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a));
         // The whole chain, in chain order: FemtoVG's `set_font` does its own per-glyph fallback
         // across the slice it's given, the same way cosmic-text's shaping falls back across
         // `db`'s loaded faces.
-        paint.set_font(&self.fonts[0]);
+        paint.set_font(self.chain_for(font, false, false));
         paint.set_font_size(font_size);
         // fill_text's y is the text baseline, not the box top, so it belongs at the snapped top
         // edge plus the font's ascender -- not the snapped bottom edge, which would cut
@@ -202,7 +324,7 @@ impl TextPainter {
                 let mut piece_paint = paint.clone();
                 let mut piece_color = color;
                 if let Some(run) = run {
-                    piece_paint.set_font(&self.fonts[variant(run.bold, run.italic)]);
+                    piece_paint.set_font(self.chain_for(font, run.bold, run.italic));
                     if let Some(c) = run.color {
                         piece_color = c;
                         piece_paint.set_color(Color::rgbaf(c.r, c.g, c.b, c.a));

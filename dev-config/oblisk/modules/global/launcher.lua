@@ -26,6 +26,7 @@
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local ui_state = require("lib.ui_state")
 local panel_card = require("components.panel_card")
 local panel_empty_state = require("components.panel_empty_state")
@@ -298,7 +299,7 @@ local function app_row(app)
 end
 
 local web_row = row_shell(WEB, "launcher-web", {
-    cell(icons.web, theme.TEXT_OFF, theme.launcher_icon, { align_v = "Center" }),
+    glyph(icons.web, theme.TEXT_OFF, theme.launcher_icon, { align_v = "Center" }),
     column {
         width = "Fill",
         align_v = "Center",

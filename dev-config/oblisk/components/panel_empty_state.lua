@@ -8,6 +8,7 @@
 -- line used by the launcher and power menu.
 local theme = require("config.theme")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 
 ---@param message string|Bound
 ---@param visible boolean|Bound
@@ -16,7 +17,7 @@ return function(message, visible, opts)
     opts = opts or {}
     local lines = {}
     if opts.icon then
-        lines[#lines + 1] = cell(opts.icon, theme.TEXT_OFF, theme.icon.xl, { align = "Center" })
+        lines[#lines + 1] = glyph(opts.icon, theme.TEXT_OFF, theme.icon.xl, { align = "Center" })
     end
     lines[#lines + 1] = cell(message, theme.TEXT_OFF, theme.font.sm, { align = "Center" })
     return column {

@@ -206,6 +206,14 @@ theme.spacing = {
     xl = s(24, 16),
 }
 
+-- The family `components/glyph.lua` names on every icon node (ADR-0144). `fonts` in `shell.lua`
+-- declares `Propo`, which spaces the patched Nerd Font icons proportionally and fills most of the
+-- em with them; `Mono` fits each into one cell, so a row of indicators keeps an even rhythm and an
+-- icon sits at the size its token asked for. Both families carry these codepoints, so a longer
+-- `fonts` chain could not choose between them -- the declared face wins per-glyph fallback every
+-- time, which is why the node names this one.
+theme.icon_font = "JetBrainsMono Nerd Font Mono"
+
 theme.font = {
     xs   = s(10, 8),
     sm   = s(12, 10),

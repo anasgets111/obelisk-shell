@@ -70,7 +70,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("rect", &["children"]),
     ("row", &["children", "scroll", "spacing"]),
     ("column", &["children", "scroll", "spacing"]),
-    ("text", &["content", "elide", "font_size", "foreground", "max_lines", "on_link", "text_align", "wrap"]),
+    ("text", &["content", "elide", "font", "font_size", "foreground", "max_lines", "on_link", "text_align", "wrap"]),
     // `foreground` is CSS `color`: the resolved SVG's `currentColor` fill (ADR-0072). Full-colour
     // icons name no `currentColor`, so this is safe.
     ("icon", &["foreground", "name", "size"]),
@@ -546,7 +546,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 585, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 587, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when

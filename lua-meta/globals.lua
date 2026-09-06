@@ -11,10 +11,11 @@
 -- `debug.getinfo`.
 
 ---The fallback chain is read at `shell.lua`'s top level before text measurement. Both readers fall
----back per glyph across it, so one declaration covers body text and Nerd Font private-use glyphs.
----The codepoint picks the face, not the node. Read once, at startup: editing it re-evaluates like
----any other change and does nothing until the shell restarts, because a chain change invalidates
----every measurement (ADR-0043).
+---back per glyph across it, so one declaration covers body text, CJK and emoji: the codepoint picks
+---the face. A node that wants a different family says so with `text.font`, and this chain stays
+---behind it as coverage (ADR-0144). Read once, at startup: editing it re-evaluates like any other
+---change and does nothing until the shell restarts, because a chain change invalidates every
+---measurement (ADR-0043).
 ---
 ---Non-string entries, holes, and named keys are refused. `#` is undefined on sparse tables, so a
 ---hole would lose the tail. An unmatched family is skipped with a diagnostic; typos cost one entry.

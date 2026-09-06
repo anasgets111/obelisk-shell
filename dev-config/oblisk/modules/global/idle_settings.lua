@@ -30,6 +30,7 @@
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local toggle = require("components.toggle")
 local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
@@ -185,7 +186,7 @@ local function chamber(entry)
                 align_v = "Center",
                 spacing = theme.spacing.xs,
                 children = {
-                    cell(entry.icon, ink, theme.icon.sm, { align_v = "Center" }),
+                    glyph(entry.icon, ink, theme.icon.sm, { align_v = "Center" }),
                     cell(idle.format(entry.delay), ink, theme.font.xs, { align_v = "Center" }),
                 },
             },
@@ -221,7 +222,7 @@ local timeline = row {
     },
 }
 
-local function banner(glyph, content, tint, ground, visible)
+local function banner(codepoint, content, tint, ground, visible)
     return row {
         width = "Fill",
         height = theme.idle_track_height,
@@ -232,7 +233,7 @@ local function banner(glyph, content, tint, ground, visible)
         padding = { left = theme.spacing.md, right = theme.spacing.md },
         visible = visible,
         children = {
-            cell(glyph, tint, theme.icon.sm, { align_v = "Center" }),
+            glyph(codepoint, tint, theme.icon.sm, { align_v = "Center" }),
             cell(content, tint, theme.font.xs, { width = "Fill", align_v = "Center" }),
         },
     }
@@ -307,7 +308,7 @@ local function duration_button(profile, stage)
                         width = "Fill",
                         align_v = "Center",
                     }),
-                    cell(icons.chevron_down, theme.TEXT_OFF, theme.icon.xs, { align_v = "Center" }),
+                    glyph(icons.chevron_down, theme.TEXT_OFF, theme.icon.xs, { align_v = "Center" }),
                 },
             },
         },
@@ -407,7 +408,7 @@ local function stage_row(item)
         leading = row {
             align_v = "Center",
             spacing = theme.spacing.xs,
-            children = { reorder(item), cell(stage.icon, ink, theme.icon.md, { align_v = "Center" }) },
+            children = { reorder(item), glyph(stage.icon, ink, theme.icon.md, { align_v = "Center" }) },
         },
         trailing = row {
             spacing = theme.spacing.sm,
@@ -492,7 +493,7 @@ local flow_strip = row {
     align_v = "Center",
     spacing = theme.spacing.sm,
     children = {
-        cell(icons.play, computed({ settings, idle.inhibited }, function(resolved, held)
+        glyph(icons.play, computed({ settings, idle.inhibited }, function(resolved, held)
             return (resolved.enabled and not held) and theme.ACCENT or theme.TEXT_OFF
         end), theme.icon.sm, { align_v = "Center" }),
         cell(
@@ -530,8 +531,8 @@ local flow_card = panel_card({ flow_strip, timeline, held_banner, paused_banner 
 
 -- `SettingsSection` is glyph-on-plate, title, description, rows. `panel_header` already has that
 -- shape, so each section is a header plus card children.
-local function section(glyph, title, description, children)
-    local nodes = { panel_header { title = title, subtitle = description, icon = glyph, title_size = theme.font.xl } }
+local function section(codepoint, title, description, children)
+    local nodes = { panel_header { title = title, subtitle = description, icon = codepoint, title_size = theme.font.xl } }
     for _, node in ipairs(children) do
         nodes[#nodes + 1] = node
     end

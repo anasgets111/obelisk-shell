@@ -9,6 +9,7 @@
 //! measure callback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mlua::Value;
 
@@ -33,6 +34,8 @@ pub enum PaintStyle {
         /// Styled stretches of `content`, remapped when the scene rewrites it (ADR-0104).
         runs: Vec<StyleRun>,
         font_size: f32,
+        /// The family this node named, or `None` for the declared chain (ADR-0144).
+        font: Option<Arc<str>>,
         color: Rgba,
         align: TextAlign,
         elide: Elide,
@@ -81,6 +84,7 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
                 content,
                 runs,
                 font_size: parse_font_size(properties)?,
+                font: parse_font_family(properties)?,
                 color: parse_foreground(properties)?,
                 align: parse_text_align(properties)?,
                 elide: parse_elide(properties)?,
@@ -133,6 +137,37 @@ mod tests {
         );
         let err = style(&lua, r#"return { kind = "text", content = "hi", text_align = 1 }"#).unwrap_err();
         assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "text_align"));
+    }
+
+    /// A `text` that says nothing draws in the declared chain, which is most nodes.
+    #[test]
+    fn a_text_node_without_a_font_property_draws_in_the_declared_chain() {
+        let lua = Lua::new();
+        let parsed = style(&lua, r#"return { kind = "text", content = "hi" }"#).unwrap().unwrap();
+        assert!(matches!(parsed, PaintStyle::Text { font: None, .. }), "got {parsed:?}");
+    }
+
+    /// The family reaches paint as the config wrote it, not normalised: the painter keys its
+    /// chains on the name the node asked for, so any rewriting here would miss the chain.
+    #[test]
+    fn a_text_node_carries_the_family_name_it_was_given() {
+        let lua = Lua::new();
+        let parsed = style(&lua, r#"return { kind = "text", content = "hi", font = "JetBrainsMono Nerd Font Mono" }"#)
+            .unwrap()
+            .unwrap();
+        let PaintStyle::Text { font, .. } = parsed else { panic!("expected text") };
+        assert_eq!(font.as_deref(), Some("JetBrainsMono Nerd Font Mono"));
+    }
+
+    /// An empty string would otherwise read as "no family named" and silently draw in the declared
+    /// chain with nothing for the reader to point at.
+    #[test]
+    fn an_empty_or_non_string_font_fails_the_pass_naming_the_property() {
+        let lua = Lua::new();
+        let err = style(&lua, r#"return { kind = "text", content = "hi", font = "" }"#).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "font"), "got {err:?}");
+        let err = style(&lua, r#"return { kind = "text", content = "hi", font = 1 }"#).unwrap_err();
+        assert!(matches!(&err, LayoutError::InvalidProperty { property, .. } if property == "font"));
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub fn run(
     let specs = app.client.run_startup_evaluation().unwrap_or_default();
     // Set the declared font chain after evaluation but before first paint; `TextPainter` loads it
     // lazily, and `set_chain` rebuilds instead of respawning. No declaration keeps the default.
+    // A family a node names by hand is not resolved here: it lands on first sight (ADR-0144).
     app.shaping.set_chain(&crate::lua::fonts::declared_chain(app.client.lua()));
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {

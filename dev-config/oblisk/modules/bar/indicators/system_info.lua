@@ -7,6 +7,7 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local pill = require("components.pill")
 
 -- `sysinfo`'s three pollers start dormant until configured (ADR-0035); without this, the readouts
@@ -18,12 +19,12 @@ local pill = require("components.pill")
 -- nothing reads `temp_cores` or `temp_gpu`, and a dormant poller costs nothing.
 oblisk.sysinfo:invoke("configure", { cpu_interval = 2, ram_interval = 5 })
 
-local function readout(glyph, read)
+local function readout(codepoint, read)
     return row {
         align_v = "Center",
         spacing = theme.spacing.xs,
         children = {
-            cell(glyph, theme.DIM, theme.icon.sm, { align_v = "Center" }),
+            glyph(codepoint, theme.DIM, theme.icon.sm, { align_v = "Center" }),
             cell(util.label(oblisk.sysinfo, read), theme.FG, theme.font.xs, { align_v = "Center" }),
         },
     }

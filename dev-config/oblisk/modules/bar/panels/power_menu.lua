@@ -196,6 +196,12 @@ local function slot(index)
                 font_size = role:map(function(what)
                     return what == "countdown" and theme.font.sm or theme.icon.lg
                 end),
+                -- The same switch the size makes: the countdown is digits and belongs in the
+                -- declared family, the resting state is a Nerd Font glyph and belongs in the icon
+                -- one. `nil` is the declared chain.
+                font = role:map(function(what)
+                    return what ~= "countdown" and theme.icon_font or nil
+                end),
                 align_h = "Center",
                 align_v = "Center",
             },

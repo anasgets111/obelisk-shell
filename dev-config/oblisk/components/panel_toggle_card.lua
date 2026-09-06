@@ -8,6 +8,7 @@
 -- the capability pushes a table and only the caller knows which field is the switch.
 local theme = require("config.theme")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 
 ---@class PanelToggleCardOpts
 ---@field slot string The hover region's name; one per tile.
@@ -54,7 +55,7 @@ return function(opts)
     end)
 
     local lines = {
-        cell(opts.icon, ink, theme.icon.md, { align = "Center" }),
+        glyph(opts.icon, ink, theme.icon.md, { align = "Center" }),
         cell(opts.label, ink, theme.font.xs, { align = "Center" }),
     }
     if opts.detail then

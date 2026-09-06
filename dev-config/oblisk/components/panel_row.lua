@@ -13,6 +13,7 @@
 -- its actions are the two trailing icons.
 local theme = require("config.theme")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 
 -- Annotated like `components/cell.lua`: payload fields become text here and `title`/`subtitle` go
 -- straight to `cell`. Without these shapes, `list` `itemfn`'s `any` reached `text.content`
@@ -55,7 +56,7 @@ return function(opts)
         -- red),
         -- but `PaintStyle::Icon` has no tint. `opts.art` is for unchosen artwork such as an
         -- application's icon.
-        children[#children + 1] = cell(opts.icon, opts.icon_color or title_color, theme.icon.md, { align_v = "Center" })
+        children[#children + 1] = glyph(opts.icon, opts.icon_color or title_color, theme.icon.md, { align_v = "Center" })
     elseif opts.art then
         children[#children + 1] = icon { name = opts.art, size = theme.icon.md, align_v = "Center" }
     end

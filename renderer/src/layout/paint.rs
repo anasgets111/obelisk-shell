@@ -34,6 +34,9 @@ pub enum Draw {
         /// Byte ranges drawn in another face, underlined, or recoloured (ADR-0104).
         runs: Vec<StyleRun>,
         font_size: f32,
+        /// The family this was measured and drawn in, or `None` for the declared chain
+        /// (ADR-0144).
+        font: Option<std::sync::Arc<str>>,
         color: Rgba,
         align: TextAlign,
         /// Center a `textfield` line; ordinary text starts at the top of its content box.
@@ -293,13 +296,20 @@ fn run(
                 }
                 paint_border(painter.canvas_mut(), rect, *radius, *colors, *widths, scale);
             }
-            Draw::Text { content, runs, font_size, color, align, centered } => {
+            Draw::Text { content, runs, font_size, font, color, align, centered } => {
                 let mut rect = rect;
                 if *centered {
                     rect.y += ((rect.height - crate::text::shaping::line_height(*font_size)) / 2.0).max(0.0);
                 }
                 painter.draw_text(
-                    TextDraw { text: content, runs, font_size: *font_size, color: *color, align: *align },
+                    TextDraw {
+                        text: content,
+                        runs,
+                        font_size: *font_size,
+                        font: font.as_deref(),
+                        color: *color,
+                        align: *align,
+                    },
                     rect,
                     scale,
                 )
@@ -428,7 +438,7 @@ fn draw_for(
         // chain (single-face Noto Sans): `measure_text` agreed with cosmic-text's `shape()` to
         // within 0.0001px on a 53-character, 32px string, last lit pixel 3-4 physical pixels inside
         // the measured edge. No shaving observed today, but the clip is the safe direction.
-        PaintStyle::Text { content, runs, font_size, color, align, elide: _, wrap: _, max_lines: _ } => {
+        PaintStyle::Text { content, runs, font_size, font, color, align, elide: _, wrap: _, max_lines: _ } => {
             Some(Draw::Text {
                 content: content.clone(),
                 runs: runs
@@ -436,6 +446,7 @@ fn draw_for(
                     .map(|run| StyleRun { color: run.color.map(|c| fade(c, opacity)), ..run.clone() })
                     .collect(),
                 font_size: *font_size,
+                font: font.clone(),
                 color: fade(*color, opacity),
                 align: *align,
                 centered: false,
@@ -500,6 +511,9 @@ fn draw_for(
                 content,
                 runs: Vec::new(),
                 font_size: *font_size,
+                // A `textfield` draws its placeholder and its masked content in the declared
+                // chain; nothing in § 5.2 lets one name a family.
+                font: None,
                 color: fade(*color, opacity),
                 align: *align,
                 centered: true,
@@ -753,7 +767,7 @@ mod tests {
     use crate::layout::scene::{LogicalSize, Scene};
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
     use crate::lua::signal;
-    use crate::text::shaping::{ShapeRequest, ShapingHandle};
+    use crate::text::shaping::{FaceRole, ShapeRequest, ShapingHandle};
 
     const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
 
@@ -859,6 +873,7 @@ mod tests {
             width,
             height,
             &font_chain,
+            shaping.font_generation(),
         )
         .map_err(|e| eprintln!("EGL init failed, skip: FemtoVG init: {e}"))
         .ok()
@@ -1897,6 +1912,7 @@ mod tests {
             line_height: crate::text::shaping::line_height(FONT_SIZE),
             max_width: None,
             runs: Vec::new(),
+            font: None,
         });
 
         let mut paint = Paint::color(Color::black());
@@ -1927,7 +1943,7 @@ mod tests {
     fn femtovg_and_cosmic_text_agree_on_a_bold_runs_width() {
         let Some(instance) = init_headless_egl(400, 60) else { return };
         let shaping = ShapingHandle::spawn();
-        if !shaping.font_chain_data().iter().any(|face| face.primary && face.bold) {
+        if !shaping.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Declared) && face.bold) {
             eprintln!("skip: the chain's family has no bold face installed");
             return;
         }
@@ -1946,6 +1962,7 @@ mod tests {
             line_height: crate::text::shaping::line_height(FONT_SIZE),
             max_width: None,
             runs: vec![crate::text::shaping::FontRun { range: 0..TEXT.len(), bold: true, italic: false }],
+            font: None,
         });
         let mut paint = Paint::color(Color::black());
         paint.set_font(painter.variant_fonts(true, false));
@@ -1958,6 +1975,95 @@ mod tests {
             shaped.width,
             femtovg_width
         );
+    }
+
+    /// The whole runtime path in one test: a family named for the first time is resolved on the
+    /// shaping worker, and `sync` has to get those faces into femtovg -- otherwise the node
+    /// measures in one family and paints in another, the divergence ADR-0043 decision 2 closed.
+    #[test]
+    fn a_family_named_after_the_painter_was_built_reaches_femtovg_through_sync() {
+        let Some(instance) = init_headless_egl(400, 60) else { return };
+        let (declared, named) = ("Noto Sans", "Noto Sans Mono");
+        if !crate::text::fonts::fc_match_available()
+            || !crate::text::fonts::family_installed(declared)
+            || !crate::text::fonts::family_installed(named)
+        {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        }
+        let shaping = ShapingHandle::spawn();
+        shaping.set_chain(&[declared.to_string()]);
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+        assert_eq!(painter.named_fonts(named), None, "nothing is registered for a family nobody named");
+
+        // What a text node does: measure first, which is what resolves the family.
+        shaping.shape(ShapeRequest {
+            text: "hello".into(),
+            font_size: 20.0,
+            line_height: crate::text::shaping::line_height(20.0),
+            max_width: None,
+            runs: Vec::new(),
+            font: Some(std::sync::Arc::from(named)),
+        });
+        let generation = shaping.font_generation();
+        assert_ne!(generation, painter.font_generation(), "the painter should now be behind");
+
+        painter.sync(&shaping.font_chain_data(), generation);
+        let chain = painter.named_fonts(named).expect("the named family should lead a chain of its own");
+        assert_ne!(chain[0], painter.fonts()[0], "and that chain leads with a face of its own");
+        assert_eq!(painter.font_generation(), generation);
+    }
+
+    /// femtovg's `add_shared_font_with_index` is a `SlotMap::insert`: it mints a new `FontId` every
+    /// call and never dedups by bytes. A `sync` that re-registered the whole list would re-parse
+    /// every face, strand the previous `Font` entries for the life of the surface, and hand back
+    /// different ids each time -- so the declared chain's ids must survive a sync untouched.
+    #[test]
+    fn syncing_a_new_family_does_not_re_register_the_faces_femtovg_already_holds() {
+        let Some(instance) = init_headless_egl(400, 60) else { return };
+        let (declared, named) = ("Noto Sans", "Noto Sans Mono");
+        if !crate::text::fonts::fc_match_available()
+            || !crate::text::fonts::family_installed(declared)
+            || !crate::text::fonts::family_installed(named)
+        {
+            eprintln!("skip: need two installed families to tell apart");
+            return;
+        }
+        let shaping = ShapingHandle::spawn();
+        shaping.set_chain(&[declared.to_string()]);
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+        let before: Vec<_> = painter.fonts().to_vec();
+
+        shaping.ensure_family(&std::sync::Arc::from(named));
+        painter.sync(&shaping.font_chain_data(), shaping.font_generation());
+
+        assert_eq!(painter.fonts(), &before[..], "the declared chain's ids must not be re-minted");
+
+        // And a second sync over the same faces mints nothing new either.
+        let after_first = painter.named_fonts(named).map(<[_]>::to_vec);
+        painter.sync(&shaping.font_chain_data(), painter.font_generation() + 1);
+        assert_eq!(painter.fonts(), &before[..]);
+        assert_eq!(painter.named_fonts(named).map(<[_]>::to_vec), after_first);
+    }
+
+    /// A name nothing on the system answers gets no chain, so `chain_for` hands the node the
+    /// declared one -- a typo draws the text in the wrong face, never as nothing.
+    #[test]
+    fn a_family_nothing_answers_gets_no_chain_of_its_own() {
+        let Some(instance) = init_headless_egl(400, 60) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+        shaping.shape(ShapeRequest {
+            text: "hello".into(),
+            font_size: 20.0,
+            line_height: crate::text::shaping::line_height(20.0),
+            max_width: None,
+            runs: Vec::new(),
+            font: Some(std::sync::Arc::from("ZZ No Such Family 9184")),
+        });
+        painter.sync(&shaping.font_chain_data(), shaping.font_generation());
+        assert_eq!(painter.named_fonts("ZZ No Such Family 9184"), None);
+        assert!(!painter.fonts().is_empty(), "and the declared chain is still there to draw with");
     }
 
     /// A `text` node's content

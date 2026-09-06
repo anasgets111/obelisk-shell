@@ -58,7 +58,7 @@ pub fn hit_path(root: &ResolvedNode, point: LogicalPoint) -> Vec<&ResolvedNode> 
 /// is what paint measures with; the two agree to within 2% (`layout::paint`'s divergence tests),
 /// which is well inside the slack a press on a word has.
 pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHandle) -> Option<String> {
-    let Some(PaintStyle::Text { content, runs, font_size, align, .. }) = node.paint.as_ref() else {
+    let Some(PaintStyle::Text { content, runs, font_size, font, align, .. }) = node.paint.as_ref() else {
         return None;
     };
     if runs.iter().all(|run| run.href.is_none()) || point.y < 0.0 {
@@ -87,6 +87,7 @@ pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHan
                     line_height,
                     max_width: None,
                     runs: rebased.into_iter().collect(),
+                    font: font.clone(),
                 })
                 .width;
             (width, run)
@@ -300,6 +301,7 @@ mod tests {
             content: content.to_string(),
             runs,
             font_size: 14.0,
+            font: None,
             color: crate::layout::node::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
             align,
             elide: crate::layout::node::Elide::None,
@@ -321,6 +323,7 @@ mod tests {
                 line_height: shaping::line_height(14.0),
                 max_width: None,
                 runs: Vec::new(),
+                font: None,
             })
             .width
     }

@@ -23,6 +23,7 @@
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
+local glyph = require("components.glyph")
 local ui_state = require("lib.ui_state")
 local wallpaper = require("lib.wallpaper")
 local panel_card = require("components.panel_card")
@@ -278,7 +279,7 @@ local function tile(entry)
                 background = theme.ACCENT,
                 visible = applied,
                 children = {
-                    cell(icons.check, theme.text_contrast(theme.ACCENT), theme.font.xs, { align = "Center", align_v = "Center" }),
+                    glyph(icons.check, theme.text_contrast(theme.ACCENT), theme.font.xs, { align = "Center", align_v = "Center" }),
                 },
             },
         },
