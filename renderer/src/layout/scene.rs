@@ -91,19 +91,15 @@ impl LayoutStyle {
             opacity: node::parse_opacity(properties)?,
         })
     }
-
-    /// This node's margin along `axis`, both edges.
-    fn margin_on(&self, axis: MainAxis) -> f32 {
-        match axis {
-            MainAxis::Horizontal => self.margin.horizontal(),
-            MainAxis::Vertical => self.margin.vertical(),
-        }
-    }
 }
 
-/// Public, ID-bearing output of resolution: geometry, parsed paint, and the resolved property map
-/// retained for `hover`, callbacks, and surface specs (`wayland::surface::apply_resolved_state`
-/// re-derives those at configure cadence). Used by `Scene::surface` and `overlay_input_regions`.
+/// The one node type: what a pass produces, what [`Scene`] retains for the next reconcile, and
+/// what every reader borrows. Geometry, parsed paint, and the resolved property map retained for
+/// `hover`, callbacks, and surface specs (`wayland::surface::apply_resolved_state` re-derives
+/// those at configure cadence). Used by `Scene::surface` and `overlay_input_regions`.
+///
+/// `Clone` exists for `Scene::apply`'s rollback snapshot. Readers take `&` from `Scene::surface`;
+/// nothing outside this module builds one.
 ///
 /// `resolve_properties` ran over this node's raw map exactly once, so this snapshot lets later
 /// readers take values without resolving anything. `properties` holds resolved values, never a
@@ -126,6 +122,9 @@ pub struct ResolvedNode {
     pub id: NodeId,
     pub kind: String,
     pub rect: LogicalRect,
+    /// This node's own margin, kept because a parent measures its children's footprint after they
+    /// are built ([`extent_along`]). The rest of [`LayoutStyle`] is pass-local and is not retained.
+    pub margin: EdgeInsets,
     pub visible: bool,
     /// This node's own `opacity`, before any ancestor's. `layout::paint::build_node` multiplies
     /// the chain descending, the same way it intersects a clip, so a panel fades with everything
@@ -138,31 +137,12 @@ pub struct ResolvedNode {
     pub children: Vec<ResolvedNode>,
 }
 
-/// Retained geometry, properties, paint, and `NodeId` for the next reconcile. `Clone` exists only
-/// for `Scene::apply`'s rollback snapshot.
-#[derive(Clone)]
-struct RetainedNode {
-    id: NodeId,
-    kind: String,
-    rect: LogicalRect,
-    /// Geometry for the pass that produced this node, including `visible` and `opacity`.
-    style: LayoutStyle,
-    properties: HashMap<String, Value>,
-    paint: Option<PaintStyle>,
-    children: Vec<RetainedNode>,
-}
-
-impl RetainedNode {
-    fn to_resolved(&self) -> ResolvedNode {
-        ResolvedNode {
-            id: self.id,
-            kind: self.kind.clone(),
-            rect: self.rect,
-            visible: self.style.visible,
-            opacity: self.style.opacity,
-            properties: self.properties.clone(),
-            paint: self.paint.clone(),
-            children: self.children.iter().map(RetainedNode::to_resolved).collect(),
+impl ResolvedNode {
+    /// This node's margin along `axis`, both edges.
+    fn margin_on(&self, axis: MainAxis) -> f32 {
+        match axis {
+            MainAxis::Horizontal => self.margin.horizontal(),
+            MainAxis::Vertical => self.margin.vertical(),
         }
     }
 }
@@ -173,14 +153,14 @@ impl RetainedNode {
 /// (ADR-0045). Descendants use per-parent id matching, with positional fallback for id-less nodes.
 #[derive(Default)]
 pub struct Scene {
-    surfaces: HashMap<String, RetainedNode>,
+    surfaces: HashMap<String, ResolvedNode>,
     next_id: u64,
 }
 
 /// Adds `node` and its descendants to the running node and property totals. Shared by
 /// [`Scene::census`] and [`Scene::census_by_surface`] so the per-surface figures always sum to the
 /// total the same report prints beside them.
-fn census_walk(node: &RetainedNode, nodes: &mut usize, properties: &mut usize) {
+fn census_walk(node: &ResolvedNode, nodes: &mut usize, properties: &mut usize) {
     *nodes += 1;
     *properties += node.properties.len();
     for child in &node.children {
@@ -249,7 +229,11 @@ impl Scene {
             if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua) {
                 self.surfaces = surfaces_snapshot;
                 self.next_id = next_id_snapshot;
-                return Err(blame_the_budget(err));
+                // Blame first: a hook interruption is about the pass, not this instance.
+                return Err(match blame_the_budget(err) {
+                    LayoutError::PassBudgetExceeded => LayoutError::PassBudgetExceeded,
+                    other => other.on_surface(&instance.instance_id),
+                });
             }
         }
         if let Err(err) = admit(self) {
@@ -352,8 +336,8 @@ impl Scene {
     /// (`layout::instance::SurfaceInstance::instance_id`), not by the declared `id` a config
     /// writes. `crate::wayland::App::paint_surface` looks a tree up with exactly the id its
     /// `TrackedSurface` carries, which is what makes the two id spaces one (ADR-0038).
-    pub fn surface(&self, instance_id: &str) -> Option<ResolvedNode> {
-        self.surfaces.get(instance_id).map(RetainedNode::to_resolved)
+    pub fn surface(&self, instance_id: &str) -> Option<&ResolvedNode> {
+        self.surfaces.get(instance_id)
     }
 
     /// Drops the retained tree for an instance that no longer exists.
@@ -428,7 +412,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 
 /// Selects `child`, `children`, generated list children, or no children. Surface roles share one
 /// `child`; `textfield` is a leaf (§ 5.2 item 8). Its callbacks and secure-submit fields remain in
-/// `RetainedNode.properties`; the keyboard path reads the latter from the scene while the secret
+/// `ResolvedNode.properties`; the keyboard path reads the latter from the scene while the secret
 /// buffer stays on `App` (ADR-0005).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
@@ -502,8 +486,8 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
 /// capability-push cadence (ADR-0044 decision 2).
 fn pair_children_by_id_then_position(
     fresh_children: &[VirtualNode],
-    old_children: Vec<RetainedNode>,
-) -> Result<Vec<Option<RetainedNode>>, LayoutError> {
+    old_children: Vec<ResolvedNode>,
+) -> Result<Vec<Option<ResolvedNode>>, LayoutError> {
     let fresh_ids: Vec<Option<String>> =
         fresh_children.iter().map(|c| node::parse_node_id(&c.properties)).collect::<Result<_, _>>()?;
 
@@ -522,7 +506,7 @@ fn pair_children_by_id_then_position(
     // treats absent and validated-no-id alike.
     let old_ids: Vec<Option<String>> =
         old_children.iter().map(|c| node::parse_node_id(&c.properties).ok().flatten()).collect();
-    let mut old_slots: Vec<Option<RetainedNode>> = old_children.into_iter().map(Some).collect();
+    let mut old_slots: Vec<Option<ResolvedNode>> = old_children.into_iter().map(Some).collect();
 
     let mut retained_by_id: HashMap<&str, usize> = HashMap::with_capacity(old_ids.len());
     for (index, id) in old_ids.iter().enumerate() {
@@ -532,7 +516,7 @@ fn pair_children_by_id_then_position(
     }
 
     // Identified subsequence: a miss stays `None`, not a positional slot.
-    let mut matched: Vec<Option<RetainedNode>> = Vec::with_capacity(fresh_children.len());
+    let mut matched: Vec<Option<ResolvedNode>> = Vec::with_capacity(fresh_children.len());
     for fresh_id in &fresh_ids {
         let claimed = fresh_id
             .as_deref()
@@ -580,7 +564,7 @@ enum Measure {
 }
 
 /// One node after identity, resolution and parsing, and before geometry: everything a
-/// [`RetainedNode`] needs except the rect, plus the taffy node that rect will come out of.
+/// [`ResolvedNode`] needs except the rect, plus the taffy node that rect will come out of.
 ///
 /// The tree of these is what [`prepare`] builds walking the fresh `VirtualNode` tree in
 /// declaration order, and what [`finish`] walks again to read the solved geometry back.
@@ -595,7 +579,7 @@ struct PreparedNode {
     /// The retained children of a node that is not `visible` this pass, carried through untouched
     /// (ADR-0124): not rebuilt, not laid out, not dropped. `children` is empty whenever this is
     /// not.
-    frozen: Vec<RetainedNode>,
+    frozen: Vec<ResolvedNode>,
 }
 
 /// `Content` and `Fill` map to taffy's `auto`; `Fill` gets its meaning from parent flow and
@@ -797,7 +781,7 @@ fn new_solver_node(
 fn prepare(
     scene: &mut Scene,
     tree: &mut taffy::TaffyTree<Measure>,
-    retained: Option<RetainedNode>,
+    retained: Option<ResolvedNode>,
     kind: &str,
     properties: HashMap<String, Value>,
     style: LayoutStyle,
@@ -922,7 +906,7 @@ fn finish(
     tree: &taffy::TaffyTree<Measure>,
     prepared: PreparedNode,
     shaping: &ShapingHandle,
-) -> Result<RetainedNode, LayoutError> {
+) -> Result<ResolvedNode, LayoutError> {
     let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen } = prepared;
     let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
     let size = LogicalSize { width: layout.size.width, height: layout.size.height };
@@ -930,18 +914,20 @@ fn finish(
     // Frozen children come back as they were (see `prepare`): no scroll offset applied again to
     // rects that already carry one, no text refitted to a box that was not laid out.
     if !style.visible {
-        return Ok(RetainedNode {
+        return Ok(ResolvedNode {
             id,
             kind,
             rect: LogicalRect { x: layout.location.x, y: layout.location.y, width: size.width, height: size.height },
-            style,
+            margin: style.margin,
+            visible: style.visible,
+            opacity: style.opacity,
             properties,
             paint,
             children: frozen,
         });
     }
 
-    let mut children: Vec<RetainedNode> =
+    let mut children: Vec<ResolvedNode> =
         children.into_iter().map(|child| finish(tree, child, shaping)).collect::<Result<_, _>>()?;
 
     // ADR-0069 decision 4. Subtracted from every child's main coordinate, so a scrolled child sits
@@ -981,11 +967,13 @@ fn finish(
     // built, because what it rewrites is the string the display list will carry.
     fit_text_to_box(&mut paint, (size.width - style.padding.horizontal()).max(0.0), shaping);
 
-    Ok(RetainedNode {
+    Ok(ResolvedNode {
         id,
         kind,
         rect: LogicalRect { x: layout.location.x, y: layout.location.y, width: size.width, height: size.height },
-        style,
+        margin: style.margin,
+        visible: style.visible,
+        opacity: style.opacity,
         properties,
         paint,
         children,
@@ -995,8 +983,8 @@ fn finish(
 /// How much room this container's visible children take along `axis`, margins and gaps included:
 /// the number a scroll offset is clamped against. The same footprint the sizing pass used, which
 /// keeps a scroll limit and the layout it scrolls in agreement.
-fn extent_along(children: &[RetainedNode], axis: MainAxis, spacing: f32) -> f32 {
-    let visible: Vec<&RetainedNode> = children.iter().filter(|c| c.style.visible).collect();
+fn extent_along(children: &[ResolvedNode], axis: MainAxis, spacing: f32) -> f32 {
+    let visible: Vec<&ResolvedNode> = children.iter().filter(|c| c.visible).collect();
     let extents: f32 = visible
         .iter()
         .map(|c| {
@@ -1004,7 +992,7 @@ fn extent_along(children: &[RetainedNode], axis: MainAxis, spacing: f32) -> f32 
                 MainAxis::Horizontal => c.rect.width,
                 MainAxis::Vertical => c.rect.height,
             };
-            extent + c.style.margin_on(axis)
+            extent + c.margin_on(axis)
         })
         .sum();
     extents + spacing * visible.len().saturating_sub(1) as f32
@@ -1130,7 +1118,7 @@ fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::sign
 /// child's place in the content.
 fn reveal_child(
     properties: &HashMap<String, Value>,
-    children: &[RetainedNode],
+    children: &[ResolvedNode],
     axis: MainAxis,
     padding_start: f32,
     content_main: f32,
@@ -1141,7 +1129,7 @@ fn reveal_child(
     let Some(index) = signal.take_reveal() else {
         return;
     };
-    let Some(child) = children.iter().filter(|c| c.style.visible).nth(index - 1) else {
+    let Some(child) = children.iter().filter(|c| c.visible).nth(index - 1) else {
         return;
     };
     let (start, extent) = match axis {
@@ -2540,7 +2528,7 @@ pub(super) mod tests {
             }
             node.children.iter().find_map(find)
         }
-        find(&scene.surface("bar@TEST").unwrap()).expect("expected a text node")
+        find(scene.surface("bar@TEST").unwrap()).expect("expected a text node")
     }
 
     // ---- styled runs following a wrap or an elide (ADR-0104) ----
@@ -3175,6 +3163,66 @@ pub(super) mod tests {
         deserialize_lua_table(&table).unwrap()
     }
 
+    /// What one production read of a retained tree costs:
+    /// `cargo test -p renderer --release read_seam -- --ignored --nocapture`. Ignored because it
+    /// reports a number rather than asserting one, and only a release build's number means
+    /// anything.
+    ///
+    /// It exists because the seam it measures used to rebuild the tree it was asked to read. On
+    /// this 162-node fixture that was 43.4us per read against 134ns once `Scene::surface` lent its
+    /// tree instead -- the evidence for that change, and the guard if a clone ever comes back.
+    /// `hit_path` stands in for the pointer path, which is what pays this per motion event.
+    #[test]
+    #[ignore]
+    fn read_seam_cost() {
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r##"
+                local kids = {}
+                for i = 1, 40 do
+                  kids[i] = row {
+                    spacing = 2,
+                    background = "#204080FF",
+                    children = {
+                      rect { width = 8, height = 8, background = "#FFFFFFFF" },
+                      text { content = "item " .. i, font_size = 12 },
+                      rect { width = 8, height = 8, background = "#00FF00FF" },
+                    },
+                  }
+                end
+                return panel { id = "bar", child = row { spacing = 4, children = kids } }
+                "##,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        let mut scene = Scene::new();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+
+        let (_, nodes, properties) = scene.census();
+        let point = crate::layout::hit::LogicalPoint { x: 120.0, y: 5.0 };
+        let iterations = 20_000;
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..iterations {
+                let tree = scene.surface("bar@TEST").unwrap();
+                sink += crate::layout::hit::hit_path(tree, point).len();
+            }
+            std::hint::black_box(sink);
+            best = best.min(start.elapsed());
+        }
+        println!(
+            "READ_SEAM nodes={nodes} properties={properties} iterations={iterations} best={:?} per_read={:?}",
+            best,
+            best / iterations
+        );
+    }
+
     #[test]
     fn a_tree_at_the_depth_cap_is_accepted_and_one_level_past_it_is_rejected() {
         let deepest = MAX_TREE_DEPTH as usize;
@@ -3215,7 +3263,7 @@ pub(super) mod tests {
         let mut node = scene.surface("bar@TEST").unwrap();
         for _ in 0..=NESTING {
             assert_eq!(node.children.len(), 1);
-            node = node.children.into_iter().next().unwrap();
+            node = &node.children[0];
         }
         assert_eq!(node.kind, "rect");
         assert_eq!(node.rect.width, 4.0, "the innermost rect's own geometry must have resolved");
@@ -3816,6 +3864,7 @@ pub(super) mod tests {
         children: Vec<ResolvedNode>,
     ) -> ResolvedNode {
         ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(id),
             kind: kind.to_string(),
             rect: LogicalRect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 },
@@ -3857,6 +3906,7 @@ pub(super) mod tests {
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(102),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
@@ -3867,6 +3917,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(103),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
@@ -3877,6 +3928,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let root = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(104),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
@@ -3895,6 +3947,7 @@ pub(super) mod tests {
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(105),
             kind: "rect".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
@@ -3905,6 +3958,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let mut root = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(106),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
@@ -3923,6 +3977,7 @@ pub(super) mod tests {
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(107),
             kind: "panel".to_string(),
             rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
@@ -3931,6 +3986,7 @@ pub(super) mod tests {
             properties: HashMap::new(),
             paint: None,
             children: vec![ResolvedNode {
+                margin: crate::layout::node::EdgeInsets::default(),
                 id: NodeId::test(120),
                 kind: "row".to_string(),
                 rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },

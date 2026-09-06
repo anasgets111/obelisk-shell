@@ -176,10 +176,8 @@ impl App {
             .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { .. }))
             .map(|tracked| tracked.surface_id.clone())
             .collect();
-        let can_authenticate = lock_instances
-            .iter()
-            .filter_map(|id| self.client.scene().surface(id))
-            .any(|tree| tree_can_authenticate(&tree));
+        let can_authenticate =
+            lock_instances.iter().filter_map(|id| self.client.scene().surface(id)).any(tree_can_authenticate);
         match lock_command(locked, !lock_instances.is_empty(), can_authenticate, self.session_lock.is_some()) {
             LockCommand::Nothing => {}
             LockCommand::Refuse(reason) => self.refuse_lock(reason),

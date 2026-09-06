@@ -26,10 +26,8 @@ fn wheel_steps(pixels: f64, steps: i32) -> f32 {
     -wheel_delta(pixels, steps) / WHEEL_STEP_PIXELS
 }
 
-/// One press waiting for its release (ADR-0050 decision 2). `ResolvedNode` has no identity
-/// (`NodeId` lives on `RetainedNode`, dropped by `to_resolved`), so the rect stands in: moving the
-/// button between press and release cancels the click, as moving it off the pointer would for a
-/// real identity.
+/// One press waiting for its release (ADR-0050 decision 2). The rect stands in for identity:
+/// moving the button between press and release cancels the click.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ArmedClick {
     instance_id: String,
@@ -543,11 +541,9 @@ impl App {
     /// Ask [`focus_on_enter`] over scoped trees; called both on `enter` and when trees change under
     /// an existing focus.
     fn field_the_scope_declares(&self, scope: &[String], current: Option<FocusedField>) -> Option<FocusedField> {
-        // Owned trees end the `self.client` borrow before the caller writes through `&mut self`.
-        let trees: Vec<(&str, layout::ResolvedNode)> =
+        let trees: Vec<(&str, &layout::ResolvedNode)> =
             scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
-        let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
-        focus_on_enter(&borrowed, current.as_ref())
+        focus_on_enter(&trees, current.as_ref())
     }
 
     /// Arm a newly visible sole `secure_submit` when the tree changes under existing focus. Enter
@@ -580,11 +576,10 @@ impl App {
     /// when the user returns manually; automatic handoff must not append to a forgotten search.
     /// Fire `on_change("")` on every arm so launchers reset selection/scroll and state clears.
     fn arm_autofocus_field(&mut self, scope: &[String]) {
-        let trees: Vec<(&str, layout::ResolvedNode)> =
+        let trees: Vec<(&str, &layout::ResolvedNode)> =
             scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
-        let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
         let Some((surface_id, FieldTarget::Plain { id, on_change, on_submit, on_cancel, on_navigate })) =
-            autofocus_field_in_scope(&borrowed)
+            autofocus_field_in_scope(&trees)
         else {
             return;
         };
@@ -626,11 +621,10 @@ impl App {
             if field.typing {
                 return;
             }
-            let trees: Vec<(&str, layout::ResolvedNode)> =
+            let trees: Vec<(&str, &layout::ResolvedNode)> =
                 scope.iter().filter_map(|id| self.client.scene().surface(id).map(|tree| (id.as_str(), tree))).collect();
-            let borrowed: Vec<(&str, &layout::ResolvedNode)> = trees.iter().map(|(id, tree)| (*id, tree)).collect();
             let same_field = matches!(
-                autofocus_field_in_scope(&borrowed),
+                autofocus_field_in_scope(&trees),
                 Some((_, FieldTarget::Plain { id, .. })) if id == field.id
             );
             if same_field {
@@ -751,7 +745,7 @@ impl App {
             .client
             .scene()
             .surface(&field.surface_id)
-            .is_some_and(|tree| layout::hit::contains_node(&tree, field.id));
+            .is_some_and(|tree| layout::hit::contains_node(tree, field.id));
         if self.surface_is_live(&field.surface_id) && node_exists {
             return;
         }
@@ -851,14 +845,14 @@ impl App {
 
     /// One hit-test answers button, field, and drag (ADR-0050 decisions 1/4). Coordinates are
     /// logical surface-local while `paint_surface` remains scale `1.0`; a future HiDPI change must
-    /// move this conversion with `paint_surface` and `apply_input_region`. `Scene::surface` owns a
-    /// clone before the client borrow ends, and clones handlers/targets out of the tree.
+    /// move this conversion with `paint_surface` and `apply_input_region`. Handlers and targets are
+    /// cloned out of the lent tree; the tree itself is not.
     fn hit_under(&self, index: usize, position: (f64, f64)) -> PointerHit {
         let Some(tree) = self.client.scene().surface(&self.surfaces[index].surface_id) else {
             return PointerHit { button: None, field: None, drag: None };
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
-        let path = layout::hit::hit_path(&tree, point);
+        let path = layout::hit::hit_path(tree, point);
         PointerHit {
             button: clickable(&path, point, &self.shaping),
             field: focused_field(&path),
@@ -901,7 +895,7 @@ impl App {
             return;
         };
         let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
-        let path = layout::hit::hit_path(&tree, point);
+        let path = layout::hit::hit_path(tree, point);
         // Deepest scrollable under the pointer wins.
         let scrollable = path.iter().enumerate().rev().find_map(|(depth, node)| {
             let signal = layout::scene::scroll_signal_of(node)?;
@@ -946,19 +940,23 @@ impl App {
         handle.set_changed(mlua::Value::Number(f64::from(current + delta)));
     }
 
-    /// Set the cursor chosen by [`layout::hit::cursor_under`] (ADR-0107) only when it changes;
-    /// motion arrives per pixel and each `set_shape` would add compositor work. `Leave` clears the
-    /// cache because the shape is bound to the next enter serial.
-    fn sync_cursor(&mut self, tree: Option<&layout::ResolvedNode>, position: (f64, f64)) {
+    /// The cursor [`layout::hit::cursor_under`] chooses under `position` (ADR-0107). Split from
+    /// [`Self::show_cursor`] so the choosing ends its borrow of the lent tree before the showing
+    /// writes through `&mut self`.
+    fn cursor_for(&self, tree: Option<&layout::ResolvedNode>, position: (f64, f64)) -> cursor_icon::CursorIcon {
+        let Some(tree) = tree else {
+            return cursor_icon::CursorIcon::Default;
+        };
+        let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
+        layout::hit::cursor_under(&layout::hit::hit_path(tree, point), point, &self.shaping)
+    }
+
+    /// Set the cursor only when it changes; motion arrives per pixel and each `set_shape` would add
+    /// compositor work. `Leave` clears the cache because the shape is bound to the next enter
+    /// serial.
+    fn show_cursor(&mut self, shape: cursor_icon::CursorIcon) {
         let Some(pointer) = self.pointer.as_ref() else {
             return;
-        };
-        let shape = match tree {
-            Some(tree) => {
-                let point = layout::hit::LogicalPoint { x: position.0 as f32, y: position.1 as f32 };
-                layout::hit::cursor_under(&layout::hit::hit_path(tree, point), point, &self.shaping)
-            }
-            None => cursor_icon::CursorIcon::Default,
         };
         if self.cursor_shown == Some(shape) {
             return;
@@ -985,7 +983,7 @@ impl App {
             return;
         };
         let tree = self.client.scene().surface(&surface_id);
-        self.sync_hover(index, tree.as_ref(), Some(position), false);
+        self.sync_hover(index, tree, Some(position), false);
     }
 
     /// Write all `hover` signals, or clear them for `None` (ADR-0062). Collect writes before
@@ -994,20 +992,9 @@ impl App {
     /// continues (ADR-0044 decision 2). `fire` enables `on_hover` only for motion/leave, not enter-
     /// motion or re-layout.
     ///
-    /// Takes the tree rather than fetching it: `Scene::surface` deep-clones a retained tree, and a
-    /// motion event needs it here *and* in [`Self::sync_cursor`]. Fetching in each was two clones
-    /// per motion, twice the one the ceiling below accepts.
+    /// Takes the tree rather than fetching it so one lookup serves this and the cursor.
     ///
-    /// ponytail: one deep clone per motion on the dispatch thread, a few hundred `HashMap`s.
-    /// Upgrade: a borrowing `&RetainedNode` accessor, which removes the clone rather than sharing
-    /// it.
-    fn sync_hover(
-        &mut self,
-        index: usize,
-        tree: Option<&layout::ResolvedNode>,
-        position: Option<(f64, f64)>,
-        fire: bool,
-    ) {
+    fn sync_hover(&self, index: usize, tree: Option<&layout::ResolvedNode>, position: Option<(f64, f64)>, fire: bool) {
         // Skip the expensive tree walk when no config registered `hover(name)`.
         if !crate::lua::signal::any_hover_registered(self.client.lua()) {
             return;
@@ -1297,7 +1284,7 @@ impl PointerHandler for App {
                     self.cursor_shown = None;
                     self.pointer_at = None;
                     let tree = self.client.scene().surface(&self.surfaces[index].surface_id);
-                    self.sync_hover(index, tree.as_ref(), None, true);
+                    self.sync_hover(index, tree, None, true);
                 }
                 // Motion off the armed rect does not disarm; return and release still click. Enter
                 // and Motion update hover, but only Motion fires `on_hover` (ADR-0112 amendment):
@@ -1310,10 +1297,12 @@ impl PointerHandler for App {
                     if moved {
                         self.fire_on_drag(&instance_id, event.position, "move");
                     }
-                    // Fetched once for both: each wants this tree and `Scene::surface` clones it.
+                    // One lookup serves both; `Scene::surface` lends its tree.
                     let tree = self.client.scene().surface(&self.surfaces[index].surface_id);
-                    self.sync_hover(index, tree.as_ref(), Some(event.position), moved);
-                    self.sync_cursor(tree.as_ref(), event.position);
+                    self.sync_hover(index, tree, Some(event.position), moved);
+                    // Chosen while the tree is still borrowed, shown once that borrow has ended.
+                    let shape = self.cursor_for(tree, event.position);
+                    self.show_cursor(shape);
                 }
                 // Wheel (ADR-0069); use the event's own position.
                 PointerEventKind::Axis { horizontal, vertical, .. } => {
@@ -1575,6 +1564,7 @@ mod tests {
             properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
         }
         layout::ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             // Distinct per node, since `focused_field` now reads an identity off one of these and
             // a shared id would make every hand-built field the same field.
             id: layout::scene::NodeId::test(NEXT_TEST_NODE_ID.fetch_add(1, Ordering::Relaxed)),

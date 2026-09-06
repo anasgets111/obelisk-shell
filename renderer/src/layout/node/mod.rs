@@ -118,6 +118,26 @@ pub enum LayoutError {
     PassBudgetExceeded,
 }
 
+impl LayoutError {
+    /// Names the surface this came from, added by `layout::scene::Scene::apply_admitting` as it
+    /// walks instances. A whole-scene re-resolve reported one property name for a config with a
+    /// dozen surfaces (`invalid value for \`background\`` and nothing else), leaving a reader to
+    /// grep every surface that has one; the instance id is right there in the loop.
+    ///
+    /// It extends `detail` rather than wrapping in a new variant so that `InvalidProperty` stays
+    /// the variant callers match on, `property` keeps naming the property alone, and no reader of
+    /// this enum has to learn a wrapper. The other variants already name the node kind or the whole
+    /// pass, which is enough to find them, and none of them has a free-form field to extend.
+    pub(crate) fn on_surface(self, surface: &str) -> Self {
+        match self {
+            Self::InvalidProperty { property, detail } => {
+                Self::InvalidProperty { property, detail: format!("on `{surface}`: {detail}") }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Crate-visible for `layout::scene::Scene::apply_one_instance`; all crate `InvalidProperty`
 /// values use this helper.
 pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError {
@@ -243,8 +263,8 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// skipped on every kind ([`parse_node_id`]/[`parse_surface_id`] read it wherever it appears).
 /// `layer`/`anchor`/`monitor`/`namespace` are read only by `surface::surface_topology` on
 /// top-level surfaces; skipping them on a `rect` (where no parser reads them) would leak a live
-/// `Signal` into `layout::scene::RetainedNode::properties`, breaking `ResolvedNode::properties`'s
-/// "never a `Signal`" invariant. Below a surface these resolve like any ordinary property.
+/// `Signal` into `layout::scene::ResolvedNode::properties`, breaking its "never a `Signal`"
+/// invariant. Below a surface these resolve like any ordinary property.
 /// `namespace` joins the carve-out for the same protocol reason as `monitor`:
 /// `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at creation and no request changes
 /// it on a live surface. The in-place `panel` fields (`keyboard_interactivity`, `exclusive`,
@@ -270,7 +290,7 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 /// One node's raw property map with every `Signal` replaced by its current value (ADR-0044
 /// decision 1). Called once per node per pass, as that node enters reconciliation; everything
 /// downstream (this module's parsers, `layout::scene`'s sizing/positioning passes,
-/// `RetainedNode::properties`) reads the result, not the raw map. Once, and once is load-bearing:
+/// `ResolvedNode::properties`) reads the result, not the raw map. Once, and once is load-bearing:
 /// `Signal::get_value` runs a `computed` signal's Lua closure, and a closure that is not a pure
 /// function of unchanged state (`os.clock()`, `math.random`, an accumulator upvalue) answers
 /// differently on every call, so one read per property makes the resolved tree a snapshot of one
@@ -334,7 +354,11 @@ pub fn resolve_properties(
             resolved.insert(property.clone(), value.clone());
             continue;
         };
-        let value = signal.get_value(lua).map_err(|e| invalid(property, format!("Signal getter failed: {e}")))?;
+        // Name the node kind: a config has many `background`s, and the bare property left a reader
+        // grepping every one of them. `Scene::apply_admitting` adds the surface.
+        let value = signal
+            .get_value(lua)
+            .map_err(|e| invalid(property, format!("Signal getter on a `{kind}` node failed: {e}")))?;
         match value {
             Value::UserData(_) => {
                 return Err(invalid(

@@ -587,6 +587,7 @@ impl RendererClient {
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
             return false;
         }
+        start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
         dump_layout_if_asked(&self.scene);
         true
     }
@@ -614,7 +615,7 @@ fn dump_layout_if_asked(scene: &Scene) {
         }
     }
     let mut out = format!("layout dump: {wanted}\n");
-    walk(&surface, 0, &mut out);
+    walk(surface, 0, &mut out);
     eprint!("{out}");
 }
 
@@ -721,12 +722,17 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
 /// Starts capabilities named by applied `textfield` `secure_submit`s (ADR-0070 decision 5), so a
 /// password prompt registers its agent even if nothing reads the member. The sender deduplicates.
 ///
-/// ponytail: not called from `re_resolve_if_dirty` (`Scene::surface` deep-clones every repaint).
-/// Gap: a later-pushed `textfield` waits for reevaluation. Upgrade: accumulated roster.
+/// Called from every successful apply, `re_resolve_if_dirty` included, so a `textfield` a pushed
+/// value reveals registers its agent on the re-resolve that reveals it rather than waiting for the
+/// next reevaluation.
+///
+/// ponytail: one tree walk per instance per re-resolve, at capability-push cadence.
+/// `CommandSender::start_capability` dedupes, so a repeat costs one set lookup and no frame.
+/// Upgrade: an accumulated roster, if the walk itself ever shows up.
 fn start_secure_submit_capabilities(scene: &Scene, instances: &[SurfaceInstance], commands: &CommandSender) {
     for instance in instances {
         let Some(tree) = scene.surface(&instance.instance_id) else { continue };
-        for target in crate::layout::secure_submit::secure_submit_targets(&tree) {
+        for target in crate::layout::secure_submit::secure_submit_targets(tree) {
             commands.start_capability(&target.capability);
         }
     }
@@ -945,6 +951,49 @@ mod tests {
         assert!(queued_starts(&mut outbound_rx).contains(&"polkit".to_string()));
     }
 
+    /// The other half of ADR-0070 decision 5: a field a pushed value reveals must register its
+    /// agent on the re-resolve that reveals it. `re_resolve_if_dirty` never reads `shell.lua`, so
+    /// waiting for the next reevaluation left a revealed prompt with no agent behind it.
+    #[test]
+    fn a_secure_submit_revealed_by_a_pushed_value_starts_its_capability_on_that_re_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"
+            return panel { id = "prompt", layer = "Top", child = row { children = computed({oblisk.network}, function(ssid)
+                if ssid then
+                    return { textfield { secure_submit = { capability = "polkit", action = "authenticate" } } }
+                end
+                return {}
+            end) } }
+            "#,
+        );
+        let (mut client, mut outbound_rx) = test_client(&path);
+        run_startup(&mut client);
+        assert!(
+            !queued_starts(&mut outbound_rx).contains(&"polkit".to_string()),
+            "nothing declares the field yet, so nothing has named polkit"
+        );
+
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "network".to_string(),
+                revision: 1,
+                payload: serde_json::json!("home"),
+            })
+            .unwrap();
+        assert!(client.re_resolve_if_dirty(), "the push must have re-resolved");
+
+        assert!(
+            client.scene.surface("prompt@TEST").unwrap().children[0].children.len() == 1,
+            "the re-resolve must have revealed the field"
+        );
+        assert!(
+            queued_starts(&mut outbound_rx).contains(&"polkit".to_string()),
+            "the re-resolve that revealed the field must start the capability it names"
+        );
+    }
+
     #[test]
     fn apply_state_snapshot_updates_the_live_signal_without_evaluating_shell_lua() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -1056,7 +1105,7 @@ mod tests {
 
         // `hover_writes` receives the same tree as `App::sync_hover` when the pointer enters.
         let tree = client.scene.surface("bar@TEST").unwrap();
-        let writes = layout::hover::hover_writes(&tree, Some(layout::hit::LogicalPoint { x: 50.0, y: 10.0 }));
+        let writes = layout::hover::hover_writes(tree, Some(layout::hit::LogicalPoint { x: 50.0, y: 10.0 }));
         assert_eq!(writes.len(), 1, "one node declared a hover, so there is one write");
         assert!(writes[0].hovered, "the pointer is inside the row that declared it");
         assert!(writes[0].rect.is_some(), "and it reports where it is, for a tooltip to anchor to");
@@ -1074,7 +1123,7 @@ mod tests {
         // Leave again, the edge callback designs lose when reevaluation replaces the node
         // (ADR-0062 decision 1).
         let tree = client.scene.surface("bar@TEST").unwrap();
-        for write in layout::hover::hover_writes(&tree, None) {
+        for write in layout::hover::hover_writes(tree, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(write.hovered));
         }
         assert!(client.re_resolve_if_dirty());
@@ -1168,14 +1217,14 @@ mod tests {
 
         let bar = client.scene.surface("bar@TEST").unwrap();
         let mut centres = Vec::new();
-        hover_region_centres(&bar, 0.0, 0.0, &mut centres);
+        hover_region_centres(bar, 0.0, 0.0, &mut centres);
         assert!(centres.len() >= 2, "the bar declares more than one hover region, got {}", centres.len());
 
         // Regions nest: a pill row hides circles off the pill, while a point on a circle lights
         // both. `hover_writes` checks every region, not only the innermost; each lit region must
         // contain the point and each unlit one must not.
         for centre in &centres {
-            let writes = layout::hover::hover_writes(&bar, Some(*centre));
+            let writes = layout::hover::hover_writes(bar, Some(*centre));
             let lit: Vec<bool> = writes.iter().map(|write| write.hovered).collect();
             assert!(lit.iter().any(|hovered| *hovered), "a region's own centre must light it, at {centre:?}");
             for write in &writes {
@@ -1189,7 +1238,7 @@ mod tests {
 
         // Distinct slots, not one signal shared by regions. A copied slot name opens the wrong live
         // tooltip while both regions parse, resolve, and light one *write*.
-        let writes = layout::hover::hover_writes(&bar, Some(centres[0]));
+        let writes = layout::hover::hover_writes(bar, Some(centres[0]));
         let first = writes.first().expect("the walk found regions above");
         first.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(true));
         let lit_after: Vec<bool> = writes
@@ -1247,7 +1296,9 @@ mod tests {
         // now four circles precede it, and `centres.first()` tests the power button. The stronger
         // assertion is that exactly one region opens the battery tooltip, catching either side's
         // slot rename.
-        let bar = client.scene.surface("bar@TEST").unwrap();
+        // Cloned: the loop below re-resolves through `client`, and the centres come from the
+        // bar as it stood before any of that.
+        let bar = client.scene.surface("bar@TEST").unwrap().clone();
         let mut centres = Vec::new();
         hover_region_centres(&bar, 0.0, 0.0, &mut centres);
         assert!(centres.len() > 1, "the shipped bar declares more than one hover region");
@@ -1289,7 +1340,7 @@ mod tests {
         // Close again. `anchor_rect` retains its last rect instead of clearing, preserving § 6's
         // non-zero rule on the way out.
         let bar = client.scene.surface("bar@TEST").unwrap();
-        for write in layout::hover::hover_writes(&bar, None) {
+        for write in layout::hover::hover_writes(bar, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
         }
         assert!(client.re_resolve_if_dirty());
@@ -1411,7 +1462,7 @@ mod tests {
 
         let lock = client.scene.surface("lock_screen@TEST").expect("the lock screen resolves");
         let masked = |focus: Option<&layout::paint::FieldFocus>| -> Vec<String> {
-            layout::paint::build(&lock, 1.0, focus)
+            layout::paint::build(lock, 1.0, focus)
                 .commands
                 .iter()
                 .filter_map(|command| match &command.draw {

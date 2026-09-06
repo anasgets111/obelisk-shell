@@ -881,7 +881,7 @@ mod tests {
             available: size,
         }];
         scene.apply(&[surface], &instances, &shaping, lua).unwrap();
-        scene.surface("bar@TEST").unwrap()
+        scene.surface("bar@TEST").unwrap().clone()
     }
 
     // ---- display list (`build`), the seam that needs no EGL context ----

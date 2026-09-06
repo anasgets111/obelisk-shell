@@ -375,46 +375,58 @@ impl App {
     /// while create/destroy/map/unmap commit by definition.
     fn apply_resolved_state(&mut self, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
-        // Own the tree so the client borrow ends before mutable role updates.
-        let Some(tree) = self.client.scene().surface(&surface_id) else {
-            // Startup/apply failure or rollback (`Scene::apply` restores its prior state): keep the
-            // last applied fields rather than pushing defaults over a working surface.
-            return;
+        // `Scene::surface` lends its tree, so what the tree is read for is taken here and the
+        // borrow ends with this block; the role updates below write through `&mut self`. Exactly
+        // one spec is parsed -- the one this surface's role calls for.
+        let (panel, window, popup, regions, visible) = {
+            let Some(tree) = self.client.scene().surface(&surface_id) else {
+                // Startup/apply failure or rollback (`Scene::apply` restores its prior state): keep
+                // the last applied fields rather than pushing defaults over a working surface.
+                return;
+            };
+            let role = &self.surfaces[index].role;
+            (
+                matches!(role, TrackedRole::Panel { .. }).then(|| node::panel_spec(&tree.properties)),
+                matches!(role, TrackedRole::Window { .. }).then(|| node::window_spec(&tree.properties)),
+                matches!(role, TrackedRole::Popup { .. }).then(|| node::popup_spec(&tree.properties)),
+                layout::overlay_input_regions(tree, 1.0),
+                tree.visible,
+            )
         };
 
-        match &self.surfaces[index].role {
-            TrackedRole::Panel { .. } => match node::panel_spec(&tree.properties) {
-                Ok(fresh) => self.apply_spec_change(index, fresh),
-                Err(err) => eprintln!(
-                    "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
-                ),
-            },
-            TrackedRole::Window { .. } => match node::window_spec(&tree.properties) {
-                Ok(fresh) => self.apply_window_change(index, fresh),
-                Err(err) => eprintln!(
-                    "[oblisk-renderer] {surface_id}: re-resolved window properties are invalid, keeping the last applied ones: {err}"
-                ),
-            },
-            TrackedRole::Popup { .. } => match node::popup_spec(&tree.properties) {
-                // Store, do not diff: `get_popup` consumes every positioner field and no
-                // `xdg_popup.reposition` exists. The next open uses this pass's `anchor_rect`
-                // (ADR-0049 amendment), including a click-written state signal.
-                Ok(fresh) => {
-                    if let TrackedRole::Popup { spec, .. } = &mut self.surfaces[index].role {
-                        *spec = fresh;
-                    }
-                }
-                Err(err) => eprintln!(
-                    "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
-                ),
-            },
-            // Locks have no config-settable protocol field: only `ack_configure` exists and size
-            // arrives in configure. The create path parses a spec only for the role match; input
-            // region handling still runs.
-            TrackedRole::Lock { .. } => {}
+        match panel {
+            Some(Ok(fresh)) => self.apply_spec_change(index, fresh),
+            Some(Err(err)) => eprintln!(
+                "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
+            ),
+            None => {}
         }
-        self.apply_input_region(index, &tree);
-        self.apply_visibility(index, tree.visible);
+        match window {
+            Some(Ok(fresh)) => self.apply_window_change(index, fresh),
+            Some(Err(err)) => eprintln!(
+                "[oblisk-renderer] {surface_id}: re-resolved window properties are invalid, keeping the last applied ones: {err}"
+            ),
+            None => {}
+        }
+        match popup {
+            // Store, do not diff: `get_popup` consumes every positioner field and no
+            // `xdg_popup.reposition` exists. The next open uses this pass's `anchor_rect`
+            // (ADR-0049 amendment), including a click-written state signal.
+            Some(Ok(fresh)) => {
+                if let TrackedRole::Popup { spec, .. } = &mut self.surfaces[index].role {
+                    *spec = fresh;
+                }
+            }
+            Some(Err(err)) => eprintln!(
+                "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
+            ),
+            None => {}
+        }
+        // Locks have no config-settable protocol field: only `ack_configure` exists and size
+        // arrives in configure. The create path parses a spec only for the role match; input region
+        // handling still runs.
+        self.apply_input_region(index, regions);
+        self.apply_visibility(index, visible);
     }
 
     /// Set the per-surface input region from the resolved tree (§ 5.1, ADR-0038 decision 5): no
@@ -423,7 +435,7 @@ impl App {
     /// diff against the last region: the following GPU repaint costs more than one `wl_region`
     /// round trip. Skip a hidden window with no `wl_surface`; its first post-show re-resolve sets
     /// the region.
-    fn apply_input_region(&mut self, index: usize, tree: &layout::ResolvedNode) {
+    fn apply_input_region(&mut self, index: usize, regions: Vec<crate::text::snap::PhysicalRect>) {
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
         };
@@ -436,7 +448,7 @@ impl App {
                 return;
             }
         };
-        for rect in layout::overlay_input_regions(tree, 1.0) {
+        for rect in regions {
             region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
         }
         surface.set_input_region(Some(region.wl_region()));

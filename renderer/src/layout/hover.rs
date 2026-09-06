@@ -117,6 +117,7 @@ mod tests {
             properties.insert("on_hover".to_string(), on_hover);
         }
         ResolvedNode {
+            margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),
             kind: "row".to_string(),
             rect: LogicalRect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 },

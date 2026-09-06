@@ -88,7 +88,7 @@ pub(crate) fn lock_stays_authenticatable(
             continue;
         };
         if tree.kind == "lock" {
-            if tree_can_authenticate(&tree) {
+            if tree_can_authenticate(tree) {
                 return Ok(());
             }
             locks.push(instance.instance_id.as_str());
