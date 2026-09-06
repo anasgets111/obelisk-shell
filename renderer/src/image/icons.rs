@@ -45,7 +45,12 @@ fn memoized(name: &str, size: u16, lookup: impl FnOnce() -> Option<PathBuf>) -> 
     }
     let found = lookup();
     // Do not hold the map across `lookup`: its filesystem walk would serialize callers.
-    memo().lock().expect("icon memo poisoned").entry(size).or_default().insert(name.to_string(), found.clone());
+    let mut memo = memo().lock().expect("icon memo poisoned");
+    let by_name = memo.entry(size).or_default();
+    if by_name.len() >= MEMO_CAPACITY {
+        by_name.clear();
+    }
+    by_name.insert(name.to_string(), found.clone());
     found
 }
 
@@ -56,12 +61,22 @@ fn memoized(name: &str, size: u16, lookup: impl FnOnce() -> Option<PathBuf>) -> 
 /// limited to the render thread; an uncontended lock is nanoseconds against the measured 1.6ms
 /// lookup.
 ///
-/// ponytail: unbounded, bounded by distinct tray/config icon names. Each entry is a name and path;
-/// thousands of names grow it. Generation swap frees it, as with `ImageCache`.
+/// Capped at [`MEMO_CAPACITY`] names per size and cleared wholesale there, because the set of names
+/// is not bounded by what is installed: a notification's `app_icon` is a bare theme name chosen by
+/// whichever application sent it, and a config drawing it (`icon { name = group.app_icon }`) hands
+/// it straight to [`resolve`]. Every novel name also pays the ~1.6ms walk this memo exists to
+/// avoid, on the render thread.
+///
+/// Cleared rather than evicted, following `text::shaping`'s cache: an LRU maintains a recency order
+/// on every hit, which is work on the path the memo exists to make cheap.
 fn memo() -> &'static Mutex<Memo> {
     static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(Memo::new()))
 }
+
+/// Names remembered per size. Sized like `text::shaping`'s cache: far past any real working set (a
+/// bar and its panels resolve tens of icons), while still bounding a stream of novel names.
+const MEMO_CAPACITY: usize = 4096;
 
 /// Size -> name -> path, nested so hits borrow the inner `&str` without allocating.
 type Memo = HashMap<u16, HashMap<String, Option<PathBuf>>>;
@@ -196,5 +211,22 @@ mod tests {
         // Memoize `None` exactly like a hit.
         assert_eq!(memoized("oblisk-test-missing", 16, || None), None);
         assert_eq!(memoized("oblisk-test-missing", 16, || panic!("an absent name must not be looked up again")), None);
+    }
+
+    /// A notification's `app_icon` is an arbitrary name from whichever application sent it, so the
+    /// set of names is not bounded by what is installed. Without the cap this map grew for the life
+    /// of the generation.
+    #[test]
+    fn the_memo_drops_its_names_rather_than_growing_without_bound() {
+        let mut walks = 0;
+        for i in 0..=MEMO_CAPACITY {
+            memoized(&format!("name-that-no-theme-has-{i}"), 999, || {
+                walks += 1;
+                None
+            });
+        }
+        let held = memo().lock().unwrap().get(&999).map(HashMap::len).unwrap_or_default();
+        assert!(held <= MEMO_CAPACITY, "the map must not hold more than the cap, held {held}");
+        assert_eq!(walks, MEMO_CAPACITY + 1, "every novel name still resolves; the cap bounds memory, not correctness");
     }
 }
