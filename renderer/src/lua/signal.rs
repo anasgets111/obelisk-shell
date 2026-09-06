@@ -1535,18 +1535,31 @@ mod tests {
         // calls, and this test asserted the cut-off. [`EvaluationMemo`] removes the blow-up
         // instead: the second edge into each level is a lookup, so the graph is 20 calls, finishes,
         // and still answers 2^20 -- the same number the slow version reached the long way.
+        //
+        // Counts calls rather than timing the evaluation. A wall-clock bound flakes under the
+        // parallel suite for the reason the next test's own comment records: a descheduled thread
+        // blows the deadline without doing any more work. The call count is what the memo actually
+        // changes -- 20 against 2^20-1, five orders of magnitude apart -- so it fails the blow-up
+        // this exists to catch on any machine, at any load.
         let lua = lua_with_signal("a", Value::Integer(1));
-        lua.load("for _ = 1, 20 do a = computed({a, a}, function(x, y) return x + y end) end").exec().unwrap();
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&calls);
+        lua.globals()
+            .set(
+                "add",
+                lua.create_function(move |_, (x, y): (i64, i64)| {
+                    counter.set(counter.get() + 1);
+                    Ok(x + y)
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        lua.load("for _ = 1, 20 do a = computed({a, a}, add) end").exec().unwrap();
 
-        let start = Instant::now();
         let result: mlua::Result<i64> = lua.load("return a:get()").eval();
-        let elapsed = start.elapsed();
 
         assert_eq!(result.unwrap(), 1_048_576, "a shared dependency must still be summed once per edge");
-        assert!(
-            elapsed < Duration::from_millis(5),
-            "20 memoized levels must not approach the budget, took {elapsed:?}"
-        );
+        assert_eq!(calls.get(), 20, "one call per level; the un-memoized graph would make 2^20-1");
     }
 
     #[test]
