@@ -2974,3 +2974,54 @@ What this gives up is a guard on four components a live shell exercises daily, a
 them moves into `share/starter` it becomes product and the runner in decision 3 stops being
 machinery for a sample. Until then the boundary is that the engine tests the engine.
 
+
+## 0156. A swap handshake hands back every frame it is not the reader of, because the Candidate asks for its capabilities before it signals ready
+
+On 2026-09-07 a live session locked with no PAM worker behind the lock screen: it rendered, took
+keystrokes, and had nothing to authenticate against, which under `ext-session-lock-v1` is a
+lockout rather than a failed unlock. Recovery went through ADR-0060's takeover marker.
+
+The Renderer evaluates `shell.lua` before it sends `ReadySignal` (`wayland/mod.rs`'s § 14.2 order:
+evaluate, bind, clear, signal), and ADR-0070 decision 1 makes reading `oblisk.<capability>` queue a
+`StartCapability`. So a Candidate's starts always reach the Supervisor *ahead of* the `ReadySignal`
+the swap handshake is waiting for -- and `SocketCandidateLink::recv_matching` logged and threw away
+everything that was not the frame it wanted. Every swap, not only a rushed one.
+
+It stayed invisible because `Capabilities::start` is idempotent and the generation before had
+usually started the same names already, so the dropped frame asked for something that existed. The
+first read of a name is the one that matters, and at boot that name is `lock`.
+
+1. **Non-handshake frames are deferred, not dropped.** `recv_matching` now sets each one aside in
+   arrival order for the caller. The bug was never specific to `StartCapability`: `Command`,
+   `SetState`, `LockReport`, `RequestReload` and `ReevaluateReport` went the same way, and
+   `main.rs`'s own comment on the stale-`LockReport` arm spells out what losing one of those costs.
+   Fixing the shared receiver fixes all of them at once.
+2. **`ReadySignal` and `PresentationEvidence` are still dropped.** This link is the only reader
+   either one has, so one arriving out of turn is stale or a wire desync, not work owed to anybody.
+   Deferring them would hand the main loop a frame whose only handler logs it as exactly that.
+3. **They go back through the main loop's `match`, via a queue drained ahead of the socket.** Not
+   re-queued onto the inbound channel: it is bounded at `MAX_INBOUND_FRAMES` for flood control, so
+   a replay would either await inside a path nothing is draining, or `try_send` and drop again
+   under the load where dropping hurts most. A `VecDeque` popped by `next_inbound` before it reads
+   the socket keeps the order exact and needs no second handler. The pop is synchronous, so the arm
+   stays cancel-safe.
+4. **The replay happens whether or not the swap succeeded.** A handshake that times out consumed
+   the frames all the same, and the Candidate that sent them may be about to become authoritative.
+
+Not built: an acknowledgement for `StartCapability`. Nothing re-sends one lost to a connection that
+dies mid-write, and the renderer-side `started` set means a generation asks exactly once. That is a
+narrower hole than this one and wants a real second occurrence before it grows a protocol.
+
+Measured live on 2026-09-07, same machine, same swap (one surface added to `dev-config`), the two
+binaries A/B'd: **26 frames dropped before, 0 after.** Twenty-one were `StartCapability` -- every
+capability the config uses, `lock` among them -- and five were `Command` envelopes with real work
+in them: `storage.open` of the state file, `files.watch` on the wallpaper directory,
+`sysinfo.configure`, `idle.register`, and `updates.configure` carrying the whole package list. So
+the failure was never the rare race the roadmap recorded. It was total capability loss on every
+topology reload, hidden because the outgoing generation's controllers were already built and the
+incoming one inherited them.
+
+The roadmap row that recorded this said the drop was silent. It was not -- `recv_matching` printed
+a line naming the frame and both generations on every one. What was missing was anyone reading the
+log, which is the argument for the frame surviving rather than for a louder message.
+

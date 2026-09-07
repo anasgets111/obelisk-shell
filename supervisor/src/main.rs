@@ -44,6 +44,22 @@ const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
     reap_grace: process::DEFAULT_REAP_GRACE,
 };
 
+/// The next frame for the main loop: a deferred one first, then the socket. A swap handshake
+/// borrows the shared receiver and takes frames it is not the reader of off it (ADR-0025), so
+/// `replay` is where they wait; draining it first is what keeps their order.
+///
+/// Cancel-safe, which the `select!` arm requires: the pop is synchronous, so the only await point
+/// is `Receiver::recv`, and a cancelled call cannot have taken a frame from either source.
+async fn next_inbound(
+    replay: &mut std::collections::VecDeque<socket::InboundFrame>,
+    inbound: &mut tokio::sync::mpsc::Receiver<socket::InboundFrame>,
+) -> Option<socket::InboundFrame> {
+    match replay.pop_front() {
+        Some(frame) => Some(frame),
+        None => inbound.recv().await,
+    }
+}
+
 /// Whether an `Unchanged` report names the most recently sent `Reevaluate`; a mismatch is a
 /// superseded evaluation and cannot authorize the reload (ADR-0024).
 fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
@@ -256,6 +272,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // restart into (ADR-0059 decision 3).
     let mut shutdown = Shutdown::Requested;
 
+    // Frames a swap handshake read off `inbound_frames` without being their reader (ADR-0156).
+    // Drained ahead of the socket so they keep their arrival order relative to each other and to
+    // everything that arrived after the swap.
+    let mut replay: std::collections::VecDeque<socket::InboundFrame> = std::collections::VecDeque::new();
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -298,7 +319,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),
             Some(()) = reload_events.recv() => supervisor.begin_reload(),
             Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
-            Some(inbound) = inbound_frames.recv() => match inbound.frame {
+            Some(inbound) = next_inbound(&mut replay, &mut inbound_frames) => match inbound.frame {
                 RendererFrame::LockReport(report) if inbound.generation_id != supervisor.authoritative.generation_id => {
                     // A superseded, unreaped connection still sends frames. Either stale report
                     // corrupts the swap gate: Unlocked/Finished reaps the live lock holder, while
@@ -358,7 +379,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     supervisor.defer_swap(sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) => {
-                    supervisor.swap_generation(sequence, &mut inbound_frames).await;
+                    supervisor.swap_generation(sequence, &mut inbound_frames, &mut replay).await;
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
@@ -477,6 +498,38 @@ mod tests {
         // SIGTERM at session end must not look like failure. `RestartPreventExitStatus` names one
         // code, so every other exit means restarting is recovery.
         assert_eq!(Shutdown::Requested.exit_code(), 0);
+    }
+
+    /// Order is the whole point of holding the frames in a queue rather than pushing them back
+    /// onto the socket channel: a deferred `StartCapability` must be handled before whatever
+    /// arrived while the swap was finishing, not after it.
+    #[tokio::test]
+    async fn next_inbound_drains_every_deferred_frame_before_it_reads_the_socket_again() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        tx.send(socket::InboundFrame {
+            generation_id: 9,
+            frame: shared::RendererFrame::StartCapability { capability: "after".to_string() },
+        })
+        .await
+        .unwrap();
+
+        let mut replay: std::collections::VecDeque<socket::InboundFrame> = ["lock", "audio"]
+            .into_iter()
+            .map(|capability| socket::InboundFrame {
+                generation_id: 9,
+                frame: shared::RendererFrame::StartCapability { capability: capability.to_string() },
+            })
+            .collect();
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let inbound = next_inbound(&mut replay, &mut rx).await.expect("three frames are available");
+            let shared::RendererFrame::StartCapability { capability } = inbound.frame else {
+                panic!("only starts were queued");
+            };
+            seen.push(capability);
+        }
+        assert_eq!(seen, ["lock", "audio", "after"], "both held frames come first, in the order they were held");
     }
 
     #[test]

@@ -427,10 +427,13 @@ impl Supervisor {
     /// Runs one `TopologyChanged` swap (ADR-0025) inline. Swaps are rare and bounded by seconds
     /// (`PBA_TIMINGS`), so capability traffic cannot starve. Borrow `inbound` so the link reads
     /// Candidate ReadySignal/evidence from the loop's receiver.
+    /// `replay` receives every frame the handshake took off the shared channel without being its
+    /// reader, in arrival order, for the caller's loop to handle once the swap is over (ADR-0156).
     pub(crate) async fn swap_generation(
         &mut self,
         sequence: u64,
         inbound: &mut tokio::sync::mpsc::Receiver<InboundFrame>,
+        replay: &mut std::collections::VecDeque<InboundFrame>,
     ) {
         let candidate_generation_id = self.take_generation_id();
         let candidate_envs = vec![
@@ -440,11 +443,17 @@ impl Supervisor {
         // All latest snapshots hydrate Candidate's first evaluation (§ 14.2, ADR-0029), not just
         // audio's.
         let snapshots: Vec<shared::StateSnapshot> = self.last_snapshots.values().cloned().collect();
-        let mut link = SocketCandidateLink { registry: self.registry.clone(), candidate_generation_id, inbound };
+        let mut link = SocketCandidateLink::new(self.registry.clone(), candidate_generation_id, inbound);
 
-        match reload::run_pba(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS)
-            .await
-        {
+        let outcome =
+            reload::run_pba(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS)
+                .await;
+        // Before the outcome, and on the failure path too: a handshake that fails still consumed
+        // the frames, and a `StartCapability` the Candidate sent while evaluating is owed to the
+        // main loop either way.
+        replay.extend(std::mem::take(&mut link.deferred));
+
+        match outcome {
             Ok(outcome) => {
                 // ADR-0043 decision 1: widest handoff point, Candidate presented while superseded
                 // still owns every buffer and both are resident. Sample before swap reaps one.

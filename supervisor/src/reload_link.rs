@@ -36,18 +36,42 @@ impl std::fmt::Display for SocketLinkError {
 impl std::error::Error for SocketLinkError {}
 
 /// `push_state_snapshot`/`send_activate_draw` use [`GenerationRegistry::send_frame`]; receive
-/// methods filter `inbound` and log frames not tagged for this candidate.
+/// methods filter `inbound` and set aside every frame not tagged for this candidate.
 pub struct SocketCandidateLink<'a> {
     pub registry: GenerationRegistry,
     pub candidate_generation_id: u32,
     /// Borrowed for one in-flight handshake; see the module comment.
     pub inbound: &'a mut mpsc::Receiver<InboundFrame>,
+    /// Frames this handshake consumed from the shared channel without being their reader, in
+    /// arrival order, for the caller to hand back to the main loop (ADR-0156).
+    ///
+    /// ponytail: unbounded, and moving a frame here frees the slot `MAX_INBOUND_FRAMES` was
+    /// holding it in, so a flood over the handshake window grows this without a cap of its own.
+    /// The window is the `ready_timeout` in `PBA_TIMINGS` (2s) and the flood would have to come
+    /// from a Renderer this Supervisor spawned. Upgrade to a cap that drops the oldest and says
+    /// so, if one ever fills.
+    pub deferred: Vec<InboundFrame>,
 }
 
-impl SocketCandidateLink<'_> {
-    /// Receives until the candidate's frame matches `extract`, logging/dropping others. Returns
-    /// `ConnectionClosed` if the channel ends. Box rejected frames because clippy's
-    /// `result_large_err` flags an unboxed `RendererFrame` error.
+/// A frame only [`SocketCandidateLink`] ever reads, so one arriving out of turn is stale or a
+/// wire-protocol desync rather than work the main loop still owes someone. Everything else is
+/// deferred instead of dropped.
+fn is_handshake_frame(frame: &RendererFrame) -> bool {
+    matches!(frame, RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_))
+}
+
+impl<'a> SocketCandidateLink<'a> {
+    pub fn new(
+        registry: GenerationRegistry,
+        candidate_generation_id: u32,
+        inbound: &'a mut mpsc::Receiver<InboundFrame>,
+    ) -> Self {
+        SocketCandidateLink { registry, candidate_generation_id, inbound, deferred: Vec::new() }
+    }
+
+    /// Receives until the candidate's frame matches `extract`. Returns `ConnectionClosed` if the
+    /// channel ends. Box rejected frames because clippy's `result_large_err` flags an unboxed
+    /// `RendererFrame` error.
     async fn recv_matching<T>(
         &mut self,
         what: &str,
@@ -57,21 +81,28 @@ impl SocketCandidateLink<'_> {
             let InboundFrame { generation_id, frame } =
                 self.inbound.recv().await.ok_or(SocketLinkError::ConnectionClosed)?;
             if generation_id != self.candidate_generation_id {
-                eprintln!(
-                    "SocketCandidateLink({what}): frame from generation {generation_id} dropped during an in-flight swap handshake for \
-                     generation {} (wrong generation): {frame:?}",
-                    self.candidate_generation_id
-                );
+                self.set_aside(what, generation_id, frame, "wrong generation");
                 continue;
             }
             match extract(frame) {
                 Ok(value) => return Ok(value),
-                Err(frame) => eprintln!(
-                    "SocketCandidateLink({what}): frame from generation {generation_id} dropped during an in-flight swap handshake \
-                     (not a {what}): {frame:?}"
-                ),
+                Err(frame) => self.set_aside(what, generation_id, *frame, &format!("not a {what}")),
             }
         }
+    }
+
+    /// Queues a frame this handshake is not the reader of, or drops it if nothing else reads it
+    /// either.
+    fn set_aside(&mut self, what: &str, generation_id: u32, frame: RendererFrame, why: &str) {
+        if is_handshake_frame(&frame) {
+            eprintln!(
+                "SocketCandidateLink({what}): handshake frame from generation {generation_id} dropped during an \
+                 in-flight swap handshake for generation {} ({why}): {frame:?}",
+                self.candidate_generation_id
+            );
+            return;
+        }
+        self.deferred.push(InboundFrame { generation_id, frame });
     }
 }
 
@@ -172,7 +203,7 @@ mod tests {
     async fn push_state_snapshot_sends_a_state_snapshot_frame_to_the_candidate_generation() {
         let (registry, mut rx) = registry_with_connection(9);
         let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         link.push_state_snapshot(&[snapshot()]).await.expect("send must succeed");
 
@@ -187,8 +218,7 @@ mod tests {
     async fn push_state_snapshot_retries_until_the_candidate_connection_registers() {
         let registry = GenerationRegistry::default();
         let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link =
-            SocketCandidateLink { registry: registry.clone(), candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry.clone(), 9, &mut inbound_rx);
 
         let late_registry = registry.clone();
         let (tx, mut rx) = mpsc::channel(16);
@@ -211,7 +241,7 @@ mod tests {
     async fn send_activate_draw_sends_an_activate_draw_frame_with_the_given_nonce() {
         let (registry, mut rx) = registry_with_connection(9);
         let (_inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         link.send_activate_draw(42).await.expect("send must succeed");
 
@@ -224,7 +254,7 @@ mod tests {
     async fn recv_ready_signal_returns_the_surfaces_from_the_matching_generation() {
         let (registry, _rx) = registry_with_connection(9);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         inbound_tx
             .send(InboundFrame {
@@ -242,7 +272,7 @@ mod tests {
     async fn recv_ready_signal_skips_an_irrelevant_frame_arriving_before_the_relevant_one() {
         let (registry, _rx) = registry_with_connection(9);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         // Wrong generation, still authoritative, reporting something unrelated.
         inbound_tx
@@ -271,7 +301,7 @@ mod tests {
     async fn recv_presentation_evidence_skips_a_mismatched_nonce_then_matches() {
         let (registry, _rx) = registry_with_connection(9);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         inbound_tx
             .send(InboundFrame {
@@ -298,12 +328,114 @@ mod tests {
         assert_eq!(surface_id, "main_bar");
     }
 
+    /// The lockout of 2026-09-07 (ADR-0156). A Candidate evaluates `shell.lua` before it signals
+    /// ready, so every `oblisk.<capability>` the config reads queues a `StartCapability` that
+    /// reaches this link ahead of the `ReadySignal` it is waiting for. Dropping those left the
+    /// Supervisor with no `lock` controller behind a lock screen that still took keystrokes.
+    #[tokio::test]
+    async fn a_start_capability_sent_before_the_ready_signal_is_kept_for_the_main_loop() {
+        let (registry, _rx) = registry_with_connection(9);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
+
+        for capability in ["lock", "audio"] {
+            inbound_tx
+                .send(InboundFrame {
+                    generation_id: 9,
+                    frame: RendererFrame::StartCapability { capability: capability.to_string() },
+                })
+                .await
+                .unwrap();
+        }
+        inbound_tx
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }),
+            })
+            .await
+            .unwrap();
+
+        link.recv_ready_signal().await.expect("the ready signal still resolves past the starts");
+
+        let started: Vec<String> = link
+            .deferred
+            .iter()
+            .filter_map(|held| match &held.frame {
+                RendererFrame::StartCapability { capability } => Some(capability.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["lock".to_string(), "audio".to_string()], "both, in the order they arrived");
+    }
+
+    /// The authoritative generation keeps running during a swap, and what it sends is work this
+    /// Supervisor still owes it, not handshake traffic for a candidate it knows nothing about.
+    #[tokio::test]
+    async fn a_frame_from_another_generation_is_kept_rather_than_dropped_for_being_the_wrong_one() {
+        let (registry, _rx) = registry_with_connection(9);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
+
+        inbound_tx.send(InboundFrame { generation_id: 8, frame: command_frame() }).await.unwrap();
+        inbound_tx
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }),
+            })
+            .await
+            .unwrap();
+
+        link.recv_ready_signal().await.expect("the ready signal still resolves");
+
+        assert_eq!(link.deferred.len(), 1, "the other generation's command is held: {:?}", link.deferred);
+        assert_eq!(link.deferred[0].generation_id, 8, "and it is handed back tagged with its own generation");
+    }
+
+    /// Only this link reads a `ReadySignal` or `PresentationEvidence`, so one arriving out of turn
+    /// has no second reader to be handed to; holding it would send the main loop a frame whose only
+    /// handler logs it as a desync.
+    #[tokio::test]
+    async fn a_handshake_frame_out_of_turn_is_still_dropped_because_nothing_else_reads_one() {
+        let (registry, _rx) = registry_with_connection(9);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
+
+        inbound_tx
+            .send(InboundFrame {
+                generation_id: 8,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["stale".to_string()] }),
+            })
+            .await
+            .unwrap();
+        inbound_tx
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::PresentationEvidence(PresentationEvidence {
+                    nonce: 1,
+                    surface_id: "stale".to_string(),
+                }),
+            })
+            .await
+            .unwrap();
+        inbound_tx
+            .send(InboundFrame {
+                generation_id: 9,
+                frame: RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }),
+            })
+            .await
+            .unwrap();
+
+        link.recv_ready_signal().await.expect("the ready signal must resolve past both");
+
+        assert!(link.deferred.is_empty(), "neither is owed to anyone: {:?}", link.deferred);
+    }
+
     #[tokio::test]
     async fn recv_ready_signal_reports_connection_closed_when_the_channel_ends() {
         let (registry, _rx) = registry_with_connection(9);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         drop(inbound_tx);
-        let mut link = SocketCandidateLink { registry, candidate_generation_id: 9, inbound: &mut inbound_rx };
+        let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
         let err = link.recv_ready_signal().await.expect_err("a closed channel must not resolve Ok");
         assert!(matches!(err, SocketLinkError::ConnectionClosed));
