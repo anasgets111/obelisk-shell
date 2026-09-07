@@ -10,7 +10,6 @@
 -- the fill drew a lozenge inside the pill's left end at low charge because the engine clipped only
 -- to rectangles.
 local theme = require("config.theme")
-local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
@@ -34,23 +33,6 @@ local function battery_color(b)
         return theme.PEACH
     end
     return theme.GREEN
-end
-
-local function battery_glyph(b)
-    if b == nil or not b.present then
-        return icons.battery_ac
-    end
--- `Charging` gets the bolt. Mains at a charge limit and full get the plug: the cable is in and the
--- level is not moving, a state once indistinguishable from running on battery.
-    if b.state == "Charging" then
-        return icons.battery_pending
-    end
-    if b.state == "PendingCharge" or b.state == "FullyCharged" then
-        return icons.battery_ac
-    end
-    -- Five buckets over 0..100. Lua's 1-based indexing makes 100% bucket 5, not an out-of-range 6.
-    local bucket = math.floor((b.percent or 0) / 20) + 1
-    return icons.battery_levels[math.max(1, math.min(5, bucket))]
 end
 
 -- One readout colour works with the translucent fill. The old two-colour switch at 60% existed for
@@ -107,7 +89,7 @@ local readout = row {
     align_v = "Center",
     spacing = theme.spacing.xs,
     children = {
-        glyph(oblisk.battery:map(battery_glyph), READOUT, theme.icon.md, { align_v = "Center" }),
+        glyph(oblisk.battery:map(util.battery_glyph), READOUT, theme.icon.md, { align_v = "Center" }),
         cell(util.label(oblisk.battery, function(b)
             if not b.present then
                 return "ac"

@@ -74,6 +74,28 @@ function util.battery_at_most(b, percent)
     return b ~= nil and b.present and util.battery_is_draining(b.state) and b.percent <= percent
 end
 
+-- Five-level glyph plus the two cable states, shared by `modules/bar/indicators/battery.lua` and
+-- the lock card's status row. It takes the raw payload so a caller with a `nil` battery still gets
+-- the AC glyph rather than a branch of its own.
+--
+-- `Charging` gets the bolt. Mains at a charge limit and full get the plug: the cable is in and the
+-- level is not moving, a state once indistinguishable from running on battery.
+function util.battery_glyph(b)
+    local icons = require("config.icons")
+    if b == nil or not b.present then
+        return icons.battery_ac
+    end
+    if b.state == "Charging" then
+        return icons.battery_pending
+    end
+    if b.state == "PendingCharge" or b.state == "FullyCharged" then
+        return icons.battery_ac
+    end
+    -- Five buckets over 0..100. Lua's 1-based indexing makes 100% bucket 5, not an out-of-range 6.
+    local bucket = math.floor((b.percent or 0) / 20) + 1
+    return icons.battery_levels[math.max(1, math.min(5, bucket))]
+end
+
 function util.count(list)
     return list and #list or 0
 end
@@ -114,6 +136,28 @@ function util.volume_glyph(a)
         return icons.vol_mid
     end
     return icons.vol_high
+end
+
+-- Four strength buckets, matching `NetworkService.getWifiIcon`'s 0..100 tiering, shared by the
+-- bar indicator and the lock card's status row.
+function util.network_glyph(n)
+    local icons = require("config.icons")
+    if n == nil then
+        return icons.wifi_none
+    end
+    if n.ssid == "Ethernet" then
+        return icons.ethernet
+    end
+    -- A dead radio and a live one joined to nothing are different pictures. `wifi_enabled` was
+    -- added to `NetworkState` so the first can be drawn.
+    if not n.networking_enabled or not n.wifi_enabled then
+        return icons.wifi_off
+    end
+    if n.ssid == nil then
+        return icons.wifi_none
+    end
+    local tier = math.floor(((n.strength or 0) / 100) * 3.999) + 1
+    return icons.wifi[math.max(1, math.min(4, tier))]
 end
 
 function util.volume_icon_name(a)

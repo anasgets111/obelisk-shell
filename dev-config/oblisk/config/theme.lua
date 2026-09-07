@@ -34,6 +34,16 @@ end
 -- sessions seed them first in `wayland/mod.rs` (ADR-0041 decision 2).
 local FALLBACK_HEIGHT = 1080
 
+-- Logical width of the same output, for the one token measured across the screen rather than down
+-- it. Same 1080p-era fallback reasoning as `FALLBACK_HEIGHT`.
+local MAIN_WIDTH = (function()
+    local screen = main_screen()
+    if screen ~= nil and screen.width ~= nil then
+        return screen.width
+    end
+    return 1920
+end)()
+
 local SCALE = (function()
     local screen = main_screen()
     -- Use `screen.height` directly. `wayland/output.rs` already divides once: a 3840x2160 panel at
@@ -342,6 +352,20 @@ theme.osd_track           = s(12, 8)
 -- `dialogWidth`: the polkit card (`modules/global/polkit.lua`), narrower than the launcher because
 -- it holds one sentence, one field and two buttons.
 theme.dialog_width        = s(450, 360)
+
+-- ## The lock card (`modules/global/lock.lua`)
+--
+-- `LockContent.qml`'s own formula, kept as a formula: 38% of the output, clamped to 480..720. This
+-- is the one token measured from screen *width*, because the card is landscape -- 715px on this
+-- 1920px seat, against the 448px an `s(480)` height-scaled token produced. That card was taller
+-- than it was wide and nothing inside it read like the mirror.
+--
+-- ponytail: sampled once at evaluation, like `SCALE`. Moving the shell to a narrower output leaves
+-- the old width until the next edit.
+theme.lock_card_width = math.max(480, math.min(math.floor(MAIN_WIDTH * 0.38), 720))
+-- `controlHeightLg * 2.4`, the initials disc, measured off the mirror at 106px on a 1200px-tall
+-- screen.
+theme.lock_avatar = s(112, 72)
 
 -- ## The launcher (`modules/global/launcher.lua`)
 --

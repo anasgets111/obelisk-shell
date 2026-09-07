@@ -1534,20 +1534,27 @@ mod tests {
         assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
 
         let lock = client.scene.surface("lock_screen@TEST").expect("the lock screen resolves");
+        // Walk into `Transformed`, which is where a scaled subtree keeps its commands. The card
+        // enters with a `scale`, so every glyph on it sits one level down and a flat scan of the
+        // top-level list reported a lock screen that draws no text at all.
+        fn drawn_text(commands: &[layout::paint::DrawCmd], out: &mut Vec<String>) {
+            for command in commands {
+                match &command.draw {
+                    layout::paint::Draw::Text { content, .. } => out.push(content.clone()),
+                    layout::paint::Draw::Transformed { commands, .. } => drawn_text(commands, out),
+                    _ => {}
+                }
+            }
+        }
         let masked = |focus: Option<&layout::paint::FieldFocus>| -> Vec<String> {
-            layout::paint::build(lock, 1.0, focus)
-                .commands
-                .iter()
-                .filter_map(|command| match &command.draw {
-                    layout::paint::Draw::Text { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
-                .collect()
+            let mut out = Vec::new();
+            drawn_text(&layout::paint::build(lock, 1.0, focus).commands, &mut out);
+            out
         };
 
         let unfocused = masked(None);
         assert!(
-            unfocused.iter().any(|drawn| drawn == "password"),
+            unfocused.iter().any(|drawn| drawn == "Password"),
             "an untouched field shows its placeholder: {unfocused:?}"
         );
 
@@ -1560,7 +1567,7 @@ mod tests {
             "five keystrokes must draw five of this config's `mask_character`: {typed:?}"
         );
         assert!(
-            !typed.iter().any(|drawn| drawn == "password"),
+            !typed.iter().any(|drawn| drawn == "Password"),
             "the placeholder gives way once something is typed: {typed:?}"
         );
     }
