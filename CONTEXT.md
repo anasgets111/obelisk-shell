@@ -78,6 +78,16 @@ Current project vocabulary. Implementation contracts live in [docs](docs/oblisk-
 
 **Tween**: A retained node's property in flight between the value it displayed and the target a pass resolved, advanced per compositor frame callback without Lua. _Avoid_: animation object, transition, Behavior
 
+**Linger**: Keeping a surface mapped after its `visible` source dropped, for as long as its exit tween runs, through `delay(signal, ms)`. _Avoid_: close-hold timer, retained copy
+
+**Keyframe sequence**: A node property walked through a declared list of values, once or repeatedly, driven by elapsed time rather than by what a pass resolved. _Avoid_: timeline, animation group, SequentialAnimation
+
+**Leaving node**: A child the retained scene no longer holds, kept painted at its last rect and out of the flow for the length of its `animate.exit` block, which replaces every tween it was running. _Avoid_: exit transition, removal animation, ghost node
+
+**Pulse**: A signal reading `true` for a fixed window after its source changes value, which is how a config fires a one-shot animation without an imperative call. _Avoid_: trigger, event, restart, edge signal
+
+**Spring**: A tween whose motion comes from stiffness and damping rather than a duration and a curve, and which hands its running speed to the run that replaces it when the target moves. _Avoid_: physics animation, damped tween, inertia
+
 ## Ownership
 
 **Lock authority**: The Supervisor's decision to acquire the lock and authorize its authenticated release. _Avoid_: lock screen, lock client

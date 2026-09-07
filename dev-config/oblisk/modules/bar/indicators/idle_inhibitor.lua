@@ -29,7 +29,7 @@ end), nil, {
     end),
     on_button = function(_, mouse_button)
         if mouse_button == "right" then
-            ui_state.idle_settings_open:set(not ui_state.idle_settings_open:get())
+            ui_state.toggle_modal("idle_settings")
         elseif mouse_button == "left" then
             idle.set_manual(not idle.manual:get())
         end

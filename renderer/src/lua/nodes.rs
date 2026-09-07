@@ -36,6 +36,7 @@ const COMMON_PROPERTIES: &[&str] = &[
     "align_v",
     "animate",
     "cursor",
+    "geometry",
     "height",
     "hover",
     "id",
@@ -44,7 +45,11 @@ const COMMON_PROPERTIES: &[&str] = &[
     "max_width",
     "on_hover",
     "opacity",
+    "origin",
     "padding",
+    "rotate",
+    "scale",
+    "translate",
     "visible",
     "width",
 ];
@@ -116,7 +121,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
 
 /// Whether `kind` accepts `property`. Unknown kinds accept all properties until their
 /// [`NODE_PROPERTIES`] row is written; rejecting all would be worse than the silence being fixed.
-fn accepts(kind: &str, property: &str) -> bool {
+pub(crate) fn accepts(kind: &str, property: &str) -> bool {
     let Some((_, own)) = NODE_PROPERTIES.iter().find(|(name, _)| *name == kind) else {
         return true;
     };
@@ -547,7 +552,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 613, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 743, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when
@@ -557,6 +562,10 @@ mod meta_stub_tests {
         match (field, ty) {
             ("opacity", _) => return Some("0.5".to_string()),
             ("animate", _) => return Some("{ opacity = 200 }".to_string()),
+            ("scale", "Axes") | ("translate", _) => return Some("{ x = 1, y = 2 }".to_string()),
+            ("scale", _) => return Some("1.5".to_string()),
+            ("rotate", _) => return Some("15".to_string()),
+            ("origin", _) => return Some("{ x = 0.5, y = 0.5 }".to_string()),
             ("border_color", "BorderColors") => return Some("{ top = \"#112233\" }".to_string()),
             ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
             // Inline table shapes have no alias.
@@ -569,6 +578,7 @@ mod meta_stub_tests {
             // Parsers check callbacks only as functions, except `list`'s two layout calls, which
             // use the return value. These three bare `Bound` fields take the handle itself.
             ("hover", _) => return Some("hover(\"probe\")".to_string()),
+            ("geometry", _) => return Some("geometry(\"probe\")".to_string()),
             ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
             ("source", "Bound") => return Some("SIGNAL_LIST".to_string()),
             // Literal-array `list.source` is fixed for the pass; real lists therefore use the

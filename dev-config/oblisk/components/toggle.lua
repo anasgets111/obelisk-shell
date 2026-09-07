@@ -5,14 +5,16 @@
 -- pushes a table, not a bool; only the caller knows the field. `on_change` receives the flipped
 -- value so the
 -- caller can route it through `capability:invoke(...)` or local `state()`.
--- Move the thumb with signal-bound `align_h` (`"Start"`/`"End"`), like `components/volume.lua`'s
--- icon name, not a pixel `margin` offset. § 5.1 and `layout/node/mod.rs`'s `resolve_properties`
--- prove Signals for base non-structural properties, but not for Signals nested in `margin` fields.
+-- The thumb slides like `OToggle.qml`'s `Behavior on x`: the track is a `row` whose first child is
+-- a spacer with a signal-bound, eased `width` (ADR-0145). `align_h` would snap and `margin`'s edge
+-- table cannot carry a tween; a bare-number spacer width can.
 local theme = require("config.theme")
 
 local TRACK_WIDTH = theme.s(34, 28)
 local TRACK_HEIGHT = theme.control.xs
-local THUMB = TRACK_HEIGHT - theme.s(4, 3)
+local PAD = theme.s(2, 1)
+local THUMB = TRACK_HEIGHT - 2 * PAD
+local TRAVEL = TRACK_WIDTH - 2 * PAD - THUMB
 
 local function read_bool(value, read)
     if value == nil then
@@ -35,24 +37,31 @@ return function(signal, read, on_change)
             end
             on_change(not read_bool(signal:get(), read))
         end,
-        children = { rect {
+        children = { row {
             width = "Fill",
             height = "Fill",
             radius = TRACK_HEIGHT / 2,
-            padding = { top = theme.s(2, 1), right = theme.s(2, 1), bottom = theme.s(2, 1), left = theme.s(2, 1) },
+            padding = { top = PAD, right = PAD, bottom = PAD, left = PAD },
             background = on:map(function(v)
                 return v and theme.GREEN or theme.SURFACE
             end),
-            children = { rect {
-                width = THUMB,
-                height = THUMB,
-                radius = THUMB / 2,
-                background = theme.FG,
-                align_v = "Center",
-                align_h = on:map(function(v)
-                    return v and "End" or "Start"
-                end),
-            } },
+            animate = { background = { duration = theme.animation_ms, easing = "OutCubic" } },
+            children = {
+                rect {
+                    width = on:map(function(v)
+                        return v and TRAVEL or 0
+                    end),
+                    height = "Fill",
+                    animate = { width = { duration = theme.animation_ms, easing = "OutQuad" } },
+                },
+                rect {
+                    width = THUMB,
+                    height = THUMB,
+                    radius = THUMB / 2,
+                    background = theme.FG,
+                    align_v = "Center",
+                },
+            },
         } },
     }
 end

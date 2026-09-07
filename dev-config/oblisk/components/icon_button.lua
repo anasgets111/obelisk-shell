@@ -130,6 +130,9 @@ return function(glyph, on_activate, opts)
         -- previously gave a ring to every caller asking for none.
         border_width = theme.border_width,
         border_color = border_color,
+        -- `IconButton.qml`'s two `ColorAnimation`s: the ground and ring ease under the pointer and
+        -- on selection (ADR-0145).
+        animate = { background = theme.animation_ms, border_color = theme.animation_ms },
         children = { text {
             content = glyph,
             foreground = foreground,

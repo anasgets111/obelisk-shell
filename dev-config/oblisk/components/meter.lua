@@ -1,5 +1,6 @@
 -- A percentage bar using `width`'s "NN%" strings. Signals resolve before property parsing
 -- (ADR-0044), so mapping to "45%" makes a live-width rect without progress-bar engine support.
+-- The fill eases between two percents like `FillBar.qml`'s `Behavior on width` (ADR-0145).
 local theme = require("config.theme")
 
 return function(signal, read, color, width, height, visible)
@@ -29,6 +30,7 @@ return function(signal, read, color, width, height, visible)
             height = "Fill",
             background = color,
             radius = theme.s(3, 2),
+            animate = { width = theme.animation_ms },
         } },
     }
 end

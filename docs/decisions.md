@@ -2533,9 +2533,11 @@ implicit animation, and it maps onto this tree's existing structure without a ne
 
 1. A node names what eases: `animate = { width = 147, background = { duration = 147, easing =
    "OutCubic" } }`. The table is an ordinary property, so it may be a signal (a direction-dependent
-   easing derives the whole table, per § 5.1's nested-signal rule). Numbers and colours only;
-   `"Fill"`, a percentage and an edge table snap, and a property outside the list is refused so a
-   typo fails the pass.
+   easing derives the whole table, per § 5.1's nested-signal rule). Numbers, `"NN%"` strings and
+   colours only; a percent eases only against another percent, so `"Fill"`, a percent meeting a
+   number and an edge table snap, and a property outside the list is refused so a typo fails the
+   pass. (Amended the same day: the first cut snapped every percent, which left every meter's
+   fill, the mirror's `FillBar`, unanimated.)
 2. The tween lives on the `ResolvedNode`, under the identity reconciliation already keeps
    (ADR-0099, ADR-0130 decision 5). `properties` holds the displayed value; each `Tween` holds the
    target. When a pass resolves a target that differs from the retained one, the node starts a
@@ -2569,8 +2571,372 @@ Not built, each waiting on a consumer: exit animation (`visible = false` removes
 same pass; a fade-out needs the node to outlive its `visible` or a config timer, the "exit-resource
 lifetime" the roadmap named), looping or indeterminate motion (a running-state model, not a
 target), edge-table and per-edge tweens (writing a table back per frame), transforms (no `x`,
-`y`, `scale` exist to tween). One flag ticks the whole scene, so two outputs at different refresh
+`y`, `scale` exist to tween; ADR-0149 added them). One flag ticks the whole scene, so two outputs at different refresh
 rates tick every animated surface at the union rate. A tween starts from whichever retained node
 ADR-0045 paired the fresh one with, so id-less animated siblings ripple when one is removed; give
 them ids or a `list` key. A hidden subtree's tweens are frozen with it and do not count as
 animating; the thaw's retarget settles them.
+
+## 0146. Tweens are typed by value shape, enter from `from`, and exit under `delay(signal, ms)`, because the reference config's remaining motion was blocked by names, tables and the lack of a clock
+
+ADR-0145 shipped with a list of property names a tween could carry, snapped every edge table, and
+took every first value as it was. Porting the rest of the reference config's 34 `Behavior on`
+blocks hit each of those: the notification card's `x` and the panel's `y` are `margin` edges here,
+the OSD and panel fade in from nothing, and the close side needs the surface to stay mapped while
+the exit runs. Reading Qt Quick's own design against ours (Quickshell adds only an `EasingCurve`
+helper and a render-loop hook; the machinery is Qt's) settled what to copy and what to keep away
+from.
+
+1. **Type by value, not by name.** Qt registers interpolators per `QVariant` type and a `Behavior`
+   can sit on any property. `animate` now names any property the node's own table accepts
+   (`lua::nodes::accepts`, so a typo still fails the pass), and `Animatable::from_value` decides
+   from the value: number, `"NN%"`, `#` colour, or a table of numeric edges. Two shapes that differ
+   snap. The name lists are gone.
+2. **Edge tables tween per edge.** `Animatable::Edges([f32; 4])`, absent edges read as `0` the way
+   `parse_edge_insets` does, written back as a four-key table per frame. That is the slide-in and
+   the drop the reference animates as `x`/`y`, without a transform.
+3. **`from` is the entry.** A spec may carry `from = <value>`; a property nothing displayed yet
+   starts there. Absent keeps ADR-0145's rule that a first value is taken as it is, which is also
+   what QML does with an initial binding, and what the reference has to gate by hand: three
+   `enabled: root.settled` guards in `PanelHost.qml` exist only because a `Behavior` fires on
+   construction writes too.
+4. **`delay(signal, ms)` is the clock, pull-based like every other signal.** A read notes the
+   source's new value and its due time, answers the held value, and arms the poll loop's one
+   timeout (`DelayDeadline`); a read after the due time adopts it, and a source that reverts sooner
+   cancels. The loop stays timeout-free while nothing is pending (ADR-0124), the same way a frame
+   callback is requested only while a tween runs. The timeout is the remaining hold rounded up
+   to a millisecond: truncating the last fraction gave a zero timeout that came straight back to
+   a turn still a few hundred microseconds early, some five hundred times per close on the first
+   live run. With it, `visible = linger(open, ms)` keeps a
+   surface mapped through its exit tween, and hidden subtrees already keep their content
+   (ADR-0124), so nothing is copied. The reference's `PanelHost.qml` builds the same close-hold
+   from a `Timer` and six `retained*` properties.
+
+Kept away from, deliberately: a `Behavior` overwrites the item's real property, so every binding
+downstream of `width` re-evaluates per frame in the config's language; here the pass's target
+stays the truth and only the retained node holds the displayed value, and no Lua runs per frame
+(ADR-0131). Qt keeps animating unmapped windows (the reference OSD fades to zero where nobody sees
+it); a frozen subtree here does not tick. A per-property `Behavior` object is six lines each; one
+table per node is the surface.
+
+Not built, still: a removed `list` item has no node left to ease, so dismissal snaps; `scale` and
+`rotate` need a paint-only transform property; sequences and loops (the battery plug flash) need a
+running-state model.
+
+## 0147. `geometry(name)` publishes a node's laid-out rect to Lua, written quietly by the pass, because a reveal that slides a card by its own height needs the height
+
+`PanelHost.qml` slides its card from `y = -height`, and `height` is the item's own laid-out size.
+Porting that under ADR-0146 used a theme constant sized to the tallest card, and it looked wrong:
+a 250 px card travelling 760 px in 147 ms is off screen for the first 60 ms of the open and gone
+within two frames of the close. Lua had no way to read what the pass had measured.
+
+1. `geometry(name)` is a signal kind of its own, like `hover`/`scroll`: name-keyed, engine-written,
+   `:set()` refused. A node declaring `geometry = geometry(name)` is measured; the pass and a
+   tween tick write its absolute `{ x, y, width, height }` after the solve, the space `on_click`
+   and `hover_rect` already report in.
+2. A tick's write is quiet: a tick that moved the card must not run Lua on every frame
+   (ADR-0131). A pass's write that changed a rect earns exactly one follow-up pass (amended the
+   same day): the reference morphs a switched panel's `height`, which here means the card's
+   height is bound to the section's measurement, and without the follow-up a section that grew
+   left the card one pass behind it, its content spilling until some unrelated pass. One and not
+   two, so a binding fed by its own measurement stops after a pass instead of spinning the loop.
+3. Not a `hover_rect` extension: that rect is written only while the pointer is on the node and
+   naming a hover slot makes the node an input region. Measuring must not change hit-testing.
+
+Not built: `width`/`height` bound to a geometry signal of an ancestor is a binding loop the way
+QML's is, and nothing prevents it beyond the one-pass lag.
+
+## 0148. `oblisk toggle <name> <value>` sets a state or restores its declared initial, so one keybind opens and closes a modal named by a string
+
+The three modals became one `state("modal", "")` holding the name of the one showing, the
+reference's `activeModal`, so two can never stack. That left a keybind with no toggle: `oblisk
+toggle` flipped booleans only, and `oblisk set modal '"launcher"'` needs a second binding to close.
+`toggle <name> <value>` stores the value unless the state already holds it, and then restores the
+initial the config declared, which the state registry already keeps for reload. It is a `set` with
+one comparison, the scalar one `literal_was_edited` makes, so `oblisk toggle modal launcher` reads
+like the reference's IPC and works for any scalar state. Not built: a toggle between two values
+that are both not the initial; that is two bindings, or a boolean.
+
+## 0149. `scale`, `rotate`, `translate` and `origin` are one paint-only affine on every node, because the solver must never see a transform
+
+QML gives every `Item` `scale`, `rotation` and a `transform` list, and the reference config uses
+`scale` on launcher rows, wallpaper tiles and the modal card. This tree had nothing of the kind:
+a hover zoom had to be a `width` tween, which moves siblings.
+
+1. Four properties on every node, CSS `transform`'s shape rather than QML's three mechanisms:
+   `scale` (number or `{ x, y }`), `rotate` (degrees), `translate` (`{ x, y }` px) and `origin`
+   (fractions of the box, centre by default). They compose into one matrix about the origin.
+2. Paint-only. `LayoutStyle` parses them into `ResolvedNode::transform`; the solver, `geometry`
+   and siblings see the untransformed box. `layout::paint` emits the node and its subtree as one
+   `Draw::Transformed` group and sets the matrix on the canvas, so text, images and rounded clips
+   inside need no knowledge of it. femtovg's scissor follows the matrix, which is what the node's
+   own box wants.
+3. Hit-testing maps the pointer through the inverse at each transformed node, so a scaled tile is
+   clicked where it is painted; input regions take the painted bounds. A zero scale paints
+   nothing and takes nothing.
+4. They tween through the existing shapes: a number, or an `{ x, y }` table as a second key set of
+   the table tween, with an absent axis reading the property's default (`1` for `scale`).
+
+Not done: an ancestor's clip travels with the group, so a scaled child overflowing its parent is
+cut by the parent's box scaled with it; nested transforms are not composed into input regions;
+skew and 3D. Each is a few lines when a consumer appears.
+
+## 0150. A dropped child with an `animate.exit` block stays as a leaving node until its tweens finish, because a node the tree no longer holds has nothing left to ease
+
+`animate` (ADR-0145) eases a property between two passes, and `from` (ADR-0146) covers the pass a
+node first appears in. Removal had no answer: the pass that stops returning a child destroys it,
+and the frame after a notification is dismissed simply has one fewer card. `util.linger` only
+covers a whole surface whose `visible` source dropped; it cannot hold one row of a list.
+
+1. `animate.exit = { duration, easing, <property> = <target>, ... }`, one spec shared by every
+   target in the block, which is QML's `ViewTransition` on `remove`: one transition, several
+   properties, run after the model row is gone. It parses on every live pass, so a bad block is
+   refused while the node is still there to name in the error.
+2. A child reconciliation does not claim stays in its parent as a **leaving node**: kept after the
+   live children, out of the solver, holding the rect it was laid out at. Each pass advances its
+   tweens, reparses its paint and the pixel `width`/`height` they name, and drops it once nothing
+   is in flight. `depart` starts each target from the value the node displays, or from the
+   property's identity when it never set one (`1` for `opacity` and `scale`, `0` for the rest), so
+   `exit = { opacity = 0 }` fades from opaque without the config having to say `opacity = 1`.
+3. Painted and nothing more. `in_flow()` is `visible && !leaving`, and it is what flow
+   measurement, hit-testing, input regions, `geometry` writes and autofocus ask, so a card on its
+   way out never swallows the click meant for the one that moved up into its place. `contains_node`
+   answers the same way: a leaver is back among its parent's children so that it paints, and a held
+   draft asking whether the field it was typed into is still in the tree (ADR-0108) would otherwise
+   find one the tree has already dropped, keep the keyboard on it, and run its `on_submit` for a
+   card that is gone.
+4. A leaving node is never paired again. A re-added `id` is a new node beside the one still
+   fading, the way QML builds a fresh delegate, rather than a live node yanked back out of its
+   exit. A hidden child, or one with no exit block, is gone the pass it is dropped.
+
+Not built: `visible = false` runs no exit (`util.linger` is the surface-level answer, and a hidden
+node's subtree is frozen rather than advanced); an exit block below a node that is itself dropped
+never runs, because only the child reconciliation stopped at is asked to depart, so a card wrapped
+in a row that leaves goes with the row (declare the exit on whatever the tree actually drops);
+siblings snap into the gap instead of easing into it, which is a move transition and a second
+mechanism; and a leaving node does not reflow, so only
+what paint reads moves it (`translate` slides a card out, `margin` eases a number nothing draws),
+a `width` in the block resizes the box its subtree is clipped to, and a leaving `text` keeps the
+string it was fitted to while its colour and the rest of its paint still move -- the string is what
+no pass measures again, which is narrower than freezing the whole of its paint. An absolute-positioned solver pass over the leaver is the upgrade when a
+config needs the reflow.
+
+## 0151. The easing set is QML's whole `Easing.Type` list plus CSS's cubic Bezier and steps, because eight curves is a menu and the ninth request is always the one missing
+
+`animate` shipped with eight easings (ADR-0145), the ones the reference config wrote. That is a
+menu, and a menu of motion is the wrong shape: a config that wants a drawer to settle with a bit
+of weight has to pick the nearest of eight, and the engine has no answer for "not one of these".
+
+1. All thirty-one of QML's names, spelled without the prefix, so `easing.type: Easing.OutBounce`
+   still ports by dropping four characters: the four polynomial families (`Quad`, `Cubic`, `Quart`,
+   `Quint`), `Sine`, `Expo`, `Circ`, `Back`, `Elastic` and `Bounce`, each with `In`, `Out` and
+   `InOut`, beside `Linear`. `InOutQuad` stays the default. The whole list and not the used
+   subset, because the list is the port surface: a config author moving a `NumberAnimation` across
+   reads the name they already wrote, and a partial list turns that into a runtime error at the
+   one moment they have the least context to fix it. Fifteen of these are a name, a table row and
+   a one-line arm each, all covered by the one reflection test below; the cost of holding them is
+   not the cost of designing them.
+2. Most of each family's `In` arm is written out once: `Out` is that arm reflected through the
+   centre, and `InOut` is the two halves. `Back` and `Elastic` are the exceptions and are written
+   out, because Penner widens their constant for the `InOut` case alone (`s * 1.525`, a period of
+   `0.3 * 1.5`) and a reflection of the `In` arm is a visibly different curve. The test pins all
+   thirty-one against values computed from Qt's own `QEasingCurve` at a quarter, a half and three
+   quarters, not against this module's other arms: checking a reflection against a reflection is a
+   tautology, and it passed while both exceptions were wrong.
+3. A table where a name goes is CSS's two curves QML has no name for. Four numbers are
+   `cubic-bezier(x1, y1, x2, y2)`, solved for `y` at the parameter whose `x` is the progress, which
+   is every smooth curve the named list does not hold. `{ steps = n }` is `steps(n, jump-end)`, for
+   an indicator that should tick rather than glide. Both are one `easing` value, so nothing else in
+   a spec changes shape.
+4. Only a Bezier's control `x` are bounded, to `[0, 1]`, the same bound and the same reason CSS
+   has: outside it the curve doubles back and one progress has more than one answer. The `y` are
+   free, which is what lets a Bezier overshoot the way `OutBack` does.
+
+`dev-config` is unchanged by this: the reference config reaches for seven of the original eight
+and `OutBack` once, so every curve it wants already existed. This is framework generality, and the
+tests are its only consumer until a config asks for one.
+
+Not built: a named easing cannot be given `Elastic`'s period or `Back`'s overshoot as parameters,
+the way QML's `easing.amplitude`/`easing.overshoot` can. A Bezier covers the smooth cases and the
+Penner constants are what everyone recognises; a spring (velocity, not a curve of progress) is its
+own mechanism and its own decision.
+
+## 0152. `keyframes` walks a property through a list of values and `loops` repeats the walk, gated by nothing but whether the entry is there, because a shell has no way to call `restart()`
+
+Five animations in the reference config are a `SequentialAnimation` or a looped `NumberAnimation`:
+two spinners, the power menu's breathing countdown, the battery's plug flash and the lock screen's
+shake. `animate` (ADR-0145) could express none of them. It eases one property from what it shows to
+what a pass resolved, once.
+
+1. An entry may name `keyframes`, a list of at least two values. The first is where the property
+   starts; each later one is a segment eased into over the entry's `duration` and `easing`, or over
+   its own when it is written `{ value, duration, easing }`. A segment of no duration is a jump
+   rather than a stop, which is QML's `PropertyAction`; a segment between two equal values is a
+   hold, which is its `PauseAnimation`. Both fall out of the one shape instead of being two more.
+2. `loops` is a count, or `"Infinite"`, and one when absent.
+3. A sequence drives its property. It reads nothing the pass resolved for it and eases toward
+   nothing, which is what `SequentialAnimation on <property>` does in QML: it takes the property
+   over for as long as it runs.
+4. There is no `running` flag. The entry's own presence is the gate, and `animate` is already a
+   bindable property, so `animate = counting:map(function(on) return on and { ... } or {} end)`
+   starts and stops it. That is one mechanism instead of two, and it also answers what the
+   reference has to write by hand: a property with no entry falls back to the value the pass
+   resolves, which is the mirror's `onRunningChanged: opacity = 1.0`.
+5. Phase comes from whole nanoseconds against the frame list, not from elapsed seconds in an
+   `f32`. An endless sequence runs as long as the process does, and a 24-bit mantissa is out of
+   millisecond resolution after two hours and out of a whole 100 ms cycle after a fortnight, at
+   which point a spinner freezes and jumps rather than turning.
+6. The run is stateless in the value and stateful only in one bit. Which frame is showing is
+   derived from elapsed time against the frame list, so it survives reconciliation with nothing to
+   carry, and the same list going round again is the same run. The bit is `Tween::resting`: a
+   counted sequence that has played out stays in the list, holding its last frame, so a pass that
+   re-resolves for some unrelated signal can tell a finished run from one never started. Without
+   it the tween would be dropped on the frame it finished and started over on the next pass.
+
+Not built: a trigger. Three of the five consumers are fired imperatively (`clickFlash.restart()`,
+a shake on a failed unlock), and this engine has no imperative call into a node -- a config
+describes what is, not what to do. A one-shot therefore runs once per entry, and re-firing it means
+the entry going away and coming back across two passes. A signal that pulses would be the smallest
+thing that closes this, and it belongs with `delay` rather than here. Also not built: easing
+between two *whole sequences*, and a sequence on a property another sequence already drives.
+
+## 0153. `pulse(signal, ms)` is the trigger and `delay` is a spec's lead-in, because the three animations left in the reference config are fired by a call this engine will never have
+
+ADR-0152 shipped the shape of a one-shot and no way to fire one twice. Five reference animations
+are sequences; two run forever and need no trigger, and the other three -- the battery's plug
+flash, its click flash and the lock screen's shake -- are `restart()` called from a signal handler.
+A config here describes what is, not what to do, so there is nothing to call. The gap is not a
+missing verb; it is that no signal in the vocabulary says *a change just happened*.
+
+1. **`pulse(signal, ms)` is `delay(signal, ms)` read from the other side.** `delay` answers the
+   old value until a change has settled for `ms`; `pulse` answers `true` for `ms` after a change
+   and `false` the rest of the time. Both are pull-based, both compare against a value the cell
+   remembers, and both arm the poll loop's one timeout, which is now named for the wake rather
+   than for `delay` (`WakeDeadline`, `next_wake_deadline`, `take_due_wake`). A change inside an
+   open window restarts it rather than extending it, which is what `restart()` does to a running
+   `SequentialAnimation`.
+2. **A pulse gates an entry; it does not start an animation.** `animate = pulse(clicks,
+   ms):map(function(on) return on and { opacity = { ... } } or {} end)` puts a sequence entry in
+   the table while the window is open and takes it away after, and ADR-0152 decision 4 already
+   made the entry's presence the gate. Firing a one-shot twice is therefore the entry leaving and
+   coming back, which is exactly what it always was; the pulse is only what makes those two passes
+   happen. Nothing was added to `animate` for this.
+3. **The window is the config's business, not the engine's.** A pulse shorter than what it drives
+   cuts the sequence off; the engine does not read the animation to size the window, because a
+   pulse also gates things that are not animations. `[1, 60000]` ms, the same bound `delay` has:
+   the bound is on the whole milliseconds the caller gets, so a window that rounds to none is
+   refused rather than accepted and never opened.
+4. **A pulse fires on any change, and one edge is a `computed` away.** The reference's
+   `onIsPluggedInChanged: if (isPluggedIn)` becomes `computed({ pulse(plugged, ms), plugged },
+   function(fired, on) return fired and on end)`. An `edge = "rising"` option would be a second
+   mechanism for something the first one already composes into.
+5. **`delay` on a spec is the lead-in a sequence cannot express.** A pause *between* two frames is
+   a segment of equal values (ADR-0152 decision 1), but a pause *before* the first is not
+   expressible, because a sequence starts on frame one by definition. `delay = ms` on any entry
+   holds the property still and then runs, which is CSS's `transition-delay` and the
+   `PauseAnimation` a QML `SequentialAnimation` needs a wrapper for. It is one saturating
+   subtraction in `Tween::progressed`, and both `at` and `done` read it, so the delay is added to
+   the tween's life rather than taken out of it. On a sequence it offsets the whole run once,
+   loops and all, not each cycle: the phase is measured from the moment the first frame is left.
+6. **A delayed tween still asks for frames while it waits.** It repaints its unchanged value up to
+   sixty times a second for the length of the hold. Skipping those would mean the frame-callback
+   loop knowing which tweens are merely waiting, and one flag already ticks the whole scene
+   (ADR-0145): a delay costs no more than the tween beside it that is actually moving.
+
+`dev-config` gains the plug flash, which is the whole mechanism in one place: `pulse` on the
+charging state, gated to the rising edge by `computed`, driving a `loops = 2` sequence of
+`PropertyAction`/`PauseAnimation` pairs written as zero-duration and equal-value segments. The
+click flash and the shake are the same shape over a `state` counter a handler writes and are left
+to whoever ports those modules.
+
+`delay` on a spec has no consumer at all, in `dev-config` or in the reference, and this is not
+ADR-0151's position restated: those 31 easings finish a closed list QML defines and the reference
+already reaches into, while nothing outside this repo asks for a lead-in. It is here for decision
+5's reason alone -- ADR-0152 made a pause between two frames writable and a pause before the first
+frame unwritable, and that asymmetry is in the vocabulary rather than in any config.
+
+Not built: a pulse that fires on a *predicate* rather than on any change (`computed` covers it), a
+pulse of zero width for something that only wants the dirty pass, and a `delay` that differs per
+keyframe -- the frames carry their own `duration`, and a zero-value segment in front of the list
+is already a per-sequence lead-in a config can write by hand.
+
+## 0154. A `spring` is a third kind of motion, not a thirty-second easing, because the one thing an easing cannot do is keep its speed when the target moves
+
+The reference config contains no `SpringAnimation` and no `SmoothedAnimation`, and the roadmap
+row for animation says to decide against a real consumer before adding one. So this is not
+completeness, and the case for it is not that QML has springs. It is that `animate` has a
+behavioural hole no curve can fill: a tween whose target changes mid-flight starts a fresh curve
+from a standstill at whatever value is on screen (ADR-0145's `retarget`), so anything driven by a
+signal that moves while the motion runs -- a hover, a drag, a measured geometry -- visibly stops
+and restarts. A spring is the mechanism that does not, because its state is a velocity rather
+than a position along a curve.
+
+1. **In units of the displacement, not of the property.** The spring works on `s`, the fraction of
+   the original displacement still to cross: `1` when the run begins, `0` on the target. The value
+   is `to + s * (from - to)`, so one scalar drives a number, a percent, a colour and an edge table
+   alike, it feeds the existing `lerp(from, to, t)` with `t = 1 - s` and needs no new interpolation
+   path, its overshoot is `t > 1` and is clamped by the property's own range exactly as `OutBack`'s
+   already was, and -- the part that actually mattered -- the rest threshold is dimensionless. A
+   spring in property units would have needed an epsilon that knows a pixel from an opacity from an
+   8-bit colour channel; a thousandth of the displacement needs nothing.
+2. **Solved in closed form, not integrated per frame.** `Tween::at` has to stay a pure function of
+   elapsed time: a pass and a tick both call it, and ADR-0152 made the running value carry no state
+   across reconciliation. Stepping a velocity forward per frame would be a second source of truth,
+   would drift with the refresh rate, and would put two outputs at different rates out of step. The
+   three regimes -- underdamped, critically damped, overdamped -- are three closed solutions of
+   `s'' + damping * s' + stiffness * s = 0`, chosen by the sign of `stiffness - (damping/2)^2`
+   against a threshold relative to `stiffness`, because that quantity is in units of stiffness and
+   a fixed threshold would call a soft spring critical and a stiff one never.
+3. **`stiffness` and `damping`, both required, no `mass`.** Mass divides out of both, so naming it
+   would be a third number that only rescales the other two. No defaults either: a spring whose
+   constants are implicit cannot be read or tuned. Not QML's `spring`/`damping` scalars -- there is
+   no mirror obligation here, because the reference never uses the type.
+4. **A spring has no `duration`, and the parser stops requiring one only for it.** `duration`,
+   `easing`, `loops` and `keyframes` beside a spring are all refused rather than ignored, which is
+   the same rule ADR-0152 applied to `from` beside a sequence: two ways of saying the timing is a
+   config bug, not a precedence question. The rule runs the other way too, so a `loops` with no
+   `keyframes` to count is refused rather than read by nobody.
+5. **Which fields are live is now a type.** `AnimationSpec` carried `duration`, `easing` and
+   `sequence` with doc comments saying when each was dead; a third motion made that a three-way
+   puzzle, so it is a `Motion` enum -- `Eased { duration, easing }`, `Sequence`, `Spring` -- which
+   is what ADR-0152's review asked for and was deferred until this landed. `delay` stays outside
+   it, on the spec, because it applies to all three.
+6. **`done` comes from a bound on the envelope, not from watching the value.** Each regime bounds
+   its solution above by `amplitude * exp(-rate * t)` and inverts that, so the settle time is
+   computed once when the spec is parsed and is never early -- late only keeps a tween sitting on
+   its target for an extra frame, while early would drop it mid-flight. Capped at sixty seconds so
+   that constants approaching no damping cannot ask for frames forever, and `at` is pinned to
+   exactly `1` past the settle so the property lands on the value a pass resolved.
+7. **The hand-over is a projection.** Both runs read `value = to + s * (from - to)`, so matching
+   the value's rate across a retarget gives the new run's starting velocity as the old run's rate
+   projected onto the new displacement -- exact for a single number, and for a colour or an edge
+   table the closest one scalar comes when the components are not moving in step. It is bounded,
+   because a target landing almost where the value already is makes the projection enormous and
+   would fling the next run off the screen.
+
+8. **A pass that changes nothing carries the spring, and only the spring.** A spring's `velocity`
+   is the rate the last retarget handed it, never a number a config wrote, so re-parsing the entry
+   always yields one at rest -- and every unrelated signal in the surface causes a pass. A running
+   spring whose two constants still match therefore keeps the spring it is running rather than the
+   freshly parsed one. What it does not keep is the entry around it: `delay` is re-read like any
+   other field, so editing it still lands on a spring already moving. Editing a constant is a
+   config change and takes the new spring at its parsed rest; neither case restarts the run, whose
+   target never moved.
+
+Nothing in `dev-config` uses this and the tests are its consumer, the same standing `delay` has
+under ADR-0153. The roadmap's animation row says to decide against a real consumer before adding a
+spring, that rule was not met here, and it stays in the row unchanged rather than being softened to
+fit what was built -- softening it was the first draft of this ADR and was the wrong instinct,
+because a gate edited by the change it gates is not a gate. The trade is recorded instead: roughly
+two hundred lines solving a second-order equation in three regimes, with a hand-over whose ceiling
+is written on `Spring::handed` and no config to catch a regression in it.
+
+Not built: `mass` as a third constant, a spring on a sequence's individual segments, a per-channel
+velocity for a colour whose components move apart (the ceiling is written on `Spring::handed`),
+and the `SmoothedAnimation` shape, which is a velocity limit rather than a spring and would be a
+fourth motion rather than a knob on this one.
+
+Amendment: the spring stays. Asked to rule on the paragraph above, the owner kept it, so the
+sentence about taking it back out is no longer a standing intent -- it records only that the code
+is separable, which is worth knowing and is not a plan. The gate it was measured against is
+untouched and still governs the next addition to that row.

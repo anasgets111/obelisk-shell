@@ -26,7 +26,7 @@ use style::{parse_background, parse_border_color, parse_border_width, parse_clip
 
 #[cfg(test)]
 pub use animate::Animatable;
-pub use animate::{Tween, advance, retarget};
+pub use animate::{Tween, advance, depart, retarget};
 pub use content::{
     Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
     segments,
@@ -40,8 +40,9 @@ pub use spec::{
 #[cfg(test)]
 pub use spec::LockSpec;
 pub use style::{
-    BorderColor, ClipShape, parse_align, parse_cursor, parse_edge_insets, parse_list_direction, parse_max_size,
-    parse_opacity, parse_size_mode, parse_spacing, parse_visible,
+    Affine, BorderColor, ClipShape, Transform, apply_affine, invert_affine, parse_align, parse_cursor,
+    parse_edge_insets, parse_list_direction, parse_max_size, parse_opacity, parse_size_mode, parse_spacing,
+    parse_transform, parse_visible,
 };
 pub use surface::{Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
 pub use toplevel::{ConstraintAdjustment, PopupAnchor, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec};
@@ -289,6 +290,8 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
         // ADR-0069 decision 4: the positioning pass reads this signal's number and writes the
         // clamped one back, so it needs the handle, not a snapshot.
         || property == "scroll"
+        // ADR-0147: the pass writes the laid-out rect into this handle after the solve.
+        || property == "geometry"
         || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 

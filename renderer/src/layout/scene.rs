@@ -69,6 +69,7 @@ struct LayoutStyle {
     spacing: f32,
     visible: bool,
     opacity: f32,
+    transform: node::Transform,
 }
 
 impl LayoutStyle {
@@ -90,6 +91,7 @@ impl LayoutStyle {
             spacing: node::parse_spacing(properties)?,
             visible: node::parse_visible(properties)?,
             opacity: node::parse_opacity(properties)?,
+            transform: node::parse_transform(properties)?,
         })
     }
 }
@@ -131,6 +133,10 @@ pub struct ResolvedNode {
     /// the chain descending, the same way it intersects a clip, so a panel fades with everything
     /// in it from one property. 1.0 is the default and contributes nothing.
     pub opacity: f32,
+    /// This node's own paint-only affine (ADR-0149), applied about its box after layout; `rect`
+    /// and everything the solver produced are untransformed. `layout::paint` composes it down
+    /// the subtree, `layout::hit` maps the pointer back through its inverse.
+    pub transform: node::Transform,
     pub properties: HashMap<String, Value>,
     /// This node's paint properties, parsed here rather than by `layout::paint` on every frame
     /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
@@ -140,16 +146,28 @@ pub struct ResolvedNode {
     /// displayed this frame, each tween the target it is heading for; `Scene::tick` advances them
     /// between passes and `node::retarget` reconciles them against the next pass's values.
     pub tweens: Vec<Tween>,
+    /// The tree no longer holds this node; it stays, at the rect it last had, while its
+    /// `animate.exit` tweens run (ADR-0150). Out of flow (siblings have already closed over its
+    /// slot) and out of reach (no hit, no input region, no geometry), painted after its live
+    /// siblings until the last tween ends, when the next pass drops it.
+    pub leaving: bool,
 }
 
 impl ResolvedNode {
+    /// Visible and laid out this pass: what a flow measures and a reader may address. A leaving
+    /// node is visible and neither.
+    fn in_flow(&self) -> bool {
+        self.visible && !self.leaving
+    }
+
     /// Whether any visible node in this tree is mid-tween, which is what asks the compositor for
     /// another frame callback (`wayland::surface::App::paint_surface`). A hidden node's subtree is
     /// frozen (ADR-0124), tweens included: nothing advances them, so counting them would arm a
     /// callback chain that never ends. They wait there and the thaw's `node::retarget` settles
     /// them.
     pub fn animating(&self) -> bool {
-        self.visible && (!self.tweens.is_empty() || self.children.iter().any(ResolvedNode::animating))
+        self.visible
+            && (self.tweens.iter().any(|tween| !tween.resting) || self.children.iter().any(ResolvedNode::animating))
     }
 
     /// This node's margin along `axis`, both edges.
@@ -302,7 +320,7 @@ impl Scene {
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
         let mut properties = build_child_for_output(properties, &fresh.kind, &instance.output)?;
-        let tweens = node::retarget(existing.as_ref().map(tween_state), &mut properties, now, lua)?;
+        let tweens = node::retarget(&fresh.kind, existing.as_ref().map(tween_state), &mut properties, now, lua)?;
         // The root has no parent, so its once-per-node parse happens here; children parse in the
         // parent's loop.
         let style = LayoutStyle::parse(&properties)?;
@@ -311,7 +329,9 @@ impl Scene {
         // failed walk drops the temporary tree without extra rollback state.
         let mut tree = new_solver_tree();
         let prepared = prepare(self, &mut tree, existing, &fresh.kind, properties, style, tweens, None, lua, now, 0)?;
-        self.surfaces.insert(key, solve_instance(&mut tree, prepared, available, shaping)?);
+        let solved = solve_instance(&mut tree, prepared, available, shaping)?;
+        publish_geometry(&solved, 0.0, 0.0, lua, false).map_err(|e| node::invalid("geometry", e.to_string()))?;
+        self.surfaces.insert(key, solved);
         Ok(())
     }
 
@@ -340,7 +360,13 @@ impl Scene {
             let outcome = relayout_retained(retained.clone(), instance.available, shaping, lua, now)
                 .and_then(|tree| if budget.exceeded() { Err(LayoutError::PassBudgetExceeded) } else { Ok(tree) });
             match outcome {
-                Ok(tree) => *retained = tree,
+                Ok(tree) => {
+                    // Quiet: a tick never schedules a pass (ADR-0131).
+                    if let Err(err) = publish_geometry(&tree, 0.0, 0.0, lua, true) {
+                        eprintln!("[oblisk-renderer] {key}: writing a geometry signal failed: {err}");
+                    }
+                    *retained = tree;
+                }
                 Err(err) => {
                     eprintln!("[oblisk-renderer] {key}: relaying out a tween failed, snapping it: {err}");
                     strip_tweens(retained);
@@ -602,13 +628,20 @@ fn prepare_retained(
         children: Vec::with_capacity(if style.visible { children.len() } else { 0 }),
         frozen: children,
         tweens,
+        leaving: Vec::new(),
     };
     if !node.style.visible {
         return Ok(node);
     }
     let own_axis = main_axis_of(&node.kind, &node.properties)?;
     for child in std::mem::take(&mut node.frozen) {
-        node.children.push(prepare_retained(tree, child, own_axis, lua, now)?);
+        if child.leaving {
+            if let Some(child) = advance_leaving(child, now, lua)? {
+                node.leaving.push(child);
+            }
+        } else {
+            node.children.push(prepare_retained(tree, child, own_axis, lua, now)?);
+        }
     }
     let child_ids: Vec<taffy::NodeId> = node.children.iter().map(|child| child.taffy).collect();
     tree.set_children(taffy_id, &child_ids).map_err(taffy_failed)?;
@@ -618,13 +651,13 @@ fn prepare_retained(
 /// Pairs children by identity (ADR-0045 decisions 1-2): an `id` matches only the same `id`, while
 /// id-less children match positionally among other id-less children. An id miss is new, never a
 /// positional fallback, so it cannot inherit an unrelated `NodeId`/subtree. Unclaimed retained
-/// nodes are dropped. The linear match uses one `HashMap<&str, usize>` per parent; sibling
+/// nodes come back second, for `prepare` to see off. The linear match uses one `HashMap<&str, usize>` per parent; sibling
 /// count is unbounded (`1..10000` is legal Lua), and this runs on the Wayland dispatch thread at
 /// capability-push cadence (ADR-0044 decision 2).
 fn pair_children_by_id_then_position(
     fresh_children: &[VirtualNode],
     old_children: Vec<ResolvedNode>,
-) -> Result<Vec<Option<ResolvedNode>>, LayoutError> {
+) -> Result<(Vec<Option<ResolvedNode>>, Vec<ResolvedNode>), LayoutError> {
     let fresh_ids: Vec<Option<String>> =
         fresh_children.iter().map(|c| node::parse_node_id(&c.properties)).collect::<Result<_, _>>()?;
 
@@ -672,7 +705,7 @@ fn pair_children_by_id_then_position(
         }
     }
 
-    Ok(matched)
+    Ok((matched, old_slots.into_iter().flatten().collect()))
 }
 
 /// The parent's flow axis. Stacking parents have none; each child gets the whole content box.
@@ -727,6 +760,44 @@ struct PreparedNode {
     /// not.
     frozen: Vec<ResolvedNode>,
     tweens: Vec<Tween>,
+    /// Children on their way out (ADR-0150), already advanced this pass. Not in the solver.
+    leaving: Vec<ResolvedNode>,
+}
+
+/// One pass of a leaving node (ADR-0150): its tweens move, the paint and the box they name
+/// follow, and the node is gone once nothing is in flight. Its subtree is frozen the way a hidden
+/// node's is (ADR-0124).
+// ponytail: no solver pass. A `width`/`height` in the exit block resizes the box the subtree is
+// clipped to, it does not reflow the subtree; a leaving `text` keeps the string it was fitted to.
+// A relayout under an absolute-positioned solver node is the upgrade if a config needs the reflow.
+fn advance_leaving(mut node: ResolvedNode, now: Instant, lua: &Lua) -> Result<Option<ResolvedNode>, LayoutError> {
+    node::advance(&mut node.tweens, &mut node.properties, now, lua)?;
+    if node.tweens.is_empty() {
+        return Ok(None);
+    }
+    let style = LayoutStyle::parse(&node.properties)?;
+    let fresh = node::paint_style(&node.kind, &node.properties)?;
+    node.paint = match (node.paint.take(), fresh) {
+        // A leaving `text` keeps the string it was fitted to: no pass measures it again, so the
+        // ellipsis or the wrap it was given still describes the box it is leaving in. Everything
+        // else about its paint is re-read like any other node's, which is what lets an exit fade
+        // a label's `foreground` rather than freeze it at the colour it was dropped with.
+        (
+            Some(PaintStyle::Text { content, runs, .. }),
+            Some(PaintStyle::Text { font_size, font, color, align, elide, wrap, max_lines, .. }),
+        ) => Some(PaintStyle::Text { content, runs, font_size, font, color, align, elide, wrap, max_lines }),
+        (_, fresh) => fresh,
+    };
+    node.opacity = style.opacity;
+    node.transform = style.transform;
+    node.margin = style.margin;
+    if let SizeMode::Pixels(width) = style.width_mode {
+        node.rect.width = width;
+    }
+    if let SizeMode::Pixels(height) = style.height_mode {
+        node.rect.height = height;
+    }
+    Ok(Some(node))
 }
 
 /// `Content` and `Fill` map to taffy's `auto`; `Fill` gets its meaning from parent flow and
@@ -978,6 +1049,10 @@ fn prepare(
     let id = retained.as_ref().map(|r| r.id);
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
+    // Already leaving children are not paired again: a re-added id is a new node beside the one
+    // still fading (QML makes a fresh delegate too).
+    let (leaving, old_children): (Vec<ResolvedNode>, Vec<ResolvedNode>) =
+        old_children.into_iter().partition(|child| child.leaving);
 
     // Before the children, because a `text`'s measurement reads the `content` and `font_size`
     // parsed here rather than parsing them a second time.
@@ -1004,13 +1079,16 @@ fn prepare(
         children: Vec::new(),
         frozen: old_children,
         tweens,
+        leaving: Vec::new(),
     };
     if !node.style.visible {
+        node.frozen.extend(leaving);
         return Ok(node);
     }
 
     let fresh_children = children_of(kind, &node.properties)?;
-    let matched_candidates = pair_children_by_id_then_position(&fresh_children, std::mem::take(&mut node.frozen))?;
+    let (matched_candidates, mut unclaimed) =
+        pair_children_by_id_then_position(&fresh_children, std::mem::take(&mut node.frozen))?;
     let own_axis = main_axis_of(kind, &node.properties)?;
 
     node.children.reserve(fresh_children.len());
@@ -1021,14 +1099,21 @@ fn prepare(
         // same variant, kind and level the recursive call raises (see `ensure_node_admissible`).
         ensure_node_admissible(&fresh_child.kind, depth + 1)?;
 
-        let reusable = candidate.filter(|c| c.kind == fresh_child.kind);
+        let reusable = match candidate {
+            Some(candidate) if candidate.kind != fresh_child.kind => {
+                unclaimed.push(candidate);
+                None
+            }
+            candidate => candidate,
+        };
 
         // This child's one resolve and one parse for this pass, both here rather than inside the
         // recursive call, because the style the call is handed is built from them and a second
         // read of an impure `margin` could answer differently. Tweens go between the two: the
         // parse must see the displayed value, not the target (ADR-0145).
         let mut child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
-        let child_tweens = node::retarget(reusable.as_ref().map(tween_state), &mut child_properties, now, lua)?;
+        let child_tweens =
+            node::retarget(&fresh_child.kind, reusable.as_ref().map(tween_state), &mut child_properties, now, lua)?;
         let child_style = LayoutStyle::parse(&child_properties)?;
         node.children.push(prepare(
             scene,
@@ -1043,6 +1128,20 @@ fn prepare(
             now,
             depth + 1,
         )?);
+    }
+
+    // The ones on their way out: those already leaving move on, those the tree just dropped
+    // start their exit (ADR-0150). A hidden one, or one with no exit block, is simply gone.
+    for child in leaving {
+        if let Some(child) = advance_leaving(child, now, lua)? {
+            node.leaving.push(child);
+        }
+    }
+    for mut child in unclaimed {
+        if child.visible && node::depart(&child.kind, &mut child.tweens, &mut child.properties, now, lua)? {
+            child.leaving = true;
+            node.leaving.push(child);
+        }
     }
 
     let child_ids: Vec<taffy::NodeId> = node.children.iter().map(|child| child.taffy).collect();
@@ -1062,7 +1161,8 @@ fn finish(
     prepared: PreparedNode,
     shaping: &ShapingHandle,
 ) -> Result<ResolvedNode, LayoutError> {
-    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen, tweens } = prepared;
+    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen, tweens, leaving } =
+        prepared;
     let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
     let size = LogicalSize { width: layout.size.width, height: layout.size.height };
 
@@ -1076,10 +1176,12 @@ fn finish(
             margin: style.margin,
             visible: style.visible,
             opacity: style.opacity,
+            transform: style.transform,
             properties,
             paint,
             children: frozen,
             tweens,
+            leaving: false,
         });
     }
 
@@ -1123,6 +1225,14 @@ fn finish(
     // built, because what it rewrites is the string the display list will carry.
     fit_text_to_box(&mut paint, (size.width - style.padding.horizontal()).max(0.0), shaping);
 
+    // Last, so an exit paints over what took its place -- and after the scroll loop above, which
+    // is why a leaving child keeps the offset it was dropped at rather than travelling with the
+    // list.
+    // ponytail: a reader who scrolls during a 150 ms exit sees the leaver drift out of place. The
+    // upgrade is to carry the offset each leaver was dropped at on the node and subtract the
+    // difference here; nothing has asked for it, and lists here scroll far slower than they fade.
+    children.extend(leaving);
+
     Ok(ResolvedNode {
         id,
         kind,
@@ -1130,10 +1240,12 @@ fn finish(
         margin: style.margin,
         visible: style.visible,
         opacity: style.opacity,
+        transform: style.transform,
         properties,
         paint,
         children,
         tweens,
+        leaving: false,
     })
 }
 
@@ -1141,7 +1253,7 @@ fn finish(
 /// the number a scroll offset is clamped against. The same footprint the sizing pass used, which
 /// keeps a scroll limit and the layout it scrolls in agreement.
 fn extent_along(children: &[ResolvedNode], axis: MainAxis, spacing: f32) -> f32 {
-    let visible: Vec<&ResolvedNode> = children.iter().filter(|c| c.visible).collect();
+    let visible: Vec<&ResolvedNode> = children.iter().filter(|c| c.in_flow()).collect();
     let extents: f32 = visible
         .iter()
         .map(|c| {
@@ -1287,7 +1399,7 @@ fn reveal_child(
     let Some(index) = signal.take_reveal() else {
         return;
     };
-    let Some(child) = children.iter().filter(|c| c.visible).nth(index - 1) else {
+    let Some(child) = children.iter().filter(|c| c.in_flow()).nth(index - 1) else {
         return;
     };
     let (start, extent) = match axis {
@@ -1603,17 +1715,77 @@ pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<Phy
 }
 
 fn collect_input_regions(node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32, out: &mut Vec<PhysicalRect>) {
-    if !node.visible {
+    if !node.in_flow() {
         return;
     }
     let rect = LogicalRect { x: origin_x + node.rect.x, y: origin_y + node.rect.y, ..node.rect };
     if takes_input_as_a_box(node) {
-        out.push(snap_to_physical(rect, scale));
+        let bounds = painted_bounds(node, rect);
+        if bounds.width > 0.0 && bounds.height > 0.0 {
+            out.push(snap_to_physical(bounds, scale));
+        }
         return;
     }
     for child in &node.children {
         collect_input_regions(child, rect.x, rect.y, scale, out);
     }
+}
+
+/// Writes every visible `geometry(name)` node's absolute rect into its signal (ADR-0147), the same
+/// space `hover_writes` reports. No dirty flag: a pass write that changed a rect notes it for
+/// `RendererClient` to turn into one follow-up pass, and a `quiet` tick write notes nothing, so no
+/// frame ever schedules a pass. Hidden nodes keep their last rect, the way a hidden subtree keeps
+/// everything else.
+fn publish_geometry(node: &ResolvedNode, origin_x: f32, origin_y: f32, lua: &Lua, quiet: bool) -> mlua::Result<()> {
+    if !node.in_flow() {
+        return Ok(());
+    }
+    let (x, y) = (origin_x + node.rect.x, origin_y + node.rect.y);
+    if let Some(Value::UserData(ud)) = node.properties.get("geometry")
+        && let Some(cell) = crate::lua::signal::from_userdata(ud).and_then(|signal| signal.geometry_cell())
+    {
+        const KEYS: [&str; 4] = ["x", "y", "width", "height"];
+        let fresh = [x, y, node.rect.width, node.rect.height];
+        let same = match &*cell.borrow() {
+            Value::Table(old) => KEYS.into_iter().zip(fresh).all(|(key, v)| old.get::<f32>(key).ok() == Some(v)),
+            _ => false,
+        };
+        if !same {
+            let rect = lua.create_table_with_capacity(0, 4)?;
+            for (key, v) in KEYS.into_iter().zip(fresh) {
+                rect.set(key, v)?;
+            }
+            *cell.borrow_mut() = Value::Table(rect);
+            if !quiet {
+                crate::lua::signal::note_geometry_moved(lua);
+            }
+        }
+    }
+    for child in &node.children {
+        publish_geometry(child, x, y, lua, quiet)?;
+    }
+    Ok(())
+}
+
+/// Where a node is on screen: its box, or the bounds of that box under its own transform
+/// (ADR-0149), so a scaled tile takes input where it is painted.
+/// ponytail: ancestors' transforms are not composed in; a transformed node inside a transformed
+/// node reports its own box's bounds only. Upgrade path: carry the matrix down this walk.
+fn painted_bounds(node: &ResolvedNode, rect: LogicalRect) -> LogicalRect {
+    if node.transform.is_identity() {
+        return rect;
+    }
+    let m = node.transform.matrix(rect);
+    let corners = [
+        (rect.x, rect.y),
+        (rect.x + rect.width, rect.y),
+        (rect.x, rect.y + rect.height),
+        (rect.x + rect.width, rect.y + rect.height),
+    ]
+    .map(|(x, y)| node::apply_affine(m, x, y));
+    let (x0, y0) = corners.iter().fold((f32::MAX, f32::MAX), |(x0, y0), &(x, y)| (x0.min(x), y0.min(y)));
+    let (x1, y1) = corners.iter().fold((f32::MIN, f32::MIN), |(x1, y1), &(x, y)| (x1.max(x), y1.max(y)));
+    LogicalRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
 }
 
 /// [`overlay_input_regions`]'s "solid" test. A `background` of `#00000000` counts: the IDL says it
@@ -1939,6 +2111,324 @@ pub(super) mod tests {
         scene.tick(&[instance_at(&surface, full())], &shaping, &lua, started + std::time::Duration::from_millis(50));
         assert!(clock.elapsed() < std::time::Duration::from_secs(20), "must be bounded, took {:?}", clock.elapsed());
         assert!(!scene.surface("bar@TEST").unwrap().animating(), "the tween is dropped, not retried next frame");
+    }
+
+    #[test]
+    fn a_new_node_with_a_from_enters_from_it_and_an_edge_table_tweens_per_edge() {
+        // ADR-0146: `from` is the entry animation; the margin table eases edge by edge.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"return panel { id = "bar", child = rect { width = 10, height = 10,
+                margin = state("m", { left = 0 }), opacity = 1,
+                animate = { opacity = { duration = 100, from = 0 },
+                            margin = { duration = 100, easing = "Linear", from = { left = 40 } } } } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let child = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(child.opacity, 0.0, "a first value starts at `from`, not at the target");
+        assert_eq!(child.rect.x, 40.0);
+        let started = child.tweens[0].started;
+        scene.tick(&[instance_at(&surface, full())], &shaping, &lua, started + std::time::Duration::from_millis(50));
+        let child = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(child.rect.x, 20.0, "halfway along a linear edge tween");
+        assert!((child.opacity - 0.5).abs() < 0.01, "got {}", child.opacity);
+    }
+
+    /// A leaving `text` is not relaid out, so it keeps the string it was fitted to -- but its
+    /// colour is paint, not layout, and freezing the whole of its paint left a label unable to
+    /// fade on the way out while every other node could.
+    #[test]
+    fn a_leaving_text_animates_its_colour_while_keeping_the_string_it_was_fitted_to() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        // Elided on purpose: the fitted string differs from the one the config wrote, so a paint
+        // re-read that forgot to carry it would hand back the whole untruncated message.
+        let source = "a long message that will not fit";
+        let (lua, surface) = surface_from(
+            r##"local label = text { id = "label", width = 60, font_size = 14, elide = "End",
+                   content = "a long message that will not fit", foreground = "#000000",
+                   animate = { exit = { duration = 100, easing = "Linear", foreground = "#ff0000" } } }
+               return panel { id = "bar", child = row { children = state("kids", { label }) } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r#"state("kids", {}):set({})"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+
+        let leaver = &scene.surface("bar@TEST").unwrap().children[0].children[0];
+        assert!(leaver.leaving, "the label is on its way out");
+        let started = leaver.tweens[0].started;
+        let instances = [instance_at(&surface, full())];
+        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+
+        let leaver = &scene.surface("bar@TEST").unwrap().children[0].children[0];
+        let Some(PaintStyle::Text { content, color, .. }) = leaver.paint.as_ref() else { panic!("{leaver:?}") };
+        assert!(content.ends_with('\u{2026}'), "still the string it was fitted to, got {content:?}");
+        assert_ne!(content, source, "not the one the config wrote, re-read from the properties");
+        assert!((color.r - 0.5).abs() < 0.05 && color.g < 0.05, "halfway to red, got {color:?}");
+    }
+
+    /// ADR-0150: a child the tree drops stays as a leaving node while its exit tweens run, out of
+    /// flow and out of reach, painted after its live siblings; one with no exit block is gone at
+    /// once; the pass that finds nothing in flight drops it.
+    #[test]
+    fn a_dropped_child_with_an_exit_block_leaves_over_its_tweens_and_one_without_is_gone_at_once() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local a = rect { id = "a", width = 10, height = 10, background = "#ff0000",
+                   children = { rect { id = "inner", width = 4, height = 4, background = "#ffffff" } },
+                   animate = { exit = { duration = 100, easing = "Linear", opacity = 0, translate = { y = 8 } } } }
+               local b = rect { id = "b", width = 10, height = 10, background = "#00ff00" }
+               local c = rect { id = "c", width = 10, height = 10, background = "#0000ff" }
+               return panel { id = "bar", child = row { spacing = 0, children = state("kids", { a, b, c }) } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children.len(), 3);
+        let a_id = row.children[0].id;
+
+        lua.load(r#"local k = state("kids", {}):get(); state("kids", {}):set({ k[3] })"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let ids: Vec<String> =
+            row.children.iter().map(|c| node::parse_node_id(&c.properties).unwrap().unwrap()).collect();
+        assert_eq!(ids, ["c", "a"], "b had no exit block; a leaves after the live child");
+        let (c, a) = (&row.children[0], &row.children[1]);
+        assert_eq!(c.rect.x, 0.0, "the flow closed over the leaver's slot at once");
+        assert!(a.leaving && a.id == a_id && a.rect.x == 0.0, "a keeps its identity and its last rect");
+        // "Out of reach" includes the question a held draft asks of the tree it was typed into
+        // (ADR-0108). A leaver is back among `children` so it paints, and answering that question
+        // from there would keep a removed textfield focused: keys would still reach a node the
+        // tree has already dropped, and its `on_submit` would run for a card that is gone.
+        assert!(!crate::layout::hit::contains_node(row, a_id), "a leaving node is no longer in the tree");
+        // The whole subtree goes with it. `inner` never left on its own account -- it is only
+        // under something that did -- so a check that read one `leaving` flag would still find it.
+        let inner = &a.children[0];
+        assert!(!inner.leaving, "the child is not itself a leaver");
+        assert!(!crate::layout::hit::contains_node(row, inner.id), "and it is out of reach under one");
+        assert!(crate::layout::hit::contains_node(row, c.id), "its live sibling still is");
+        assert_eq!(a.opacity, 1.0, "an absent opacity departs from 1");
+        assert_eq!(row.rect.width, 10.0, "a leaving child takes no room");
+
+        let started = a.tweens[0].started;
+        let instances = [instance_at(&surface, full())];
+        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+        let a = &scene.surface("bar@TEST").unwrap().children[0].children[1];
+        assert!((a.opacity - 0.5).abs() < 0.01 && a.transform.translate == (0.0, 4.0), "halfway out: {a:?}");
+        let root = scene.surface("bar@TEST").unwrap();
+        let path = crate::layout::hit::hit_path(root, crate::layout::hit::LogicalPoint { x: 5.0, y: 5.0 });
+        assert_eq!(path.last().map(|n| n.id), Some(root.children[0].children[0].id), "the pointer lands on c, under a");
+
+        scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(100));
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].children.len(), 1, "a is gone");
+        assert!(!scene.surface("bar@TEST").unwrap().animating());
+    }
+
+    /// ADR-0150: an exit block runs when the tree drops the node, not when it hides one. A hidden
+    /// child's subtree is frozen rather than advanced (ADR-0124), so there is nothing to ease and
+    /// dropping it later is immediate; `delay(signal, ms)` is the answer for a close-hold.
+    #[test]
+    fn a_hidden_child_is_dropped_at_once_however_it_leaves() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local a = rect { id = "a", width = 10, height = 10, background = "#ff0000",
+                   visible = state("shown", true),
+                   animate = { exit = { duration = 100, opacity = 0 } } }
+               local b = rect { id = "b", width = 10, height = 10, background = "#00ff00" }
+               return panel { id = "bar", child = row { spacing = 0, children = state("kids", { a, b }) } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].children.len(), 2);
+
+        // Hiding it alone changes nothing about how many nodes there are: it is still in the tree.
+        lua.load(r#"state("shown", true):set(false)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children.len(), 2, "hiding is not leaving");
+        assert!(!row.children[0].visible && !row.children[0].leaving);
+
+        lua.load(r#"local k = state("kids", {}):get(); state("kids", {}):set({ k[2] })"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let root = scene.surface("bar@TEST").unwrap();
+        assert_eq!(root.children[0].children.len(), 1, "a hidden node has nothing showing to ease out");
+        assert!(!root.animating());
+    }
+
+    /// A leaving node is out of the reconciliation, so putting its `id` back builds a second node
+    /// beside it rather than pulling the first back out of its exit -- QML makes a fresh delegate
+    /// too. The one still fading keeps its own identity until its tweens end.
+    #[test]
+    fn re_adding_a_leaving_id_builds_a_new_node_beside_it() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local a = rect { id = "a", width = 10, height = 10, background = "#ff0000",
+                   animate = { exit = { duration = 100, easing = "Linear", opacity = 0 } } }
+               return panel { id = "bar", child = row { spacing = 0, children = state("kids", { a }) } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let first = scene.surface("bar@TEST").unwrap().children[0].children[0].id;
+
+        let kids = |src: &str| lua.load(src).exec().unwrap();
+        kids(r#"state("kids", {}):set({})"#);
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let started = scene.surface("bar@TEST").unwrap().children[0].children[0].tweens[0].started;
+
+        // The fixture's own `a` is not reachable from Lua, so rebuild an identical child instead.
+        lua.load(
+            r##"state("kids", {}):set({ rect { id = "a", width = 10, height = 10, background = "#ff0000",
+                   animate = { exit = { duration = 100, easing = "Linear", opacity = 0 } } } })"##,
+        )
+        .exec()
+        .unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children.len(), 2, "the new `a` and the old one still fading");
+        assert!(!row.children[0].leaving && row.children[0].id != first, "the live one is a fresh node");
+        assert!(row.children[1].leaving && row.children[1].id == first, "the leaver kept its identity");
+        assert_eq!(row.rect.width, 10.0, "only the live one is measured");
+
+        scene.tick(&[instance_at(&surface, full())], &shaping, &lua, started + std::time::Duration::from_millis(100));
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert_eq!(row.children.len(), 1);
+        assert!(!row.children[0].leaving);
+    }
+
+    /// A leaving child sits at the rect it was dropped at, scroll offset and all. The pass that
+    /// removed it re-solves the scroll for the children that are left, and the leaver does not
+    /// travel with them: it fades where the reader last saw it.
+    #[test]
+    fn a_leaving_child_keeps_the_scroll_offset_it_was_dropped_at() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local function tile(name) return rect { id = name, width = 10, height = 40,
+                   background = "#ff0000", animate = { exit = { duration = 100, opacity = 0 } } } end
+               return panel { id = "bar", child = column { width = 100, height = 100, spacing = 0,
+                   scroll = scroll("s"), children = state("kids", { tile("a"), tile("b"), tile("c") }) } }"##,
+        );
+        let signal: mlua::AnyUserData = lua.load(r#"return scroll("s")"#).eval().unwrap();
+        let signal = crate::lua::signal::from_userdata(&signal).unwrap();
+        signal.scroll_handle().unwrap().set_changed(mlua::Value::Number(20.0));
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let ys: Vec<f32> = scene.surface("bar@TEST").unwrap().children[0].children.iter().map(|c| c.rect.y).collect();
+        assert_eq!(ys, [-20.0, 20.0, 60.0], "120 px of tiles in a 100 px column, scrolled 20");
+
+        // Dropping the first leaves 80 px, which is less than the column: the offset clamps to 0
+        // and the two that stay move up. The leaver holds the -20 it was showing.
+        lua.load(r#"local k = state("kids", {}):get(); state("kids", {}):set({ k[2], k[3] })"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let column = &scene.surface("bar@TEST").unwrap().children[0];
+        let ys: Vec<f32> = column.children.iter().map(|c| c.rect.y).collect();
+        assert_eq!(ys, [0.0, 40.0, -20.0], "b and c reflow, a fades where it was");
+        assert!(column.children[2].leaving);
+    }
+
+    /// ADR-0152: an endless sequence drives its property between passes and keeps asking for
+    /// frames; a counted one plays out, rests on its last frame, and is not started again by a
+    /// pass that resolves for some unrelated reason.
+    #[test]
+    fn a_counted_sequence_rests_when_it_is_done_and_an_endless_one_never_does() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"return panel { id = "bar", child = row { spacing = 0, children = {
+                   rect { id = "pulse", width = 10, height = 10, background = "#ff0000", opacity = 1,
+                     animate = { opacity = { duration = 100, easing = "Linear", loops = "Infinite",
+                                             keyframes = { 1, 0.2, 1 } } } },
+                   rect { id = "flash", width = state("w", 10), height = 10, background = "#00ff00", opacity = 1,
+                     animate = { opacity = { duration = 100, easing = "Linear", loops = 1,
+                                             keyframes = { 1, 0 } } } } } } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let (pulse, flash) = (&row.children[0], &row.children[1]);
+        assert_eq!(pulse.opacity, 1.0, "both start on their first frame, not on the resolved value");
+        assert_eq!(flash.opacity, 1.0);
+        let started = pulse.tweens[0].started;
+        let instances = [instance_at(&surface, full())];
+
+        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        assert!((row.children[0].opacity - 0.6).abs() < 0.01, "halfway down the pulse");
+        assert!((row.children[1].opacity - 0.5).abs() < 0.01, "halfway through the flash");
+
+        // Past the counted one's single loop: it rests, the endless one carries on wrapping.
+        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(250)));
+        let root = scene.surface("bar@TEST").unwrap();
+        let (pulse, flash) = (&root.children[0].children[0], &root.children[0].children[1]);
+        assert!((pulse.opacity - 0.6).abs() < 0.01, "a quarter of the way round again");
+        assert_eq!(flash.opacity, 0.0, "resting on its last frame");
+        assert!(flash.tweens[0].resting && !pulse.tweens[0].resting);
+        assert!(root.animating(), "the endless one still wants frames");
+
+        // A pass for something else entirely must not restart the run that finished. `apply` reads
+        // the real clock while the ticks above are told a time, so what proves it is the run's own
+        // start instant and its resting flag, not the opacity a wall-clock `at` would compute.
+        let began = flash.tweens[0].started;
+        lua.load(r#"state("w", 10):set(20)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let flash = &scene.surface("bar@TEST").unwrap().children[0].children[1];
+        assert_eq!(flash.rect.width, 20.0, "the pass did land");
+        assert!(flash.tweens[0].resting && flash.tweens[0].started == began, "the same run, still played out");
+    }
+
+    #[test]
+    fn a_lingering_surface_keeps_its_card_tweening_through_the_close() {
+        // The panel host's shape: the root stays visible through `delay`, the card fades and lifts.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"local open = state("open", true)
+            local linger = computed({ open, delay(open, 147) }, function(now, was) return now or was end)
+            return panel { id = "host", visible = linger, child = rect { width = "Fill", height = "Fill", children = {
+                button { width = "Fill", height = "Fill" },
+                column { width = 100, margin = open:map(function(o) return { left = 30, top = o and 4 or -44 } end),
+                    opacity = open:map(function(o) return o and 1 or 0 end),
+                    animate = { opacity = { duration = 147, from = 0 }, margin = { duration = 147, easing = "OutQuad" } },
+                    children = { rect { width = 10, height = 10 } } } } } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let card = &scene.surface("host@TEST").unwrap().children[0].children[1];
+        assert_eq!(card.tweens.len(), 1, "opacity enters from 0; margin has no from and snaps");
+        let entered = card.tweens[0].started;
+        scene.tick(&[instance_at(&surface, full())], &shaping, &lua, entered + std::time::Duration::from_secs(1));
+
+        lua.load(r#"state("open", true):set(false)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let root = scene.surface("host@TEST").unwrap();
+        assert!(root.visible, "delay keeps the surface mapped");
+        let card = &root.children[0].children[1];
+        assert_eq!(card.tweens.len(), 2, "opacity and margin both leave: {:?}", card.tweens);
+        assert!(
+            (card.opacity - 1.0).abs() < 0.01 && card.rect.x == 30.0 && card.rect.y == 4.0,
+            "the close pass paints from where it was"
+        );
+        assert!(root.animating());
+    }
+
+    #[test]
+    fn a_geometry_signal_reads_the_nodes_absolute_rect_after_the_pass_without_dirtying_it() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"g = geometry("card")
+            return panel { id = "bar", child = column { padding = { left = 10, top = 5 }, children = {
+                rect { width = 30, height = 20, geometry = g } } } }"#,
+        );
+        let dirty = crate::lua::signal::DirtyFlag::new();
+        crate::lua::signal::register(&lua, dirty.clone()).unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let (x, y, h): (f32, f32, f32) = lua.load("local r = g:get() return r.x, r.y, r.height").eval().unwrap();
+        assert_eq!((x, y, h), (10.0, 5.0, 20.0));
+        assert!(!dirty.take(), "the pass itself does not dirty; the client decides on one follow-up");
+        assert!(crate::lua::signal::take_geometry_moved(&lua), "the first measurement is a change");
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert!(!crate::lua::signal::take_geometry_moved(&lua), "an unchanged rect notes nothing");
+        let err = lua.load("g:set(1)").exec().unwrap_err().to_string();
+        assert!(err.contains("a geometry"), "{err}");
     }
 
     #[test]
@@ -4190,6 +4680,8 @@ pub(super) mod tests {
     ) -> ResolvedNode {
         ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(id),
             kind: kind.to_string(),
@@ -4229,10 +4721,26 @@ pub(super) mod tests {
         assert!(overlay_input_regions(&root, 1.0).is_empty(), "a button with no handler is as transparent as a rect");
     }
 
+    /// ADR-0149: the region follows the painted box, and a node scaled to nothing paints nothing.
+    #[test]
+    fn overlay_input_regions_follow_the_transform_and_vanish_at_zero_scale() {
+        let mut card = region_node(1, "rect", (10.0, 10.0, 100.0, 40.0), solid_paint(), Vec::new());
+        card.transform.scale = (0.5, 0.5);
+        let root = region_node(2, "panel", (0.0, 0.0, 120.0, 60.0), None, vec![card]);
+        assert_eq!(overlay_input_regions(&root, 1.0), [PhysicalRect { x0: 35, y0: 20, x1: 85, y1: 40 }]);
+
+        let mut gone = region_node(3, "rect", (10.0, 10.0, 100.0, 40.0), solid_paint(), Vec::new());
+        gone.transform.scale = (0.0, 0.0);
+        let root = region_node(4, "panel", (0.0, 0.0, 120.0, 60.0), None, vec![gone]);
+        assert!(overlay_input_regions(&root, 1.0).is_empty(), "nothing painted, nothing to press");
+    }
+
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(102),
             kind: "rect".to_string(),
@@ -4245,6 +4753,8 @@ pub(super) mod tests {
         };
         let hidden_child = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(103),
             kind: "rect".to_string(),
@@ -4257,6 +4767,8 @@ pub(super) mod tests {
         };
         let root = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(104),
             kind: "panel".to_string(),
@@ -4277,6 +4789,8 @@ pub(super) mod tests {
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(105),
             kind: "rect".to_string(),
@@ -4289,6 +4803,8 @@ pub(super) mod tests {
         };
         let mut root = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(106),
             kind: "panel".to_string(),
@@ -4309,6 +4825,8 @@ pub(super) mod tests {
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(107),
             kind: "panel".to_string(),
@@ -4319,6 +4837,8 @@ pub(super) mod tests {
             paint: None,
             children: vec![ResolvedNode {
                 tweens: Vec::new(),
+                leaving: false,
+                transform: node::Transform::default(),
                 margin: crate::layout::node::EdgeInsets::default(),
                 id: NodeId::test(120),
                 kind: "row".to_string(),

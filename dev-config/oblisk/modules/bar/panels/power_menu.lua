@@ -20,6 +20,7 @@ local panel_row = require("components.panel_row")
 local meter = require("components.meter")
 local icon_button = require("components.icon_button")
 local section_header = require("components.section_header")
+local expanding_pill = require("components.expanding_pill")
 local ui_state = require("lib.ui_state")
 
 local KIND = "power"
@@ -101,10 +102,10 @@ local function step_brightness(delta)
     oblisk.brightness:invoke("set", stepped)
 end
 
--- Mirror `ExpandingPill`: power-off circle expands on hover to log out/restart/power off. Put
--- `hover` on the containing row so gaps do not leave it, as `workspace_strip.lua` does. That is
--- what the mirror's collapse timer exists to paper over. No width animation; the engine has none,
--- so the volume pill snaps too.
+-- `ExpandingPill`: the power-off circle expands on hover to log out/restart/power off, and stays
+-- open through a countdown (`holdOpen`). `components/expanding_pill.lua` owns the expansion; each
+-- slot's ground, ring and countdown fill ease like the mirror's `IconButton` and `FillBar`, and
+-- the pending action's opacity pulse is a looping keyframe sequence (ADR-0152).
 --
 -- During a countdown the pill stays open: the chosen action keeps its glyph under an accent ring,
 -- the next slot shows seconds over a growing fill, and the third cancels. Left-click the chosen
@@ -114,10 +115,7 @@ end
 -- Right-click with no countdown opens the panel below, which adds lock, sleep, settings, and
 -- brightness; settings has no other door.
 local SLOT_COUNT = #ACTIONS
-local pill_hovered = hover("power-pill")
-local expanded = computed({ pill_hovered, counting }, function(is_hovered, any)
-    return is_hovered or any
-end)
+local pill = expanding_pill.new({ slot = "power-pill", hold_open = counting })
 
 -- Countdown circle: the last slot unless it is the chosen action.
 local function countdown_index(key)
@@ -148,11 +146,8 @@ local function slot(index)
         end
         return is_hovered and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
     end)
-    return button {
-        width = theme.item_width,
-        height = theme.item_height,
+    return pill.cell(button {
         align_h = "Center",
-        align_v = "Center",
         hover = slot_hovered,
         radius = theme.item_radius,
         -- Plain fill bar cut by the circle's arc, `FillBar.qml` under a clip.
@@ -165,8 +160,21 @@ local function slot(index)
             end
             return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
         end),
-        visible = expanded:map(function(open)
-            return open or index == SLOT_COUNT
+        -- `SequentialAnimation on opacity { loops: Infinite; running: counting && isActionSlot }`:
+        -- the chosen action breathes while its countdown runs. The gate is the entry itself
+        -- (ADR-0152) -- no entry, no sequence, and the opacity falls back to the resolved `1`,
+        -- which is what the mirror's `onRunningChanged` handler had to write by hand.
+        animate = is_chosen:map(function(chosen)
+            local eases = { background = theme.animation_ms, border_color = theme.animation_ms }
+            if chosen then
+                eases.opacity = {
+                    duration = theme.animation_slow_ms,
+                    easing = "InOutQuad",
+                    loops = "Infinite",
+                    keyframes = { 1, 0.4, 1 },
+                }
+            end
+            return eases
         end),
         children = {
             -- Mirror `FillBar`: seconds elapsed as a ground growing from the left under the number.
@@ -180,6 +188,7 @@ local function slot(index)
                 end),
                 height = "Fill",
                 background = theme.ON_HOVER,
+                animate = { width = theme.animation_ms },
             },
             text {
                 content = computed({ role, seconds_left }, function(what, left)
@@ -224,7 +233,10 @@ local function slot(index)
                 end
             end
         end,
-    }
+    }, pill.expanded:map(function()
+        -- The mirror's `collapsedIndex` is the last slot: power off is the one circle at rest.
+        return index == SLOT_COUNT
+    end))
 end
 
 local slots = {}
@@ -232,13 +244,7 @@ for index = 1, SLOT_COUNT do
     slots[index] = slot(index)
 end
 
-local power_button = row {
-    height = theme.item_height,
-    align_v = "Center",
-    spacing = theme.spacing.sm,
-    hover = pill_hovered,
-    children = slots,
-}
+local power_button = pill.row(slots)
 
 local body = {
     section_header("session"),

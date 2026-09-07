@@ -35,6 +35,9 @@ See [VM setup](../renderer/src/lua/mod.rs), [JSON conversion](../renderer/src/lu
 | `signal:map(fn)` | Derived signal; keep the callback free of side effects |
 | `computed({signals...}, fn)` | Derived signal with explicit dependencies |
 | `state(name, initial)` | Writable signal; `:set(value)` marks the scene dirty |
+| `geometry(name)` | The laid-out `{ x, y, width, height }` of the node declaring `geometry = geometry(name)`, written by each layout; a pass that changes it earns one follow-up pass, a tween tick none |
+| `delay(signal, ms)` | `signal` once it has held a new value for `ms`; a change that reverts sooner is dropped. Close-hold and trailing debounce in one shape |
+| `pulse(signal, ms)` | `true` for `ms` after `signal` changes value, `false` otherwise; a change inside an open window restarts it. What fires a one-shot animation, since nothing here can call `restart()` |
 | `oblisk.<capability>:on_change(fn)` | Runs `fn(current, previous)` per pushed snapshot; may invoke actions or write state |
 
 Pass the signal itself to a node property to keep it live:
@@ -168,19 +171,77 @@ tables do not resolve, so derive the whole table instead.
 | `cursor` | CSS cursor name; innermost explicit/default cursor wins |
 | `hover` | Handle from `hover(name)` |
 | `on_hover` | `function(inside)` on hover edges |
-| `animate` | `{ <property> = ms \| { duration = ms, easing = "<name>" } }`; named properties ease from the displayed value to a newly resolved one instead of snapping |
+| `geometry` | The signal `geometry(name)` returned; the pass writes this node's absolute rect into it |
+| `animate` | `{ <property> = ms \| { duration = ms, easing = "<name>" \| { x1, y1, x2, y2 } \| { steps = n }, from = <value>, keyframes = { <value>, ... }, loops = n \| "Infinite" }, exit = { duration = ms, easing = "<name>", <property> = <target>, ... } }`; named properties ease from the displayed value to a newly resolved one instead of snapping; `from` is where a property nothing displayed yet starts; `exit` is where the node eases to once the tree drops it |
+| `scale` | Paint-only scale about `origin`: a number for both axes or `{ x, y }`, `[0, 64]`; layout is untouched, hit-testing and input regions follow the painted box |
+| `rotate` | Paint-only rotation in degrees, clockwise, about `origin`; `[-8192, 8192]` like every geometry number |
+| `translate` | Paint-only `{ x, y }` shift in logical pixels, `[-8192, 8192]` each, applied after `scale` and `rotate` |
+| `origin` | `{ x, y }` fractions of the node's box that `scale` and `rotate` pivot on, `[0, 1]` each, refused outside; default its centre |
 
 Sizes and maximum sizes accept 0–8192 logical pixels. See
 [geometry parsing](../renderer/src/layout/node/style.rs).
 
-`animate` names numeric properties (`width`, `height`, `max_width`, `max_height`, `margin`,
-`padding`, `spacing`, `radius`, `border_width`, `opacity`, `font_size`, `size`) and colour
-properties (`background`, `border_color`, `foreground`). Durations are `(0, 60000]` ms. Easing
-names are QML's without the prefix: `Linear`, `InQuad`, `OutQuad`, `InOutQuad` (default),
-`InCubic`, `OutCubic`, `InOutCubic`, `OutBack`. A tween runs
-between the engine's own passes on compositor frame callbacks and reads no Lua; a first value, a
-`"Fill"`/percent/edge-table endpoint and a property `animate` stops naming all snap. Any other
-property is refused. See [tweens](../renderer/src/layout/node/animate.rs).
+`animate` may name any property the node has; a name the node does not accept is refused. What
+the value is decides whether it tweens, the way Qt registers interpolators by type: a number, a
+`"NN%"` size, a `#` colour and an edge table of numbers each ease against a value of the same
+shape, and anything else (`"Fill"`, a boolean, a table of colours, a change of shape) snaps.
+Durations are `[1, 60000]` ms and an entry may hold the property still for a `delay` of
+`[0, 60000]` ms first, which is CSS's `transition-delay` (ADR-0153); the delay is added to the
+tween's life rather than taken out of it, and on a sequence it offsets the whole run once, not
+each cycle. Easing names are QML's without the prefix: `Linear`, and `In`,
+`Out` and `InOut` of `Quad` (`InOutQuad` is the default), `Cubic`, `Quart`, `Quint`, `Sine`,
+`Expo`, `Circ`, `Back`, `Elastic` and `Bounce`. `Back`, `Elastic` and `Bounce` leave `[0, 1]` on
+purpose; the property's own range pulls the result back. In place of a name, `easing` takes a
+table: four numbers are CSS `cubic-bezier(x1, y1, x2, y2)`, with `x1` and `x2` bounded to `[0, 1]`
+and the `y` free, and `{ steps = n }` is CSS `steps(n)`, `n` within `[1, 1000]`, holding each value
+and reaching the target only at the end (ADR-0151). A tween runs
+between the engine's own passes on compositor frame callbacks and reads no Lua. A property
+nothing displayed yet, on a new node or one that lacked it, is taken as it is unless the entry
+names a `from`, which is where it starts. A property `animate` stops naming snaps. See
+[tweens](../renderer/src/layout/node/animate.rs).
+
+An entry naming `spring` is a mass on a spring instead of a curve of progress (ADR-0154):
+`{ spring = { stiffness = 220, damping = 26 } }`, both required, `stiffness` within
+`(0, 100000]` and `damping` within `(0, 10000]`, with `2 * sqrt(stiffness)` the damping that stops
+it overshooting. It has no `duration` and no `easing` — naming either beside a spring is refused,
+as are `keyframes` and `loops` — because how long it takes falls out of the two constants. What a spring does
+that no easing can is keep its speed through a change of target: an eased tween whose target moves
+mid-flight starts a fresh curve from a standstill at the value on screen, while a spring hands its
+running rate to the run that replaces it. Its overshoot is clamped by the property's own range,
+the same way `OutBack`'s is. There is no `mass`: it divides out of both constants.
+
+An entry naming `keyframes` walks the property through that list instead of easing it to the value
+a pass resolved (ADR-0152): at least two values, the first where it starts and each later one a
+segment eased into over the entry's `duration` and `easing`, or over its own when the frame is
+written `{ value = <v>, duration = ms, easing = <easing> }`. A segment of `duration = 0` is a jump,
+and one between two equal values is a hold, which together are QML's `PropertyAction` and
+`PauseAnimation`; at least one segment must last, since a list of nothing but jumps takes no time
+to walk and repeating it forever would ask for a frame every frame while showing one still value.
+`loops` is a whole count within `[1, 10000]` or `"Infinite"`, `1` when absent, and is refused
+without a `keyframes` list to count. A sequence takes the property over for as long as it runs and reads nothing resolved for
+it; there is no separate `running` flag, because `animate` is itself bindable and an entry that is
+not there is a sequence that is not running, leaving the property at its resolved value. A counted
+sequence holds its last frame once it has played out and does not start again. `pulse(signal, ms)`
+is what re-fires one: `animate = pulse(clicks, 400):map(function(on) return on and { ... } or {} end)`
+puts the entry there for the length of the window and takes it away after, so the next change
+starts the sequence over.
+
+`animate.exit` is the one entry that is not a property name. Its block holds a `duration`, an
+optional `easing` and `delay`, and the targets the node eases to once a pass stops returning it: a child the
+parent no longer holds stays as a leaving node, painted at the rect it was laid out at, until
+those tweens finish (ADR-0150). Each target starts from the value the node displays, or from the
+property's identity when it never set one (`1` for `opacity` and `scale`, `0` for the rest). A
+leaving node is painted and nothing else: it takes no room in its parent's flow, no clicks, no
+scroll and no `geometry` write, and its `id` is not matched again, so re-adding it builds a new
+node beside the one still fading. Because no solver runs over it, only what paint reads moves it:
+`opacity`, the colours, `scale`, `rotate`, `translate` and a pixel `width`/`height`. A `margin` or
+an alignment in the block eases its number and changes nothing on screen; `translate` is what
+slides a card out. A child with no `exit` block, or one that was already hidden, is
+gone the pass it is dropped, and so is everything under a node that leaves without an exit block
+of its own: only the child a pass stopped returning is asked to depart, never its descendants, so
+declare the exit on whatever the tree actually drops. Departing also ends every tween the node was
+already running, so the block's `duration` is the whole of the node's remaining life. Exit does not
+run for `visible = false`; `delay(signal, ms)` holds a whole surface open instead.
 
 Boxes, rows, columns, buttons and surface roots also accept `background`, `radius`,
 `border_color`, `border_width` and `clip`.
@@ -285,6 +346,7 @@ See [wire format and dispatch limits](oblisk-supervisor-services-dbus.md#13-cont
 | `oblisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
 | `oblisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
 | `oblisk toggle <name>` | Toggles declared boolean state |
+| `oblisk toggle <name> <value>` | Sets declared state to the value, or back to its declared initial when it already holds it; one keybind for a modal whose state names the one showing |
 
 `check` does not validate live service behavior or rendered layout.
 See [CLI](../supervisor/src/cli.rs) and [check implementation](../renderer/src/check.rs).

@@ -57,6 +57,9 @@ pub enum Draw {
     /// A subtree masked by the declaring node's rounded arc. Rectangular clips flatten into each
     /// command; rounded clips stay grouped for [`execute`].
     Clipped { radius: f32, commands: Vec<DrawCmd> },
+    /// The subtree of a node with a `scale`/`rotate`/`translate` (ADR-0149), drawn under its
+    /// affine. Coordinates inside are the untransformed absolute ones.
+    Transformed { matrix: node::Affine, commands: Vec<DrawCmd> },
 }
 
 /// One drawable node: what, where, and its precomputed ancestor clip. Intersections are axis
@@ -85,7 +88,7 @@ impl DisplayList {
         fn walk(commands: &[DrawCmd], files: &[std::path::PathBuf]) -> bool {
             commands.iter().any(|command| match &command.draw {
                 Draw::Image { source, .. } => files.iter().any(|file| file.as_os_str() == source.as_str()),
-                Draw::Clipped { commands, .. } => walk(commands, files),
+                Draw::Clipped { commands, .. } | Draw::Transformed { commands, .. } => walk(commands, files),
                 _ => false,
             })
         }
@@ -99,7 +102,7 @@ impl DisplayList {
             for command in commands {
                 match &command.draw {
                     Draw::Image { source, box_px, .. } => out.push((std::path::PathBuf::from(source), *box_px)),
-                    Draw::Clipped { commands, .. } => walk(commands, out),
+                    Draw::Clipped { commands, .. } | Draw::Transformed { commands, .. } => walk(commands, out),
                     _ => {}
                 }
             }
@@ -186,34 +189,49 @@ fn build_node(
     let opacity = inherited_opacity * node.opacity;
     let draw = node.paint.as_ref().and_then(|style| draw_for(style, node.id, rect, scale, opacity, focus));
 
-    let Some(radius) = rounded_clip(node) else {
-        if let Some(draw) = draw {
-            out.push(DrawCmd { rect, clip, draw });
+    // A transformed node paints itself and its subtree as one group under its matrix
+    // (ADR-0149), so the group is built into `out` and lifted out of it afterwards. Coordinates
+    // inside stay the untransformed absolute ones this walk computes; the matrix is about the
+    // node's absolute origin, so the canvas maps them at draw time. Scissors inside follow the
+    // matrix too, femtovg's own rule, which is right for the node's own box.
+    // ponytail: an ancestor's clip is carried along as well, so a scaled child overflowing its
+    // parent is cut by the parent's box scaled with it, not the box itself. Upgrade path: set the
+    // parent clip once outside the group and `intersect_scissor` inside.
+    let start = out.len();
+    let (x, y) = (rect.x, rect.y);
+    match rounded_clip(node) {
+        None => {
+            if let Some(draw) = draw {
+                out.push(DrawCmd { rect, clip, draw });
+            }
+            for child in &node.children {
+                build_node(child, x, y, scale, clip, opacity, focus, out);
+            }
         }
-        for child in &node.children {
-            build_node(child, x, y, scale, clip, opacity, focus, out);
+        // Rounded order matches QML: fill, masked subtree, border. A child reaching the arc would
+        // cover a border painted first.
+        Some(radius) => {
+            let (fill, border) = split_fill_and_border(draw);
+            if let Some(fill) = fill {
+                out.push(DrawCmd { rect, clip, draw: fill });
+            }
+            let mut inner = Vec::new();
+            for child in &node.children {
+                build_node(child, x, y, scale, clip, opacity, focus, &mut inner);
+            }
+            // A leaf has nothing to clip, so avoid the render target and composite.
+            if !inner.is_empty() {
+                out.push(DrawCmd { rect, clip, draw: Draw::Clipped { radius, commands: inner } });
+            }
+            if let Some(border) = border {
+                out.push(DrawCmd { rect, clip, draw: border });
+            }
         }
-        return;
-    };
-
-    // Rounded order matches QML: fill, masked subtree, border. A child reaching the arc would cover
-    // a border painted first.
-    let (fill, border) = split_fill_and_border(draw);
-    if let Some(fill) = fill {
-        out.push(DrawCmd { rect, clip, draw: fill });
     }
-
-    let mut inner = Vec::new();
-    for child in &node.children {
-        build_node(child, x, y, scale, clip, opacity, focus, &mut inner);
-    }
-    // A leaf has nothing to clip, so avoid the render target and composite.
-    if !inner.is_empty() {
-        out.push(DrawCmd { rect, clip, draw: Draw::Clipped { radius, commands: inner } });
-    }
-
-    if let Some(border) = border {
-        out.push(DrawCmd { rect, clip, draw: border });
+    if !node.transform.is_identity() {
+        let matrix = node.transform.matrix(rect);
+        let commands: Vec<DrawCmd> = out.drain(start..).collect();
+        out.push(DrawCmd { rect, clip, draw: Draw::Transformed { matrix, commands } });
     }
 }
 
@@ -335,6 +353,13 @@ fn run(
             Draw::Clipped { radius, commands } => {
                 draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch)
             }
+            Draw::Transformed { matrix, commands } => {
+                let canvas = painter.canvas_mut();
+                canvas.save();
+                canvas.set_transform(&femtovg::Transform2D(*matrix));
+                run(painter, images, commands, scale, target, scratch);
+                painter.canvas_mut().restore();
+            }
         }
     }
 }
@@ -362,6 +387,13 @@ fn draw_clipped(
     scratch: &mut Vec<ImageId>,
 ) {
     let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
+    // A box with no area shows nothing, and asking for a 0xN render target leaves GL with an
+    // incomplete framebuffer that the next composite on this canvas paints as a full square. A
+    // pill cell tweening its width through zero (`components/expanding_pill.lua`) hit this on the
+    // first and last frame of every expansion.
+    if width == 0 || height == 0 {
+        return;
+    }
     // `PREMULTIPLIED` prevents a second alpha multiplication; `FLIP_Y` maps canvas y=0 to the last
     // GL texture row. Both match femtovg 0.26.0's drop-shadow flags (`src/lib.rs`).
     let flags = ImageFlags::PREMULTIPLIED | ImageFlags::FLIP_Y;
@@ -587,9 +619,16 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 /// sides use two semicircular caps joined by `|width - height|`. Both wind like `rounded_rect`
 /// (left, bottom, right, top), which controls the fill-fan inset.
 ///
-/// A box whose sides differ by a hair still leaves a hair-length segment and can still bevel.
-/// Nothing produces one: a config asks for a circle (one expression sets both sides equal) or a
-/// pill (they differ by the whole run of the content).
+/// A box whose sides differ by a hair is a circle. A hair-length straight run between the two
+/// caps is worse than a bevel: for a box 2 µm narrower than it is tall, the vertical-cap path's
+/// fill fan folds over and paints the whole bounding square (`a_box_a_hair_narrower_than_tall_is_
+/// still_a_circle`). Tweens produce exactly that: a `width = "Fill"` circle inside a cell whose
+/// width and padding both ease lands a rounding error either side of its height on different
+/// frames (`components/expanding_pill.lua`), and the narrow frames flashed as squares.
+/// Below this the two sides of a box count as equal (`box_path`): the 0.05 px band the sweep in
+/// its doc comment found clear of femtovg's bevel fold, and far above any layout rounding error.
+const HAIR: f32 = 0.05;
+
 fn box_path(rect: LogicalRect, radius: f32) -> Path {
     let LogicalRect { x, y, width: w, height: h } = rect;
     let mut path = Path::new();
@@ -598,8 +637,8 @@ fn box_path(rect: LogicalRect, radius: f32) -> Path {
         path.rect(x, y, w, h);
     } else if radius < w.min(h) / 2.0 {
         path.rounded_rect(x, y, w, h, radius);
-    } else if w == h {
-        path.circle(x + w / 2.0, y + h / 2.0, w / 2.0);
+    } else if (w - h).abs() <= HAIR {
+        path.circle(x + w / 2.0, y + h / 2.0, w.min(h) / 2.0);
     } else if w > h {
         let r = h / 2.0;
         let (cy, right) = (y + r, x + w - r);
@@ -2254,6 +2293,26 @@ mod tests {
 
     // ---- `clip = "Rounded"` ----
 
+    /// A `width = "Fill"` circle in a tweening cell lands a rounding error narrower than its
+    /// height on some frames. That box took the vertical-cap branch, whose hair-length straight run
+    /// folded the fill fan over the whole square; the wider case never did, which is why it showed
+    /// on some frames and not others.
+    #[test]
+    fn a_box_a_hair_narrower_than_tall_is_still_a_circle() {
+        let Some(instance) = init_headless_egl(64, 48) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 48) else { return };
+        let white = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        for (name, w) in [("a hair narrower", 31.999_998), ("a hair wider", 32.000_004), ("square", 32.0)] {
+            let canvas = painter.canvas_mut();
+            canvas.clear_rect(0, 0, 64, 48, Color::rgbaf(0.0, 0.0, 0.0, 1.0));
+            fill_rect(canvas, LogicalRect { x: 8.0, y: 8.0, width: w, height: 32.0 }, 17.0, white);
+            canvas.flush();
+            assert_eq!(pixel_at(canvas, 9, 9), (0, 0, 0, 255), "{name}: the corner outside the circle stays black");
+            assert_eq!(pixel_at(canvas, 24, 24), (255, 255, 255, 255), "{name}: the centre is filled");
+        }
+    }
+
     /// The shape `dev-config`'s battery indicator is: a pill with a child filling its left third.
     /// Without the rounded clip that child is a square-cornered block poking out of the left cap,
     /// which is why the config gave it the pill's own radius and got a lozenge instead.
@@ -2423,6 +2482,30 @@ mod tests {
     }
 
     /// A leaf that asks for a rounded clip has nothing to clip, so it buys no offscreen pass.
+    /// ADR-0149: `scale` paints a node bigger without moving its layout box. A 16px white square
+    /// centred in a 64x48 black panel, scaled 2x, covers 32px around the same centre.
+    #[test]
+    fn a_scaled_node_paints_about_its_origin_and_its_layout_box_is_unchanged() {
+        let Some(instance) = init_headless_egl(64, 48) else { return };
+        let lua = Lua::new();
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 48) else { return };
+        let root = resolved_surface(
+            &lua,
+            r##"return panel { id = "bar", width = 64, height = 48, background = "#000000ff", child = rect {
+                width = 16, height = 16, margin = { left = 24, top = 16 }, background = "#ffffffff", scale = 2 } }"##,
+            LogicalSize { width: 64.0, height: 48.0 },
+        );
+        assert_eq!(root.children[0].rect.width, 16.0, "the solver never sees the scale");
+        assert_eq!(root.children[0].transform.scale, (2.0, 2.0));
+        paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+        let canvas = painter.canvas_mut();
+        assert_eq!(pixel_at(canvas, 18, 10), (255, 255, 255, 255), "inside the painted 16..48 x 8..40 box");
+        assert_eq!(pixel_at(canvas, 45, 38), (255, 255, 255, 255));
+        assert_eq!(pixel_at(canvas, 12, 10), (0, 0, 0, 255), "outside it");
+        assert_eq!(pixel_at(canvas, 32, 24), (255, 255, 255, 255), "the centre stays put");
+    }
+
     #[test]
     fn a_childless_rounded_clip_builds_no_group() {
         let lua = Lua::new();

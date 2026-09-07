@@ -15,8 +15,8 @@ pub enum Command {
     },
     /// Evaluate the config and report what it says, without taking a Wayland surface.
     Check,
-    /// `set <name> <value>` or `toggle <name>` writes a running config's `state` signal
-    /// from outside for a compositor keybind (ADR-0112).
+    /// `set <name> <value>`, `toggle <name>` or `toggle <name> <value>` writes a running config's
+    /// `state` signal from outside for a compositor keybind (ADR-0112).
     SetState(shared::SetState),
     Version,
     Help,
@@ -38,6 +38,9 @@ USAGE:
     oblisk check [OPTIONS]      evaluate the config and exit
     oblisk set <NAME> <VALUE>   write the running config's state(NAME) signal
     oblisk toggle <NAME>        flip it, when it holds a boolean
+    oblisk toggle <NAME> <VALUE>
+                                set it to VALUE, or back to its declared
+                                initial when it already is VALUE
 
 OPTIONS:
     -c, --config <DIR>   the config directory, holding shell.lua. Overrides
@@ -51,8 +54,10 @@ shell reloads when any .lua file in it changes.
 
 `set` and `toggle` are how a compositor keybind reaches a running config:
 bind `oblisk toggle launcher_open` and the config's `state(\"launcher_open\",
-false)` flips. VALUE is read as JSON (true, 3, \"text\", [1,2]); anything
-that is not JSON is taken as a string, so quoting `notifications` is optional.
+false)` flips; bind `oblisk toggle modal launcher` and `state(\"modal\", \"\")`
+becomes \"launcher\", or \"\" again when it already was. VALUE is read as JSON
+(true, 3, \"text\", [1,2]); anything that is not JSON is taken as a string, so
+quoting `notifications` is optional.
 ";
 
 /// `-c` names a directory, but accepts a path to `shell.lua` because that is what someone reaches
@@ -74,6 +79,12 @@ fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
     std::path::absolute(&dir).map_err(|err| format!("--config {}: {err}", dir.display()))
 }
 
+/// Whether `arg` is one of the options this parser knows, rather than a value that merely begins
+/// with a dash. `-1` is a `set` value; `-c` is an option even where a value is expected.
+fn is_option(arg: &str) -> bool {
+    matches!(arg, "-c" | "--config" | "--force" | "-V" | "--version" | "-h" | "--help") || arg.starts_with("--config=")
+}
+
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let mut args = argv.into_iter().skip(1).peekable();
     let mut command = None;
@@ -92,10 +103,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 });
             }
             // Take the state name and `set` value before flags; a value may begin with a dash
-            // (`-1`).
-            _ if matches!(command, Some("set" | "toggle"))
-                && (positional.is_empty() || command == Some("set") && positional.len() == 1) =>
-            {
+            // (`-1`). An option the parser knows is still an option in that slot, or
+            // `oblisk toggle open -c /dir` would store the flag as the value and then choke on the
+            // directory.
+            _ if matches!(command, Some("set" | "toggle")) && positional.len() < 2 && !is_option(&arg) => {
                 positional.push(arg);
             }
             "-c" | "--config" => {
@@ -130,9 +141,18 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             Command::SetState(shared::SetState { name, write: shared::StateWrite::Set(value) })
         }
         Some("toggle") => {
-            let [name] = <[String; 1]>::try_from(positional)
-                .map_err(|_| "toggle takes one state name: `oblisk toggle launcher_open`".to_string())?;
-            Command::SetState(shared::SetState { name, write: shared::StateWrite::Toggle })
+            let mut positional = positional.into_iter();
+            let name = positional
+                .next()
+                .ok_or_else(|| "toggle takes a state name: `oblisk toggle launcher_open`".to_string())?;
+            let write = match positional.next() {
+                // The same reading as `set`: JSON when it parses, a string otherwise.
+                Some(value) => shared::StateWrite::ToggleTo(
+                    serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value)),
+                ),
+                None => shared::StateWrite::Toggle,
+            };
+            Command::SetState(shared::SetState { name, write })
         }
         _ => Command::Run,
     };
@@ -148,6 +168,38 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> Result<Args, String> {
         parse(std::iter::once("oblisk".to_string()).chain(args.iter().map(|a| (*a).to_string())))
+    }
+
+    /// The state name and value are taken before flags so a value like `-5` is not read as one,
+    /// but an option the parser knows is still an option in that slot. Taking `-c` as the toggle
+    /// value stored a flag in the state and then failed on the directory behind it.
+    #[test]
+    fn an_option_after_a_state_name_is_still_an_option() {
+        use shared::{SetState, StateWrite};
+        let dir = std::env::temp_dir();
+        let path = dir.to_str().unwrap();
+        let joined = format!("--config={path}");
+        for args in [
+            vec!["toggle", "launcher_open", "-c", path],
+            vec!["toggle", "launcher_open", "--config", path],
+            // The joined form is one argument, so it is the one a bare "starts with a dash" test
+            // would wave through as the toggle's value.
+            vec!["toggle", "launcher_open", joined.as_str()],
+        ] {
+            let parsed = parse_args(&args).unwrap();
+            assert_eq!(
+                parsed.command,
+                Command::SetState(SetState { name: "launcher_open".into(), write: StateWrite::Toggle }),
+                "{args:?}"
+            );
+            assert_eq!(parsed.config_dir.as_deref(), Some(std::path::Path::new(path)), "{args:?}");
+        }
+        // A value that merely begins with a dash is still a value.
+        let parsed = parse_args(&["set", "volume_step", "-5"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SetState(SetState { name: "volume_step".into(), write: StateWrite::Set(serde_json::json!(-5)) })
+        );
     }
 
     #[test]
@@ -174,10 +226,14 @@ mod tests {
     fn a_path_to_shell_lua_resolves_to_its_directory() {
         // Accommodate the common `-c ~/.config/oblisk/shell.lua` after editing that file.
         //
-        // Use an absolute path: `is_file()` then sees it, while tests run from the crate root.
-        let shell_lua = format!("{}/../dev-config/oblisk/shell.lua", env!("CARGO_MANIFEST_DIR"));
-        let args = parse_args(&["-c", &shell_lua]).unwrap();
-        assert!(args.config_dir.unwrap().ends_with("dev-config/oblisk"));
+        // A file this test makes, not the shipped config: the rule under test is "a path to a file
+        // resolves to its parent", which has nothing to do with what the sample happens to contain.
+        // Absolute, because `is_file()` has to see it and tests run from the crate root.
+        let dir = tempfile::tempdir().unwrap();
+        let shell_lua = dir.path().join("shell.lua");
+        std::fs::write(&shell_lua, "return {}").unwrap();
+        let args = parse_args(&["-c", shell_lua.to_str().unwrap()]).unwrap();
+        assert_eq!(args.config_dir.as_deref(), Some(dir.path()));
     }
 
     #[test]
@@ -214,9 +270,16 @@ mod tests {
             parse_args(&["toggle", "launcher_open"]).unwrap().command,
             Command::SetState(SetState { name: "launcher_open".into(), write: StateWrite::Toggle })
         );
+        assert_eq!(
+            parse_args(&["toggle", "modal", "launcher"]).unwrap().command,
+            Command::SetState(SetState {
+                name: "modal".into(),
+                write: StateWrite::ToggleTo(serde_json::json!("launcher"))
+            }),
+            "a toggle with a value is a toggle to it"
+        );
         assert!(parse_args(&["set", "launcher_open"]).is_err(), "set without a value");
         assert!(parse_args(&["toggle"]).is_err(), "toggle without a name");
-        assert!(parse_args(&["toggle", "a", "b"]).is_err(), "toggle with a value has misread the verb");
     }
 
     #[test]

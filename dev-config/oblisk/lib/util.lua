@@ -386,4 +386,14 @@ function util.shown_when(signal, predicate)
     end)
 end
 
+-- `signal` or its value from up to `ms` ago: true while the source is true and for `ms` after it
+-- drops. The close-hold `PanelHost.qml` builds from a `Timer` and six `retained*` copies; here the
+-- hidden subtree keeps its content (ADR-0124) and `delay` keeps the surface mapped while the exit
+-- tween runs (ADR-0146).
+function util.linger(signal, ms)
+    return computed({ signal, delay(signal, ms) }, function(now, was)
+        return now or was
+    end)
+end
+
 return util

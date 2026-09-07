@@ -15,7 +15,7 @@ local wallpaper_button = icon_button(icons.wallpaper, nil, {
     selected = ui_state.wallpaper_picker_open,
     on_button = function(_, mouse_button)
         if mouse_button == "left" then
-            ui_state.wallpaper_picker_open:set(not ui_state.wallpaper_picker_open:get())
+            ui_state.toggle_modal("wallpaper_picker")
         elseif mouse_button == "right" then
             wallpaper.randomize_all()
         end

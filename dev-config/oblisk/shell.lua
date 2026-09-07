@@ -47,8 +47,7 @@ local notifications = require("modules.notification.popup")
 local osd = require("modules.osd.popup")
 local settings = require("modules.bar.panels.settings")
 local panel_host = require("modules.shell.panel_host")
-local launcher = require("modules.global.launcher")
-local wallpaper_picker = require("modules.global.wallpaper_picker")
+local modal_host = require("modules.global.modal_host")
 -- Each tooltip is its own surface, not a bar child: `popup` is an `xdg_popup` rooted under the bar
 -- (§ 6, ADR-0062). `visible = false` creates no Wayland object until hover.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
@@ -61,7 +60,6 @@ local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 -- The idle tooltip counts down to the next stage, which the bar has no room to show.
 local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
-local idle_settings = require("modules.global.idle_settings")
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
 -- Not a surface. Registers the battery's OSD, low-battery notification and suspend effects once;
@@ -86,9 +84,7 @@ return {
     network_tooltip,
     bluetooth_tooltip,
     idle_tooltip,
-    launcher,
-    wallpaper_picker,
-    idle_settings,
+    modal_host,
     lock_screen,
     polkit_dialog,
 }

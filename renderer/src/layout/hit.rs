@@ -6,7 +6,7 @@
 use cursor_icon::CursorIcon;
 use mlua::Value;
 
-use crate::layout::node::{PaintStyle, StyleRun, TextAlign, segments};
+use crate::layout::node::{PaintStyle, StyleRun, TextAlign, apply_affine, invert_affine, segments};
 use crate::layout::scene::ResolvedNode;
 use crate::text::shaping::{self, FontRun, ShapeRequest, ShapingHandle};
 use crate::text::snap::LogicalRect;
@@ -146,8 +146,12 @@ pub fn cursor_under(path: &[&ResolvedNode], point: LogicalPoint, shaping: &Shapi
 /// Whether a node with `id` is still somewhere under `root`, visible or not. The question a held
 /// draft asks of the tree it was typed into (ADR-0108): identity, not geometry, so a field that
 /// moved is still found and one that was removed is not.
+///
+/// A leaving node is not found, nor anything under it. The tree has already dropped it and only
+/// its exit is still playing (ADR-0150), so a field inside one has nowhere to show a draft and its
+/// callbacks belong to a subtree that is gone -- which is the removal this answers `false` for.
 pub fn contains_node(root: &ResolvedNode, id: crate::layout::scene::NodeId) -> bool {
-    root.id == id || root.children.iter().any(|child| contains_node(child, id))
+    !root.leaving && (root.id == id || root.children.iter().any(|child| contains_node(child, id)))
 }
 
 /// The absolute (surface-local) rect of `path`'s last node, `None` for an empty path. It sums the
@@ -169,11 +173,24 @@ fn descend<'a>(
     origin_y: f32,
     path: &mut Vec<&'a ResolvedNode>,
 ) -> bool {
-    if !node.visible {
+    // A leaving node is painted and nothing more (ADR-0150).
+    if !node.visible || node.leaving {
         return false;
     }
     let x = origin_x + node.rect.x;
     let y = origin_y + node.rect.y;
+    // A transformed node is hit where it is painted: map the pointer back into its untransformed
+    // space (ADR-0149), and hand that point down, since children paint under the same matrix.
+    // A degenerate matrix (zero scale) paints nothing and takes nothing.
+    let point = if node.transform.is_identity() {
+        point
+    } else {
+        let Some(inverse) = invert_affine(node.transform.matrix(LogicalRect { x, y, ..node.rect })) else {
+            return false;
+        };
+        let (px, py) = apply_affine(inverse, point.x, point.y);
+        LogicalPoint { x: px, y: py }
+    };
     if !contains(LogicalRect { x, y, ..node.rect }, point) {
         return false;
     }
@@ -198,6 +215,8 @@ mod tests {
     fn node(kind: &str, (x, y, width, height): (f32, f32, f32, f32), children: Vec<ResolvedNode>) -> ResolvedNode {
         ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: crate::layout::node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),
             kind: kind.to_string(),
@@ -220,6 +239,26 @@ mod tests {
 
     fn function(lua: &mlua::Lua) -> Value {
         Value::Function(lua.create_function(|_, ()| Ok(())).unwrap())
+    }
+
+    /// ADR-0149: a scaled node is hit where it is painted. A 20px button scaled 2x about its
+    /// centre covers 10px beyond its laid-out box on every side, and its children are found
+    /// through the same inverse.
+    #[test]
+    fn a_scaled_node_takes_the_pointer_where_it_is_painted() {
+        let mut scaled = node("button", (100.0, 100.0, 20.0, 20.0), vec![node("rect", (0.0, 0.0, 10.0, 20.0), vec![])]);
+        scaled.transform.scale = (2.0, 2.0);
+        let tree = node("panel", (0.0, 0.0, 400.0, 400.0), vec![scaled]);
+        // Inside the painted box (90..130), outside the laid-out one (100..120).
+        let path = hit_path(&tree, LogicalPoint { x: 92.0, y: 95.0 });
+        assert_eq!(path.len(), 3, "the button and its left child, which paints over 90..110");
+        assert_eq!(path[2].kind, "rect");
+        assert_eq!(hit_path(&tree, LogicalPoint { x: 125.0, y: 105.0 }).len(), 2, "the right half has no child");
+        assert_eq!(hit_path(&tree, LogicalPoint { x: 135.0, y: 105.0 }).len(), 1, "past the painted box");
+        let mut flat = node("button", (100.0, 100.0, 20.0, 20.0), vec![]);
+        flat.transform.scale = (0.0, 1.0);
+        let tree = node("panel", (0.0, 0.0, 400.0, 400.0), vec![flat]);
+        assert_eq!(hit_path(&tree, LogicalPoint { x: 110.0, y: 110.0 }).len(), 1, "a zero scale takes nothing");
     }
 
     #[test]

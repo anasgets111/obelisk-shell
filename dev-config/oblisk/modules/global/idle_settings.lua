@@ -38,6 +38,7 @@ local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
 local section_header = require("components.section_header")
 local ui_state = require("lib.ui_state")
+local modal = require("components.modal")
 local idle = require("lib.idle")
 local store = require("lib.store")
 
@@ -121,7 +122,7 @@ local header = panel_header {
     end),
     -- The master switch sits beside the flow it controls, as `FlowSummary` does; no label needed.
     on_close = function()
-        open:set(false)
+        ui_state.close_modal("idle_settings")
     end,
 }
 
@@ -566,46 +567,22 @@ local card_children = {
     section(icons.settings, "behaviour", "what may keep the session awake", behaviour_children),
 }
 
-return panel {
-    id = "idle_settings",
-    namespace = "oblisk-idle-settings",
-    layer = "Top",
-    anchor = { top = true, bottom = true, left = true, right = true },
-    exclusive = false,
-    width = "Fill",
-    height = "Fill",
-    visible = open,
-    child = rect {
-        width = "Fill",
-        height = "Fill",
-        children = {
-            -- Scrim and click-outside catcher in one node. `hit::descend` walks children in reverse
-            -- and stops at the card, so only clicks beside it land here.
-            button {
-                width = "Fill",
-                height = "Fill",
-                cursor = "default",
-                background = theme.SCRIM,
-                on_click = function()
-                    open:set(false)
-                end,
-            },
-            panel_card(card_children, {
-                width = theme.idle_modal_width,
-                align_h = "Center",
-                align_v = "Center",
-                spacing = theme.spacing.lg,
-                padding = {
-                    top = theme.spacing.xl,
-                    right = theme.spacing.xl,
-                    bottom = theme.spacing.xl,
-                    left = theme.spacing.xl,
-                },
-                radius = theme.radius.lg,
-                background = theme.GLASS,
-                border_width = theme.border_width,
-                border_color = theme.BORDER,
-            }),
+return modal({
+    kind = "idle_settings",
+    card = panel_card(card_children, {
+        width = theme.idle_modal_width,
+        align_h = "Center",
+        align_v = "Center",
+        spacing = theme.spacing.lg,
+        padding = {
+            top = theme.spacing.xl,
+            right = theme.spacing.xl,
+            bottom = theme.spacing.xl,
+            left = theme.spacing.xl,
         },
-    },
-}
+        radius = theme.radius.lg,
+        background = theme.GLASS,
+        border_width = theme.border_width,
+        border_color = theme.BORDER,
+    }),
+})

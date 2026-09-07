@@ -58,6 +58,17 @@ end
 -- that contrast threshold and the second colour.
 local READOUT = theme.text_contrast(theme.GLASS_CONTROL)
 
+-- `onIsPluggedInChanged: if (isPluggedIn) plugFlash.restart()`. `pulse` says a change just
+-- happened; the `computed` beside it keeps only the rising edge, so unplugging does not flash.
+-- The window has to outlast what it gates: the flash is two cycles of hold-dark, jump-lit,
+-- hold-lit, so four `animation_fast_ms` in all.
+local plugged = oblisk.battery:map(function(b)
+    return b ~= nil and b.present and not util.battery_is_draining(b.state)
+end)
+local plug_flash = computed({ pulse(plugged, theme.animation_fast_ms * 4), plugged }, function(fired, on)
+    return fired and on
+end)
+
 local fill = rect {
     width = oblisk.battery:map(function(b)
         if b == nil or not b.present then
@@ -68,6 +79,24 @@ local fill = rect {
     height = "Fill",
     background = oblisk.battery:map(function(b)
         return theme.with_opacity(battery_color(b), 0.38)
+    end),
+    -- `BatteryIndicator.qml`: the level slides and the threshold colour fades (ADR-0145), and the
+    -- fill blinks twice when the cable goes in. The entry's presence is what runs the sequence
+    -- (ADR-0152), so the whole table is bound rather than a `running` flag inside it. `PropertyAction`
+    -- is a segment of no duration and `PauseAnimation` a segment between two equal values.
+    animate = plug_flash:map(function(flashing)
+        local eases = {
+            width = theme.animation_ms,
+            background = { duration = theme.animation_ms, easing = "OutCubic" },
+        }
+        if flashing then
+            eases.opacity = {
+                duration = theme.animation_fast_ms,
+                loops = 2,
+                keyframes = { 0, 0, { value = 1, duration = 0 }, 1 },
+            }
+        end
+        return eases
     end),
 }
 

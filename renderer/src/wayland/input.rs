@@ -198,11 +198,16 @@ fn focused_field(path: &[&layout::ResolvedNode]) -> Option<FieldTarget> {
 }
 /// First plain `autofocus = true` field in scope document order (ADR-0112). Skip masked fields and
 /// fields without callbacks; unlike two `secure_submit` fields, duplicate search boxes are a config
-/// mistake, so deterministic order beats refusing both.
+/// mistake, so deterministic order beats refusing both. A hidden subtree is skipped whole: it is
+/// frozen (ADR-0124) and cannot take keys, and one surface that holds several modals' cards keeps
+/// the closed ones hidden beside the open one.
 fn autofocus_field_in_scope(scope: &[(&str, &layout::ResolvedNode)]) -> Option<(String, FieldTarget)> {
     for (surface_id, tree) in scope {
         let mut stack = vec![*tree];
         while let Some(node) = stack.pop() {
+            if !node.visible || node.leaving {
+                continue;
+            }
             if node.kind == "textfield"
                 && matches!(node.properties.get("autofocus"), Some(Value::Boolean(true)))
                 && let Some(target @ FieldTarget::Plain { .. }) = focused_field(&[node])
@@ -1565,6 +1570,8 @@ mod tests {
         }
         layout::ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: crate::layout::node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             // Distinct per node, since `focused_field` now reads an identity off one of these and
             // a shared id would make every hand-built field the same field.
@@ -2189,6 +2196,17 @@ mod tests {
                 assert_eq!(id, first_id, "document order, not {second_id:?}");
             }
             other => panic!("expected the first autofocus field, got {other:?}"),
+        }
+
+        // A hidden card's field is out of reach: the next visible one is armed instead.
+        let mut hidden = autofocus_textfield(&lua);
+        hidden.visible = false;
+        let shown = autofocus_textfield(&lua);
+        let shown_id = shown.id;
+        let tree = tree_with(&lua, vec![hidden, shown]);
+        match autofocus_field_in_scope(&[("modal_host@eDP-1", &tree)]) {
+            Some((_, FieldTarget::Plain { id, .. })) => assert_eq!(id, shown_id),
+            other => panic!("expected the visible field, got {other:?}"),
         }
 
         // Masked, or declaring nothing that could read the keys: not candidates, whatever they say.

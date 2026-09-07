@@ -25,6 +25,7 @@ local icons = require("config.icons")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
 local ui_state = require("lib.ui_state")
+local modal = require("components.modal")
 local wallpaper = require("lib.wallpaper")
 local panel_card = require("components.panel_card")
 local panel_empty_state = require("components.panel_empty_state")
@@ -196,7 +197,7 @@ local function select_first()
 end
 
 local function close()
-    ui_state.wallpaper_picker_open:set(false)
+    ui_state.close_modal("wallpaper_picker")
 end
 
 local function apply(path)
@@ -252,12 +253,18 @@ local function tile(entry)
             apply(entry.path)
         end,
         children = {
+            -- `WallpaperPicker.qml`: the picture zooms 1.11x under the pointer, cut by the tile's
+            -- rounded box (ADR-0149).
             image {
                 source = entry.path,
                 fit = "cover",
                 async = true,
                 width = "Fill",
                 height = "Fill",
+                scale = hovered:map(function(on)
+                    return on and 1.11 or 1
+                end),
+                animate = { scale = { duration = theme.animation_fast_ms, easing = "OutCubic" } },
             },
             -- Bottom name strip, the mirror's `shadowColorStrong` band.
             rect {
@@ -539,40 +546,18 @@ local card_margin = oblisk.screens:map(function(screens)
     }
 end)
 
-return panel {
-    id = "wallpaper_picker",
-    namespace = "oblisk-wallpaper-picker",
-    layer = "Top",
-    anchor = { top = true, bottom = true, left = true, right = true },
-    exclusive = false,
-    width = "Fill",
-    height = "Fill",
-    visible = ui_state.wallpaper_picker_open,
-    keyboard_interactivity = ui_state.wallpaper_picker_open:map(function(open)
-        return open and "Exclusive" or "None"
-    end),
-    child = rect {
-        width = "Fill",
-        height = "Fill",
-        children = {
-            button {
-                width = "Fill",
-                height = "Fill",
-                cursor = "default",
-                background = theme.SCRIM,
-                on_click = close,
-            },
-            panel_card({ search, body }, {
-                width = theme.wallpaper_picker_width,
-                height = theme.wallpaper_picker_height,
-                margin = card_margin,
-                spacing = theme.spacing.md,
-                padding = { top = card_padding, right = card_padding, bottom = card_padding, left = card_padding },
-                radius = theme.radius.lg,
-                background = theme.GLASS,
-                border_width = theme.border_width,
-                border_color = theme.BORDER,
-            }),
-        },
-    },
-}
+return modal({
+    kind = "wallpaper_picker",
+    keyboard = true,
+    card = panel_card({ search, body }, {
+        width = theme.wallpaper_picker_width,
+        height = theme.wallpaper_picker_height,
+        margin = card_margin,
+        spacing = theme.spacing.md,
+        padding = { top = card_padding, right = card_padding, bottom = card_padding, left = card_padding },
+        radius = theme.radius.lg,
+        background = theme.GLASS,
+        border_width = theme.border_width,
+        border_color = theme.BORDER,
+    }),
+})

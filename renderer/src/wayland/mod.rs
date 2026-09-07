@@ -442,6 +442,7 @@ pub fn run(
         // per-field commits would show the compositor a half-updated surface.
         // Profiling adds three `clock_gettime` calls per turn for the resolve/repaint split.
         let mut phases = idle_profile::Phases::start(profile.is_some());
+        app.client.wake_due_signals();
         let re_resolved = app.client.re_resolve_if_dirty();
         // A frame callback is the tween clock (ADR-0145). Taken every turn so a callback that
         // arrives with a push is answered by this repaint, not repeated next turn. A turn that
@@ -544,13 +545,24 @@ pub fn run(
         }
         if let Some(guard) = event_queue.prepare_read() {
             let fd = guard.connection_fd();
-            // No timeout (ADR-0124): Wayland events use the connection fd; Supervisor frames,
-            // landed decodes, and socket-thread exit use the waker. The body has no timer.
+            // No timeout while idle (ADR-0124): Wayland events use the connection fd; Supervisor
+            // frames, landed decodes, and socket-thread exit use the waker. The one timeout is a
+            // pending `delay(signal, ms)` or an open `pulse(signal, ms)` window (ADR-0146,
+            // ADR-0153), armed only while one is running, the way a frame callback is requested
+            // only while a tween is.
             let mut fds = [
                 nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN),
                 nix::poll::PollFd::new(waker.fd(), nix::poll::PollFlags::POLLIN),
             ];
-            let woke = matches!(nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE), Ok(n) if n > 0);
+            let timeout = app.client.next_wake_deadline().map_or(nix::poll::PollTimeout::NONE, |due| {
+                // Rounded up: `as_millis` on the last fraction of a hold is 0, and a zero timeout
+                // returns at once to a turn that finds the deadline still a few hundred
+                // microseconds away, hundreds of times over.
+                let millis = due.saturating_duration_since(std::time::Instant::now()).as_micros().div_ceil(1000);
+                nix::poll::PollTimeout::try_from(millis.min(i32::MAX as u128) as i32)
+                    .unwrap_or(nix::poll::PollTimeout::NONE)
+            });
+            let woke = matches!(nix::poll::poll(&mut fds, timeout), Ok(n) if n > 0);
             let wayland_ready = woke && fds[0].any().unwrap_or(false);
             if let Some(profile) = profile.as_mut() {
                 profile

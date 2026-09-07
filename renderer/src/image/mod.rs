@@ -931,18 +931,30 @@ mod tests {
         assert!(!is_vector(Path::new("/tmp/gzipped.svgz")));
     }
 
+    /// A wallpaper's shape without a wallpaper's art: a 16:9 viewBox filled corner to corner by one
+    /// gradient. Enough to tell a rasterizer that works from one that renders an empty pixmap.
+    const GRADIENT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#001020"/><stop offset="1" stop-color="#a0d0ff"/>
+      </linearGradient></defs>
+      <rect width="1920" height="1080" fill="url(#g)"/>
+    </svg>"##;
+
     #[test]
-    fn the_shipped_wallpaper_rasterizes_to_opaque_pixels_at_the_size_asked_for() {
-        // Exercise resvg against the shipped file (ADR-0055): a tree parsing to nothing renders a
-        // transparent pixmap, not an error.
-        let svg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
-        let (pixels, width, height) = rasterize_svg(&svg, 128, None).expect("the shipped wallpaper should parse");
+    fn an_svg_rasterizes_opaque_to_its_longest_edge_keeping_its_aspect_ratio() {
+        // Exercises resvg (ADR-0055): a tree parsing to nothing renders a transparent pixmap rather
+        // than an error, so "it did not fail" proves nothing on its own. A fixture rather than the
+        // shipped wallpaper, whose art is free to change without breaking an engine test.
+        let dir = tempfile::tempdir().unwrap();
+        let svg = dir.path().join("gradient.svg");
+        std::fs::write(&svg, GRADIENT_SVG).unwrap();
+        let (pixels, width, height) = rasterize_svg(&svg, 128, None).expect("the fixture should parse");
         // 1920x1080 viewBox, longest edge 128, preserves the aspect ratio.
         assert_eq!((width, height), (128, 72));
         assert_eq!(pixels.len(), (width * height * 4) as usize);
         let opaque = pixels.as_chunks::<4>().0.iter().filter(|px| px[3] > 0).count();
-        assert_eq!(opaque, (width * height) as usize, "the wallpaper covers its whole viewBox");
-        // More than one colour proves the gradient and obelisk survived.
+        assert_eq!(opaque, (width * height) as usize, "the fill covers its whole viewBox");
+        // More than one colour proves the gradient survived rather than flattening to its first stop.
         let distinct: std::collections::HashSet<[u8; 3]> =
             pixels.as_chunks::<4>().0.iter().map(|px| [px[0], px[1], px[2]]).collect();
         assert!(distinct.len() > 16, "expected a gradient, got {} colours", distinct.len());
@@ -1217,8 +1229,11 @@ mod tests {
     #[test]
     fn a_missing_file_and_a_real_one_read_different_versions() {
         assert_eq!(FileVersion::read(Path::new("/nonexistent/oblisk-x.png")), FileVersion::default());
-        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/wallpaper.svg");
-        let version = FileVersion::read(&shipped);
+        // Any file with bytes in it; the rule is about read versus missing, not about the contents.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.svg");
+        std::fs::write(&present, GRADIENT_SVG).unwrap();
+        let version = FileVersion::read(&present);
         assert_ne!(version, FileVersion::default());
         assert!(version.len > 0);
     }

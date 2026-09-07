@@ -11,11 +11,10 @@ local SLOT = "launcher"
 local launcher_button = icon_button(icons.launcher, function()
     -- Refresh on open, not a timer: enumeration walks a directory and only this click needs it
     -- current (ADR-0061).
-    local opening = not ui_state.launcher_open:get()
-    if opening then
+    if not ui_state.launcher_open:get() then
         oblisk.applications:invoke("refresh")
     end
-    ui_state.launcher_open:set(opening)
+    ui_state.toggle_modal("launcher")
 end, { slot = SLOT, selected = ui_state.launcher_open })
 
 local launcher_tooltip = tooltip({

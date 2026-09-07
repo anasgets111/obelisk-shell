@@ -132,6 +132,78 @@ enum SignalKind {
         cell: Rc<RefCell<Value>>,
         dirty: DirtyFlag,
     },
+    /// `geometry(name)` (ADR-0147): the laid-out `{ x, y, width, height }` of the node declaring
+    /// `geometry = geometry(name)`, in its surface's logical coordinates, the same space `on_click`
+    /// and `hover_rect` report. Written by the layout pass and by a tween tick, never by Lua, and
+    /// written quietly: a read sees the last layout, and a binding on it settles one pass later
+    /// rather than dirtying the scene it was measured in. QML's `item.height` for a `y: -height`
+    /// reveal.
+    Geometry(Rc<RefCell<Value>>),
+    /// `delay(signal, ms)` (ADR-0146): follows `source` once it has held a new value for `hold`.
+    /// Pull-based like everything else here: a read notes the pending value and its due time,
+    /// arms the poll loop's one timeout through [`WakeDeadline`], and keeps answering the held
+    /// value until a read after the due time adopts the new one. A source that returns to the
+    /// held value before then cancels the change, which makes this a trailing debounce as well
+    /// as QML's close-hold `Timer`.
+    Delayed {
+        source: Rc<Signal>,
+        hold: Duration,
+        cell: Rc<RefCell<DelayCell>>,
+    },
+    /// `pulse(signal, ms)` (ADR-0153): `true` for `ms` after `source` changes value, `false`
+    /// otherwise. The other half of [`SignalKind::Delayed`]'s shape and the same machinery -- that
+    /// one answers the old value until a change settles, this one says a change just happened --
+    /// and it is what fires a one-shot animation, which a config has no way to call `restart()` on
+    /// (ADR-0152). Pull-based: a read compares against the value it last saw, arms the wake, and
+    /// falls back to `false` on the read after the window closes.
+    Pulse {
+        source: Rc<Signal>,
+        hold: Duration,
+        cell: Rc<RefCell<PulseCell>>,
+    },
+}
+
+struct DelayCell {
+    held: Value,
+    pending: Option<(Value, Instant)>,
+}
+
+struct PulseCell {
+    /// The source value this signal last read. Seeded at construction, so a pulse starts low and
+    /// fires on the first change rather than on the pass that built it.
+    seen: Value,
+    /// When the window closes, while one is open.
+    until: Option<Instant>,
+}
+
+/// The earliest moment a clock-driven signal has to be re-read -- a `delay`'s hold coming due or
+/// a `pulse`'s window closing -- read by the poll loop as its timeout; `None` keeps the loop
+/// timeout-free (ADR-0124). One slot, not a list: a due wake dirties the scene, the pass re-reads
+/// every such signal, and each one still pending re-arms itself.
+#[derive(Default)]
+struct WakeDeadline(Option<Instant>);
+
+fn arm_wake(lua: &Lua, due: Instant) {
+    if lua.app_data_ref::<WakeDeadline>().is_none() {
+        lua.set_app_data(WakeDeadline::default());
+    }
+    let mut slot = lua.app_data_mut::<WakeDeadline>().expect("just ensured the slot exists");
+    slot.0 = Some(slot.0.map_or(due, |current| current.min(due)));
+}
+
+/// When the poll loop has to wake for a pending `delay` or `pulse`, if any.
+pub fn next_wake_deadline(lua: &Lua) -> Option<Instant> {
+    lua.app_data_ref::<WakeDeadline>().and_then(|slot| slot.0)
+}
+
+/// Clears a due deadline and says so; the caller dirties the scene. Not due, or none, is `false`.
+pub fn take_due_wake(lua: &Lua, now: Instant) -> bool {
+    let Some(mut slot) = lua.app_data_mut::<WakeDeadline>() else { return false };
+    if slot.0.is_some_and(|due| due <= now) {
+        slot.0 = None;
+        return true;
+    }
+    false
 }
 
 impl SignalKind {
@@ -144,6 +216,9 @@ impl SignalKind {
             SignalKind::Hover { .. } => "a hover",
             SignalKind::Scroll { .. } => "a scroll",
             SignalKind::State { .. } => "a state",
+            SignalKind::Delayed { .. } => "a delayed",
+            SignalKind::Pulse { .. } => "a pulse",
+            SignalKind::Geometry(_) => "a geometry",
         }
     }
 }
@@ -303,6 +378,15 @@ impl Signal {
         }
     }
 
+    /// Geometry write end for `layout::scene`; `None` for other kinds, so `geometry = hover(...)`
+    /// or a state signal is inert rather than overwritten.
+    pub(crate) fn geometry_cell(&self) -> Option<Rc<RefCell<Value>>> {
+        match &self.0 {
+            SignalKind::Geometry(cell) => Some(Rc::clone(cell)),
+            _ => None,
+        }
+    }
+
     /// Hover write end for `crate::wayland`; `None` for other kinds by design.
     pub(crate) fn hover_handle(&self) -> Option<LiveSignalHandle> {
         match &self.0 {
@@ -342,6 +426,15 @@ impl Signal {
             SignalKind::Hover { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::Scroll { cell, .. } => Ok(cell.borrow().clone()),
             SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
+            SignalKind::Geometry(cell) => Ok(cell.borrow().clone()),
+            SignalKind::Delayed { source, hold, cell } => {
+                let fresh = source.get_value(lua)?;
+                Ok(cell.borrow_mut().follow(fresh, *hold, Instant::now(), |due| arm_wake(lua, due)))
+            }
+            SignalKind::Pulse { source, hold, cell } => {
+                let fresh = source.get_value(lua)?;
+                Ok(Value::Boolean(cell.borrow_mut().fire(fresh, *hold, Instant::now(), |due| arm_wake(lua, due))))
+            }
             SignalKind::Computed { deps, func } => {
                 // A repeat within this evaluation costs one hash lookup and no Lua. Checked before
                 // `CpuBudget::enter` on purpose: a hit does no work, so it must not spend a nesting
@@ -369,6 +462,54 @@ impl Signal {
                 budget.check_not_exceeded()?;
                 EvaluationMemo::insert(lua, key, &value);
                 Ok(value)
+            }
+        }
+    }
+}
+
+impl DelayCell {
+    /// One read: the value to answer now, and whether to arm a wake for later. Split from the
+    /// signal so the clock is a parameter.
+    fn follow(&mut self, fresh: Value, hold: Duration, now: Instant, arm: impl FnOnce(Instant)) -> Value {
+        if fresh == self.held {
+            self.pending = None;
+            return self.held.clone();
+        }
+        let due = match &self.pending {
+            Some((pending, due)) if *pending == fresh => *due,
+            _ => now + hold,
+        };
+        if now >= due {
+            self.held = fresh;
+            self.pending = None;
+        } else {
+            self.pending = Some((fresh, due));
+            arm(due);
+        }
+        self.held.clone()
+    }
+}
+
+impl PulseCell {
+    /// One read: whether the window is open now, and whether to arm a wake for its close. Split
+    /// from the signal so the clock is a parameter, the way [`DelayCell::follow`] is.
+    ///
+    /// A change while a window is already open restarts it rather than extending the old one,
+    /// which is what `restart()` does to a running `SequentialAnimation`. The window is not
+    /// re-armed once it has closed, so a source that holds its new value pulses once.
+    fn fire(&mut self, fresh: Value, hold: Duration, now: Instant, arm: impl FnOnce(Instant)) -> bool {
+        if fresh != self.seen {
+            self.seen = fresh;
+            self.until = Some(now + hold);
+        }
+        match self.until {
+            Some(until) if now < until => {
+                arm(until);
+                true
+            }
+            _ => {
+                self.until = None;
+                false
             }
         }
     }
@@ -496,9 +637,9 @@ impl UserData for Signal {
 /// dirty checks. Refuses missing state or non-boolean toggle values, the two keybind/config
 /// mismatches.
 pub fn write_state(lua: &Lua, set: &shared::SetState) -> Result<(), String> {
-    let signal = lua
+    let (signal, initial) = lua
         .app_data_ref::<StateRegistry>()
-        .and_then(|registry| registry.0.get(&set.name).map(|(signal, _)| signal.clone()))
+        .and_then(|registry| registry.0.get(&set.name).cloned())
         .ok_or_else(|| format!("this config declares no state({:?}, ...)", set.name))?;
     let value = match &set.write {
         shared::StateWrite::Set(json) => {
@@ -509,6 +650,14 @@ pub fn write_state(lua: &Lua, set: &shared::SetState) -> Result<(), String> {
             Ok(other) => return Err(format!("it holds {}, and only a boolean toggles", other.type_name())),
             Err(err) => return Err(format!("its value could not be read: {err}")),
         },
+        // Back to the declared initial when it already holds the value: the scalar comparison
+        // `literal_was_edited` makes, so `1` and `1.0` are the same value and a table never is.
+        shared::StateWrite::ToggleTo(json) => {
+            let wanted = crate::lua::json::to_lua(lua, json)
+                .map_err(|err| format!("the value does not convert to Lua: {err}"))?;
+            let current = signal.get_value(lua).map_err(|err| format!("its value could not be read: {err}"))?;
+            if literal_was_edited(&current, &wanted) == Some(false) { initial } else { wanted }
+        }
     };
     signal.reseed(value).map_err(|err| format!("refused at the marshalling boundary: {err}"))
 }
@@ -540,6 +689,26 @@ struct HoverRegistry(HashMap<String, (Signal, Signal)>);
 /// open panel to top (ADR-0069 decision 2).
 #[derive(Default)]
 struct ScrollRegistry(HashMap<String, Signal>);
+
+/// Name-keyed `geometry(name)` registry, so a reload keeps the last measured rect instead of
+/// answering zero until the next pass.
+#[derive(Default)]
+struct GeometryRegistry(HashMap<String, Signal>);
+
+/// Set when a pass's geometry write changed a rect (ADR-0147 amendment); the client turns it into
+/// one follow-up pass so a binding on the measurement settles, and only one, so a binding that
+/// feeds its own measurement cannot spin the loop.
+#[derive(Default)]
+struct GeometryMoved(bool);
+
+pub(crate) fn note_geometry_moved(lua: &Lua) {
+    lua.set_app_data(GeometryMoved(true));
+}
+
+/// Whether a pass write moved a rect since the last take.
+pub fn take_geometry_moved(lua: &Lua) -> bool {
+    lua.app_data_mut::<GeometryMoved>().is_some_and(|mut moved| std::mem::take(&mut moved.0))
+}
 
 /// One `Computed`'s identity for [`EvaluationMemo`]. `computed()` and [`Signal::mapped`] each
 /// allocate a fresh `Rc<Vec<Signal>>`, so the address separates every distinct computed; only
@@ -779,11 +948,24 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
     ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>() || ud.is::<crate::lua::idle::IdleMember>()
 }
 
-/// Registers `computed` (§ 1.2), `state` (ADR-0044 decision 5), `hover`, `hover_rect`, and
-/// `scroll`.
+/// Registers `computed` (§ 1.2), `delay` and `pulse` (ADR-0146, ADR-0153), `state`
+/// (ADR-0044 decision 5), `hover`, `hover_rect`, and `scroll`.
 /// Dependencies are signal-like userdata. Pass the shared dirty flag explicitly, not via
 /// `app_data`: a hidden coupling failing inside a config author's `state()` call is worse than
 /// threading one argument through. `set` marks the same flag `new_live` returns and
+/// The `ms` a `delay` or a `pulse` is given, as whole milliseconds.
+///
+/// Bounded on what the caller actually gets rather than on the number it wrote: `0.1` clears a
+/// bound written in floats and then rounds to nothing, leaving a `delay` that holds for no time
+/// and a `pulse` that is never true, both of them silently.
+fn parse_hold(what: &str, millis: f64) -> Result<Duration, mlua::Error> {
+    let rounded = millis.round() as u64;
+    if !(millis > 0.0 && millis <= 60_000.0) || rounded == 0 {
+        return Err(mlua::Error::runtime(format!("{what} must be within [1, 60000] ms, got {millis}")));
+    }
+    Ok(Duration::from_millis(rounded))
+}
+
 /// `RendererClient` drains.
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     let hover_dirty = dirty.clone();
@@ -802,6 +984,34 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 collected.push(signal);
             }
             Ok(Signal(SignalKind::Computed { deps: Rc::new(collected), func }))
+        })?,
+    )?;
+    lua.globals().set(
+        "delay",
+        lua.create_function(|lua, (source, millis): (mlua::AnyUserData, f64)| {
+            let source = from_userdata(&source)
+                .ok_or_else(|| mlua::Error::runtime("delay() takes a Signal or an `oblisk` capability first"))?;
+            let hold = parse_hold("delay() hold", millis)?;
+            let held = source.get_value(lua)?;
+            Ok(Signal(SignalKind::Delayed {
+                source: Rc::new(source),
+                hold,
+                cell: Rc::new(RefCell::new(DelayCell { held, pending: None })),
+            }))
+        })?,
+    )?;
+    lua.globals().set(
+        "pulse",
+        lua.create_function(|lua, (source, millis): (mlua::AnyUserData, f64)| {
+            let source = from_userdata(&source)
+                .ok_or_else(|| mlua::Error::runtime("pulse() takes a Signal or an `oblisk` capability first"))?;
+            let hold = parse_hold("pulse() window", millis)?;
+            let seen = source.get_value(lua)?;
+            Ok(Signal(SignalKind::Pulse {
+                source: Rc::new(source),
+                hold,
+                cell: Rc::new(RefCell::new(PulseCell { seen, until: None })),
+            }))
         })?,
     )?;
     lua.globals().set(
@@ -855,6 +1065,29 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     )?;
     lua.globals()
         .set("hover_rect", lua.create_function(move |lua, name: String| Ok(hover_slot(lua, &rect_dirty, name)?.1))?)?;
+    lua.globals().set(
+        "geometry",
+        lua.create_function(|lua, name: String| {
+            if lua.app_data_ref::<GeometryRegistry>().is_none() {
+                lua.set_app_data(GeometryRegistry::default());
+            }
+            let existing =
+                lua.app_data_ref::<GeometryRegistry>().expect("just ensured the registry exists").0.get(&name).cloned();
+            if let Some(signal) = existing {
+                return Ok(signal);
+            }
+            let zero = lua.create_table()?;
+            for key in ["x", "y", "width", "height"] {
+                zero.set(key, 0.0)?;
+            }
+            let signal = Signal(SignalKind::Geometry(Rc::new(RefCell::new(Value::Table(zero)))));
+            lua.app_data_mut::<GeometryRegistry>()
+                .expect("just ensured the registry exists")
+                .0
+                .insert(name, signal.clone());
+            Ok(signal)
+        })?,
+    )?;
     lua.globals().set(
         "scroll",
         lua.create_function(move |lua, name: String| {
@@ -999,6 +1232,99 @@ mod tests {
     }
 
     /// VM whose `state` marks the flag `RendererClient` drains.
+    #[test]
+    fn a_delayed_signal_answers_the_old_value_until_the_source_has_held_the_new_one() {
+        let mut cell = DelayCell { held: Value::Boolean(true), pending: None };
+        let t0 = Instant::now();
+        let hold = Duration::from_millis(147);
+        let mut armed = None;
+        assert_eq!(cell.follow(Value::Boolean(false), hold, t0, |due| armed = Some(due)), Value::Boolean(true));
+        assert_eq!(armed, Some(t0 + hold), "the first read of a change arms the wake");
+        assert_eq!(cell.follow(Value::Boolean(false), hold, t0 + hold / 2, |_| ()), Value::Boolean(true));
+        assert_eq!(cell.follow(Value::Boolean(false), hold, t0 + hold, |_| ()), Value::Boolean(false));
+        // A change that returns before its hold elapses is cancelled outright.
+        let later = t0 + hold + Duration::from_millis(1);
+        cell.follow(Value::Boolean(true), hold, later, |_| ());
+        assert_eq!(
+            cell.follow(Value::Boolean(false), hold, later + Duration::from_millis(1), |_| ()),
+            Value::Boolean(false)
+        );
+        assert!(cell.pending.is_none());
+        assert_eq!(cell.follow(Value::Boolean(false), hold, later + hold, |_| ()), Value::Boolean(false));
+    }
+
+    #[test]
+    fn delay_is_a_global_that_holds_a_state_write_and_arms_the_poll_deadline() {
+        let (lua, _dirty) = lua_with_state();
+        lua.load(r#"open = state("open", false) held = delay(open, 1)"#).exec().unwrap();
+        lua.load("open:set(true)").exec().unwrap();
+        assert!(!lua.load("return held:get()").eval::<bool>().unwrap());
+        assert!(next_wake_deadline(&lua).is_some());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(take_due_wake(&lua, Instant::now()));
+        assert!(lua.load("return held:get()").eval::<bool>().unwrap());
+        assert!(next_wake_deadline(&lua).is_none(), "an adopted value leaves nothing armed");
+        for refused in ["delay(open, 0)", "delay(open, 0.1)"] {
+            // 0.1 ms rounds to no milliseconds at all, so a hold that reads as positive would
+            // adopt on the very next poll and never hold anything.
+            let err = lua.load(refused).exec().unwrap_err().to_string();
+            assert!(err.contains("[1, 60000]"), "{refused}: {err}");
+        }
+    }
+
+    /// The clock is a parameter, so the window is exercised without sleeping through it.
+    #[test]
+    fn a_pulse_opens_on_a_change_restarts_on_the_next_one_and_closes_by_itself() {
+        let hold = Duration::from_millis(100);
+        let start = Instant::now();
+        let mut cell = PulseCell { seen: Value::Integer(0), until: None };
+
+        assert!(!cell.fire(Value::Integer(0), hold, start, |_| ()), "an unchanged source never fires");
+        let mut armed = None;
+        assert!(cell.fire(Value::Integer(1), hold, start, |due| armed = Some(due)));
+        assert_eq!(armed, Some(start + hold), "an open window arms the close");
+        // The source holds its new value: the window stays open on its own, then shuts once.
+        assert!(cell.fire(Value::Integer(1), hold, start + Duration::from_millis(50), |_| ()));
+        assert!(!cell.fire(Value::Integer(1), hold, start + hold, |_| ()), "the window closes at its due time");
+        assert!(!cell.fire(Value::Integer(1), hold, start + hold * 2, |_| ()), "and does not reopen");
+
+        // A second change mid-window restarts it rather than extending the first, which is what
+        // `restart()` does to a running animation.
+        let reopened = start + hold * 2;
+        assert!(cell.fire(Value::Integer(2), hold, reopened, |_| ()));
+        let mut armed = None;
+        assert!(cell.fire(Value::Integer(3), hold, reopened + Duration::from_millis(60), |due| armed = Some(due)));
+        assert_eq!(armed, Some(reopened + Duration::from_millis(60) + hold));
+    }
+
+    #[test]
+    fn pulse_is_a_global_that_starts_low_fires_on_a_write_and_arms_the_poll_deadline() {
+        let (lua, _dirty) = lua_with_state();
+        lua.load(r#"clicks = state("clicks", 0) flashing = pulse(clicks, 50)"#).exec().unwrap();
+        assert!(!lua.load("return flashing:get()").eval::<bool>().unwrap(), "a pulse starts low");
+        assert!(next_wake_deadline(&lua).is_none(), "and arms nothing until something changes");
+
+        lua.load("clicks:set(1)").exec().unwrap();
+        assert!(lua.load("return flashing:get()").eval::<bool>().unwrap());
+        assert!(next_wake_deadline(&lua).is_some());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(take_due_wake(&lua, Instant::now()));
+        assert!(!lua.load("return flashing:get()").eval::<bool>().unwrap(), "the window closed");
+
+        for refused in ["pulse(clicks, 0)", "pulse(clicks, 0.1)"] {
+            let err = lua.load(refused).exec().unwrap_err().to_string();
+            assert!(err.contains("[1, 60000]"), "{refused}: {err}");
+        }
+        lua.globals().set("handle", lua.create_any_userdata(7u32).unwrap()).unwrap();
+        let err = lua.load("pulse(handle, 50)").exec().unwrap_err().to_string();
+        assert!(err.contains("Signal"), "{err}");
+
+        // Read-only for the same reason every other engine-written signal is: the only thing that
+        // may open the window is the source changing.
+        let err = lua.load("flashing:set(true)").exec().unwrap_err().to_string();
+        assert!(err.contains("a pulse"), "{err}");
+    }
+
     fn lua_with_state() -> (Lua, DirtyFlag) {
         let lua = Lua::new();
         let dirty = DirtyFlag::new();
@@ -1321,6 +1647,14 @@ mod tests {
             write_state(&lua, &shared::SetState { name: "panel_kind".into(), write: shared::StateWrite::Toggle });
         assert!(not_bool.unwrap_err().contains("only a boolean toggles"));
         assert!(!dirty.take(), "a refused write changes nothing");
+
+        // `toggle <name> <value>`: to the value, then back to the declared initial.
+        let to_launcher = || shared::StateWrite::ToggleTo(serde_json::json!("launcher"));
+        write_state(&lua, &shared::SetState { name: "panel_kind".into(), write: to_launcher() }).unwrap();
+        assert_eq!(lua.load("return KIND:get()").eval::<String>().unwrap(), "launcher");
+        write_state(&lua, &shared::SetState { name: "panel_kind".into(), write: to_launcher() }).unwrap();
+        assert_eq!(lua.load("return KIND:get()").eval::<String>().unwrap(), "none", "already it: back to the initial");
+        assert!(dirty.take());
     }
 
     #[test]

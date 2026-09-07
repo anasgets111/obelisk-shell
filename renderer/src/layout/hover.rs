@@ -118,6 +118,8 @@ mod tests {
         }
         ResolvedNode {
             tweens: Vec::new(),
+            leaving: false,
+            transform: crate::layout::node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),
             kind: "row".to_string(),

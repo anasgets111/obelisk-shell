@@ -34,6 +34,7 @@
 -- `max_height`
 -- and scrolls at the same cap.
 local theme = require("config.theme")
+local util = require("lib.util")
 local panel_card = require("components.panel_card")
 local ui_state = require("lib.ui_state")
 
@@ -49,20 +50,23 @@ local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, not
 
 -- Build every body, but show only the matching `kind`. Invisible children contribute no size
 -- (`resolve_sizes` in scene.rs), so stacked bodies cost the visible panel's height, not their sum.
-local function panel_section(panel)
-    return column {
+-- Each section measures itself (`geometry`, ADR-0147). A hidden section keeps the rect it last
+-- laid out, so the height a reveal needs is known before the pass that shows it, the mirror's
+-- `panelItem.preferredHeight`; a section never shown yet reads zero.
+local sections = {}
+local section_rects = {}
+for _, panel in ipairs(panels) do
+    local rect = geometry("panel-section-" .. panel.kind)
+    table.insert(section_rects, rect)
+    table.insert(sections, column {
         width = "Fill",
         spacing = theme.spacing.xs,
         visible = ui_state.panel_kind:map(function(kind)
             return kind == panel.kind
         end),
+        geometry = rect,
         children = panel.body,
-    }
-end
-
-local sections = {}
-for _, panel in ipairs(panels) do
-    table.insert(sections, panel_section(panel))
+    })
 end
 
 -- Shared width except history, updates, and audio. Those use their own widths because history is a
@@ -90,7 +94,7 @@ end)
 -- `screens[1]` on a hotplugged second head is the same guess as `config/theme.lua`'s `main_screen`.
 -- This follows the signal, so resolution changes move the clamp instead of stranding boot values.
 -- Empty `oblisk.screens` (first evaluation and `socket.rs` harness) clamps only at zero.
-local card_margin = computed({ ui_state.popup_anchor, oblisk.screens, card_width }, function(anchor, screens, width)
+local card_x = computed({ ui_state.popup_anchor, oblisk.screens, card_width }, function(anchor, screens, width)
     local anchor_x = (anchor and anchor.x) or 0
     local anchor_width = (anchor and anchor.width) or 0
     local x = anchor_x + anchor_width / 2 - width / 2
@@ -99,7 +103,52 @@ local card_margin = computed({ ui_state.popup_anchor, oblisk.screens, card_width
         x = math.min(x, screen.width - width - theme.spacing.sm)
         x = math.max(x, theme.spacing.sm)
     end
-    return { left = math.floor(math.max(0, x)), top = theme.panel_gap }
+    return math.floor(math.max(0, x))
+end)
+
+-- `PanelHost.qml`'s `revealProgress`: the card drops from just above the surface's top edge, which
+-- is the bar's bottom, and retracts the same way while `linger` keeps the surface mapped for the
+-- exit (ADR-0146). No fade: the mirror moves `y` only, and the surface edge cuts the card the way
+-- its `clip` cuts `hiddenY`. The travel is the shown section's measured height plus the card's
+-- chrome, the mirror's `-height`, read off the section rather than the card so that switching
+-- kinds while closed retracts to the *next* card's height and a taller one does not start
+-- part-visible. A section never laid out reads zero and falls back to the tallest card, so the
+-- first open of each kind in a session drops from further up.
+--
+-- The horizontal placement is on a wrapper, not the card: a tween carries a whole edge table, and
+-- `left` on the same node as `top` would slide the card sideways from the previous indicator's
+-- anchor. The mirror animates `y` alone; `x` snaps.
+--
+-- Switching kinds while open does not retract: `PanelHost.qml` morphs the card in place, its
+-- `NumberTransition`s on `width` and `height`. That needs the card's height to be a number rather
+-- than its content, so it is the shown section's measured height plus the card's chrome; a pass
+-- that changes a measurement earns one follow-up pass (ADR-0147), which is what keeps the card
+-- from sitting one pass behind a section that grew. A section never measured leaves the card
+-- content-sized, which snaps that once.
+local CARD_CHROME = theme.spacing.sm * 2 + theme.border_width * 2
+local card_height = computed({ ui_state.panel_kind, table.unpack(section_rects) }, function(kind, ...)
+    for index, panel in ipairs(panels) do
+        if panel.kind == kind then
+            local height = select(index, ...).height
+            return height > 0 and height + CARD_CHROME or nil
+        end
+    end
+    return nil
+end)
+local hidden_top = card_height:map(function(height)
+    return height and -(height + theme.panel_gap) or -theme.panel_slide
+end)
+local card_margin = computed({ hidden_top, ui_state.panel_open }, function(hidden, open)
+    return { top = open and theme.panel_gap or hidden }
+end)
+-- A signal so `from` carries the current hidden position, which is what makes the first open of a
+-- kind slide rather than appear (a first value is taken as it is without one).
+local card_animate = hidden_top:map(function(hidden)
+    return {
+        margin = { duration = theme.animation_ms, easing = "OutQuad", from = { top = hidden } },
+        width = { duration = theme.animation_ms, easing = "OutCubic" },
+        height = { duration = theme.animation_ms, easing = "OutCubic" },
+    }
 end)
 
 return panel {
@@ -116,7 +165,7 @@ return panel {
     exclusive = false,
     width = "Fill",
     height = "Fill",
-    visible = ui_state.panel_open,
+    visible = util.linger(ui_state.panel_open, theme.animation_ms),
     -- `password_ssid` names the network whose `network:connect` awaits a password and is nil
     -- otherwise (§ 2.5), so this holds the keyboard only while typing is needed.
     --
@@ -167,15 +216,24 @@ return panel {
             -- No `height`: the card is its content. `renderer/src/socket.rs`'s
             -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` checks
             -- fit.
-            panel_card(sections, {
-                width = card_width,
-                -- A stacking child starts at its parent origin (`parse_align` defaults to `Start`);
-                -- the margin above is the full placement offset.
-                margin = card_margin,
-                background = theme.GLASS,
-                border_width = theme.border_width,
-                border_color = theme.BORDER,
-            }),
+            -- A stacking child starts at its parent origin (`parse_align` defaults to `Start`);
+            -- the wrapper's margin is the full horizontal placement, the card's the vertical.
+            column {
+                margin = card_x:map(function(x)
+                    return { left = x }
+                end),
+                children = {
+                    panel_card(sections, {
+                        width = card_width,
+                        height = card_height,
+                        margin = card_margin,
+                        animate = card_animate,
+                        background = theme.GLASS,
+                        border_width = theme.border_width,
+                        border_color = theme.BORDER,
+                    }),
+                },
+            },
         },
     },
 }

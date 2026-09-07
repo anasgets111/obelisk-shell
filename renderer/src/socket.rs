@@ -132,6 +132,10 @@ pub struct RendererClient {
     /// by `crate::wayland::App::set_session_lock` and teardown. **A `bool`, not instance ids**:
     /// hotplug replaces instances, so the veto reads [`Self::instances`].
     holds_session_lock: bool,
+    /// Whether the last pass was the one follow-up a moved `geometry` rect earns (ADR-0147
+    /// amendment). A moved rect in that pass gets no second follow-up, so a binding fed by its own
+    /// measurement settles or stops, never spins.
+    geometry_follow_up: bool,
     /// Clone of `crate::wayland::App`'s `ShapingHandle`: one worker and `FontSystem` per process
     /// (ADR-0023).
     shaping: ShapingHandle,
@@ -218,6 +222,7 @@ impl RendererClient {
             scene: Scene::new(),
             instances: Vec::new(),
             holds_session_lock: false,
+            geometry_follow_up: false,
             shaping,
             capabilities: RefCell::new(namespace.capabilities),
             commands,
@@ -418,6 +423,7 @@ impl RendererClient {
                 // Consume `set_screens`'s pre-evaluation seed (ADR-0041 decision 2) only after
                 // success; a failed apply leaves it for the next one.
                 self.dirty.take();
+                self.settle_geometry();
                 true
             }
             Err(err) => {
@@ -552,6 +558,7 @@ impl RendererClient {
                 self.state.applied_output = Some(output);
                 // The poll loop repaints on `re_resolve_if_dirty`.
                 self.dirty.mark();
+                self.settle_geometry();
             }
             Err(err) => {
                 eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}")
@@ -588,8 +595,19 @@ impl RendererClient {
             return false;
         }
         start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
+        self.settle_geometry();
         dump_layout_if_asked(&self.scene);
         true
+    }
+
+    /// One follow-up pass when a pass moved a `geometry(name)` rect, so a property bound to the
+    /// measurement lays out from it before anything else happens; never two in a row.
+    fn settle_geometry(&mut self) {
+        let moved = crate::lua::signal::take_geometry_moved(self.loader.lua());
+        self.geometry_follow_up = moved && !self.geometry_follow_up;
+        if self.geometry_follow_up {
+            self.dirty.mark();
+        }
     }
 
     /// One animation frame (ADR-0145): advances every tween to `now` and relays out the instances
@@ -597,6 +615,21 @@ impl RendererClient {
     /// Called from the poll loop when a compositor frame callback lands, the same turn position
     /// as [`Self::re_resolve_if_dirty`] and for the same downstream (surface state, hover,
     /// repaint).
+    /// The poll loop's only timeout: when the earliest pending `delay(signal, ms)` is due
+    /// (ADR-0146) or the earliest open `pulse(signal, ms)` window closes (ADR-0153). `None` while
+    /// nothing is pending, which is the idle case ADR-0124 keeps timeout-free.
+    pub fn next_wake_deadline(&self) -> Option<std::time::Instant> {
+        crate::lua::signal::next_wake_deadline(self.loader.lua())
+    }
+
+    /// Dirties the scene when a `delay` came due or a `pulse` window closed, so this turn's
+    /// re-resolve adopts the new value.
+    pub fn wake_due_signals(&mut self) {
+        if crate::lua::signal::take_due_wake(self.loader.lua(), std::time::Instant::now()) {
+            self.dirty.mark();
+        }
+    }
+
     pub fn tick_animations(&mut self, now: std::time::Instant) -> bool {
         self.scene.tick(&self.instances, &self.shaping, self.loader.lua(), now)
     }
@@ -1181,9 +1214,7 @@ mod tests {
                 ("network_tooltip", "popup"),
                 ("bluetooth_tooltip", "popup"),
                 ("idle_tooltip", "popup"),
-                ("launcher", "panel"),
-                ("wallpaper_picker", "panel"),
-                ("idle_settings", "panel"),
+                ("modal_host", "panel"),
                 ("lock_screen", "lock"),
                 ("polkit_dialog", "panel"),
             ]
@@ -1203,7 +1234,9 @@ mod tests {
         out: &mut Vec<layout::hit::LogicalPoint>,
     ) {
         let (x, y) = (x + node.rect.x, y + node.rect.y);
-        if node.properties.contains_key("hover") {
+        // A collapsed pill cell (`components/expanding_pill.lua`) keeps its slot at zero width;
+        // nothing can point at it, so it has no centre to light.
+        if node.properties.contains_key("hover") && node.rect.width > 0.0 && node.rect.height > 0.0 {
             out.push(layout::hit::LogicalPoint { x: x + node.rect.width / 2.0, y: y + node.rect.height / 2.0 });
         }
         for child in &node.children {
@@ -1262,61 +1295,79 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_dev_configs_battery_tooltip_opens_when_its_pill_is_hovered() {
-        // ADR-0062 against the shipped config, the only full chain: `hover(name)` in `battery.lua`,
-        // pill `hover`, tooltip `hover_rect(name)` -> `anchor_rect`, and popup `visible`.
+    fn a_popup_bound_to_a_hover_slot_opens_for_that_slot_alone_and_closes_when_the_pointer_leaves() {
+        // The other half of ADR-0062: `hover(name)` -> pill `hover`, `hover_rect(name)` ->
+        // popup `anchor_rect`, and the popup's `visible`. A fixture rather than the shipped
+        // config, so a bar module moving cannot break an engine contract, and so the pass costs
+        // microseconds instead of racing the 5ms evaluation budget under a parallel test run.
         //
-        // Walk for `hover`, rather than indexing the left zone, so bar reordering cannot test the
-        // wrong module silently.
-        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
-        let (mut client, _outbound_rx) = test_client(&shell_lua);
-        for (capability, payload) in widest_bar_snapshots() {
-            client
-                .apply_state_snapshot(StateSnapshot { capability: capability.to_string(), revision: 1, payload })
-                .unwrap();
-        }
-        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+        // Two slots, because the contract is that a point inside one region is outside the other:
+        // one region alone could not tell "opens when hovered" from "always open".
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r##"
+            local left, right = hover("left"), hover("right")
+            return {
+                panel {
+                    id = "bar", layer = "Top", width = "Fill", height = 40,
+                    child = row {
+                        width = "Fill", height = "Fill", spacing = 0,
+                        children = {
+                            row { id = "left_pill", width = 60, height = 20, hover = left },
+                            row { id = "right_pill", width = 60, height = 20, hover = right },
+                        },
+                    },
+                },
+                popup {
+                    id = "tip", parent = "bar",
+                    anchor_rect = hover_rect("left"),
+                    visible = left,
+                    width = 120, height = 40,
+                    grab = false,
+                    anchor = "BottomLeft", gravity = "BottomRight",
+                    child = rect { width = 120, height = 40, background = "#000000ff" },
+                },
+            }
+            "##,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "the fixture must resolve into a scene");
 
-        let tooltip_is_up =
-            |client: &RendererClient| client.scene.surface("battery_tooltip").expect("the tooltip resolves").visible;
-        assert!(!tooltip_is_up(&client), "a tooltip is not up before the pointer has been anywhere");
+        let tip_is_up = |client: &RendererClient| client.scene.surface("tip").expect("the popup resolves").visible;
+        assert!(!tip_is_up(&client), "a hover popup is not up before the pointer has been anywhere");
 
-        // Pin two bugs that occur before the first hover. `grab` defaults true in § 6, but a
-        // grabbing popup needs an input serial hover cannot produce; the compositor refused the
-        // tooltip's `visible = true` on every re-resolve. `anchor_rect` is required and non-zero,
-        // while its rect signal began nil, which reads as absent, not a rect.
-        let (_output, specs) = evaluate_and_specs(&client.loader, &shell_lua).expect("the shipped config evaluates");
-        let tooltip = specs
+        // Two bugs that happen before the first hover. `grab` defaults true in § 6, but a grabbing
+        // popup needs an input serial hover cannot produce, so the compositor refused `visible =
+        // true` on every re-resolve. And `anchor_rect` is required non-zero, while its rect signal
+        // begins nil, which reads as absent rather than as a rect.
+        let (_output, specs) = evaluate_and_specs(&client.loader, &path).expect("the fixture evaluates");
+        let tip = specs
             .iter()
             .find_map(|spec| match spec {
-                SurfaceSpec::Popup(popup) if popup.id == "battery_tooltip" => Some(popup),
+                SurfaceSpec::Popup(popup) if popup.id == "tip" => Some(popup),
                 _ => None,
             })
-            .expect("the shipped config declares a battery tooltip");
-        assert!(!tooltip.grab, "a hover-opened popup must not ask for a grab; there is no click to arm its serial");
+            .expect("the fixture declares the popup");
+        assert!(!tip.grab, "a hover-opened popup must not ask for a grab; there is no click to arm its serial");
         assert!(
-            tooltip.anchor_rect.width > 0.0 && tooltip.anchor_rect.height > 0.0,
+            tip.anchor_rect.width > 0.0 && tip.anchor_rect.height > 0.0,
             "anchor_rect has to be a real non-zero rect before anything has been hovered, got {:?}",
-            tooltip.anchor_rect
+            tip.anchor_rect
         );
 
-        // Try every region. `HoverWrite` carries a signal, not its name, so the battery region
-        // cannot be selected by slot. It used to be first because nothing left of it declared one;
-        // now four circles precede it, and `centres.first()` tests the power button. The stronger
-        // assertion is that exactly one region opens the battery tooltip, catching either side's
-        // slot rename.
-        // Cloned: the loop below re-resolves through `client`, and the centres come from the
-        // bar as it stood before any of that.
+        // Cloned: the loop re-resolves through `client`, and the centres are the bar as it stood
+        // before any of that.
         let bar = client.scene.surface("bar@TEST").unwrap().clone();
         let mut centres = Vec::new();
         hover_region_centres(&bar, 0.0, 0.0, &mut centres);
-        assert!(centres.len() > 1, "the shipped bar declares more than one hover region");
+        assert_eq!(centres.len(), 2, "the fixture declares one hover region per pill");
 
         let mut opened_by = 0;
         for centre in centres {
             let writes = layout::hover::hover_writes(&bar, Some(centre));
-            // Apply writes as `App::sync_hover` does: a point inside one region is outside the
-            // others, and turning those *off* is half the walk.
+            // Applied as `App::sync_hover` does: a point inside one region is outside the others,
+            // and turning those *off* is half the walk.
             for write in &writes {
                 assert_eq!(
                     write.hovered,
@@ -1329,9 +1380,8 @@ mod tests {
                 let Some(rect) = write.rect else {
                     continue;
                 };
-                // Build here because `crate::wayland::input` is private. This is § 6's
-                // `anchor_rect`;
-                // a wrong shape fails the re-resolve below.
+                // Built here because `crate::wayland::input` is private. This is § 6's
+                // `anchor_rect`; a wrong shape fails the re-resolve below.
                 let table = client.lua().create_table().unwrap();
                 table.set("x", rect.x).unwrap();
                 table.set("y", rect.y).unwrap();
@@ -1340,29 +1390,43 @@ mod tests {
                 write.signal.hover_rect_handle().unwrap().set_changed(mlua::Value::Table(table));
             }
             client.re_resolve_if_dirty();
-            if tooltip_is_up(&client) {
+            if tip_is_up(&client) {
                 opened_by += 1;
             }
         }
-        assert_eq!(opened_by, 1, "exactly one hover region on the bar opens the battery tooltip");
+        assert_eq!(opened_by, 1, "the slot the popup names opens it, and the other one does not");
 
-        // Close again. `anchor_rect` retains its last rect instead of clearing, preserving § 6's
-        // non-zero rule on the way out.
+        // Closing again. `anchor_rect` keeps its last rect rather than clearing, which is what
+        // preserves § 6's non-zero rule on the way out.
         let bar = client.scene.surface("bar@TEST").unwrap();
         for write in layout::hover::hover_writes(bar, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
         }
         assert!(client.re_resolve_if_dirty());
-        assert!(!tooltip_is_up(&client), "the pointer left the bar, so the tooltip closed");
+        assert!(!tip_is_up(&client), "the pointer left the bar, so the popup closed");
     }
 
     #[test]
-    fn the_shipped_dev_configs_notification_card_is_up_only_while_something_is_in_the_feed() {
-        // Regression: no `visible` binding left a "no notifications" card permanently in the
-        // corner. Empty state belongs to a *panel*; an always-up popup is not a notification.
-        let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
-        let (mut client, _outbound_rx) = test_client(&shell_lua);
-        assert!(run_startup(&mut client), "the shipped dev config must resolve into a scene");
+    fn a_surface_whose_visible_reads_a_capability_goes_up_and_down_with_the_payload() {
+        // Regression: a card with no `visible` binding sat in the corner saying "no notifications"
+        // for ever. The engine contract under it is that a surface's `visible` may be a signal over
+        // a capability, and that a snapshot re-resolve moves the surface -- a fixture, so a
+        // rearranged dev-config cannot fail an engine test.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r##"
+            return { panel {
+                id = "notification_area", layer = "Top", anchor = { top = true, right = true },
+                width = 200, height = 60,
+                -- nil until the first push, as at real boot.
+                visible = oblisk.notifications:map(function(n) return n ~= nil and #n.feed > 0 end),
+                child = rect { width = 200, height = 60, background = "#111111ff" },
+            } }
+            "##,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "the fixture must resolve into a scene");
 
         let card_is_up = |client: &RendererClient| {
             client.scene.surface("notification_area@TEST").expect("the card resolves").visible

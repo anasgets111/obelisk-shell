@@ -278,14 +278,21 @@ theme.battery_pill_width = s(80, 60)
 -- width is `item_width`.
 theme.volume_expanded_width = s(120, 90)
 -- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The easing is
--- the engine's default, `InOutQuad`, which is also the mirror's most-used. Its `animationFast`/
--- `animationSlow` have no consumer here yet.
+-- the engine's default, `InOutQuad`, which is also the mirror's most-used. `animation_fast_ms` is
+-- its `animationFast`, the hover zooms.
 theme.animation_ms = 147
+theme.animation_fast_ms = 100
+-- `animationSlow`, the pace of a pulse rather than a transition: slow enough to read as breathing.
+theme.animation_slow_ms = 250
 -- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`: bar
 -- panels share one card in `modules/shell/panel_host.lua`; ADR-0110 makes it as tall as the panel.
 -- Each list is capped at `Math.min(contentHeight, Theme.itemHeight * 7)`, then scrolls.
 theme.panel_width         = s(340, 280)
 theme.panel_list_height   = s(280, 210)
+-- Where a closed panel card sits before its first layout has measured it (`geometry`,
+-- ADR-0147): above the bar by the tallest card (history: its capped list plus chrome). After that
+-- the card drops from exactly its own height, `PanelHost.qml`'s `-height`.
+theme.panel_slide         = s(760, 570)
 -- Notification history holds the popup's cards, not a dozen short rows. Its mirror width is
 -- `notificationPanelWidth: 420`; `maxAvailableHeight` lets the list use most of the screen before
 -- it scrolls.

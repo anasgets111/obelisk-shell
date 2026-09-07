@@ -27,6 +27,8 @@ return function(children, opts)
         align_h = opts.align_h,
         align_v = opts.align_v,
         visible = opts.visible,
+        opacity = opts.opacity,
+        animate = opts.animate,
         spacing = opts.spacing or theme.spacing.xs,
         background = opts.background or theme.BG,
         radius = opts.radius or theme.radius.md,

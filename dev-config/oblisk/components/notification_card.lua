@@ -15,7 +15,8 @@
 -- `textfield` (ADR-0092), `timestamp` (ADR-0093), and `hold_expiry`/`on_hover` so reading or
 -- replying does not remove the card (ADR-0094, ADR-0095).
 -- Body spans preserve bold, italic, underline, and accent links (ADR-0104); each link also gets an
--- opener button (ADR-0103). Expansion and removal still have no animation.
+-- opener button (ADR-0103). Removal slides and fades the card out (ADR-0150); expansion still
+-- snaps.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -369,6 +370,24 @@ return function(group, ui, opts)
             right = theme.spacing.md,
             bottom = theme.spacing.md,
             left = theme.spacing.md,
+        },
+        -- `NotificationCard.qml`'s `Behavior on x`: a new card slides in from the right edge and
+        -- fades, its resting `margin` a table so the entry `from` has a shape to tween against
+        -- (ADR-0146). Dismissal leaves the same way (ADR-0150), through `translate` rather than
+        -- `margin`: a leaving card is out of the solver, so only the paint-only shift moves it.
+        -- The cards below close the gap at once while it slides; easing that too is a move
+        -- transition the engine does not have.
+        margin = { left = 0 },
+        opacity = 1,
+        animate = {
+            margin = { duration = theme.animation_ms, easing = "OutCubic", from = { left = theme.notification_width } },
+            opacity = { duration = theme.animation_ms, from = 0 },
+            exit = {
+                duration = theme.animation_ms,
+                easing = "InCubic",
+                translate = { x = theme.notification_width },
+                opacity = 0,
+            },
         },
         background = opts.background or theme.GLASS,
         radius = theme.radius.md,

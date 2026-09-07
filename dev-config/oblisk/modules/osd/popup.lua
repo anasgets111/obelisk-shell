@@ -1,13 +1,20 @@
--- `OSDCard.qml` without animation: bottom-centered glass card, switching its two layouts on whether
--- the entry has a level. `modules/osd/service.lua` decides what/when; this draws the entry.
+-- `OSDCard.qml`: bottom-centered glass card, switching its two layouts on whether the entry has a
+-- level. `modules/osd/service.lua` decides what/when; this draws the entry. It fades and rises
+-- like the mirror's `Behavior on opacity`/`y`, and the surface lingers mapped through the exit
+-- (ADR-0146): the mirror unmaps its window at once, so its fade-out is never seen.
 --
 -- One `panel` with two `visible`-switched rows, not two panels. § 6 gives each surface its own
 -- compositor identity; otherwise a volume change during a toggle would overlap at one position.
 local theme = require("config.theme")
+local util = require("lib.util")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
 local meter = require("components.meter")
 local osd = require("modules.osd.service")
+
+-- `Theme.qml`'s `osdAnimationOffset`, and its `animationDuration * 1.5` for the rise.
+local SLIDE = theme.s(60, 40)
+local RISE_MS = theme.animation_ms * 1.5
 
 local function read(field)
     return osd.entry:map(function(e)
@@ -94,13 +101,25 @@ return panel {
     -- centers an axis with neither edge anchored. Explicit `width`/`height` are required because
     -- `bottom` alone anchors neither full axis.
     anchor = { bottom = true },
-    margin = { bottom = theme.s(132, 90) },
+    -- The surface is `SLIDE` taller than the card, and sits that much lower, so the card can rise
+    -- into place from below its resting spot without leaving the surface.
+    margin = { bottom = theme.s(132, 90) - SLIDE },
     width = theme.osd_width,
-    height = theme.osd_height,
-    visible = osd.visible,
+    height = theme.osd_height + SLIDE,
+    visible = util.linger(osd.visible, RISE_MS),
     child = column {
         width = "Fill",
-        height = "Fill",
+        height = theme.osd_height,
+        margin = osd.visible:map(function(shown)
+            return { top = shown and 0 or SLIDE }
+        end),
+        opacity = osd.visible:map(function(shown)
+            return shown and 1 or 0
+        end),
+        animate = {
+            opacity = { duration = theme.animation_ms, from = 0 },
+            margin = { duration = RISE_MS, easing = "OutCubic", from = { top = SLIDE } },
+        },
         background = theme.GLASS,
         radius = theme.radius.md,
         border_width = theme.border_width,

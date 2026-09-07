@@ -20,6 +20,13 @@ local settings_open = state("settings_open", false)
 local panel_open = state("panel_open", false)
 local panel_kind = state("panel_kind", "")
 
+-- The one modal on screen, `ShellUiState.activeModal`: `"launcher"`, `"wallpaper_picker"`,
+-- `"idle_settings"` or `""`. One string rather than a boolean per modal, so two can never be open
+-- at once and opening one is what closes the last (the mirror's `openModal`). Shared `state`
+-- because each modal's own close and its bar button both write it, and so one compositor keybind
+-- opens and closes one: `oblisk toggle modal launcher` sets it, or clears it when it already is.
+local active_modal = state("modal", "")
+
 -- ## Which notifications have already had their turn as a popup
 -- Popup and history are two presentations of one Supervisor notification; `dismiss` removes both,
 -- with no third "stop popping but keep listed" state. The config therefore tracks this view fact.
@@ -71,6 +78,8 @@ local function toggle_panel(kind, rect)
     if kind == "notifications" then
         mark_popups_seen()
     end
+    -- A panel and a modal never share the screen (`openPanel` clears `activeModal`).
+    active_modal:set("")
     popup_anchor:set(rect)
     panel_kind:set(kind)
     panel_open:set(true)
@@ -86,17 +95,39 @@ local function panel_showing(kind)
     end)
 end
 
--- App launcher visibility. Like `settings_open`, keep it in shared `state` because
--- `modules/global/launcher.lua`'s close and `modules/bar/indicators/launcher_button.lua`'s open
--- both write it.
-local launcher_open = state("launcher_open", false)
+local function modal_showing(kind)
+    return active_modal:map(function(current)
+        return current == kind
+    end)
+end
 
--- Wallpaper picker visibility; both the bar button and picker close write it.
-local wallpaper_picker_open = state("wallpaper_picker_open", false)
+-- Opening a modal closes any panel, as the mirror's `openModal` clears `activePanelId`; nothing
+-- else about the panel changes, so a re-open lands where it was.
+local function open_modal(kind)
+    if panel_open:get() then
+        close_panel()
+    end
+    active_modal:set(kind)
+end
 
--- Idle settings modal visibility; the bar circle's right click opens it and the modal header closes
--- it.
-local idle_settings_open = state("idle_settings_open", false)
+-- Closes `kind` only if it is the one showing, so a modal's own close cannot dismiss a later one.
+local function close_modal(kind)
+    if active_modal:get() == kind then
+        active_modal:set("")
+    end
+end
+
+local function toggle_modal(kind)
+    if active_modal:get() == kind then
+        close_modal(kind)
+    else
+        open_modal(kind)
+    end
+end
+
+local launcher_open = modal_showing("launcher")
+local wallpaper_picker_open = modal_showing("wallpaper_picker")
+local idle_settings_open = modal_showing("idle_settings")
 
 -- ## The notification card's own state
 -- Three view signals say which card/group is open; the Supervisor neither knows nor should know.
@@ -201,4 +232,8 @@ return {
     launcher_open = launcher_open,
     wallpaper_picker_open = wallpaper_picker_open,
     idle_settings_open = idle_settings_open,
+    active_modal = active_modal,
+    modal_showing = modal_showing,
+    toggle_modal = toggle_modal,
+    close_modal = close_modal,
 }

@@ -1,5 +1,5 @@
 ---@meta
--- The reactive layer: `Signal` and the five globals that make or read one.
+-- The reactive layer: `Signal` and the globals that make or read one.
 --
 -- HAND-WRITTEN and unchecked, like `globals.lua`: no roster test covers it, so drift from
 -- `renderer/src/lua/signal.rs` appears only when `just types` reports a false `dev-config` error.
@@ -48,7 +48,8 @@
 ---5 and amendment); a table `initial` is never an edit because tables compare by identity and each
 ---evaluation creates a new one.
 ---
----The name is also the target of `oblisk set <name> <value>` and `oblisk toggle <name>`, a
+---The name is also the target of `oblisk set <name> <value>`, `oblisk toggle <name>` and
+---`oblisk toggle <name> <value>` (to the value, or back to `initial` when it already holds it), a
 ---compositor keybind's way in (ADR-0112). The write behaves like `:set()` and is refused if
 ---undeclared.
 ---@generic T
@@ -96,6 +97,38 @@ function hover(name) end
 ---@param name string The same slot `hover` takes. Reading this one does not register a region; the `hover` property does that.
 ---@return Signal<Rect> # The region's absolute rect in its surface's logical coordinates.
 function hover_rect(name) end
+
+---`source` after it has held a new value for `ms` (ADR-0146). Reads answer the old value until then;
+---a source that returns to it before the hold elapses changes nothing. Two jobs in one shape: a
+---close-hold that keeps a surface mapped while its exit tween runs, `visible = computed({ open,
+---delay(open, ms) }, function(now, was) return now or was end)`, and a trailing debounce.
+---@generic T
+---@param source Signal<T> Any signal or capability.
+---@param ms integer The hold, `[1, 60000]` ms, rounded to whole milliseconds.
+---@return Signal<T> # Read-only; the source is the writer.
+function delay(source, ms) end
+
+---`true` for `ms` after `source` changes value, `false` the rest of the time (ADR-0153). The other
+---half of `delay`'s shape: that one answers the old value until a change settles, this one says a
+---change just happened. It is how a one-shot animation fires, since a config cannot call
+---`restart()`: `animate = pulse(clicks, 400):map(function(on) return on and { opacity = { ... } } or {} end)`
+---starts a sequence when the window opens and drops it when the window closes (ADR-0152). A change
+---while the window is open restarts it. Gate the direction with `computed` when only one edge
+---should fire: `computed({ pulse(plugged, ms), plugged }, function(fired, on) return fired and on end)`.
+---@param source Signal<any> Any signal or capability.
+---@param ms integer The window, `[1, 60000]` ms, rounded to whole milliseconds. Make it at least as long as what it drives.
+---@return Signal<boolean> # Read-only; the source is the writer.
+function pulse(source, ms) end
+
+---The laid-out `{ x, y, width, height }` of the node declaring `geometry = geometry(name)`, in its
+---surface's logical coordinates, the same space `on_click` and `hover_rect` report (ADR-0147). The
+---layout pass and tween ticks write it; Lua cannot. A pass that changes it earns one follow-up
+---pass, so a binding on it settles right after the node it measures; a tick's write earns none, and
+---a binding fed by its own measurement stops after that one pass. Zero until the first layout.
+---This is QML's `item.height` for a reveal that slides a card by its own height.
+---@param name string The slot. Naming it on a node's `geometry` makes that node the one measured; two calls with one name are one signal.
+---@return Signal<Rect> # The node's absolute rect in its surface's logical coordinates.
+function geometry(name) end
 
 ---@class ScrollSignal: Signal<number>
 ---What `scroll(name)` returns. The engine writes the offset; config can request

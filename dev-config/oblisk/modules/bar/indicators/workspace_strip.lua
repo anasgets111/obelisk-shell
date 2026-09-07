@@ -1,7 +1,6 @@
 -- Mirrors `WorkspaceStrip.qml`: one collapsed circle for the active workspace, expanding under the
--- pointer to one circle per workspace, then narrowing on exit. `hover` belongs on the containing
--- row, as in `modules/bar/panels/power_menu.lua`, so crossing gaps does not leave the region. The
--- earlier twelve always-open dots assumed collapsing needed a timer; it needed the row.
+-- pointer to one circle per workspace, then narrowing `animationDuration + 200` after it leaves.
+-- The pill itself is `components/expanding_pill.lua`, shared with the power menu.
 --
 -- Ground: accent when active, glass when populated, `DISABLED` at half opacity when empty
 -- (ADR-0117,
@@ -19,11 +18,11 @@
 -- a trailing empty workspace and needs no padding. The payload lists only existing workspaces;
 -- padding is this strip's `compositor`-keyed policy.
 --
--- The ground and border ease between states (ADR-0145). Not mirrored: the strip's width animation
--- on expand, because a dot's `visible` flips and a first value is taken as it is.
+-- The ground and border ease between states (ADR-0145); the expansion is the pill's.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
+local expanding_pill = require("components.expanding_pill")
 
 local PADDED_SLOTS = 10
 
@@ -53,7 +52,7 @@ local function workspaces_of(w)
     return padded
 end
 
-local pill_hovered = hover("workspace-pill")
+local pill = expanding_pill.new({ slot = "workspace-pill", collapse_ms = theme.animation_ms + 200 })
 
 local function workspace_button(ws)
     local id = ws.id
@@ -88,10 +87,7 @@ local function workspace_button(ws)
     local has_icon = icon_name:map(function(name)
         return name ~= ""
     end)
-    return button {
-        width = theme.item_width,
-        height = theme.item_height,
-        align_v = "Center",
+    return pill.cell(button {
         radius = theme.item_radius,
         hover = slot_hovered,
         background = ground,
@@ -103,9 +99,6 @@ local function workspace_button(ws)
             return current.populated and 1 or theme.opacity.disabled
         end),
         animate = { background = theme.animation_ms, border_color = theme.animation_ms, opacity = theme.animation_ms },
-        visible = computed({ pill_hovered, is_active }, function(open, active)
-            return open or active
-        end),
         children = {
             icon {
                 name = icon_name,
@@ -128,25 +121,18 @@ local function workspace_button(ws)
             end
             oblisk.workspaces:invoke("focus", id)
         end,
-    }
+    }, is_active)
 end
 
--- The row is the pill's hover region and has no ground; the mirror's circles sit directly on the
--- bar.
-return row {
-    height = theme.item_height,
-    align_v = "Center",
-    hover = pill_hovered,
-    children = {
-        list {
-            direction = "Horizontal",
-            spacing = theme.spacing.sm,
-            align_v = "Center",
-            source = oblisk.workspaces:map(workspaces_of),
-            itemfn = workspace_button,
-            key = function(ws)
-                return tostring(ws.id)
-            end,
-        },
+-- No ground of its own; the mirror's circles sit directly on the bar.
+return pill.row({
+    list {
+        direction = "Horizontal",
+        align_v = "Center",
+        source = oblisk.workspaces:map(workspaces_of),
+        itemfn = workspace_button,
+        key = function(ws)
+            return tostring(ws.id)
+        end,
     },
-}
+})

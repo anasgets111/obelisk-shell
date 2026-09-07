@@ -150,6 +150,10 @@ pub enum StateWrite {
     /// Flip a boolean. Refused on any other value, since a keybind cannot know the current one
     /// and "toggle" means nothing else.
     Toggle,
+    /// `oblisk toggle <name> <value>`: store this value, unless the state already holds it, in
+    /// which case restore the initial the config declared. One keybind opens and closes a modal
+    /// whose state is the name of the one showing (`state("modal", "")`).
+    ToggleTo(serde_json::Value),
 }
 
 /// Supervisor -> Renderer: re-evaluate `shell.lua`. Echo `sequence` in every response so a second

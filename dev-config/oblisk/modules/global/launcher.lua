@@ -4,8 +4,9 @@
 --
 -- A plain `textfield` with `autofocus = true` gets the keyboard on map and opens empty. `on_change`
 -- filters, `on_navigate` moves selection and calls the list scroll signal's `reveal`, `on_submit`
--- launches, and `on_cancel` closes. A compositor keybind can also toggle `launcher_open`, so it is
--- named `state`, not local.
+-- launches, and `on_cancel` closes. A compositor keybind toggles it through the shared `modal`
+-- state (`oblisk toggle modal launcher`, `lib/ui_state.lua`), which is why that is a named
+-- `state`, not a local.
 --
 -- ## Layer surface, not `window`
 --
@@ -28,6 +29,7 @@ local icons = require("config.icons")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
 local ui_state = require("lib.ui_state")
+local modal = require("components.modal")
 local panel_card = require("components.panel_card")
 local panel_empty_state = require("components.panel_empty_state")
 
@@ -209,7 +211,7 @@ local function move(delta)
 end
 
 local function close()
-    ui_state.launcher_open:set(false)
+    ui_state.close_modal("launcher")
 end
 
 local function activate()
@@ -293,7 +295,16 @@ local function app_row(app)
     return row_shell(app.id, "launcher-app-" .. app.id, {
         -- `Utils.resolveIconSource(..., "application-x-executable")`: entries without `Icon=` still
         -- get a generic picture.
-        icon { name = app.icon or "application-x-executable", size = theme.launcher_icon, align_v = "Center" },
+        -- `AppLauncher.qml`: the selected row's icon grows 1.3x in place (ADR-0149).
+        icon {
+            name = app.icon or "application-x-executable",
+            size = theme.launcher_icon,
+            align_v = "Center",
+            scale = selected:map(function(on)
+                return on and 1.3 or 1
+            end),
+            animate = { scale = { duration = theme.animation_fast_ms, easing = "OutCubic" } },
+        },
         column { width = "Fill", align_v = "Center", children = lines },
     })
 end
@@ -400,66 +411,38 @@ local card_margin = oblisk.screens:map(function(screens)
     }
 end)
 
-return panel {
-    id = "launcher",
-    namespace = "oblisk-launcher",
-    layer = "Top",
-    anchor = { top = true, bottom = true, left = true, right = true },
-    exclusive = false,
-    width = "Fill",
-    height = "Fill",
-    visible = ui_state.launcher_open,
-    -- Exclusive only while open: the field must be typable without a click, and an off-screen
-    -- surface
-    -- must hold nothing.
-    keyboard_interactivity = ui_state.launcher_open:map(function(open)
-        return open and "Exclusive" or "None"
-    end),
-    child = rect {
-        width = "Fill",
-        height = "Fill",
-        children = {
-            -- Scrim and outside catcher in one. `hit::descend` stops at the card, so only clicks
-            -- beside
-            -- it land here.
-            button {
-                width = "Fill",
-                height = "Fill",
-                cursor = "default",
-                background = theme.SCRIM,
-                on_click = close,
+return modal({
+    kind = "launcher",
+    keyboard = true,
+    card = panel_card({
+        search,
+        panel_card({ web_row, app_list, no_results, no_apps }, {
+            width = "Fill",
+            height = "Fill",
+            background = theme.GLASS_CONTENT,
+            border_width = theme.border_width,
+            border_color = theme.GLASS_BORDER,
+            padding = {
+                top = theme.spacing.sm,
+                right = theme.spacing.sm,
+                bottom = theme.spacing.sm,
+                left = theme.spacing.sm,
             },
-            panel_card({
-                search,
-                panel_card({ web_row, app_list, no_results, no_apps }, {
-                    width = "Fill",
-                    height = "Fill",
-                    background = theme.GLASS_CONTENT,
-                    border_width = theme.border_width,
-                    border_color = theme.GLASS_BORDER,
-                    padding = {
-                        top = theme.spacing.sm,
-                        right = theme.spacing.sm,
-                        bottom = theme.spacing.sm,
-                        left = theme.spacing.sm,
-                    },
-                }),
-            }, {
-                width = theme.launcher_width,
-                height = theme.launcher_height,
-                margin = card_margin,
-                spacing = theme.spacing.sm,
-                padding = {
-                    top = theme.spacing.lg,
-                    right = theme.spacing.lg,
-                    bottom = theme.spacing.lg,
-                    left = theme.spacing.lg,
-                },
-                radius = theme.radius.lg,
-                background = theme.GLASS,
-                border_width = theme.border_width,
-                border_color = theme.BORDER,
-            }),
+        }),
+    }, {
+        width = theme.launcher_width,
+        height = theme.launcher_height,
+        margin = card_margin,
+        spacing = theme.spacing.sm,
+        padding = {
+            top = theme.spacing.lg,
+            right = theme.spacing.lg,
+            bottom = theme.spacing.lg,
+            left = theme.spacing.lg,
         },
-    },
-}
+        radius = theme.radius.lg,
+        background = theme.GLASS,
+        border_width = theme.border_width,
+        border_color = theme.BORDER,
+    }),
+})
