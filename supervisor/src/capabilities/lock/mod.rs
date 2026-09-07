@@ -76,7 +76,12 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
         }
         LockEvent::Authenticated(outcome) => {
             state.authenticating = false;
-            state.attempts += 1;
+            // Only a rejected password counts. `StartFailed` and `PamError` are the worker not
+            // running, which the user at the lock screen cannot answer, and a config drawing a
+            // limit from `attempts` would shut them out for it.
+            if matches!(outcome, shared::PamOutcome::AuthFailed | shared::PamOutcome::MaxTries) {
+                state.attempts += 1;
+            }
             state.error = error_for_outcome(&outcome);
         }
         // Only confirmed locks advance acquisition, invalidating answers for the prior lock.
@@ -216,7 +221,11 @@ pub(crate) fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
         shared::PamOutcome::Success => String::new(),
         shared::PamOutcome::AuthFailed => "authentication failed".to_string(),
         shared::PamOutcome::MaxTries => "too many attempts".to_string(),
-        shared::PamOutcome::StartFailed(err) => format!("could not start authentication: {err}"),
+        // Names the repair, because no password can work and the user is looking at the only
+        // screen that will not tell them so. The detail stays for the log.
+        shared::PamOutcome::StartFailed(err) => {
+            format!("authentication is unavailable; a terminal login can repair it. {err}")
+        }
         shared::PamOutcome::PamError(err) => format!("authentication error: {err}"),
     }
 }
@@ -457,6 +466,24 @@ mod tests {
 
         // Only a confirmed Locked moves acquisition; bumping here would number a lock never taken.
         assert_eq!(state.acquisition, 4);
+    }
+
+    /// A worker that will not start is not a wrong password. Counting it spends an allowance the
+    /// user cannot avoid, and a config drawing a limit from `attempts` would shut them out for an
+    /// infrastructure failure.
+    #[test]
+    fn a_failure_to_start_authentication_does_not_count_as_an_attempt() {
+        let mut state = LockState { active: true, ..LockState::default() };
+
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::StartFailed("no worker".into())));
+        assert_eq!(state.attempts, 0);
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::PamError("broken".into())));
+        assert_eq!(state.attempts, 0);
+
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::AuthFailed));
+        assert_eq!(state.attempts, 1, "a rejected password still counts");
+        assert!(state.active, "and the lock is held throughout");
+        assert!(!state.authenticating, "with another attempt allowed after each");
     }
 
     #[test]

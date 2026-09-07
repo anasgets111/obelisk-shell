@@ -3272,7 +3272,12 @@ holding the unlock decision is already the old code; upgrading its file never pa
 fixes apply at a controlled restart after unlocking, and this only guarantees there is a way to
 unlock.
 
-Not fixed here: an upgrade that removes the loader or a library the old executable needs still stops
-the worker, and no exec strategy survives that. The failure path also deserves better than a
-truncated red line: keep the lock, clear `authenticating`, do not spend a bad-password allowance on
-an infrastructure failure, and say that a terminal login is the repair.
+The failure path is fixed alongside it, because a worker can still fail to start for other reasons.
+`apply` already held the lock and cleared `authenticating`, so a retry was allowed; it also counted
+every failure as an attempt, and now counts only `AuthFailed` and `MaxTries`. A config drawing a
+limit from `attempts` would otherwise have shut the user out for something they cannot answer.
+`StartFailed` names the repair rather than only the error, and `dev-config`'s lock status wraps: at
+380px it had clipped to "could not start authentication: pam worker f".
+
+Not fixed: an upgrade that removes the loader or a library the old executable needs still stops the
+worker, and no exec strategy survives that.
