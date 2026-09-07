@@ -281,8 +281,8 @@
 
 ---@class IdleState
 ---`oblisk.idle` payload (ADR-0141).
----@field inhibited boolean Any idle inhibitor is held, including this shell. While true, no threshold event reaches config, so its countdown must stop.
----@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell.
+---@field inhibited boolean Anything is holding the session awake: a logind inhibitor including this shell's own, or the compositor withholding idle notifications (ADR-0160). Either way no threshold event arrives while it is true, so a countdown must stop -- but for different reasons. The logind half is the Supervisor's own gate dropping events; the compositor half is the compositor never sending them, and nothing in this process gates on it.
+---@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell. A Wayland holder has an empty `who`, because no protocol names one (ADR-0160).
 
 ---@class BluetoothState
 ---@field connected_devices ConnectedDevice[] Paired, connected devices in BlueZ object order, which is not sorted.

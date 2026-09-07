@@ -3138,3 +3138,63 @@ anything but the golden test.
 
 Not built: an acknowledgement for a registration. A lost `register` is still lost, which is the
 roadmap's *Capability start acknowledgement* row for a different frame.
+
+
+## 0160. `oblisk.idle` reports that the compositor is withholding idle notifications, because nothing else can see a surface inhibitor
+
+ADR-0141 put foreign logind inhibitors in `IdleState` so the shell would stop claiming nothing held
+the session awake. It saw half the holders. `zwp_idle_inhibitor_v1` is a surface-scoped Wayland
+inhibitor, what a browser takes for a video call, and while one is up the compositor withholds
+`idled` from every `get_idle_notification` listener. logind's `BlockInhibited` never mentions it, so
+`inhibited` read false, the widget said "nothing is holding this awake", and the countdown sat at
+zero with no explanation anywhere.
+
+Measured during a Google Meet call in Zen: zero `idled` events reached the Supervisor's Wayland
+handler over four minutes of an untouched seat, with the logind gate open and the threshold
+registered.
+
+Quickshell solves the same protocol problem one layer up. `IdleMonitor` carries a
+`respectInhibitors` property, and `idle_notify/proto.cpp` picks `get_idle_notification` or
+`get_input_idle_notification` from it, leaving any comparison to the config. It exposes the pair.
+This derives one answer from it.
+
+1. **Bind `ext_idle_notifier_v1` at `1..=2` and pair every listener.** Version 2 adds
+   `get_input_idle_notification`, which the compositor may not withhold. A duration has two
+   listeners, told apart by `ListenerId`. Input events never fan out to a config. They exist so
+   silence on the gated listener reads as evidence rather than as a seat in use.
+2. **The claim is "the compositor is withholding notifications", not "an application holds a
+   surface inhibitor".** The observation does not establish the cause: niri folds its freedesktop
+   screensaver inhibition into the same flag, sway adds configured focus and fullscreen policy, and
+   the protocol lets an ordinary notification weigh inputs the twin does not. The published holder
+   has an empty `who`, since no protocol names one, and a `why` stating the observation.
+3. **Only the shortest fired threshold votes.** Any-of is the obvious rule and it is wrong.
+   Releasing an inhibitor restarts the gated timers, so a config idle at 1s and 300s gets its 1s
+   listener back a second later and its 300s one five minutes later, and any-of reads that gap as a
+   still-held inhibitor for the whole five minutes. The first version shipped that with a test
+   asserting it as correct.
+4. **A `Resumed` clears both halves of its pair.** Clearing only the reporting half made the answer
+   depend on read order: a gated `Resumed` alone leaves the input half idle, which reads as a held
+   inhibitor, and the input `Resumed` behind it is no evidence and preserves it. Every wake could
+   latch a false holder for as long as the seat stayed busy.
+5. **No evidence is not evidence of nothing held.** The divergence exists only while the seat is
+   idle, so `wayland_inhibited` answers `Option<bool>` and `PublishedIdle` keeps its last value
+   through an active seat. The published answer has no staleness bound: a seat in continuous use
+   holds it indefinitely.
+6. **`PublishedIdle` merges the two sources**, and holds its lock across the send. Different tasks
+   watch logind and the compositor, and releasing between settle and send let the other writer
+   overtake, so the older payload arrived last with `last_sent` already past it.
+7. **A version 1 compositor degrades to the logind-only answer** rather than failing to bind.
+8. **A generation appears once per duration in the fan-out.** That list is destinations, and the
+   Renderer already runs every callback it holds at a duration for each event, so a second entry ran
+   every callback again: two `register_threshold(300, ...)` calls fired four times. Each half had a
+   passing test. Only the pair was wrong.
+
+Draining the raw channel before answering narrows the window where one half of a pair is read
+without the other. It does not close it, so the published answer can still carry an ordering
+artifact and not only a stale reading.
+
+Not built: naming the holder, or asking whether one is held while the seat is in use. Neither exists
+in any protocol. A dedicated zero-timeout detector would answer live rather than one threshold late,
+and `timeout: 0` is explicitly valid. It is deferred because the always-idle behaviour it needs is
+compositor-specific, matching Hyprland while Smithay reinserts a timer, and the wakeup cost was
+never measured.

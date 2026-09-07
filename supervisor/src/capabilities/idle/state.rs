@@ -5,10 +5,11 @@
 //! the Supervisor dropped every threshold event: observed live with `systemd-inhibit --what=idle
 //! --who=mpv`, the screen said nothing. ADR-0141 adds the roster.
 //!
-//! [`IdleState::inhibited`] comes from `Manager.BlockInhibited`; [`IdleState::inhibitors`] names
-//! holders. The shell's own hold is excluded (see [`foreign_idle_inhibitors`]), which config can
-//! explain better than the `why` it passed down. Thus `inhibited` true with an empty list means
-//! only this shell holds the session awake.
+//! [`IdleState::inhibited`] is true for either kind of holder: a logind inhibitor named by
+//! `Manager.BlockInhibited`, or a Wayland surface inhibitor detected from the compositor's silence
+//! (ADR-0160). [`IdleState::inhibitors`] names holders. The shell's own hold is excluded (see
+//! [`foreign_idle_inhibitors`]), which config can explain better than the `why` it passed down.
+//! Thus `inhibited` true with an empty list means only this shell holds the session awake.
 
 use serde::Serialize;
 
@@ -24,10 +25,14 @@ pub struct IdleInhibitor {
 /// `oblisk.idle` payload (ADR-0141).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct IdleState {
-    /// Any idle inhibitor is held, including this shell. While true, no threshold event reaches
-    /// config, so its countdown must stop.
+    /// Anything is holding the session awake: a logind inhibitor including this shell's own, or
+    /// the compositor withholding idle notifications (ADR-0160). Either way no threshold event
+    /// arrives while it is true, so a countdown must stop -- but for different reasons. The logind
+    /// half is the Supervisor's own gate dropping events; the compositor half is the compositor
+    /// never sending them, and nothing in this process gates on it.
     pub inhibited: bool,
-    /// Idle-inhibitor holders other than this shell.
+    /// Idle-inhibitor holders other than this shell. A Wayland holder has an empty `who`, because
+    /// no protocol names one (ADR-0160).
     pub inhibitors: Vec<IdleInhibitor>,
 }
 

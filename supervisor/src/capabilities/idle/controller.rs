@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
+use wayland_client::Proxy;
 
 use super::gate::{IdleGate, blocks_idle};
 use super::inhibit::{
@@ -13,7 +14,7 @@ use super::inhibit::{
     apply_release_inhibit, cleanup_generation_inhibit,
 };
 use super::notify::{
-    NotifyState, cleanup_generation_thresholds, connect_wayland_idle, register_threshold_entry,
+    ListenerId, NotifyState, cleanup_generation_thresholds, connect_wayland_idle, register_threshold_entry,
     spawn_idle_event_forwarder,
 };
 use super::state::{IdleState, foreign_idle_inhibitors};
@@ -35,6 +36,60 @@ pub fn parse_inhibit_args(arguments: &[serde_json::Value]) -> Option<String> {
 /// compositor deadlock observed once at 60+ seconds without a timeout.
 const IDLE_NOTIFY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The two answers to "is anything holding the session awake", and the last payload built from
+/// them (ADR-0160).
+///
+/// Different tasks watch logind's `BlockInhibited` and the compositor's silence. Neither may
+/// publish a whole `IdleState`, which would erase what the other knows. Each sets its own field
+/// here and takes back a payload to send, or `None` when nothing moved.
+#[derive(Default)]
+pub struct PublishedIdle {
+    logind_blocked: bool,
+    logind_inhibitors: Vec<super::state::IdleInhibitor>,
+    wayland_inhibited: bool,
+    last_sent: IdleState,
+}
+
+impl PublishedIdle {
+    /// The merged payload. Nothing can name the compositor's half. No protocol lists
+    /// idle-inhibitor holders, and the withholding has causes besides a surface inhibitor (see
+    /// `notify::wayland_inhibited`). So it is an inhibitor with an empty `who`, the shape a config
+    /// already draws for a logind holder that gave none, and a `why` stating the observation.
+    fn merged(&self) -> IdleState {
+        let mut inhibitors = self.logind_inhibitors.clone();
+        if self.wayland_inhibited {
+            inhibitors.push(super::state::IdleInhibitor {
+                who: String::new(),
+                why: "the compositor is holding off idle notifications".to_string(),
+            });
+        }
+        IdleState { inhibited: self.logind_blocked || self.wayland_inhibited, inhibitors }
+    }
+
+    /// Records a change and returns the payload to send, or `None` when the answer is unchanged.
+    fn settle(&mut self) -> Option<IdleState> {
+        let next = self.merged();
+        if next == self.last_sent {
+            return None;
+        }
+        self.last_sent = next.clone();
+        Some(next)
+    }
+
+    /// `None` means the compositor gave no evidence this round, so the last answer stands; see
+    /// `notify::wayland_inhibited`.
+    pub(crate) fn set_wayland_inhibited(&mut self, held: Option<bool>) -> Option<IdleState> {
+        self.wayland_inhibited = held.unwrap_or(self.wayland_inhibited);
+        self.settle()
+    }
+
+    fn set_logind(&mut self, blocked: bool, inhibitors: Vec<super::state::IdleInhibitor>) -> Option<IdleState> {
+        self.logind_blocked = blocked;
+        self.logind_inhibitors = inhibitors;
+        self.settle()
+    }
+}
+
 #[derive(Clone)]
 pub struct IdleController {
     /// Registrations received while notify was [`NotifyState::Inert`], replayed when it becomes
@@ -49,7 +104,7 @@ pub struct IdleController {
     inhibit: Arc<LiveInhibit>,
     /// The last state [`watch_idle_inhibitors`] published, so `Capabilities::start` returns the
     /// current answer instead of `nil` until the next inhibitor (ADR-0141).
-    published: Arc<std::sync::Mutex<IdleState>>,
+    published: Arc<std::sync::Mutex<PublishedIdle>>,
 }
 
 impl IdleController {
@@ -68,18 +123,18 @@ impl IdleController {
         // Watch the always-present system bus separately: a held inhibitor matters even when
         // Wayland notify degraded to inert (ADR-0139).
         let gate = Arc::new(std::sync::Mutex::new(IdleGate::default()));
-        let published = Arc::new(std::sync::Mutex::new(IdleState::default()));
+        let published = Arc::new(std::sync::Mutex::new(PublishedIdle::default()));
         tokio::spawn(watch_idle_inhibitors(
             system_bus.clone(),
             gate.clone(),
             events_tx.clone(),
-            state_tx,
+            state_tx.clone(),
             published.clone(),
         ));
 
         let controller = Self {
             notify: notify.clone(),
-            published,
+            published: published.clone(),
             pending: Arc::new(std::sync::Mutex::new(Vec::new())),
             inhibit: Arc::new(LiveInhibit {
                 system_bus,
@@ -89,6 +144,7 @@ impl IdleController {
 
         let notify_for_task = notify.clone();
         let gate_for_task = gate.clone();
+        let published_for_task = published.clone();
         let controller_for_task = controller.clone();
         tokio::spawn(async move {
             let outcome =
@@ -96,7 +152,14 @@ impl IdleController {
                     .await;
             match outcome {
                 Ok(Ok(Ok((live, raw_events_rx)))) => {
-                    spawn_idle_event_forwarder(live.registry.clone(), gate_for_task, raw_events_rx, events_tx);
+                    spawn_idle_event_forwarder(
+                        live.registry.clone(),
+                        gate_for_task,
+                        published_for_task,
+                        raw_events_rx,
+                        events_tx,
+                        state_tx,
+                    );
                     *notify_for_task.write().unwrap() = NotifyState::Live(live);
                     eprintln!(
                         "idle: dedicated Wayland connection for ext_idle_notifier_v1 established; notify live for this run"
@@ -129,7 +192,7 @@ impl IdleController {
     /// Inhibitor state for the initial `Capabilities::start` push; without it quiet machines read
     /// `nil` forever (ADR-0076).
     pub fn snapshot(&self) -> IdleState {
-        self.published.lock().unwrap().clone()
+        self.published.lock().unwrap().merged()
     }
 
     /// Registers queued thresholds oldest first. Drain under the queue lock, then register outside
@@ -166,9 +229,21 @@ impl IdleController {
         if created_new_listener {
             let duration = Duration::from_secs(sec);
             let timeout_ms = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
-            let notification =
-                live.notifier.get_idle_notification(timeout_ms, &live.seat, &live.queue_handle, duration);
-            live.registry.lock().unwrap().listeners.insert(duration, notification);
+            let gated = ListenerId { duration, respects_inhibitors: true };
+            let notification = live.notifier.get_idle_notification(timeout_ms, &live.seat, &live.queue_handle, gated);
+            live.registry.lock().unwrap().listeners.insert(gated, notification);
+
+            // The twin the compositor may not withhold. Its only job is to prove that silence on
+            // the gated listener means an application is holding the session awake, rather than a
+            // seat that is simply in use (ADR-0160). Version 1 compositors have no such request,
+            // and degrade to the pre-ADR-0160 answer: `inhibited` reports logind only.
+            if live.notifier.version() >= 2 {
+                let input = ListenerId { duration, respects_inhibitors: false };
+                let notification =
+                    live.notifier.get_input_idle_notification(timeout_ms, &live.seat, &live.queue_handle, input);
+                live.registry.lock().unwrap().listeners.insert(input, notification);
+            }
+
             if let Err(err) = live.connection.flush() {
                 eprintln!("idle: failed to flush the get_idle_notification request for {sec}s: {err}");
             }
@@ -244,9 +319,9 @@ impl IdleController {
         }
     }
 
-    /// Notify and inhibit halves (ADR-0006/ADR-0032): everything `generation_id` owned, for a
-    /// generation that is gone. Closes the shared fd if it was the last holder. Uses the same
-    /// `state` lock as inhibit/release, serializing reload races.
+    /// Notify and inhibit halves of `reset_registrations` (ADR-0006/ADR-0032): everything
+    /// `generation_id` owned, for a generation that is gone. Closes the shared fd if it was the
+    /// last holder. Uses the same `state` lock as inhibit/release, serializing reload races.
     pub async fn reset_registrations(&self, generation_id: u32) {
         self.reset_thresholds(generation_id);
 
@@ -269,7 +344,7 @@ async fn watch_idle_inhibitors(
     gate: Arc<std::sync::Mutex<IdleGate>>,
     events_tx: UnboundedSender<shared::IdleEvent>,
     state_tx: UnboundedSender<IdleState>,
-    published: Arc<std::sync::Mutex<IdleState>>,
+    published: Arc<std::sync::Mutex<PublishedIdle>>,
 ) {
     let proxy = match Login1ManagerProxy::new(&system_bus).await {
         Ok(proxy) => proxy,
@@ -309,14 +384,9 @@ async fn watch_idle_inhibitors(
         } else {
             Vec::new()
         };
-        let next_state = IdleState { inhibited: blocked, inhibitors };
-        {
-            let mut held = published.lock().unwrap();
-            if *held == next_state {
-                continue;
-            }
-            *held = next_state.clone();
-        }
+        // Held across the send; see the matching comment in `spawn_idle_event_forwarder`.
+        let mut published = published.lock().unwrap();
+        let Some(next_state) = published.set_logind(blocked, inhibitors) else { continue };
         if state_tx.send(next_state).is_err() {
             return;
         }
