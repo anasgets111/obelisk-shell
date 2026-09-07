@@ -63,6 +63,7 @@ end, function()
     set_displays_powered(true)
     idle.since:set(0)
     idle.armed_at:set({})
+    idle.fired_at:set({})
 end)
 
 -- One pass per `oblisk.system` tick, once a second; the bar clock and `power_menu.lua` countdown
@@ -83,6 +84,13 @@ oblisk.system:on_change(function(s)
     end
     local settings = idle.read(store.idle:get())
     if not settings.enabled then
+        -- Clear on the way out, not just on the way in. Turning automation off mid-countdown used
+        -- to leave the stamp behind, so turning it back on resumed from where it stopped rather
+        -- than from now.
+        if next(idle.armed_at:get() or {}) ~= nil then
+            idle.armed_at:set({})
+            idle.fired_at:set({})
+        end
         return
     end
     local plan = idle.plan(settings, idle.profile_of(oblisk.power:get()))
@@ -100,7 +108,13 @@ oblisk.system:on_change(function(s)
     idle.armed_at:set(next_stamps)
 
     if armed and s.time - next_stamps[armed.key] >= armed.delay then
-        ACTIONS[armed.key]()
+        -- Once per arming. A stage that reports `done` is walked past on the next tick, but a
+        -- terminal one is still armed after it acts, so it would fire again every second.
+        local fired = idle.fired_at:get() or {}
+        if fired[armed.key] ~= next_stamps[armed.key] then
+            idle.fired_at:set({ [armed.key] = next_stamps[armed.key] })
+            ACTIONS[armed.key]()
+        end
     end
 end)
 

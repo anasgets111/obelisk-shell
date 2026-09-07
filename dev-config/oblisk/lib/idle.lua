@@ -246,6 +246,12 @@ idle.armed_at = state("idle_armed_at", {})
 --- Whether the displays are off because `modules/global/idle.lua` turned them off.
 idle.blanked = state("idle_blanked", false)
 
+--- The arming stamp each stage has already fired for, keyed by `stage.key`. `dpms` and `lock`
+--- report `done` once they act, so the walk moves past them. `suspend` is terminal and observes
+--- nothing, so without this it re-ran `systemctl suspend` every tick from the moment it came due
+--- until something ended the idle period.
+idle.fired_at = state("idle_fired_at", {})
+
 --- `IdleService.manualInhibit`: the bar button's own hold.
 idle.manual = state("idle_manual", false)
 
@@ -263,31 +269,32 @@ end
 --- the AC answer: a machine that cannot tell you it is on battery is plugged in.
 idle.active_profile = oblisk.power:map(idle.profile_of)
 
---- Human-readable hold reasons, or an empty list. Pure and payload-based so
+--- Reasons *this config* would take a logind hold for, or an empty list. Pure and payload-based so
 --- `modules/global/idle.lua`
 --- can use `on_change`'s value instead of a possibly stale `computed` in its callback.
+---
+--- Holds only, which is why foreign holders are absent. Taking our own inhibitor because another
+--- application holds one is a second block for one reason, and nothing released it: the writers
+--- watch privacy, mpris and storage, never `oblisk.idle`. A foreign holder disappearing left ours
+--- out for the life of the shell. [`idle.reasons`] adds them back for anything drawing the list.
 --- @param privacy table? `oblisk.privacy`'s payload
 --- @param mpris table? `oblisk.mpris`'s payload
 --- @param settings table the result of [`idle.read`]
 --- @param manual boolean
---- @param foreign table? `oblisk.idle` payload of holders not taken by this config
 --- @return string[]
-function idle.reasons_from(privacy, mpris, settings, manual, foreign)
+function idle.own_reasons(privacy, mpris, settings, manual)
     local reasons = {}
     if manual then
         reasons[#reasons + 1] = "manual"
     end
-    -- These reasons include holds this config did not take, such as `systemd-inhibit --what=idle`
-    -- or a browser call. The framework honored them since ADR-0139 but exposed them only with
-    -- ADR-0141; before that, the shell said "nothing is holding this awake" while holding every
-    -- threshold event.
-    for _, inhibitor in ipairs((foreign or {}).inhibitors or {}) do
-        reasons[#reasons + 1] = inhibitor.who ~= "" and inhibitor.who or "another application"
-    end
-    -- `automaticInhibitorActive`: video, camera, microphone, and screen capture, named separately
-    -- so
+    -- `automaticInhibitorActive`: video, camera, microphone and screen capture, named separately so
     -- "why is my laptop not sleeping" gets the actual reason rather than "media".
-    if settings.video_auto_inhibit then
+    --
+    -- Gated on the master switch, unlike `manual` above it. These hold off *our* stages, so with
+    -- automatic actions off there is nothing to hold, and a system-wide logind block would assert
+    -- idle policy this shell was told not to run. `manual` stays ungated, being an explicit press
+    -- with its own glyph.
+    if settings.enabled and settings.video_auto_inhibit then
         if media.is_playing_video(mpris) then
             reasons[#reasons + 1] = "video"
         end
@@ -307,11 +314,21 @@ function idle.reasons_from(privacy, mpris, settings, manual, foreign)
     return reasons
 end
 
---- [`idle.reasons_from`] over the live payloads, for anything that draws them.
+--- Everything holding the session awake, ours and anyone else's, for anything drawing the list.
+---
+--- Foreign entries are holds this config did not take: `systemd-inhibit --what=idle`, a browser
+--- call, or the compositor withholding notifications for a surface inhibitor (ADR-0160, which
+--- arrives with an empty `who`). The framework honored them from ADR-0139 and exposed them only in
+--- ADR-0141. Before that the shell said "nothing is holding this awake" while every threshold event
+--- was held.
 idle.reasons = computed(
     { oblisk.privacy, oblisk.mpris, store.idle, idle.manual, oblisk.idle },
     function(p, m, stored, manual, foreign)
-        return idle.reasons_from(p, m, idle.read(stored), manual, foreign)
+        local reasons = idle.own_reasons(p, m, idle.read(stored), manual)
+        for _, inhibitor in ipairs((foreign or {}).inhibitors or {}) do
+            reasons[#reasons + 1] = inhibitor.who ~= "" and inhibitor.who or "another application"
+        end
+        return reasons
     end
 )
 
@@ -331,12 +348,11 @@ end)
 function idle.sync_inhibit()
     -- Our hold is excluded from `oblisk.idle.inhibitors` by `foreign_idle_inhibitors`, so readback
     -- cannot make this function think it already holds one and skip acquiring it.
-    local reasons = idle.reasons_from(
+    local reasons = idle.own_reasons(
         oblisk.privacy:get(),
         oblisk.mpris:get(),
         idle.read(store.idle:get()),
-        idle.manual:get(),
-        oblisk.idle:get()
+        idle.manual:get()
     )
     local want = #reasons > 0
     if want == idle.holding:get() then
@@ -425,6 +441,14 @@ function idle.move(key, step)
     order[at], order[to] = order[to], order[at]
     idle.write(nil, "order", order)
 end
+
+--- The master switch on its own, for anything drawing "is automation running". A table constructor
+--- drops a trailing `nil`, so a missing name here shortened a dependency list silently rather than
+--- raising: `modules/bar/indicators/idle_inhibitor.lua` asked for four dependencies, got three, and
+--- read its fourth argument as `nil`, which made its countdown line unreachable.
+idle.enabled = store.idle:map(function(stored)
+    return idle.read(stored).enabled
+end)
 
 --- Current plan.
 idle.schedule = computed({ store.idle, idle.active_profile }, function(stored, profile)
