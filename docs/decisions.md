@@ -2940,3 +2940,37 @@ Amendment: the spring stays. Asked to rule on the paragraph above, the owner kep
 sentence about taking it back out is no longer a standing intent -- it records only that the code
 is separable, which is worth knowing and is not a plan. The gate it was measured against is
 untouched and still governs the next addition to that row.
+
+## 0155. The engine's test suite guards no `dev-config` component, because nineteen files nothing ships are sample usage and not product
+
+Six tests in `renderer/src/lua/mod.rs` loaded `dev-config/oblisk` to assert what
+`components/panel_card.lua`, `panel_header.lua`, `toggle.lua` and `panel_toggle_card.lua` build
+and how their `on_click` filters a button. The subject of every one of them was Lua that lives in
+the sample config. ADR-0154's test sweep moved four *engine* tests off that same load and left
+these behind, on the reading that fixing them meant building a Lua test runner first.
+
+1. **`share/starter` ships one file, and it is `shell.lua`.** The nineteen files under
+   `dev-config/oblisk/components/` are not installed, not referenced by the starter, and not part
+   of anything a user of this engine receives. They are how one config is written. A test suite
+   that fails when a sample is restyled is measuring the sample.
+2. **Every engine contract those six touched is already pinned by a fixture.** The one that is
+   not pure Lua is `on_click`'s second argument, and `wayland/input.rs` holds it three times over:
+   `on_click_takes_the_button_name_as_a_second_argument_beside_the_rect`,
+   `on_clicks_argument_is_the_buttons_rect_as_four_named_fields`, and the `BTN_RIGHT`/`BTN_MIDDLE`
+   name mapping. The six called the Lua handler directly from Rust, so they never reached the
+   engine's dispatch at all; what they tested was the component's own `if button == "left"`.
+3. **Deleted, not moved.** A Lua spec runner cannot be a standalone one: these components need
+   `panel`, `text`, `state` and the node builders, which exist only inside the engine's VM, so the
+   only host is a new engine subcommand next to `oblisk check`. That is new machinery whose whole
+   beneficiary is a sample. `just check` already parses every Lua file and type-checks
+   `dev-config` against `lua-meta`, which is what catches a component breaking structurally; the
+   rest is caught by running the shell, which is what a sample config is for.
+4. **`require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out` stays.** Its
+   subject really is the shipped tree: whether `?` substitution resolves a dotted `config.theme`
+   across directories, which a flat fixture cannot pose. That is the shape ADR-0154's sweep asked
+   for -- keep the load when the config is the thing under test.
+
+What this gives up is a guard on four components a live shell exercises daily, and the day any of
+them moves into `share/starter` it becomes product and the runner in decision 3 stops being
+machinery for a sample. Until then the boundary is that the engine tests the engine.
+
