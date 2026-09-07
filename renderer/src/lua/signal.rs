@@ -3,9 +3,9 @@
 //! with
 //! dependency values, not handles, so its body does not call `:get()` on declared deps.
 //!
-//! ponytail: `computed`/`map` recompute on every outermost `get`, with no invalidation graph across
-//! gets. [`EvaluationMemo`] collapses repeats *within* one evaluation; nothing caches *between*
-//! them, so the Watcher still decides when a value goes stale.
+//! ponytail: `computed`/`map` recompute on every layout pass, with no invalidation graph across
+//! passes. [`EvaluationMemo`] collapses repeats *within* one pass; nothing caches *between* them,
+//! so the Watcher still decides when a value goes stale.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -726,18 +726,24 @@ struct MemoTable(HashMap<MemoKey, Value>);
 /// filter twice for every row's `background` (`results` directly and again through `web_shown`),
 /// and a diamond of depth N evaluated its root 2^N times.
 ///
-/// Scoped to one evaluation, never across them: between two `get`s a `state`/`Live` cell may have
-/// changed, and nothing here observes that. Within one evaluation the memo also makes an impure
-/// closure (`os.clock()`, `math.random`) answer consistently on every path instead of differing by
-/// which dependency edge reached it.
+/// Scoped to one layout pass, never across them: between two passes a `state`/`Live` cell may have
+/// changed, and nothing here observes that. Within the scope the memo also makes an impure closure
+/// (`os.clock()`, `math.random`) answer consistently on every path instead of differing by which
+/// dependency edge reached it.
 ///
-/// ponytail: one evaluation is one property of one node, because `node::resolve_properties` calls
-/// [`Signal::get_value`] per property. The launcher's `results` therefore still runs once for
-/// `background`, once for `border_color`, and once for the label colour of every row, rather than
-/// once for the pass. Widening it to [`LayoutPassBudget`]'s scope is the next rung and would make
-/// that one call per pass; it is not taken here because `layout::scene` writes a `Scroll` cell
-/// mid-pass (`set_without_dirtying` for the clamp), so a pass-wide memo changes when a derived
-/// readout sees a clamp, and that wants measuring against a real config first.
+/// [`LayoutPassBudget`] opens the table, so one pass is the scope whenever a pass is running
+/// (ADR-0157): the launcher's `results` answers once for the pass rather than once for
+/// `background`, once for `border_color`, and once for the label colour of every row. Outside a
+/// pass -- startup evaluation, a `capability::CapabilityHandle::notify_change` handler -- the
+/// outermost `Computed` still owns it, which is what keeps a handler that `:set()`s between its
+/// own `:get()`s observing its own writes.
+///
+/// The cost is that `layout::scene` writes two cells mid-pass, and a derived readout of either now
+/// holds the value it had when the pass started rather than depending on where in the tree the
+/// reader sits: the `Scroll` clamp ([`LiveSignalHandle::set_quiet`], whose own contract already
+/// says a derived readout sees the clamp next pass) and the `geometry(name)` publish (whose move
+/// schedules the follow-up pass `Scene::settle_geometry` runs). Both settle on the next pass, and
+/// both were previously answered one way above the writer and another way below it.
 struct EvaluationMemo<'lua> {
     lua: &'lua Lua,
     /// Only the outermost holder installs and removes the table.
@@ -844,7 +850,9 @@ pub(crate) struct LayoutPassBudget<'lua> {
 }
 
 impl<'lua> LayoutPassBudget<'lua> {
-    /// Starts the pass clock and holds the hook across it, putting `__index` under a budget.
+    /// Starts the pass clock and holds the hook across it, putting `__index` under a budget. Also
+    /// opens the [`EvaluationMemo`] for the pass: a computed then answers once for every node and
+    /// property that reads it, instead of once per property (ADR-0157).
     pub(crate) fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
         if lua.app_data_ref::<PassDeadline>().is_none() {
             lua.set_app_data(PassDeadline::default());
@@ -853,6 +861,12 @@ impl<'lua> LayoutPassBudget<'lua> {
         acquire_hook(lua)?;
         lua.app_data_mut::<PassDeadline>().expect("just ensured the slot exists").0 =
             Some(Deadline::lasting(LAYOUT_PASS_CAP));
+        // Unconditional, like the deadline above it: only a `Computed` installs a memo and none is
+        // running when a pass starts, so there is never a table here to displace. Both fields
+        // assume one live budget for the same reason -- nesting two would have the inner `Drop`
+        // clear the outer's deadline as well -- and an `owner` flag on one of them would only
+        // suggest otherwise.
+        lua.set_app_data(MemoTable::default());
         Ok(Self { lua })
     }
 
@@ -866,6 +880,7 @@ impl<'lua> LayoutPassBudget<'lua> {
 impl Drop for LayoutPassBudget<'_> {
     fn drop(&mut self) {
         self.lua.app_data_mut::<PassDeadline>().expect("enter always runs before its Drop").0 = None;
+        self.lua.remove_app_data::<MemoTable>();
         release_hook(self.lua);
     }
 }
@@ -1203,6 +1218,92 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((before, after), (2, 42));
+    }
+
+    /// ADR-0157. `node::resolve_properties` reads one property at a time, so before the pass owned
+    /// the memo this shared computed ran once for every property of every node that reached it --
+    /// measured live at 1.35ms of CPU for a single cold getter, against a 5ms cap.
+    #[test]
+    fn a_computed_read_by_two_properties_in_one_pass_runs_its_body_once() {
+        let (lua, _dirty) = lua_with_state();
+        let runs: i64 = {
+            let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+            lua.load(
+                r#"
+                runs = 0
+                local n = state("n", 1)
+                shared = computed({ n }, function(v) runs = runs + 1 return v end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            // Two reads the way two properties of two nodes reach one signal, not one Lua chunk:
+            // each is its own outermost `get_value`, which is what used to open its own memo.
+            for _ in 0..4 {
+                lua.load("shared:get()").exec().unwrap();
+            }
+            lua.globals().get("runs").unwrap()
+        };
+        assert_eq!(runs, 1, "four outermost reads inside one pass are one evaluation");
+    }
+
+    /// The pass is the scope, not a cache across passes: the next pass has to see a `state` written
+    /// since, or a config would read its own writes one frame stale forever.
+    #[test]
+    fn the_next_pass_evaluates_again_rather_than_serving_the_last_ones_answer() {
+        let (lua, _dirty) = lua_with_state();
+        lua.load(
+            r#"
+            runs = 0
+            n = state("n", 1)
+            shared = computed({ n }, function(v) runs = runs + 1 return v end)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let first: i64 = {
+            let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+            lua.load("shared:get() shared:get()").exec().unwrap();
+            lua.globals().get("runs").unwrap()
+        };
+        lua.load("n:set(21)").exec().unwrap();
+        let second: i64 = {
+            let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+            lua.load("return shared:get()").eval().unwrap()
+        };
+
+        assert_eq!(first, 1, "the first pass evaluates once");
+        assert_eq!(second, 21, "the second pass sees the write, rather than the memo from the first");
+    }
+
+    /// ADR-0157's cost, stated as a test. `layout::scene` clamps a `Scroll` cell mid-pass with
+    /// `set_quiet`, and a derived readout evaluated before the clamp now keeps the pre-clamp answer
+    /// for the whole pass instead of depending on where in the tree the reader sits.
+    /// `LiveSignalHandle::set_quiet`'s own contract already says the clamp lands on a derived
+    /// readout next pass; this is what makes that true of every reader rather than some.
+    #[test]
+    fn a_cell_written_mid_pass_reaches_a_derived_readout_on_the_next_pass_not_this_one() {
+        let (lua, _dirty) = lua_with_state();
+        let signal: mlua::AnyUserData = lua.load(r#"return scroll("s")"#).eval().unwrap();
+        let scroll = from_userdata(&signal).unwrap();
+        lua.globals().set("offset", signal.clone()).unwrap();
+        lua.load(r#"readout = computed({ offset }, function(v) return v end)"#).exec().unwrap();
+
+        let during: f64 = {
+            let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+            lua.load("return readout:get()").eval::<f64>().unwrap();
+            // The clamp: derived from geometry this pass measured, so it does not dirty the scene.
+            scroll.scroll_handle().unwrap().set_quiet(Value::Number(120.0));
+            lua.load("return readout:get()").eval().unwrap()
+        };
+        let next: f64 = {
+            let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+            lua.load("return readout:get()").eval().unwrap()
+        };
+
+        assert_eq!(during, 0.0, "the reader that came first sets the pass's answer, wherever it sits in the tree");
+        assert_eq!(next, 120.0, "and the clamp lands on the next pass, which is what `set_quiet` promises");
     }
 
     /// A wide diamond must not spend nesting levels on cache hits: the memo is checked before

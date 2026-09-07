@@ -3025,3 +3025,52 @@ The roadmap row that recorded this said the drop was silent. It was not -- `recv
 a line naming the frame and both generations on every one. What was missing was anyone reading the
 log, which is the argument for the frame surviving rather than for a louder message.
 
+
+## 0157. The layout pass owns the evaluation memo, because a config's shared computed was answering once per property rather than once per pass
+
+ADR-0044 decision 3's ceiling was closed halfway. `EvaluationMemo` collapsed repeats within one
+evaluation, and `node::resolve_properties` calls `Signal::get_value` once per property, so one
+evaluation was one property of one node. A computed reached by twelve properties across four nodes
+ran its body twelve times a pass. `signal.rs` already named widening it "the next rung" and
+deferred it for want of a measurement against a real config.
+
+Here is the measurement. Every signal getter in a live `dev-config` shell was timed on
+`CLOCK_THREAD_CPUTIME_ID` under 40 spinners on 20 cores, the contention a `cargo build` on this
+machine produces:
+
+| | worst getter CPU | getters over 500us in ~20s |
+| :--- | ---: | ---: |
+| Per-property memo | 1.35 ms | 87 |
+| Per-pass memo | 0.57 ms | ~3 |
+
+Against the 5ms cap that is 3.7x headroom becoming 8.8x. The prompt was a real failure: a live
+`row.padding` on `components/expanding_pill.lua`'s cell -- a four-link chain through `linger`,
+`delay` and `hover` doing no real work -- exceeded 5ms once during a boot under a parallel build,
+and the scene kept its prior frame. `row.padding` measured 1.20ms cold, second worst of everything
+sampled.
+
+1. **`LayoutPassBudget::enter` opens the memo and its `Drop` closes it.** The scope was already
+   expressed as an RAII holder with an `owner` flag, so every `EvaluationMemo::enter` inside a pass
+   simply becomes a non-owner and the table outlives it. Four lines, two of them the set and the
+   remove. The pass takes the table unconditionally rather than claiming it behind an `owner` flag
+   of its own: no `Computed` is running when a pass starts, so there is nothing to displace, and
+   both of this budget's fields already assume one live holder -- nesting two would have the inner
+   `Drop` clear the outer's deadline too. A flag on one field and not the other would read as
+   nesting-safety that is not there.
+2. **Outside a pass nothing changes.** Startup evaluation and a `notify_change` handler still let
+   the outermost `Computed` own the table, which is what keeps a handler that `:set()`s between its
+   own `:get()`s observing its own writes.
+3. **The cost is that two mid-pass writers now land a pass later, for every reader rather than
+   some.** `layout::scene` writes a `Scroll` cell for the clamp and publishes a `geometry(name)`
+   rect, both while resolution is still walking the tree. A derived readout of either used to give
+   the pre-write answer above the writer and the post-write answer below it -- a split that
+   depended on where in the tree the reader sat and was documented nowhere. Now every reader gets
+   the value the pass started with. `LiveSignalHandle::set_quiet`'s own contract already said a
+   derived readout sees the clamp next pass, so this makes that sentence true instead of
+   approximately true, and `Scene::settle_geometry` already schedules the follow-up pass a moved
+   rect needs.
+
+Not built: caching across passes. Nothing here observes a `state` or `Live` cell changing between
+two passes, so the Watcher stays the thing that decides when a value is stale, and an invalidation
+graph is a different design rather than a wider scope.
+
