@@ -34,6 +34,7 @@ const NODE_KINDS: [&str; 13] = [
 const COMMON_PROPERTIES: &[&str] = &[
     "align_h",
     "align_v",
+    "animate",
     "cursor",
     "height",
     "hover",
@@ -546,7 +547,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 587, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 613, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when
@@ -555,6 +556,7 @@ mod meta_stub_tests {
     fn sample(field: &str, ty: &str) -> Option<String> {
         match (field, ty) {
             ("opacity", _) => return Some("0.5".to_string()),
+            ("animate", _) => return Some("{ opacity = 200 }".to_string()),
             ("border_color", "BorderColors") => return Some("{ top = \"#112233\" }".to_string()),
             ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
             // Inline table shapes have no alias.

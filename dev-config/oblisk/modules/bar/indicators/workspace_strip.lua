@@ -19,7 +19,8 @@
 -- a trailing empty workspace and needs no padding. The payload lists only existing workspaces;
 -- padding is this strip's `compositor`-keyed policy.
 --
--- Not mirrored: width animation and opacity fade; the engine cannot draw them.
+-- The ground and border ease between states (ADR-0145). Not mirrored: the strip's width animation
+-- on expand, because a dot's `visible` flips and a first value is taken as it is.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -101,6 +102,7 @@ local function workspace_button(ws)
         opacity = entry:map(function(current)
             return current.populated and 1 or theme.opacity.disabled
         end),
+        animate = { background = theme.animation_ms, border_color = theme.animation_ms, opacity = theme.animation_ms },
         visible = computed({ pill_hovered, is_active }, function(open, active)
             return open or active
         end),

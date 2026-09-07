@@ -38,7 +38,7 @@ Recommendations, not accepted API designs. Correctness comes before feature expa
 | Wayland/input extras | No shortcut inhibition, per-surface idle inhibition, touch gestures or cross-app drag/drop | Pick supported hardware/protocols and an actual consumer; logind inhibition is already available |
 | Runtime construction | Top-level declarations change through generation swaps | Keep current topology rules unless dynamic windows require a different lifetime model |
 | Fonts and localization | Global font chain; no per-node family or translation API; application names are unlocalized | Decide supported language/font requirements before expanding text and application metadata |
-| Animation | No animation API | Separate design track: retained-node interpolation, compositor frame gating and exit-resource lifetime; no full scene resolve per frame |
+| Animation | `animate` eases numbers and colours between resolved values (ADR-0145); no exit animation, looping/indeterminate motion, edge-table or transform tweens | Exit needs a node to outlive `visible = false` or a config timer; loops need a running-state model. Decide against a real consumer before adding either |
 
 ## Keep in config or use existing tools
 

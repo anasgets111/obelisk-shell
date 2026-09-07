@@ -9,7 +9,7 @@ use mlua::{Function, Lua, Table, Value};
 use shared::{
     LockOutcome, LockReport, PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize,
 };
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -184,6 +184,11 @@ pub struct App {
     /// field's surface. Without this flag, the mask or caret appears only on an unrelated repaint,
     /// once a second on a lock-screen clock.
     field_input_changed: bool,
+    /// A compositor frame callback landed for a surface whose tree was mid-tween (ADR-0145). The
+    /// poll loop takes it once per turn and advances every tween; `paint_surface` asks for the
+    /// next one while anything is still moving, which is what keeps the chain alive and lets it
+    /// die on its own when nothing is (ADR-0130 decision 3).
+    animation_frame_due: bool,
     /// Surfaces actually drawn and swapped since the last idle-profile sample; paint walks all
     /// mapped surfaces and declines most, so the aggregate count matters.
     surfaces_drawn: usize,
@@ -284,6 +289,7 @@ pub fn run(
         focused_text_field: None,
         secure_buffer: shared::SecureBuffer::new(),
         field_input_changed: false,
+        animation_frame_due: false,
         surfaces_drawn: 0,
     };
 
@@ -437,6 +443,14 @@ pub fn run(
         // Profiling adds three `clock_gettime` calls per turn for the resolve/repaint split.
         let mut phases = idle_profile::Phases::start(profile.is_some());
         let re_resolved = app.client.re_resolve_if_dirty();
+        // A frame callback is the tween clock (ADR-0145). Taken every turn so a callback that
+        // arrives with a push is answered by this repaint, not repeated next turn. A turn that
+        // re-resolved skips the tick: the pass's `retarget` already advanced every visible tween
+        // to its own instant, and the repaint asks for the next callback either way.
+        let ticked = std::mem::take(&mut app.animation_frame_due)
+            && !re_resolved
+            && app.client.tick_animations(std::time::Instant::now());
+        let re_resolved = re_resolved || ticked;
         phases.mark_resolve();
         // Take unconditionally so a keystroke arriving with a push is covered by this repaint, not
         // repeated next turn.
@@ -499,6 +513,7 @@ pub fn run(
                 idle_profile::Turn {
                     dispatched,
                     re_resolved,
+                    ticked,
                     typed,
                     decoded: !landed.is_empty(),
                     draws: draw_nonces.len(),

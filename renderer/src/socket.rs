@@ -591,6 +591,15 @@ impl RendererClient {
         dump_layout_if_asked(&self.scene);
         true
     }
+
+    /// One animation frame (ADR-0145): advances every tween to `now` and relays out the instances
+    /// that carry one, without reading `shell.lua` or any signal. Returns whether any tree changed.
+    /// Called from the poll loop when a compositor frame callback lands, the same turn position
+    /// as [`Self::re_resolve_if_dirty`] and for the same downstream (surface state, hover,
+    /// repaint).
+    pub fn tick_animations(&mut self, now: std::time::Instant) -> bool {
+        self.scene.tick(&self.instances, &self.shaping, self.loader.lua(), now)
+    }
 }
 
 /// `OBLISK_DUMP_LAYOUT=<instance id>` (e.g. `panel_host@eDP-1`) prints each visible node's kind,

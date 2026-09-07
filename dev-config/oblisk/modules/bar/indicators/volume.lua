@@ -2,9 +2,9 @@
 -- steps,
 -- middle-click mutes, and right-click opens the audio panel.
 --
--- Expansion is two properties, not animation. `hover` is an engine signal (ADR-0062), read by
--- `width` and the readout's `visible`; the mirror's 147ms tween snaps because the engine does not
--- interpolate properties between resolves.
+-- `hover` is an engine signal (ADR-0062), read by `width` and the readout's `visible`. The width
+-- and the ground ease over the mirror's 147ms through `animate` (ADR-0145); the percentage still
+-- appears at once, since `visible` is not a property a tween carries.
 --
 -- The whole control is `components/slider.lua`, matching the mirror's `Slider`; its accent fill
 -- runs
@@ -72,6 +72,7 @@ return slider {
     background = ground,
     color = fill,
     fill_visible = hovered,
+    animate = { width = theme.animation_ms, background = theme.animation_ms, border_color = theme.animation_ms },
     border_width = theme.border_width,
     border_color = computed({ hovered, panel_open }, function(is_hovered, open)
         if open then

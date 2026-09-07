@@ -168,9 +168,19 @@ tables do not resolve, so derive the whole table instead.
 | `cursor` | CSS cursor name; innermost explicit/default cursor wins |
 | `hover` | Handle from `hover(name)` |
 | `on_hover` | `function(inside)` on hover edges |
+| `animate` | `{ <property> = ms \| { duration = ms, easing = "<name>" } }`; named properties ease from the displayed value to a newly resolved one instead of snapping |
 
 Sizes and maximum sizes accept 0–8192 logical pixels. See
 [geometry parsing](../renderer/src/layout/node/style.rs).
+
+`animate` names numeric properties (`width`, `height`, `max_width`, `max_height`, `margin`,
+`padding`, `spacing`, `radius`, `border_width`, `opacity`, `font_size`, `size`) and colour
+properties (`background`, `border_color`, `foreground`). Durations are `(0, 60000]` ms. Easing
+names are QML's without the prefix: `Linear`, `InQuad`, `OutQuad`, `InOutQuad` (default),
+`InCubic`, `OutCubic`, `InOutCubic`, `OutBack`. A tween runs
+between the engine's own passes on compositor frame callbacks and reads no Lua; a first value, a
+`"Fill"`/percent/edge-table endpoint and a property `animate` stops naming all snap. Any other
+property is refused. See [tweens](../renderer/src/layout/node/animate.rs).
 
 Boxes, rows, columns, buttons and surface roots also accept `background`, `radius`,
 `border_color`, `border_width` and `clip`.

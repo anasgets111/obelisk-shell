@@ -21,8 +21,10 @@ const DEFAULT_INTERVAL_SECS: u64 = 10;
 pub struct Turn {
     /// `dispatch_pending` handed handlers a Wayland event.
     pub dispatched: bool,
-    /// `re_resolve_if_dirty` rebuilt the tree.
+    /// `re_resolve_if_dirty` rebuilt the tree, or a tween tick relaid it out.
     pub re_resolved: bool,
+    /// A compositor frame callback advanced a tween (ADR-0145); a subset of `re_resolved`.
+    pub ticked: bool,
     /// A keystroke changed a text field.
     pub typed: bool,
     /// A background image decode landed.
@@ -105,6 +107,7 @@ pub struct Counters {
     wake_neither: u64,
     dispatched: u64,
     re_resolved: u64,
+    ticked: u64,
     typed: u64,
     decoded: u64,
     draws: u64,
@@ -222,6 +225,7 @@ impl IdleProfile {
         }
         c.dispatched += u64::from(turn.dispatched);
         c.re_resolved += u64::from(turn.re_resolved);
+        c.ticked += u64::from(turn.ticked);
         c.typed += u64::from(turn.typed);
         c.decoded += u64::from(turn.decoded);
         c.draws += turn.draws as u64;
@@ -251,7 +255,7 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
     let spinning = c.turns >= 100 && c.idle_turns * 2 > c.turns;
     format!(
         "idle {:.1}s: turns={} idle={} cpu proc={:.2}% main={:.2}% | wake wl={} wake={} both={} none={} \
-         | work dispatch={} resolve={} type={} decode={} draw={} paint={} drawn={} \
+         | work dispatch={} resolve={} tick={} type={} decode={} draw={} paint={} drawn={} \
          | ms resolve={:.1} surfstate={:.1} repaint={:.1} dispatch={:.1} \
          | focus turns={} searched={} redundant={} ms={:.1} redundant={:.1} ({:.2}% of a core){}",
         secs,
@@ -265,6 +269,7 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
         c.wake_neither,
         c.dispatched,
         c.re_resolved,
+        c.ticked,
         c.typed,
         c.decoded,
         c.draws,

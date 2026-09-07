@@ -216,7 +216,12 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface, _time: u32) {}
+    /// A frame callback `App::paint_surface` requested because that surface's tree was mid-tween
+    /// (ADR-0145). One flag for every surface: the poll loop ticks the whole scene, and a second
+    /// output's callback in the same turn is absorbed by it.
+    fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface, _time: u32) {
+        self.animation_frame_due = true;
+    }
 
     fn surface_enter(
         &mut self,

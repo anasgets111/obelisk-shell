@@ -29,6 +29,7 @@ local theme = require("config.theme")
 ---@field background? Color|Bound Overrides `track`.
 ---@field border_width? integer
 ---@field border_color? Color|Bound
+---@field animate? Animations|Bound Eases the track's own properties; the fill follows the value and is not eased.
 ---@field hover? Signal
 ---@field visible? boolean|Bound
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") The left click still lands after the drag ends.
@@ -114,6 +115,7 @@ return function(opts)
         background = opts.background or opts.track or theme.SURFACE,
         border_width = opts.border_width,
         border_color = opts.border_color,
+        animate = opts.animate,
         hover = opts.hover,
         visible = opts.visible,
         on_click = opts.on_click,

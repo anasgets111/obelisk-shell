@@ -40,6 +40,9 @@
 ---@alias Length integer|"Fill" Pixels in `[0, 8192]`, or fill the available space.
 ---@alias Color string Hex `#RRGGBB` or `#RRGGBBAA`. Strict: no shorthand, no named colours.
 ---@alias BorderColors { top?: Color, right?: Color, bottom?: Color, left?: Color } Per-edge colours, the one edge table whose values are strings rather than pixels. A signal in an edge is refused: bind `border_color` itself instead.
+---@alias Easing "Linear"|"InQuad"|"OutQuad"|"InOutQuad"|"InCubic"|"OutCubic"|"InOutCubic"|"OutBack" QML's `Easing.Type` names without the prefix. `OutBack` overshoots and is clamped to the property's range.
+---@alias Animation integer|{ duration: integer, easing?: Easing } A duration in milliseconds, `(0, 60000]`, with `InOutQuad` when no easing is named.
+---@alias Animations { width?: Animation, height?: Animation, max_width?: Animation, max_height?: Animation, margin?: Animation, padding?: Animation, spacing?: Animation, radius?: Animation, border_width?: Animation, opacity?: Animation, font_size?: Animation, size?: Animation, background?: Animation, border_color?: Animation, foreground?: Animation } Which of this node's properties ease between values, and how. Numbers and colours only: `"Fill"`, a percentage or an edge table at either end snaps.
 
 ---@class NodeBase
 ---@field width? Length|Bound Pixels, or `"Fill"` to take what the parent has left. Omitted means the node sizes to its content.
@@ -52,6 +55,7 @@
 ---@field align_v? Align|Bound The same two jobs as `align_h`, swapped: main axis on a `column`, cross axis on a `row`.
 ---@field visible? boolean|Bound `false` keeps the node out of the constraint and paint passes, and out of its parent's spacing.
 ---@field opacity? number|Bound `[0, 1]`, default `1`. Inherited multiplicatively. Refused outside the range rather than clamped. A node at `0` still lays out and still takes pointer events.
+---@field animate? Animations|Bound QML's `Behavior on x`: when a pass resolves a new value for a named property, the node eases from what it shows to the new value over the duration instead of snapping, and keeps easing between passes without running any Lua (ADR-0145). Only a node that already exists animates; a first value is taken as it is. Naming a property no tween carries is refused.
 ---@field id? string Reconciliation hint, unique among siblings. Not addressable from Lua and has no effect on layout or paint (ADR-0045).
 ---@field hover? Bound The signal `hover(name)` returned. Marks this node's box as that slot's region.
 ---@field cursor? Cursor|Bound The shape the pointer takes over this node. Omitted means the node decides by what it is: a `button` with an `on_click` and a link's own words are `"pointer"`, a `textfield` is `"text"`, everything else is the arrow. Set it for the exceptions: `"default"` on a control that is off, `"grab"` on a handle, `"not-allowed"` on something refused. The innermost node under the pointer that says anything wins, so a `cursor` on a card still yields to a link in its body (ADR-0107).

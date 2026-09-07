@@ -117,6 +117,7 @@ mod tests {
             properties.insert("on_hover".to_string(), on_hover);
         }
         ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),
             kind: "row".to_string(),

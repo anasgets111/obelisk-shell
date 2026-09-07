@@ -76,6 +76,8 @@ Current project vocabulary. Implementation contracts live in [docs](docs/oblisk-
 
 **Frame gating**: Permission to repaint only when compositor pacing permits it and the surface's display content has changed. _Avoid_: vsync, throttling, damage
 
+**Tween**: A retained node's property in flight between the value it displayed and the target a pass resolved, advanced per compositor frame callback without Lua. _Avoid_: animation object, transition, Behavior
+
 ## Ownership
 
 **Lock authority**: The Supervisor's decision to acquire the lock and authorize its authenticated release. _Avoid_: lock screen, lock client

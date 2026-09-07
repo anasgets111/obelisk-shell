@@ -7,6 +7,7 @@
 //! to another signal errors rather than reading again, while `MAX_TREE_DEPTH` bounds recursive
 //! tree construction.
 
+mod animate;
 mod content;
 mod paint_style;
 mod spec;
@@ -23,6 +24,9 @@ use content::{
 use spec::parse_secure_submit;
 use style::{parse_background, parse_border_color, parse_border_width, parse_clip, parse_radius};
 
+#[cfg(test)]
+pub use animate::Animatable;
+pub use animate::{Tween, advance, retarget};
 pub use content::{
     Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
     segments,

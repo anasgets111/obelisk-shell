@@ -2523,3 +2523,54 @@ A named family is never coverage for the declared chain, though the declared fam
 every named one. Plain text must not drift into whichever family some unrelated node happened to
 name; a node that named a display font and then drew prose in it should still get glyphs that font
 lacks.
+
+## 0145. `animate` is per-property tweening on the retained node, ticked by compositor frame callbacks, never by Lua
+
+QML's `Behavior on width { NumberAnimation { duration; easing.type } }` is what every shell config
+reaches for: the reference config has 34 `Behavior on` blocks, on `color`, `opacity`, `width`,
+`x`, `border.color` and a few layout sizes, with `InOutQuad` and `OutCubic` at 100-250 ms. That is
+implicit animation, and it maps onto this tree's existing structure without a new object model:
+
+1. A node names what eases: `animate = { width = 147, background = { duration = 147, easing =
+   "OutCubic" } }`. The table is an ordinary property, so it may be a signal (a direction-dependent
+   easing derives the whole table, per § 5.1's nested-signal rule). Numbers and colours only;
+   `"Fill"`, a percentage and an edge table snap, and a property outside the list is refused so a
+   typo fails the pass.
+2. The tween lives on the `ResolvedNode`, under the identity reconciliation already keeps
+   (ADR-0099, ADR-0130 decision 5). `properties` holds the displayed value; each `Tween` holds the
+   target. When a pass resolves a target that differs from the retained one, the node starts a
+   tween from the value on screen, which is what the retained map holds after the last pass or
+   tick, whether that was at rest or mid-flight. An unchanged target keeps the running tween, so
+   the whole-scene re-resolve every signal write causes (ADR-0044 decision 2) does not restart
+   motion. A first value is taken as it is, as QML does.
+3. Between passes, `Scene::tick` advances every tween and lays the instance out again from the
+   retained property maps: same parsers, same solver, same frozen-when-hidden rule, but no signal
+   read, no item function, no id allocated. This is ADR-0131's "interpolate retained state and
+   repaint": a resolve costs 1.4 ms release median before layout, a retained relayout only the
+   solver and the memoized measurements.
+4. The clock is the compositor's. `paint_surface` requests a `wl_surface.frame` callback before
+   the commit only while that surface's tree is mid-tween; the callback sets one flag the poll
+   loop takes on its next turn. Nothing is armed when nothing moves, so ADR-0124's timeout-free
+   poll stays that way and ADR-0130 decision 3 holds. Progress is elapsed time since the pass
+   that started the tween, never accumulated frame deltas (ADR-0130 decision 2). A mid-tween
+   surface commits even an unchanged display list, because a frame request is only answered after
+   a commit.
+5. Overshooting easings (`OutBack`) are clamped into the property's legal range, so a `width`
+   easing to `0` never hands the parser a negative. The default easing is `InOutQuad`, the
+   reference config's most-used, not QML's `Linear`.
+
+Rejected: an animated signal (`animated(signal, spec)`) whose value tweens. Reading it means a
+Lua resolve of the whole scene per frame, the thing ADR-0131 measured out. Rejected: a per-frame
+Lua callback (Noctalia's animator) for the same reason and because config authors this UI, not
+native widgets (ADR-0130 decision 4). Rejected: a generic timer as the tween clock; frame callbacks
+are pacing the compositor already provides.
+
+Not built, each waiting on a consumer: exit animation (`visible = false` removes the node the
+same pass; a fade-out needs the node to outlive its `visible` or a config timer, the "exit-resource
+lifetime" the roadmap named), looping or indeterminate motion (a running-state model, not a
+target), edge-table and per-edge tweens (writing a table back per frame), transforms (no `x`,
+`y`, `scale` exist to tween). One flag ticks the whole scene, so two outputs at different refresh
+rates tick every animated surface at the union rate. A tween starts from whichever retained node
+ADR-0045 paired the fresh one with, so id-less animated siblings ripple when one is removed; give
+them ids or a `list` key. A hidden subtree's tweens are frozen with it and do not count as
+animating; the thaw's retarget settles them.

@@ -643,16 +643,21 @@ impl App {
         // because the clock's seconds digit advanced (ADR-0044 decision 2's global dirty flag).
         // An absent tree becomes an empty list and still reaches clear/swap to erase old contents.
         let tree = self.client.scene().surface(&surface_id);
+        let animating = tree.is_some_and(layout::ResolvedNode::animating);
         // End the immutable field-focus borrow before mutably borrowing the painter; `Draw::Text`
         // owns its string.
         let list = {
             let focus = self.field_focus_for(&surface_id);
             tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
         };
-        if self.surfaces[index]
-            .last_painted
-            .as_ref()
-            .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list)
+        // A mid-tween surface always commits, even an unchanged list: the frame callback below
+        // is only answered after a commit, and a tween whose first tick moved nothing visible
+        // would otherwise never get its second (ADR-0145).
+        if !animating
+            && self.surfaces[index]
+                .last_painted
+                .as_ref()
+                .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list)
         {
             return;
         }
@@ -712,6 +717,12 @@ impl App {
             layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
         }
 
+        // Before the swap, which is the commit it has to precede. Requested only while a tween is
+        // running, so an idle shell arms nothing and the loop's timeout-free poll stays that way
+        // (ADR-0124, ADR-0130 decision 3).
+        if animating && let Some(surface) = self.surfaces[index].role.wl_surface() {
+            surface.frame(&self.queue_handle, FrameCallbackData(surface.clone()));
+        }
         if let Err(e) = egl.instance.swap_buffers(egl.display, egl_surface) {
             log_bind_failure(&surface_id, "eglSwapBuffers", e);
             self.exit = true;

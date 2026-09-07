@@ -197,6 +197,7 @@ mod tests {
 
     fn node(kind: &str, (x, y, width, height): (f32, f32, f32, f32), children: Vec<ResolvedNode>) -> ResolvedNode {
         ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),
             kind: kind.to_string(),

@@ -277,6 +277,10 @@ theme.battery_pill_width = s(80, 60)
 -- Width when the pointer hovers the volume control; it leaves room for the percentage. Collapsed
 -- width is `item_width`.
 theme.volume_expanded_width = s(120, 90)
+-- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The easing is
+-- the engine's default, `InOutQuad`, which is also the mirror's most-used. Its `animationFast`/
+-- `animationSlow` have no consumer here yet.
+theme.animation_ms = 147
 -- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`: bar
 -- panels share one card in `modules/shell/panel_host.lua`; ADR-0110 makes it as tall as the panel.
 -- Each list is capped at `Math.min(contentHeight, Theme.itemHeight * 7)`, then scrolls.

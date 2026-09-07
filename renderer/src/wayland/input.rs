@@ -1564,6 +1564,7 @@ mod tests {
             properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
         }
         layout::ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             // Distinct per node, since `focused_field` now reads an identity off one of these and
             // a shared id would make every hand-built field the same field.

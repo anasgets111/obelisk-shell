@@ -6,11 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::Instant;
 
 use mlua::{Lua, Value};
 
 use crate::layout::instance::SurfaceInstance;
-use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, SizeMode, StyleRun};
+use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, SizeMode, StyleRun, Tween};
 use crate::lua::nodes::VirtualNode;
 use crate::text::shaping::{self, ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
@@ -135,9 +136,22 @@ pub struct ResolvedNode {
     /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
     pub paint: Option<PaintStyle>,
     pub children: Vec<ResolvedNode>,
+    /// Properties in flight between two resolved targets (ADR-0145). `properties` holds what is
+    /// displayed this frame, each tween the target it is heading for; `Scene::tick` advances them
+    /// between passes and `node::retarget` reconciles them against the next pass's values.
+    pub tweens: Vec<Tween>,
 }
 
 impl ResolvedNode {
+    /// Whether any visible node in this tree is mid-tween, which is what asks the compositor for
+    /// another frame callback (`wayland::surface::App::paint_surface`). A hidden node's subtree is
+    /// frozen (ADR-0124), tweens included: nothing advances them, so counting them would arm a
+    /// callback chain that never ends. They wait there and the thaw's `node::retarget` settles
+    /// them.
+    pub fn animating(&self) -> bool {
+        self.visible && (!self.tweens.is_empty() || self.children.iter().any(ResolvedNode::animating))
+    }
+
     /// This node's margin along `axis`, both edges.
     fn margin_on(&self, axis: MainAxis) -> f32 {
         match axis {
@@ -213,6 +227,8 @@ impl Scene {
     ) -> Result<(), LayoutError> {
         let next_id_snapshot = self.next_id;
         let surfaces_snapshot = self.surfaces.clone();
+        // One clock reading for the pass, so every tween it starts shares a start.
+        let now = Instant::now();
 
         // One budget for the whole pass: the hook covers gaps where a resolved table's `__index`
         // runs, and individually legal 5ms getters cannot add up without a pass deadline.
@@ -226,7 +242,7 @@ impl Scene {
             |outcome: LayoutError| if budget.exceeded() { LayoutError::PassBudgetExceeded } else { outcome };
 
         for instance in instances {
-            if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua) {
+            if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua, now) {
                 self.surfaces = surfaces_snapshot;
                 self.next_id = next_id_snapshot;
                 // Blame first: a hook interruption is about the pass, not this instance.
@@ -258,6 +274,7 @@ impl Scene {
         instance: &SurfaceInstance,
         shaping: &ShapingHandle,
         lua: &Lua,
+        now: Instant,
     ) -> Result<(), LayoutError> {
         // Match the declared id, then key the retained tree by instance id (ADR-0045 decision 1).
         let mut fresh = None;
@@ -284,52 +301,54 @@ impl Scene {
         // that parses their margin before recursing.
         ensure_node_admissible(&fresh.kind, 0)?;
         let properties = node::resolve_properties(&fresh.properties, &fresh.kind, lua)?;
-        let properties = build_child_for_output(properties, &fresh.kind, &instance.output)?;
+        let mut properties = build_child_for_output(properties, &fresh.kind, &instance.output)?;
+        let tweens = node::retarget(existing.as_ref().map(tween_state), &mut properties, now, lua)?;
         // The root has no parent, so its once-per-node parse happens here; children parse in the
         // parent's loop.
         let style = LayoutStyle::parse(&properties)?;
-        // An unsized `window` or `lock` root is its configured surface. `available` is the
-        // compositor's `xdg_toplevel` configure size, already converted by `set_instance_size`.
-        // A window's `Content`
-        // default used to give children a zero budget, so `child = column { width = "Fill" }`
-        // painted a 0x0 tree into niri's configured 1920x1168 tile. A lock has no width/height
-        // (`lock_spec` refuses both), so the same default produced a transparent buffer over a
-        // locked session, the passwordless black screen ADR-0052 decision 3 rejects. Override only
-        // the `Content` axes; a window's explicitly supplied fields remain honoured.
-        let forced = if matches!(fresh.kind.as_str(), "window" | "lock") {
-            (
-                (style.width_mode == SizeMode::Content).then_some(available.width),
-                (style.height_mode == SizeMode::Content).then_some(available.height),
-            )
-        } else {
-            (None, None)
-        };
 
         // Taffy trees are per-instance and per-pass; only retained `NodeId`s cross the call, so a
         // failed walk drops the temporary tree without extra rollback state.
-        let mut tree: taffy::TaffyTree<Measure> = taffy::TaffyTree::new();
-        // Geometry stays fractional until `layout::text::snap` applies the surface scale at paint.
-        // Taffy otherwise rounds layouts to whole numbers.
-        tree.disable_rounding();
-        let prepared = prepare(self, &mut tree, existing, &fresh.kind, properties, style, None, lua, 0)?;
-
-        // Patch the root after the walk: its `Fill`/`Percent` resolve against configured room
-        // because it has no parent; descendants take size from the solver.
-        let mut root_style = tree.style(prepared.taffy).map_err(taffy_failed)?.clone();
-        root_style.size = taffy::Size {
-            width: match forced.0.or_else(|| resolve_non_content(style.width_mode, available.width)) {
-                Some(width) => taffy::Dimension::length(width),
-                None => taffy::Dimension::auto(),
-            },
-            height: match forced.1.or_else(|| resolve_non_content(style.height_mode, available.height)) {
-                Some(height) => taffy::Dimension::length(height),
-                None => taffy::Dimension::auto(),
-            },
-        };
-        tree.set_style(prepared.taffy, root_style).map_err(taffy_failed)?;
-        solve(&mut tree, prepared.taffy, available, shaping)?;
-        self.surfaces.insert(key, finish(&tree, prepared, shaping)?);
+        let mut tree = new_solver_tree();
+        let prepared = prepare(self, &mut tree, existing, &fresh.kind, properties, style, tweens, None, lua, now, 0)?;
+        self.surfaces.insert(key, solve_instance(&mut tree, prepared, available, shaping)?);
         Ok(())
+    }
+
+    /// Advances every tween to `now` and lays the affected instances out again from their retained
+    /// property maps, without running Lua (ADR-0145): the only Lua the retained walk touches is a
+    /// plain table read. Returns whether any tree changed. An instance whose relayout fails keeps
+    /// its last tree and loses its tweens, so a bug there is one log line and a snap rather than a
+    /// log line per frame; the values a tick writes are ones a pass already accepted, so that
+    /// should not happen.
+    pub fn tick(&mut self, instances: &[SurfaceInstance], shaping: &ShapingHandle, lua: &Lua, now: Instant) -> bool {
+        // The retained maps keep a resolved edge table's handle, so its `__index` runs on the
+        // parse a tick repeats; the pass budget is what bounds it here as in `apply_admitting`.
+        let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
+            Ok(budget) => budget,
+            Err(err) => {
+                eprintln!("[oblisk-renderer] tick: no pass budget, skipping the frame: {err}");
+                return false;
+            }
+        };
+        let mut relaid = false;
+        for instance in instances {
+            let key = instance.instance_id.as_str();
+            let Some(retained) = self.surfaces.get_mut(key).filter(|tree| tree.animating()) else { continue };
+            // ponytail: the clone is the rollback for a failure that should not happen; the same
+            // shape `apply_admitting` uses per pass. Drop it once a tick has never failed in use.
+            let outcome = relayout_retained(retained.clone(), instance.available, shaping, lua, now)
+                .and_then(|tree| if budget.exceeded() { Err(LayoutError::PassBudgetExceeded) } else { Ok(tree) });
+            match outcome {
+                Ok(tree) => *retained = tree,
+                Err(err) => {
+                    eprintln!("[oblisk-renderer] {key}: relaying out a tween failed, snapping it: {err}");
+                    strip_tweens(retained);
+                }
+            }
+            relaid = true;
+        }
+        relaid
     }
 
     /// One surface instance's resolved tree, by its `"{id}@{output}"` instance id
@@ -478,6 +497,124 @@ fn resolve_non_content(mode: SizeMode, available: f32) -> Option<f32> {
     }
 }
 
+/// What `node::retarget` reads off a retained node.
+fn tween_state(node: &ResolvedNode) -> (&[Tween], &HashMap<String, Value>) {
+    (&node.tweens, &node.properties)
+}
+
+fn strip_tweens(node: &mut ResolvedNode) {
+    node.tweens.clear();
+    node.children.iter_mut().for_each(strip_tweens);
+}
+
+/// A per-pass solver tree. Geometry stays fractional until `layout::text::snap` applies the
+/// surface scale at paint; taffy otherwise rounds layouts to whole numbers.
+fn new_solver_tree() -> taffy::TaffyTree<Measure> {
+    let mut tree = taffy::TaffyTree::new();
+    tree.disable_rounding();
+    tree
+}
+
+/// The root's size, the solve and the read-back, shared by a pass and a tick.
+///
+/// Patch the root after the walk: its `Fill`/`Percent` resolve against configured room because it
+/// has no parent; descendants take size from the solver.
+fn solve_instance(
+    tree: &mut taffy::TaffyTree<Measure>,
+    prepared: PreparedNode,
+    available: LogicalSize,
+    shaping: &ShapingHandle,
+) -> Result<ResolvedNode, LayoutError> {
+    let style = prepared.style;
+    let forced = forced_root_size(&prepared.kind, &style, available);
+    let mut root_style = tree.style(prepared.taffy).map_err(taffy_failed)?.clone();
+    root_style.size = taffy::Size {
+        width: match forced.0.or_else(|| resolve_non_content(style.width_mode, available.width)) {
+            Some(width) => taffy::Dimension::length(width),
+            None => taffy::Dimension::auto(),
+        },
+        height: match forced.1.or_else(|| resolve_non_content(style.height_mode, available.height)) {
+            Some(height) => taffy::Dimension::length(height),
+            None => taffy::Dimension::auto(),
+        },
+    };
+    tree.set_style(prepared.taffy, root_style).map_err(taffy_failed)?;
+    solve(tree, prepared.taffy, available, shaping)?;
+    finish(tree, prepared, shaping)
+}
+
+/// A `window` or `lock` root with no size of its own is its configured surface, on the `Content`
+/// axes only. `available` is the compositor's `xdg_toplevel` configure size, already converted by
+/// `set_instance_size`. A window's `Content` default used to give children a zero budget, so
+/// `child = column { width = "Fill" }` painted a 0x0 tree into niri's configured 1920x1168 tile. A
+/// lock has no width/height (`lock_spec` refuses both), so the same default produced a transparent
+/// buffer over a locked session, the passwordless black screen ADR-0052 decision 3 rejects.
+fn forced_root_size(kind: &str, style: &LayoutStyle, available: LogicalSize) -> (Option<f32>, Option<f32>) {
+    if matches!(kind, "window" | "lock") {
+        (
+            (style.width_mode == SizeMode::Content).then_some(available.width),
+            (style.height_mode == SizeMode::Content).then_some(available.height),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+/// One instance laid out again from what it retained, its tweens advanced to `now`. The Lua-free
+/// twin of `Scene::apply_one_instance` plus [`prepare`]: no signal is read, no item function
+/// called, no id allocated; every node keeps its identity and its resolved values, and only the
+/// properties a tween carries move.
+fn relayout_retained(
+    root: ResolvedNode,
+    available: LogicalSize,
+    shaping: &ShapingHandle,
+    lua: &Lua,
+    now: Instant,
+) -> Result<ResolvedNode, LayoutError> {
+    let mut tree = new_solver_tree();
+    let prepared = prepare_retained(&mut tree, root, None, lua, now)?;
+    solve_instance(&mut tree, prepared, available, shaping)
+}
+
+/// [`prepare`] over a retained tree instead of a fresh one: same parse, same solver node, same
+/// frozen-when-hidden rule, but the children are the ones the node already has and the tweens
+/// are advanced rather than reconciled.
+fn prepare_retained(
+    tree: &mut taffy::TaffyTree<Measure>,
+    mut node: ResolvedNode,
+    parent_axis: Option<MainAxis>,
+    lua: &Lua,
+    now: Instant,
+) -> Result<PreparedNode, LayoutError> {
+    node::advance(&mut node.tweens, &mut node.properties, now, lua)?;
+    let style = LayoutStyle::parse(&node.properties)?;
+    let ResolvedNode { id, kind, properties, children, tweens, .. } = node;
+    let paint = node::paint_style(&kind, &properties)?;
+    let measure = measure_for(&kind, paint.as_ref(), &properties)?;
+    let taffy_id = new_solver_node(tree, &kind, &properties, &style, parent_axis, measure)?;
+    let mut node = PreparedNode {
+        id,
+        kind,
+        style,
+        properties,
+        paint,
+        taffy: taffy_id,
+        children: Vec::with_capacity(if style.visible { children.len() } else { 0 }),
+        frozen: children,
+        tweens,
+    };
+    if !node.style.visible {
+        return Ok(node);
+    }
+    let own_axis = main_axis_of(&node.kind, &node.properties)?;
+    for child in std::mem::take(&mut node.frozen) {
+        node.children.push(prepare_retained(tree, child, own_axis, lua, now)?);
+    }
+    let child_ids: Vec<taffy::NodeId> = node.children.iter().map(|child| child.taffy).collect();
+    tree.set_children(taffy_id, &child_ids).map_err(taffy_failed)?;
+    Ok(node)
+}
+
 /// Pairs children by identity (ADR-0045 decisions 1-2): an `id` matches only the same `id`, while
 /// id-less children match positionally among other id-less children. An id miss is new, never a
 /// positional fallback, so it cannot inherit an unrelated `NodeId`/subtree. Unclaimed retained
@@ -589,6 +726,7 @@ struct PreparedNode {
     /// (ADR-0124): not rebuilt, not laid out, not dropped. `children` is empty whenever this is
     /// not.
     frozen: Vec<ResolvedNode>,
+    tweens: Vec<Tween>,
 }
 
 /// `Content` and `Fill` map to taffy's `auto`; `Fill` gets its meaning from parent flow and
@@ -775,6 +913,38 @@ fn new_solver_node(
     .map_err(taffy_failed)
 }
 
+/// What the solver asks a leaf for its size with, for the two kinds whose size is their content.
+fn measure_for(
+    kind: &str,
+    paint: Option<&PaintStyle>,
+    properties: &HashMap<String, Value>,
+) -> Result<Option<Measure>, LayoutError> {
+    Ok(match flow_kind(kind, properties)? {
+        // `node::paint_style` gives every `text` a `PaintStyle::Text` and `flow_kind` cannot route
+        // another kind here, so the arm is total, the same shape as `children_of`'s
+        // `unreachable!`.
+        "text" => {
+            let Some(PaintStyle::Text { content, runs, font_size, font, wrap, max_lines, .. }) = paint else {
+                unreachable!("a `text` node always carries a `PaintStyle::Text`")
+            };
+            Some(Measure::Text {
+                content: content.clone(),
+                runs: runs.clone(),
+                font_size: *font_size,
+                font: font.clone(),
+                wrap: *wrap,
+                max_lines: *max_lines,
+            })
+        }
+        "icon" => Some(Measure::Square(node::parse_icon_size(properties)?)),
+        // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
+        // decoding it, and this pass has no canvas to decode against and runs on every
+        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it, measuring
+        // nothing without one, the same as an empty `rect`.
+        _ => None,
+    })
+}
+
 /// The first of the two walks: identity, resolution, parsing and tree construction, in the order
 /// the config wrote the nodes.
 ///
@@ -794,8 +964,10 @@ fn prepare(
     kind: &str,
     properties: HashMap<String, Value>,
     style: LayoutStyle,
+    tweens: Vec<Tween>,
     parent_axis: Option<MainAxis>,
     lua: &Lua,
+    now: Instant,
     depth: u32,
 ) -> Result<PreparedNode, LayoutError> {
     // Already run by whoever resolved `properties` (that is the ordering `ensure_node_admissible`
@@ -810,30 +982,7 @@ fn prepare(
     // Before the children, because a `text`'s measurement reads the `content` and `font_size`
     // parsed here rather than parsing them a second time.
     let paint = node::paint_style(kind, &properties)?;
-    let measure = match flow_kind(kind, &properties)? {
-        // `node::paint_style` gives every `text` a `PaintStyle::Text` and `flow_kind` cannot route
-        // another kind here, so the arm is total, the same shape as `children_of`'s
-        // `unreachable!`.
-        "text" => {
-            let Some(PaintStyle::Text { content, runs, font_size, font, wrap, max_lines, .. }) = paint.as_ref() else {
-                unreachable!("a `text` node always carries a `PaintStyle::Text`")
-            };
-            Some(Measure::Text {
-                content: content.clone(),
-                runs: runs.clone(),
-                font_size: *font_size,
-                font: font.clone(),
-                wrap: *wrap,
-                max_lines: *max_lines,
-            })
-        }
-        "icon" => Some(Measure::Square(node::parse_icon_size(&properties)?)),
-        // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
-        // decoding it, and this pass has no canvas to decode against and runs on every
-        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it, measuring
-        // nothing without one, the same as an empty `rect`.
-        _ => None,
-    };
+    let measure = measure_for(kind, paint.as_ref(), &properties)?;
 
     // Before the children, so their ids attach afterwards, and so the `taffy::Style` behind it is
     // gone from the stack by the time this frame recurses (see `new_solver_node`).
@@ -845,24 +994,26 @@ fn prepare(
     // gave the node `Display::None`, so nothing below it could have reached the layout anyway,
     // and `paint`, `hit` and `overlay_input_regions` stop at a hidden node. Before this, a closed
     // picker of fifty tiles was rebuilt on every push of every capability, the clock's included.
-    if !style.visible {
-        return Ok(PreparedNode {
-            id,
-            kind: kind.to_string(),
-            style,
-            properties,
-            paint,
-            taffy: taffy_id,
-            children: Vec::new(),
-            frozen: old_children,
-        });
+    let mut node = PreparedNode {
+        id,
+        kind: kind.to_string(),
+        style,
+        properties,
+        paint,
+        taffy: taffy_id,
+        children: Vec::new(),
+        frozen: old_children,
+        tweens,
+    };
+    if !node.style.visible {
+        return Ok(node);
     }
 
-    let fresh_children = children_of(kind, &properties)?;
-    let matched_candidates = pair_children_by_id_then_position(&fresh_children, old_children)?;
-    let own_axis = main_axis_of(kind, &properties)?;
+    let fresh_children = children_of(kind, &node.properties)?;
+    let matched_candidates = pair_children_by_id_then_position(&fresh_children, std::mem::take(&mut node.frozen))?;
+    let own_axis = main_axis_of(kind, &node.properties)?;
 
-    let mut children = Vec::with_capacity(fresh_children.len());
+    node.children.reserve(fresh_children.len());
     for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
         // Before this child's own getters run, not after: resolving its property map calls back
         // into Lua, and a child the walk is about to refuse must not execute anything on the way
@@ -874,35 +1025,29 @@ fn prepare(
 
         // This child's one resolve and one parse for this pass, both here rather than inside the
         // recursive call, because the style the call is handed is built from them and a second
-        // read of an impure `margin` could answer differently.
-        let child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
+        // read of an impure `margin` could answer differently. Tweens go between the two: the
+        // parse must see the displayed value, not the target (ADR-0145).
+        let mut child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
+        let child_tweens = node::retarget(reusable.as_ref().map(tween_state), &mut child_properties, now, lua)?;
         let child_style = LayoutStyle::parse(&child_properties)?;
-        children.push(prepare(
+        node.children.push(prepare(
             scene,
             tree,
             reusable,
             &fresh_child.kind,
             child_properties,
             child_style,
+            child_tweens,
             own_axis,
             lua,
+            now,
             depth + 1,
         )?);
     }
 
-    let child_ids: Vec<taffy::NodeId> = children.iter().map(|child| child.taffy).collect();
+    let child_ids: Vec<taffy::NodeId> = node.children.iter().map(|child| child.taffy).collect();
     tree.set_children(taffy_id, &child_ids).map_err(taffy_failed)?;
-
-    Ok(PreparedNode {
-        id,
-        kind: kind.to_string(),
-        style,
-        properties,
-        paint,
-        taffy: taffy_id,
-        children,
-        frozen: Vec::new(),
-    })
+    Ok(node)
 }
 
 /// The second walk: solved geometry back out of the tree and into retained nodes.
@@ -917,7 +1062,7 @@ fn finish(
     prepared: PreparedNode,
     shaping: &ShapingHandle,
 ) -> Result<ResolvedNode, LayoutError> {
-    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen } = prepared;
+    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen, tweens } = prepared;
     let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
     let size = LogicalSize { width: layout.size.width, height: layout.size.height };
 
@@ -934,6 +1079,7 @@ fn finish(
             properties,
             paint,
             children: frozen,
+            tweens,
         });
     }
 
@@ -987,6 +1133,7 @@ fn finish(
         properties,
         paint,
         children,
+        tweens,
     })
 }
 
@@ -1543,6 +1690,7 @@ pub(super) mod tests {
     fn surface_from(lua_src: &str) -> (mlua::Lua, VirtualNode) {
         let lua = mlua::Lua::new();
         register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let table: mlua::Table = lua.load(lua_src).eval().unwrap();
         let node = deserialize_lua_table(&table).unwrap();
         (lua, node)
@@ -1565,19 +1713,18 @@ pub(super) mod tests {
         shaping: &ShapingHandle,
         lua: &Lua,
     ) -> Result<(), LayoutError> {
-        let instances: Vec<SurfaceInstance> = surfaces
-            .iter()
-            .map(|surface| {
-                let declared_id = node::parse_surface_id(&surface.properties).expect("every fixture declares an `id`");
-                SurfaceInstance {
-                    instance_id: format!("{declared_id}@TEST"),
-                    declared_id,
-                    output: "TEST".to_string(),
-                    available,
-                }
-            })
-            .collect();
+        let instances: Vec<SurfaceInstance> = surfaces.iter().map(|surface| instance_at(surface, available)).collect();
         scene.apply(surfaces, &instances, shaping, lua)
+    }
+
+    fn instance_at(surface: &VirtualNode, available: LogicalSize) -> SurfaceInstance {
+        let declared_id = node::parse_surface_id(&surface.properties).expect("every fixture declares an `id`");
+        SurfaceInstance {
+            instance_id: format!("{declared_id}@TEST"),
+            declared_id,
+            output: "TEST".to_string(),
+            available,
+        }
     }
 
     /// Two outputs, `"LEFT"` and `"RIGHT"`, for the per-output child fixtures (ADR-0121).
@@ -1604,21 +1751,14 @@ pub(super) mod tests {
     fn a_function_child_is_built_once_per_output_with_that_outputs_name() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let lua = mlua::Lua::new();
-        register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-        let table: mlua::Table = lua
-            .load(
-                r#"return panel {
+        let (lua, surface) = surface_from(
+            r#"panel {
                     id = "wall",
                     child = function(output)
                         return rect { width = output == "LEFT" and 10 or 20, height = 5 }
                     end,
                 }"#,
-            )
-            .eval()
-            .unwrap();
-        let surface = deserialize_lua_table(&table).unwrap();
+        );
 
         apply_on_two_outputs(&mut scene, &surface, &shaping, &lua).unwrap();
 
@@ -1630,21 +1770,14 @@ pub(super) mod tests {
     fn a_function_child_returning_nil_maps_the_instance_empty() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let lua = mlua::Lua::new();
-        register_node_constructors(&lua).unwrap();
-        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
-        let table: mlua::Table = lua
-            .load(
-                r#"return panel {
+        let (lua, surface) = surface_from(
+            r#"panel {
                     id = "wall",
                     child = function(output)
                         if output == "LEFT" then return rect { width = 10, height = 5 } end
                     end,
                 }"#,
-            )
-            .eval()
-            .unwrap();
-        let surface = deserialize_lua_table(&table).unwrap();
+        );
 
         apply_on_two_outputs(&mut scene, &surface, &shaping, &lua).unwrap();
 
@@ -1714,6 +1847,167 @@ pub(super) mod tests {
             90.0,
             "a re-resolve after :set() must lay out the written value, not the initial one"
         );
+    }
+
+    /// A panel whose child's `width` follows `state("w")` and eases over 100 ms. Returns the
+    /// scene, the Lua state and the surface, applied once at `40`.
+    fn animated_width(easing: &str) -> (Scene, mlua::Lua, VirtualNode) {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(&format!(
+            r#"panel {{ id = "bar", child = rect {{ width = state("w", 40), height = 20,
+                animate = {{ width = {{ duration = 100, easing = "{easing}" }} }} }} }}"#
+        ));
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        (scene, lua, surface)
+    }
+
+    fn child_width(scene: &Scene) -> f32 {
+        scene.surface("bar@TEST").unwrap().children[0].rect.width
+    }
+
+    fn child_tween(scene: &Scene) -> Tween {
+        scene.surface("bar@TEST").unwrap().children[0].tweens[0].clone()
+    }
+
+    #[test]
+    fn a_changed_target_starts_a_tween_from_the_value_on_screen_and_a_tick_carries_it() {
+        // ADR-0145: the pass that sees `90` lays out `40` and a tween; the ticks do the rest
+        // without Lua.
+        let (mut scene, lua, surface) = animated_width("Linear");
+        let shaping = ShapingHandle::spawn();
+        assert_eq!(child_width(&scene), 40.0);
+        assert!(!scene.surface("bar@TEST").unwrap().animating(), "a first value is taken as it is");
+
+        lua.load(r#"state("w", 0):set(90)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert!((child_width(&scene) - 40.0).abs() < 0.5, "the pass paints from where the node was");
+        let tween = child_tween(&scene);
+        assert_eq!(tween.to, node::Animatable::Number(90.0));
+
+        let instances = [instance_at(&surface, full())];
+        assert!(scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_millis(50)));
+        assert_eq!(child_width(&scene), 65.0, "halfway through a linear tween is the midpoint");
+        assert!(scene.surface("bar@TEST").unwrap().animating());
+
+        scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_millis(100));
+        assert_eq!(child_width(&scene), 90.0);
+        assert!(!scene.surface("bar@TEST").unwrap().animating(), "an arrived tween is dropped");
+        assert!(!scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_tween_frozen_under_a_hidden_ancestor_does_not_keep_asking_for_frames() {
+        // The closed-picker stall: hidden subtrees are never advanced, so a tween caught inside
+        // one must not count, or the frame-callback chain runs until the picker opens again.
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"panel { id = "bar", child = column { visible = state("open", true), children = {
+                    rect { width = state("w", 40), height = 10, animate = { width = 100 } } } } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r#"state("w", 0):set(90) state("open", true):set(false)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert!(!scene.surface("bar@TEST").unwrap().animating());
+        assert!(!scene.tick(&[instance_at(&surface, full())], &shaping, &lua, Instant::now()));
+
+        lua.load(r#"state("open", true):set(true)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let thawed = &scene.surface("bar@TEST").unwrap().children[0].children[0];
+        assert!(thawed.tweens.is_empty() || thawed.rect.width < 90.0, "the thaw settles or resumes, never stalls");
+    }
+
+    /// The same runaway `__index` as `a_runaway_index_metamethod_fails_the_pass_instead_of_hanging_it`,
+    /// armed only once the passes are done: a tick re-parses the retained edge table, so it runs
+    /// the metamethod outside any `apply`. Slow on purpose, roughly `LAYOUT_PASS_CAP`.
+    #[test]
+    fn a_runaway_index_metamethod_snaps_the_tween_instead_of_hanging_the_tick() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"local m = setmetatable({}, { __index = function() if hang then while true do end end return 2 end })
+            return panel { id = "bar", child = rect { width = state("w", 40), height = 10, margin = m, animate = { width = 100 } } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r#"state("w", 0):set(90)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let started = child_tween(&scene).started;
+        lua.load("hang = true").exec().unwrap();
+
+        let clock = std::time::Instant::now();
+        scene.tick(&[instance_at(&surface, full())], &shaping, &lua, started + std::time::Duration::from_millis(50));
+        assert!(clock.elapsed() < std::time::Duration::from_secs(20), "must be bounded, took {:?}", clock.elapsed());
+        assert!(!scene.surface("bar@TEST").unwrap().animating(), "the tween is dropped, not retried next frame");
+    }
+
+    #[test]
+    fn a_pass_that_does_not_move_the_target_keeps_the_running_tween() {
+        let (mut scene, lua, surface) = animated_width("Linear");
+        let shaping = ShapingHandle::spawn();
+        lua.load(r#"state("w", 0):set(90)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let started = child_tween(&scene).started;
+        // An unrelated re-resolve (any signal write dirties the whole scene) must not restart it.
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        assert_eq!(child_tween(&scene).started, started);
+    }
+
+    #[test]
+    fn a_retarget_mid_flight_starts_from_the_displayed_value_not_the_old_target() {
+        let (mut scene, lua, surface) = animated_width("Linear");
+        let shaping = ShapingHandle::spawn();
+        lua.load(r#"state("w", 0):set(90)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let first = child_tween(&scene);
+        let instances = [instance_at(&surface, full())];
+        scene.tick(&instances, &shaping, &lua, first.started + std::time::Duration::from_millis(50));
+        assert_eq!(child_width(&scene), 65.0);
+
+        // The pointer left: back to 40, from wherever the box is now.
+        lua.load(r#"state("w", 0):set(40)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let second = child_tween(&scene);
+        assert_eq!(second.to, node::Animatable::Number(40.0));
+        assert_eq!(second.from, node::Animatable::Number(65.0), "from is the value the last tick displayed");
+    }
+
+    #[test]
+    fn a_colour_tween_reaches_the_paint_style_between_passes() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"panel { id = "bar", child = rect { width = 10, height = 10,
+                    background = state("bg", "#000000"),
+                    animate = { background = { duration = 100, easing = "Linear" } } } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r##"state("bg", ""):set("#ffffff")"##).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let started = child_tween(&scene).started;
+        scene.tick(&[instance_at(&surface, full())], &shaping, &lua, started + std::time::Duration::from_millis(50));
+        let Some(PaintStyle::Box { background: Some(grey), .. }) = scene.surface("bar@TEST").unwrap().children[0].paint
+        else {
+            panic!("a rect paints a box")
+        };
+        assert!((grey.r - 0.5).abs() < 0.01, "halfway from black to white is mid grey, got {grey:?}");
+    }
+
+    #[test]
+    fn a_fill_endpoint_snaps_instead_of_tweening() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"panel { id = "bar", child = rect { width = state("w", 40), height = 10,
+                    animate = { width = 100 } } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r#"state("w", 0):set("Fill")"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        // `Fill` under a content-sized panel is zero (see `a_fill_child_of_a_content_sized_row_...`);
+        // the point is that it got there in one pass with nothing left in flight.
+        assert_eq!(child_width(&scene), 0.0);
+        assert!(!scene.surface("bar@TEST").unwrap().animating());
     }
 
     #[test]
@@ -3895,6 +4189,7 @@ pub(super) mod tests {
         children: Vec<ResolvedNode>,
     ) -> ResolvedNode {
         ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(id),
             kind: kind.to_string(),
@@ -3937,6 +4232,7 @@ pub(super) mod tests {
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(102),
             kind: "rect".to_string(),
@@ -3948,6 +4244,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(103),
             kind: "rect".to_string(),
@@ -3959,6 +4256,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let root = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(104),
             kind: "panel".to_string(),
@@ -3978,6 +4276,7 @@ pub(super) mod tests {
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(105),
             kind: "rect".to_string(),
@@ -3989,6 +4288,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let mut root = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(106),
             kind: "panel".to_string(),
@@ -4008,6 +4308,7 @@ pub(super) mod tests {
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
+            tweens: Vec::new(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(107),
             kind: "panel".to_string(),
@@ -4017,6 +4318,7 @@ pub(super) mod tests {
             properties: HashMap::new(),
             paint: None,
             children: vec![ResolvedNode {
+                tweens: Vec::new(),
                 margin: crate::layout::node::EdgeInsets::default(),
                 id: NodeId::test(120),
                 kind: "row".to_string(),
