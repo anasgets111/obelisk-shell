@@ -33,8 +33,16 @@ local VIDEO_SITES = {
 }
 
 local VIDEO_EXTENSIONS = {
-    mp4 = true, mkv = true, webm = true, avi = true, mov = true, m4v = true, mpeg = true,
-    mpg = true, wmv = true, flv = true,
+    mp4 = true,
+    mkv = true,
+    webm = true,
+    avi = true,
+    mov = true,
+    m4v = true,
+    mpeg = true,
+    mpg = true,
+    wmv = true,
+    flv = true,
 }
 
 -- `find(..., true)` keeps entries literal; otherwise the `.` in `youtu.be` matches any character.

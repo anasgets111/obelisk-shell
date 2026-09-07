@@ -27,9 +27,9 @@ function pill.new(opts)
     local hovered = hover(opts.slot)
     local lingering = util.linger(hovered, opts.collapse_ms or theme.animation_ms)
     local expanded = opts.hold_open
-            and computed({ lingering, opts.hold_open }, function(open, held)
-                return open or held
-            end)
+        and computed({ lingering, opts.hold_open }, function(open, held)
+            return open or held
+        end)
         or lingering
     local self = { hovered = hovered, expanded = expanded }
 

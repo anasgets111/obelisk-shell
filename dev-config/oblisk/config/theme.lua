@@ -63,6 +63,7 @@ end)()
 function theme.s(base, min)
     return math.max(min or 0, math.floor(base * SCALE + 0.5))
 end
+
 local s = theme.s
 
 theme.scale = SCALE
@@ -129,50 +130,50 @@ end
 --
 -- Keep the ten original names: matching `Theme.qml`'s `textActiveColor`/`bgElevated` would rename
 -- thirty files for the same eleven Catppuccin swatches.
-theme.BG      = "#1e1e2eff"
-theme.SURFACE = "#313244ff"
+theme.BG                        = "#1e1e2eff"
+theme.SURFACE                   = "#313244ff"
 -- Catppuccin surface1, one step above SURFACE; pointer highlights use it instead of inventing blue
 -- (ADR-0062).
-theme.HOVER   = "#45475aff"
-theme.FG      = "#cdd6f4ff"
+theme.HOVER                     = "#45475aff"
+theme.FG                        = "#cdd6f4ff"
 -- Catppuccin subtext0, `Theme.qml`'s `textInactiveColor`. The old overlay0 (#6c7086), two steps
 -- darker, made the keyboard layout and date look disabled instead of secondary.
-theme.DIM     = "#a6adc8ff"
+theme.DIM                       = "#a6adc8ff"
 -- Mauve, not blue: the mirror's `activeColor` and every accent are #cba6f7. This config's old
 -- #89b4fa made the bars look like different themes. `MAUVE` exposes the same swatch by colour name.
-theme.ACCENT  = "#cba6f7ff"
-theme.GREEN   = "#a6e3a1ff"
-theme.YELLOW  = "#f9e2afff"
-theme.PEACH   = "#fab387ff"
-theme.RED     = "#f38ba8ff"
-theme.MAUVE   = "#cba6f7ff"
+theme.ACCENT                    = "#cba6f7ff"
+theme.GREEN                     = "#a6e3a1ff"
+theme.YELLOW                    = "#f9e2afff"
+theme.PEACH                     = "#fab387ff"
+theme.RED                       = "#f38ba8ff"
+theme.MAUVE                     = "#cba6f7ff"
 -- Catppuccin blue, formerly `ACCENT`; two modules need blue specifically.
-theme.BLUE    = "#89b4faff"
+theme.BLUE                      = "#89b4faff"
 -- Mirror's `inactiveColor` and `onHoverColor`, passed to `with_opacity`, not painted directly.
-theme.INACTIVE = "#494d64ff"
-theme.ON_HOVER = "#a28dcdff"
-theme.DISABLED = "#232634ff"
+theme.INACTIVE                  = "#494d64ff"
+theme.ON_HOVER                  = "#a28dcdff"
+theme.DISABLED                  = "#232634ff"
 
 -- Derived steps from the eleven swatches, so a scheme swap remains eleven edits.
-theme.ELEVATED       = lighten(theme.BG, 0.12)
-theme.ELEVATED_HOVER = lighten(theme.BG, 0.18)
+theme.ELEVATED                  = lighten(theme.BG, 0.12)
+theme.ELEVATED_HOVER            = lighten(theme.BG, 0.18)
 -- `textDisabled`: `withOpacity(textInactiveColor, opacityMedium)`, dimmer than DIM.
-theme.TEXT_OFF       = theme.with_opacity(theme.DIM, 0.35)
-theme.BORDER         = theme.with_opacity(theme.SURFACE, 0.75)
-theme.BORDER_SUBTLE  = theme.with_opacity(theme.SURFACE, 0.35)
+theme.TEXT_OFF                  = theme.with_opacity(theme.DIM, 0.35)
+theme.BORDER                    = theme.with_opacity(theme.SURFACE, 0.75)
+theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
 -- Shared translucent card ground formerly hand-written as `"#181825ee"`; naming it avoids a twelfth
 -- swatch.
-theme.GLASS          = "#181825ee"
-theme.GLASS_CONTENT  = theme.with_opacity(theme.ELEVATED, 0.46)
-theme.GLASS_HOVER    = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
-theme.ACCENT_SUBTLE  = theme.with_opacity(theme.ACCENT, 0.15)
-theme.ACCENT_LIGHT   = theme.with_opacity(theme.ACCENT, 0.25)
-theme.ACCENT_MEDIUM  = theme.with_opacity(theme.ACCENT, 0.35)
+theme.GLASS                     = "#181825ee"
+theme.GLASS_CONTENT             = theme.with_opacity(theme.ELEVATED, 0.46)
+theme.GLASS_HOVER               = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
+theme.ACCENT_SUBTLE             = theme.with_opacity(theme.ACCENT, 0.15)
+theme.ACCENT_LIGHT              = theme.with_opacity(theme.ACCENT, 0.25)
+theme.ACCENT_MEDIUM             = theme.with_opacity(theme.ACCENT, 0.35)
 -- Hover for an opaque `ACCENT` ground. The three alpha tints cannot lift an opaque colour; the
 -- mirror's `OButton` primary variant lightens it instead.
-theme.ACCENT_HOVER   = lighten(theme.ACCENT, 0.16)
+theme.ACCENT_HOVER              = lighten(theme.ACCENT, 0.16)
 -- Mirror's `bgSubtle`, used as the plate behind a notification card's application icon.
-theme.BG_SUBTLE      = theme.with_opacity(theme.BG, 0.15)
+theme.BG_SUBTLE                 = theme.with_opacity(theme.BG, 0.15)
 
 -- ## The glass layer
 --
@@ -180,24 +181,24 @@ theme.BG_SUBTLE      = theme.with_opacity(theme.BG, 0.15)
 -- 0.42, and near-white 0.18 borders separate them. Painting controls opaque turned floating pills
 -- into filled rectangles; radius could not fix it. Alpha reaches the compositor, so the layer
 -- surface composites against the wallpaper, not black.
-theme.GLASS_SURFACE       = theme.with_opacity(theme.BG, 0.5)
-theme.GLASS_CONTROL       = theme.with_opacity(theme.INACTIVE, 0.42)
+theme.GLASS_SURFACE             = theme.with_opacity(theme.BG, 0.5)
+theme.GLASS_CONTROL             = theme.with_opacity(theme.INACTIVE, 0.42)
 -- 0.45, not the mirror's 0.68: on a glass control over wallpaper, 0.68 made hover the bar's
 -- brightest element. 0.45 keeps the glyph white instead of inverting it.
-theme.GLASS_CONTROL_HOVER = theme.with_opacity(theme.ON_HOVER, 0.45)
-theme.GLASS_BORDER        = theme.with_opacity(theme.FG, 0.18)
-theme.GLASS_BORDER_HOVER  = theme.with_opacity(theme.FG, 0.34)
+theme.GLASS_CONTROL_HOVER       = theme.with_opacity(theme.ON_HOVER, 0.45)
+theme.GLASS_BORDER              = theme.with_opacity(theme.FG, 0.18)
+theme.GLASS_BORDER_HOVER        = theme.with_opacity(theme.FG, 0.34)
 -- Shared alert ground formerly hand-written by `rescue` and `privacy`.
-theme.ALERT_BG       = "#45253aff"
+theme.ALERT_BG                  = "#45253aff"
 -- `modalScrimColor` is 0.45 rather than the mirror's 0.88: it lays over wallpaper, where 0.88 is a
 -- blackout.
-theme.SCRIM          = theme.with_opacity(theme.BG, 0.45)
+theme.SCRIM                     = theme.with_opacity(theme.BG, 0.45)
 
 -- ## Opacity steps
 --
 -- `opacity` is a base property (§ 5.1) that multiplies down the subtree, so disabling a control
 -- needs one property rather than dimmer colours on each part.
-theme.opacity = {
+theme.opacity                   = {
     disabled = 0.5,
     muted    = 0.7,
     solid    = 0.6,
@@ -208,7 +209,7 @@ theme.opacity = {
 -- ## Scales
 --
 -- Named steps keep `spacing.sm` at the same 8px in bar and panel, and let one edit change both.
-theme.spacing = {
+theme.spacing                   = {
     xs = s(4, 2),
     sm = s(8, 4),
     md = s(12, 8),
@@ -222,9 +223,9 @@ theme.spacing = {
 -- icon sits at the size its token asked for. Both families carry these codepoints, so a longer
 -- `fonts` chain could not choose between them -- the declared face wins per-glyph fallback every
 -- time, which is why the node names this one.
-theme.icon_font = "JetBrainsMono Nerd Font Mono"
+theme.icon_font                 = "JetBrainsMono Nerd Font Mono"
 
-theme.font = {
+theme.font                      = {
     xs   = s(10, 8),
     sm   = s(12, 10),
     md   = s(14, 12),
@@ -234,7 +235,7 @@ theme.font = {
     hero = s(48, 32),
 }
 
-theme.radius = {
+theme.radius                    = {
     xs = s(3, 2),
     sm = s(6, 4),
     md = s(12, 8),
@@ -242,7 +243,7 @@ theme.radius = {
     xl = s(40, 20),
 }
 
-theme.icon = {
+theme.icon                      = {
     xs = s(12, 10),
     sm = s(14, 12),
     md = s(18, 14),
@@ -251,7 +252,7 @@ theme.icon = {
 }
 
 -- Control heights keep adjacent toggles and buttons aligned without pixel literals.
-theme.control = {
+theme.control                   = {
     xs = s(18, 16),
     sm = s(24, 20),
     md = s(28, 24),
@@ -259,16 +260,16 @@ theme.control = {
     xl = s(44, 36),
 }
 
-theme.border_width = 1
+theme.border_width              = 1
 -- `borderWidthMedium`: twice the hairline, for cards floating over wallpaper.
-theme.border_width_medium = 2
+theme.border_width_medium       = 2
 
 -- ## Surface geometry
 --
 -- Shared surface sizes replace values duplicated in each module and opener. `basePanelHeight` makes
 -- the bar 38px at 1080p instead of 34; its 31px `item` then has a little margin, whereas 34px made
 -- controls touch both edges or shrink.
-theme.bar_height          = s(42, 28)
+theme.bar_height                = s(42, 28)
 
 -- ## The item scale
 --
@@ -276,82 +277,82 @@ theme.bar_height          = s(42, 28)
 -- the clock. They diverged when the bar got its own height. `item_radius` is half of `item_height`
 -- by construction and has its own `s()` call: the mirror rounds it independently, and 18 vs 15.5
 -- separates a circle from a round square.
-theme.item_height = s(34, 20)
-theme.item_width  = s(34, 20)
-theme.item_radius = s(18, 6)
+theme.item_height               = s(34, 20)
+theme.item_width                = s(34, 20)
+theme.item_radius               = s(18, 6)
 -- Workspace dots use `control.sm`, not item size: twelve full-size controls consume 416px of a
 -- 1920px bar, while the digit-and-state strip costs about 300px and no longer dominates the left.
-theme.workspace_size = theme.control.sm
+theme.workspace_size            = theme.control.sm
 -- The mirror's `batteryPillWidth`, enough for a glyph and "100%"; the bar's non-circular item.
-theme.battery_pill_width = s(80, 60)
+theme.battery_pill_width        = s(80, 60)
 -- Width when the pointer hovers the volume control; it leaves room for the percentage. Collapsed
 -- width is `item_width`.
-theme.volume_expanded_width = s(120, 90)
+theme.volume_expanded_width     = s(120, 90)
 -- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The easing is
 -- the engine's default, `InOutQuad`, which is also the mirror's most-used. `animation_fast_ms` is
 -- its `animationFast`, the hover zooms.
-theme.animation_ms = 147
-theme.animation_fast_ms = 100
+theme.animation_ms              = 147
+theme.animation_fast_ms         = 100
 -- `animationSlow`, the pace of a pulse rather than a transition: slow enough to read as breathing.
-theme.animation_slow_ms = 250
+theme.animation_slow_ms         = 250
 -- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`: bar
 -- panels share one card in `modules/shell/panel_host.lua`; ADR-0110 makes it as tall as the panel.
 -- Each list is capped at `Math.min(contentHeight, Theme.itemHeight * 7)`, then scrolls.
-theme.panel_width         = s(340, 280)
-theme.panel_list_height   = s(280, 210)
+theme.panel_width               = s(340, 280)
+theme.panel_list_height         = s(280, 210)
 -- Where a closed panel card sits before its first layout has measured it (`geometry`,
 -- ADR-0147): above the bar by the tallest card (history: its capped list plus chrome). After that
 -- the card drops from exactly its own height, `PanelHost.qml`'s `-height`.
-theme.panel_slide         = s(760, 570)
+theme.panel_slide               = s(760, 570)
 -- Notification history holds the popup's cards, not a dozen short rows. Its mirror width is
 -- `notificationPanelWidth: 420`; `maxAvailableHeight` lets the list use most of the screen before
 -- it scrolls.
-theme.notification_panel_width = s(420, 340)
-theme.notification_list_height = s(640, 480)
+theme.notification_panel_width  = s(420, 340)
+theme.notification_list_height  = s(640, 480)
 -- Update rows need a name and two versions: at 340px, `ca-certificates-mozilla` and
 -- `3.128-1 -> 3.129-1` collide. Fixed version columns leave the name about 130px at 460px, which
 -- still elided `gpu-screen-recorder-git`; use 520px.
-theme.update_panel_width = s(520, 400)
+theme.update_panel_width        = s(520, 400)
 
 -- `Theme.audioPanelWidth`: two named sliders and a mixer.
-theme.audio_panel_width = s(380, 300)
+theme.audio_panel_width         = s(380, 300)
 -- Idle modal: action rows plus AC and battery columns, each with a timeout and switch. The mirror's
 -- `Theme.idleModalWidth` is 820px; earlier 640px and 700px versions were cramped.
-theme.idle_modal_width = s(820, 640)
+theme.idle_modal_width          = s(820, 640)
 -- `idleTimeoutControlWidth` plus its switch.
-theme.idle_profile_column = s(190, 150)
-theme.idle_row_height = s(60, 46)
+theme.idle_profile_column       = s(190, 150)
+theme.idle_row_height           = s(60, 46)
 -- Timeline track, wide as the card and tall enough for a glyph plus duration per stage, unlike the
 -- 6px `components/meter.lua` percentage meter.
-theme.idle_track_height = s(36, 28)
-theme.update_list_height = s(360, 260)
+theme.idle_track_height         = s(36, 28)
+theme.update_list_height        = s(360, 260)
 -- `updateOldVersionColumnWidth`: fixed column so versions align down the table rather than ragged
 -- content-sized cells. Wide enough for `6.1.0.r4.gc8f50c4-1`.
-theme.update_version_width = s(116, 88)
+theme.update_version_width      = s(116, 88)
 -- Keep the log shorter than the package list; its last dozen lines explain a failure.
-theme.update_log_height = s(200, 150)
+theme.update_log_height         = s(200, 150)
 -- `panelToggleCardHeight`: a radio tile tall enough for a glyph over a word.
-theme.panel_toggle_height = s(56, 44)
+theme.panel_toggle_height       = s(56, 44)
 -- `PanelEmptyState`'s `Layout.minimumHeight`: an empty list holds a glyph and line, reading as a
 -- state rather than a gap.
-theme.panel_empty_height  = s(120, 90)
-theme.panel_gap           = 4
-theme.notification_width  = s(380, 300)
+theme.panel_empty_height        = s(120, 90)
+theme.panel_gap                 = 4
+theme.notification_width        = s(380, 300)
 -- `notificationAppIconSize`: an `item_height` icon square with a few pixels of plate around it.
-theme.notification_app_icon = s(40, 32)
+theme.notification_app_icon     = s(40, 32)
 -- Popup stack surface height, not card height: up to four cards grow when groups/bodies expand, and
 -- the fixed layer surface clips overflow. It is generous rather than measured; the inner column
 -- sizes to content and only needs to fit inside.
 theme.notification_stack_height = s(560, 420)
 -- `OSDCard.qml`'s `osdSliderWidth`, `osdCardHeight`, `osdToggleIconContainerSize` and
 -- `osdSliderTrackHeight`.
-theme.osd_width           = s(300, 240)
-theme.osd_height          = s(80, 60)
-theme.osd_tile            = s(48, 36)
-theme.osd_track           = s(12, 8)
+theme.osd_width                 = s(300, 240)
+theme.osd_height                = s(80, 60)
+theme.osd_tile                  = s(48, 36)
+theme.osd_track                 = s(12, 8)
 -- `dialogWidth`: the polkit card (`modules/global/polkit.lua`), narrower than the launcher because
 -- it holds one sentence, one field and two buttons.
-theme.dialog_width        = s(450, 360)
+theme.dialog_width              = s(450, 360)
 
 -- ## The lock card (`modules/global/lock.lua`)
 --
@@ -362,29 +363,29 @@ theme.dialog_width        = s(450, 360)
 --
 -- ponytail: sampled once at evaluation, like `SCALE`. Moving the shell to a narrower output leaves
 -- the old width until the next edit.
-theme.lock_card_width = math.max(480, math.min(math.floor(MAIN_WIDTH * 0.38), 720))
+theme.lock_card_width           = math.max(480, math.min(math.floor(MAIN_WIDTH * 0.38), 720))
 -- `controlHeightLg * 2.4`, the initials disc, measured off the mirror at 106px on a 1200px-tall
 -- screen.
-theme.lock_avatar = s(112, 72)
+theme.lock_avatar               = s(112, 72)
 
 -- ## The launcher (`modules/global/launcher.lua`)
 --
 -- The mirror's `launcherWindowWidth/Height` are 860x680; its rows are 64px with 42px icons. This
 -- is smaller because rows have a name and one-line comment, not a paragraph; 680px on a 1200px
 -- screen reads as a window, not a prompt.
-theme.launcher_width      = s(720, 520)
-theme.launcher_height     = s(560, 420)
-theme.launcher_row_height = s(56, 44)
-theme.launcher_icon       = s(36, 28)
+theme.launcher_width            = s(720, 520)
+theme.launcher_height           = s(560, 420)
+theme.launcher_row_height       = s(56, 44)
+theme.launcher_icon             = s(36, 28)
 
 -- ## The wallpaper picker (`modules/global/wallpaper_picker.lua`)
 --
 -- The mirror's `wallpaperModalWidth/Height` and `wallpaperSidebarWidth` define the reference card.
 -- This fixed-width card uses four columns, unlike the mirror's "as many 230px tiles as fit"; the
 -- remaining card width determines each tile.
-theme.wallpaper_picker_width  = s(1180, 900)
-theme.wallpaper_picker_height = s(880, 660)
-theme.wallpaper_sidebar_width = s(250, 200)
-theme.wallpaper_columns       = 4
+theme.wallpaper_picker_width    = s(1180, 900)
+theme.wallpaper_picker_height   = s(880, 660)
+theme.wallpaper_sidebar_width   = s(250, 200)
+theme.wallpaper_columns         = 4
 
 return theme

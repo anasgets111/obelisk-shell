@@ -14,7 +14,8 @@ local thresholds = util.battery_thresholds
 -- normal card. No 15-second dedupe; an edge fires once.
 local function notify(summary, body, critical)
     local urgency = critical and "critical" or "normal"
-    process.run("notify-send", { "-a", "Battery", "-u", urgency, "-t", "5000", "-e", summary, body }, function() end, function() end)
+    process.run("notify-send", { "-a", "Battery", "-u", urgency, "-t", "5000", "-e", summary, body }, function() end,
+        function() end)
 end
 
 -- Mains state is `oblisk.power` (UPower manager `OnBattery`), not the battery capability.

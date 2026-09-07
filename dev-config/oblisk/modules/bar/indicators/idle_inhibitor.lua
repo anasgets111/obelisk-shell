@@ -62,7 +62,8 @@ local idle_tooltip = tooltip({
                 -- The armed stage's countdown, matching the modal masthead.
                 for _, entry in ipairs(plan.list) do
                     if entry.key == arming.key then
-                        return string.format("%s in %s", entry.title, idle.clock(math.max(0, entry.delay - arming.elapsed)))
+                        return string.format("%s in %s", entry.title,
+                            idle.clock(math.max(0, entry.delay - arming.elapsed)))
                     end
                 end
                 return "nothing is counting down"

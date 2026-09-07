@@ -434,8 +434,8 @@ local BatteryCapability = {}
 ---@class IdleCapability: Capability<IdleState>
 ---@field invoke fun(self: IdleCapability, command: "register"|"inhibit"|"release_inhibit", ...: any)
 ---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.
-             ---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.
-             ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
+---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.
+---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
 
 ---@class BluetoothCapability: Capability<BluetoothState>
 ---@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget", ...: any)

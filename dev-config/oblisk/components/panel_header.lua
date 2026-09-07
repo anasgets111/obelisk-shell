@@ -67,7 +67,8 @@ return function(opts)
     -- the plain title string's node.
     local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, title_size, { width = "Fill" }) }
     if opts.subtitle then
-        lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.TEXT_OFF, opts.subtitle_size or theme.font.xs, { width = "Fill" })
+        lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.TEXT_OFF,
+            opts.subtitle_size or theme.font.xs, { width = "Fill" })
     end
     children[#children + 1] = column { width = "Fill", align_v = "Center", children = lines }
 
@@ -78,7 +79,8 @@ return function(opts)
         children[#children + 1] = control
     end
     if opts.on_close then
-        children[#children + 1] = icon_button(icons.close, opts.on_close, { size = theme.control.sm, icon_size = theme.icon.sm })
+        children[#children + 1] = icon_button(icons.close, opts.on_close,
+            { size = theme.control.sm, icon_size = theme.icon.sm })
     end
 
     return row {

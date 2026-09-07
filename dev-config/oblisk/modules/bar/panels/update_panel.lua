@@ -72,14 +72,14 @@ end
 -- Replaces `_detectErrorMessage`: pacman's output supplies the reason, and this file turns it into
 -- actionable wording. Falls back to the exit code, which is at least true.
 local FAILURE_PHRASES = {
-    { match = "failed retrieving", say = "could not download; check the connection" },
-    { match = "could not resolve host", say = "could not download; check the connection" },
-    { match = "connection refused", say = "could not download; check the connection" },
-    { match = "not enough free disk space", say = "not enough disk space" },
+    { match = "failed retrieving",            say = "could not download; check the connection" },
+    { match = "could not resolve host",       say = "could not download; check the connection" },
+    { match = "connection refused",           say = "could not download; check the connection" },
+    { match = "not enough free disk space",   say = "not enough disk space" },
     { match = "invalid or corrupted package", say = "a package failed its signature check" },
-    { match = "signature from", say = "a package failed its signature check" },
-    { match = "conflicting files", say = "files conflict with another package" },
-    { match = "authentication", say = "authentication failed" },
+    { match = "signature from",               say = "a package failed its signature check" },
+    { match = "conflicting files",            say = "files conflict with another package" },
+    { match = "authentication",               say = "authentication failed" },
 }
 
 local function failure_reason(u)

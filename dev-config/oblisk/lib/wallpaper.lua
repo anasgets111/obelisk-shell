@@ -24,7 +24,7 @@ wallpaper.EXTENSIONS = { "jpg", "jpeg", "png", "webp" }
 -- `WallpaperService.availableModes` reduced to `image.fit` (ADR-0055 decision 3); omit `center` and
 -- `tile` because the engine draws neither.
 wallpaper.FITS = {
-    { value = "cover", label = "Fill" },
+    { value = "cover",   label = "Fill" },
     { value = "contain", label = "Fit" },
     { value = "stretch", label = "Stretch" },
 }

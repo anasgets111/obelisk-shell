@@ -203,7 +203,7 @@ local function move(delta)
     end
     local next_index = math.max(1, math.min(current + delta, #ids))
     selected_id:set(ids[next_index])
-        -- List index excludes the web row above it.
+    -- List index excludes the web row above it.
     local in_list = next_index - (ids[1] == WEB and 1 or 0)
     if in_list >= 1 then
         SCROLL:reveal(in_list)
@@ -389,13 +389,15 @@ local search = rect {
     },
 }
 
-local no_results = panel_empty_state("No results found", computed({ trimmed, results, web_shown }, function(text, found, web)
-    return text ~= "" and #found == 0 and not web
-end))
+local no_results = panel_empty_state("No results found",
+    computed({ trimmed, results, web_shown }, function(text, found, web)
+        return text ~= "" and #found == 0 and not web
+    end))
 
-local no_apps = panel_empty_state("no applications found", computed({ oblisk.applications, trimmed }, function(apps, text)
-    return text == "" and #entries_of(apps) == 0
-end))
+local no_apps = panel_empty_state("no applications found",
+    computed({ oblisk.applications, trimmed }, function(apps, text)
+        return text == "" and #entries_of(apps) == 0
+    end))
 
 -- Centered below the bar, `OModal`'s `anchors.centerIn: parent`. The surface excludes the bar's
 -- reservation, so center in its own height; `screens[1]` follows `panel_host.lua`'s clamp.

@@ -450,10 +450,14 @@ fn internal_actions(capability: &str) -> &'static [&'static str] {
 /// Use `---@field`, not `function IdleCapability:...`: a class with `---@field invoke` has no local
 /// binding for a later function, so calls read `undefined-field`. The first version did this;
 /// `just types` caught it.
+///
+/// Every emitted line starts at column zero. `lua-meta` is formatted by `just fmt`, which strips
+/// leading whitespace from a comment line, so an indented one here made `just stubs` and
+/// `just fmt-check` undo each other on every run.
 fn hand_written_methods(capability: &str) -> &'static str {
     match capability {
         "idle" => {
-            "---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n             ---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n             ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
+            "---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
         }
         _ => "",
     }

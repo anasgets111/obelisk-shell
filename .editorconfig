@@ -1,0 +1,13 @@
+# Read by lua-language-server's formatter, which is what `just fmt` and any editor pointed at that
+# server both run (see `tools/luafmt.py`). Written out rather than left to the server's defaults,
+# which these currently match exactly: a formatting gate whose rules live in someone else's release
+# notes is a gate that changes under you.
+root = true
+
+[*.lua]
+indent_style = space
+indent_size = 4
+max_line_length = 120
+# The columns in `config/theme.lua` and `config/icons.lua`. Those files are tables of constants
+# where a wrong swatch or a duplicated codepoint is spotted by the column, not by reading the line.
+align_continuous_assign_statement = true

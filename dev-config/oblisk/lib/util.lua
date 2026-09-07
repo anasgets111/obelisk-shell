@@ -386,10 +386,10 @@ function util.notification_sections(groups, now)
     local today = os.date("*t", now)
     local today_start = os.time({ year = today.year, month = today.month, day = today.day, hour = 0 })
     local buckets = {
-        { label = "urgent", items = {} },
-        { label = "today", items = {} },
+        { label = "urgent",    items = {} },
+        { label = "today",     items = {} },
         { label = "yesterday", items = {} },
-        { label = "earlier", items = {} },
+        { label = "earlier",   items = {} },
     }
     for _, group in ipairs(groups or {}) do
         local index = 4

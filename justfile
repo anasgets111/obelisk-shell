@@ -148,11 +148,18 @@ stubs:
 # warning, and folding them together buries the diff. This recipe exists because 71266cb and c83e79e
 # landed four unformatted files between them with `just check` green on both. `just fmt` was there
 # the whole time and nothing made anyone run it.
+#
+# Both languages now. The Lua half is the larger half by file count and had no gate at all, so this
+# recipe was green over config a reviewer would have sent back. `tools/luafmt.py` explains why the
+# Lua formatter is a language server rather than a formatter binary; `.editorconfig` holds its
+# rules. It skips itself when that server is missing, on the same terms as `types` below.
 fmt-check:
     cargo fmt --all -- --check
+    python3 tools/luafmt.py --check dev-config lua-meta share
 
 fmt:
     cargo fmt --all
+    python3 tools/luafmt.py dev-config lua-meta share
 
 clean:
     cargo clean

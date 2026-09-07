@@ -46,7 +46,8 @@ local notification_history = require("modules.bar.panels.notification_history")
 local update_panel = require("modules.bar.panels.update_panel")
 local audio_panel = require("modules.bar.panels.audio_panel")
 
-local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel, audio_panel }
+local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel,
+    audio_panel }
 
 -- Build every body, but show only the matching `kind`. Invisible children contribute no size
 -- (`resolve_sizes` in scene.rs), so stacked bodies cost the visible panel's height, not their sum.

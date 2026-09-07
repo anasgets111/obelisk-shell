@@ -47,15 +47,30 @@ end
 
 -- Mirror `actions`, in order. `logout` is niri's `CompositorImpl.exitSession`.
 local ACTIONS = {
-    { key = "logout", title = "log out", icon = icons.logout, run = function()
-        detached("niri", { "msg", "action", "quit", "--skip-confirmation" })
-    end },
-    { key = "reboot", title = "restart", icon = icons.power, run = function()
-        detached("systemctl", { "reboot" })
-    end },
-    { key = "poweroff", title = "power off", icon = icons.shutdown, run = function()
-        detached("systemctl", { "poweroff" })
-    end },
+    {
+        key = "logout",
+        title = "log out",
+        icon = icons.logout,
+        run = function()
+            detached("niri", { "msg", "action", "quit", "--skip-confirmation" })
+        end
+    },
+    {
+        key = "reboot",
+        title = "restart",
+        icon = icons.power,
+        run = function()
+            detached("systemctl", { "reboot" })
+        end
+    },
+    {
+        key = "poweroff",
+        title = "power off",
+        icon = icons.shutdown,
+        run = function()
+            detached("systemctl", { "poweroff" })
+        end
+    },
 }
 
 local function cancel_countdown()
