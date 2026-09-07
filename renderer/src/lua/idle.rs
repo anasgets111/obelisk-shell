@@ -19,8 +19,10 @@
 //!
 //! There is no unregister. Before each `shell.lua` evaluation, `Loader::evaluate_file` drops local
 //! thresholds; otherwise an in-place reload (ADR-0047) stacks callbacks on the same VM, so the
-//! tenth reload of a screen-dimming config dims ten times. The Supervisor keeps its listener, and
-//! re-registering the duration is a no-op there.
+//! tenth reload of a screen-dimming config dims ten times. That drop also sends
+//! `forget_thresholds`, so the Supervisor's fan-out entries go with the callbacks they fed
+//! (ADR-0158). What remains is the new tree's registrations, sent behind it on the same socket.
+//! The listener itself stays, and re-registering the duration is a no-op there.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -117,9 +119,21 @@ impl IdleRegistry {
         }
     }
 
-    /// Drops local registrations before each evaluation.
+    /// Drops local registrations before each evaluation, and tells the Supervisor to drop the
+    /// fan-out entries feeding them (ADR-0158).
+    ///
+    /// The command matters as much as the local clear. Both travel this generation's one ordered
+    /// socket, so the new tree's registrations land behind it and survive. The Supervisor used to
+    /// clear on its own timing, when the `Unchanged` report came back, which is after them. Silent
+    /// when nothing was registered, so a config that never asked for a threshold is not the reason
+    /// `idle` starts.
     pub fn forget_thresholds(&self) {
-        self.inner.borrow_mut().thresholds.clear();
+        let mut inner = self.inner.borrow_mut();
+        if inner.thresholds.is_empty() {
+            return;
+        }
+        inner.thresholds.clear();
+        inner.commands.send("idle", "forget_thresholds", Vec::new(), 0);
     }
 
     /// The `oblisk.idle` member.
@@ -239,6 +253,41 @@ mod tests {
             .filter(|frame| matches!(frame, RendererFrame::StartCapability { .. }))
             .count();
         assert_eq!(starts, 1);
+    }
+
+    /// ADR-0158: the fan-out entries must go when the callbacks they feed go, and the command must
+    /// lead the registrations behind it. It did not exist. The Supervisor cleared on its own
+    /// timing, after them, so every in-place reload left a config registered locally and reachable
+    /// by nothing.
+    #[test]
+    fn forgetting_thresholds_tells_the_supervisor_before_the_new_tree_registers() {
+        let (lua, registry, mut rx) = lua_with_idle(4);
+        lua.load("idle:register_threshold(1, function() end, function() end)").exec().unwrap();
+        queued_command(&mut rx).expect("the first evaluation registers");
+
+        registry.forget_thresholds();
+        lua.load("idle:register_threshold(1, function() end, function() end)").exec().unwrap();
+
+        let forget = queued_command(&mut rx).expect("forgetting must queue a command");
+        assert_eq!(forget.params.action, "forget_thresholds");
+        assert_eq!(forget.params.generation_id, 4);
+        assert!(forget.params.arguments.is_empty(), "it names no threshold and drops every one this generation has");
+        assert_eq!(
+            queued_command(&mut rx).map(|envelope| envelope.params.action).as_deref(),
+            Some("register"),
+            "the re-registration must queue behind the forget, or the socket delivers the order that loses it"
+        );
+    }
+
+    /// `idle` is off the roster, so a command is also a start (ADR-0070). A config that never asked
+    /// for a threshold must not have one sent on its behalf by the reload path.
+    #[test]
+    fn forgetting_nothing_queues_nothing() {
+        let (_lua, registry, mut rx) = lua_with_idle(0);
+
+        registry.forget_thresholds();
+
+        assert!(rx.try_recv().is_err(), "a generation with no thresholds must stay silent");
     }
 
     #[test]

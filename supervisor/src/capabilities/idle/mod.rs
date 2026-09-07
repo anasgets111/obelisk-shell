@@ -21,12 +21,20 @@ pub mod state;
 pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
 pub use state::IdleState;
 
-/// Actions accepted by `oblisk.idle:invoke(...)`; exhaustive dispatch keeps variants and arms in
-/// sync.
+/// Actions accepted on an `idle` `CommandEnvelope`; exhaustive dispatch keeps variants and arms in
+/// sync. Not all of them are config-callable: see `stubs::internal_actions`.
+///
+/// Doc comments on the variants would be a mistake here. schemars emits a flat `enum` for a plain
+/// unit enum and a `oneOf` once any variant carries a description, and `stubs::action_names` reads
+/// the flat form -- so one `///` below silently empties the generated `invoke` union.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleAction {
     Register,
+    // Sent by the Renderer's `IdleRegistry::forget_thresholds` before each evaluation, not by a
+    // config (ADR-0158). It rides the same ordered socket as the registrations that follow it,
+    // which is the whole point: a reset the Supervisor ran on its own timing landed after them.
+    ForgetThresholds,
     Inhibit,
     ReleaseInhibit,
 }
@@ -38,15 +46,15 @@ pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope)
     let generation_id = params.generation_id;
     let Some(action) = crate::parse_action::<IdleAction>(params) else { return };
     match action {
+        // Both threshold arms run inline rather than in a spawned task. A forget and the
+        // registrations that follow it come off one ordered socket, and two tasks would be free to
+        // apply them the other way round, which is the whole failure this pair exists to stop
+        // (ADR-0158).
         IdleAction::Register => match parse_register_args(&params.arguments) {
-            Some(sec) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.register_threshold(generation_id, sec).await;
-                });
-            }
+            Some(sec) => controller.register_threshold(generation_id, sec),
             None => crate::log_malformed_command(params),
         },
+        IdleAction::ForgetThresholds => controller.reset_thresholds(generation_id),
         IdleAction::Inhibit => match parse_inhibit_args(&params.arguments) {
             Some(reason) => {
                 let controller = controller.clone();

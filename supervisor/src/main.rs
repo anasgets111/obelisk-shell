@@ -369,7 +369,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 // ADR-0041 decision 4: a `wl_output` appeared or disappeared.
                 RendererFrame::RequestReload => supervisor.begin_reload(),
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
-                    supervisor.answer_unchanged_report(inbound.generation_id, sequence).await;
+                    supervisor.answer_unchanged_report(inbound.generation_id, sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if supervisor.lock.defers_swap() => {
                     // ADR-0042: candidate N+1 cannot acquire generation N's lock, so PBA waits for

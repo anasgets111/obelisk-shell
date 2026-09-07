@@ -3074,3 +3074,67 @@ Not built: caching across passes. Nothing here observes a `state` or `Live` cell
 two passes, so the Watcher stays the thing that decides when a value is stale, and an invalidation
 graph is a different design rather than a wider scope.
 
+
+## 0158. The Renderer says when it forgot its idle thresholds, because the Supervisor was clearing them after the replacements arrived
+
+`Loader::evaluate_named` drops every local threshold callback before each evaluation, and the
+config re-registers what the new tree wants. The Supervisor cleared its own fan-out separately,
+from `answer_unchanged_report`. Both halves were right. Their order was not.
+
+One reload, in the order the frames move:
+
+1. Supervisor sends `Reevaluate(sequence)`.
+2. Renderer forgets its callbacks, runs the config, and `register_threshold` puts an
+   `idle`/`register` command on the socket.
+3. Renderer replies `ReevaluateReport::Unchanged`.
+4. Supervisor calls `reset_registrations`, deleting the entry step 2 just made.
+
+After any in-place reload the config held callbacks nothing could reach.
+`cleanup_generation_thresholds` had emptied the generation's fan-out list, so
+`spawn_idle_event_forwarder` expanded each `idled`/`resumed` into no events. Confirmed live by
+printing from the config's own callbacks: across 22 minutes of ordinary use, with no inhibitor
+held, `on_idle` and `on_resume` ran zero times.
+
+The cost is not a missing feature. `modules/global/idle.lua` zeroes `idle.since` and clears the
+armed stamp in `on_resume`, so a lost resume leaves the stage counting from the first time the seat
+went idle, ignoring every keystroke since. A five-minute lock fires five minutes after that first
+idle whatever the user does. `power-off-monitors` changes `wl_output`, the Renderer answers with
+`RequestReload`, and that reload breaks the next one. Which is why the reported symptom began after
+a blank.
+
+1. **`IdleRegistry::forget_thresholds` sends `idle`/`forget_thresholds`.** The clear and the command
+   are one act, riding this generation's one ordered socket, so the new tree's registrations land
+   behind it. Silent when nothing was registered, so a config with no threshold does not start
+   `idle` by way of the reload path.
+
+   One exception to that order: `replay_pending_registrations` takes the queued registrations into a
+   local vector before installing them. A forget arriving in that window clears the queue and the
+   fan-out, and the replay reinstalls what it already took. Reachable only before notify goes live.
+
+2. **Both threshold arms of `dispatch` run inline.** `tokio::spawn` on each would let two tasks
+   apply a forget and a register in either order, the failure this pair exists to stop. Neither ever
+   awaited: the fan-out is a `std::sync::Mutex` and the Wayland calls are synchronous. The
+   `Inert`/`Live` holder becomes a `std::sync::RwLock` and both methods say `fn`. Inhibit stays
+   async and spawned, because it makes a real D-Bus call.
+3. **`answer_unchanged_report` resets nothing.** It had also been zeroing the generation's inhibit
+   counts and closing the logind fd, while the VM that reload keeps alive still held its own record
+   of that hold. The shell dropped a `microphone` inhibitor on the first reload and, believing it
+   still held one, never took it again. An in-place reload keeps the generation, and only its
+   thresholds were explicitly forgotten.
+4. **`reset_registrations` moves to the reap, where a generation really is gone.** It had no other
+   caller once decision 3 landed, and the swap path had never called it: a superseded generation
+   kept its fan-out entry for the life of the Supervisor, and every idle transition after a swap
+   logged a push to a generation with no connection. That was the roadmap's *Idle registrations
+   outlive their generation* row.
+5. **`forget_thresholds` is excluded from the generated `invoke` union.** It is an `IdleAction`
+   because it crosses the socket as an ordinary command, but a config calling it would silently
+   unregister its own thresholds. `stubs::internal_actions` names it, and a test holds the union to
+   the three a config may call.
+
+A doc comment on the new variant would have been the third bug here. schemars emits a flat `enum`
+for a plain unit enum and a `oneOf` once any variant is described, `stubs::action_names` reads only
+the flat form, and one `///` emptied `IdleCapability`'s whole `invoke` union without failing
+anything but the golden test.
+
+Not built: an acknowledgement for a registration. A lost `register` is still lost, which is the
+roadmap's *Capability start acknowledgement* row for a different frame.

@@ -244,9 +244,13 @@ impl Supervisor {
         begin_reload(&self.registry, self.authoritative.generation_id, &mut self.next_sequence);
     }
 
-    /// Answers `Unchanged`: clear reporter idle registrations and send the go-ahead only for the
-    /// current `Reevaluate` (ADR-0024). Address the reporter, which evaluated it, not authority.
-    pub(crate) async fn answer_unchanged_report(&self, generation_id: u32, sequence: u64) {
+    /// Answers `Unchanged`: send the go-ahead only for the current `Reevaluate` (ADR-0024).
+    /// Address the reporter, which evaluated it, not authority.
+    ///
+    /// Nothing is reset here. Idle thresholds are cleared by the reporter's own
+    /// `forget_thresholds` command, which arrives ahead of the registrations replacing them; a
+    /// reset on this frame ran after both and deleted them (ADR-0158).
+    pub(crate) fn answer_unchanged_report(&self, generation_id: u32, sequence: u64) {
         if !crate::is_current_reload(sequence, self.next_sequence) {
             eprintln!(
                 "generation {generation_id}'s Unchanged report (sequence {sequence}) is stale -- a newer Reevaluate (sequence {}) is \
@@ -254,10 +258,6 @@ impl Supervisor {
                 self.next_sequence
             );
             return;
-        }
-        // No controller means no threshold was registered.
-        if let Some(idle) = self.capabilities.idle() {
-            idle.reset_registrations(generation_id).await;
         }
         send_frame_logged(
             &self.registry,
@@ -464,6 +464,7 @@ impl Supervisor {
                         (candidate_generation_id, &outcome.candidate),
                     ],
                 );
+                let superseded_generation_id = self.authoritative.generation_id;
                 reload::swap_and_reap(
                     &self.registry,
                     &mut self.processes,
@@ -472,6 +473,15 @@ impl Supervisor {
                     outcome,
                 )
                 .await;
+                // The superseded generation is a reaped process; everything the Supervisor held on
+                // its behalf goes with it. Only the swap path needs this -- an in-place reload
+                // keeps the same VM and the same generation id, so its thresholds are replaced by
+                // the reporter's own `forget_thresholds` and its inhibit counts are still owed
+                // (ADR-0158). Without it the dead generation kept its entry in the notify fan-out
+                // and every idle transition logged a push to a generation with no connection.
+                if let Some(idle) = self.capabilities.idle() {
+                    idle.reset_registrations(superseded_generation_id).await;
+                }
             }
             Err(failure) => {
                 eprintln!("generation swap for sequence {sequence} failed: {failure}");

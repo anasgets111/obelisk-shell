@@ -2,10 +2,9 @@
 //! Split from `dbus::idle` -- see `hardware/idle/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::gate::{IdleGate, blocks_idle};
@@ -42,8 +41,10 @@ pub struct IdleController {
     /// `Live` (ADR-0139). Config evaluation reliably beats setup, so without this every boot
     /// threshold was dropped, observed as `register_threshold(generation 0, 20s) ignored`.
     pending: Arc<std::sync::Mutex<Vec<(u32, u64)>>>,
-    /// `tokio::sync::RwLock` around `Inert`/`Live`, swapped by the background setup task so
-    /// constructing an `IdleController` never blocks on Wayland.
+    /// `std::sync::RwLock` around `Inert`/`Live`, swapped by the background setup task so
+    /// constructing an `IdleController` never blocks on Wayland. Not the tokio one. Nothing holds
+    /// it across an await, and a sync threshold half is what lets `dispatch` apply a forget and the
+    /// registrations behind it in the order the socket delivered them (ADR-0158).
     notify: Arc<RwLock<NotifyState>>,
     inhibit: Arc<LiveInhibit>,
     /// The last state [`watch_idle_inhibitors`] published, so `Capabilities::start` returns the
@@ -96,13 +97,13 @@ impl IdleController {
             match outcome {
                 Ok(Ok(Ok((live, raw_events_rx)))) => {
                     spawn_idle_event_forwarder(live.registry.clone(), gate_for_task, raw_events_rx, events_tx);
-                    *notify_for_task.write().await = NotifyState::Live(live);
+                    *notify_for_task.write().unwrap() = NotifyState::Live(live);
                     eprintln!(
                         "idle: dedicated Wayland connection for ext_idle_notifier_v1 established; notify live for this run"
                     );
                     // Swap first: otherwise `register_threshold` sees inert and requeues the
                     // replay.
-                    controller_for_task.replay_pending_registrations().await;
+                    controller_for_task.replay_pending_registrations();
                 }
                 Ok(Ok(Err(err))) => {
                     eprintln!(
@@ -125,31 +126,30 @@ impl IdleController {
         controller
     }
 
-    /// Registers queued thresholds oldest first. Drain under the queue lock, then register outside
-    /// it because `register_threshold` awaits. Never hold a `std::sync::Mutex` across an await:
-    /// it can deadlock, and this codebase avoids that everywhere else. Also returns inhibitor
-    /// state for the initial `Capabilities::start` push; without it quiet machines read `nil`
-    /// forever (ADR-0076).
+    /// Inhibitor state for the initial `Capabilities::start` push; without it quiet machines read
+    /// `nil` forever (ADR-0076).
     pub fn snapshot(&self) -> IdleState {
         self.published.lock().unwrap().clone()
     }
 
-    async fn replay_pending_registrations(&self) {
+    /// Registers queued thresholds oldest first. Drain under the queue lock, then register outside
+    /// it: `register_threshold` takes the same lock to requeue when notify is still inert.
+    fn replay_pending_registrations(&self) {
         let queued: Vec<(u32, u64)> = std::mem::take(&mut *self.pending.lock().unwrap());
         if queued.is_empty() {
             return;
         }
         eprintln!("idle: notify is live; registering {} threshold(s) that arrived before it was", queued.len());
         for (generation_id, sec) in queued {
-            self.register_threshold(generation_id, sec).await;
+            self.register_threshold(generation_id, sec);
         }
     }
 
     /// Supervisor half of `idle:register_threshold(sec, on_idle, on_resume)`
     /// (docs/oblisk-supervisor-services-dbus.md §7.1; ADR-0032). Inert notify queues nothing
     /// here; live notify applies [`register_threshold_entry`] and creates a new listener if needed.
-    pub async fn register_threshold(&self, generation_id: u32, sec: u64) {
-        let notify = self.notify.read().await;
+    pub fn register_threshold(&self, generation_id: u32, sec: u64) {
+        let notify = self.notify.read().unwrap();
         let NotifyState::Live(live) = &*notify else {
             // Inert means degraded or still setting up. Queue entries in either case; a failed
             // setup leaves a small `(u32, u64)` queue rather than dropping every boot registration.
@@ -226,20 +226,29 @@ impl IdleController {
         }
     }
 
-    /// Notify and inhibit halves of `reset_registrations` (ADR-0006/ADR-0032): remove the
-    /// generation's threshold entries, zero its inhibit count, and close the shared fd if it was
-    /// the last holder. Uses the same `state` lock as inhibit/release, serializing reload races.
-    pub async fn reset_registrations(&self, generation_id: u32) {
+    /// Notify half alone (ADR-0158). Drops the generation's threshold entries because its Renderer
+    /// just dropped the callbacks they feed, and is about to register what the new tree asks for.
+    /// The Renderer's own socket orders that, so the fresh registrations land behind this one.
+    ///
+    /// Leaves inhibit counts alone. The VM lives through an in-place reload, so a config's
+    /// `state(...)` record of its own hold survives with it. Zeroing the count here would drop the
+    /// logind fd while the config still believed it held one, and nothing would retake it.
+    pub fn reset_thresholds(&self, generation_id: u32) {
         // Remove queued registrations first: a reload replaced the tree owning their callbacks
         // and must not replay them later (ADR-0139).
         self.pending.lock().unwrap().retain(|&(queued_generation, _)| queued_generation != generation_id);
-        {
-            let notify = self.notify.read().await;
-            if let NotifyState::Live(live) = &*notify {
-                let mut registry = live.registry.lock().unwrap();
-                cleanup_generation_thresholds(&mut registry.fanout, generation_id);
-            }
+        let notify = self.notify.read().unwrap();
+        if let NotifyState::Live(live) = &*notify {
+            let mut registry = live.registry.lock().unwrap();
+            cleanup_generation_thresholds(&mut registry.fanout, generation_id);
         }
+    }
+
+    /// Notify and inhibit halves (ADR-0006/ADR-0032): everything `generation_id` owned, for a
+    /// generation that is gone. Closes the shared fd if it was the last holder. Uses the same
+    /// `state` lock as inhibit/release, serializing reload races.
+    pub async fn reset_registrations(&self, generation_id: u32) {
+        self.reset_thresholds(generation_id);
 
         let mut state = self.inhibit.state.lock().await;
         if cleanup_generation_inhibit(&mut state.counts, generation_id).should_close_fd {

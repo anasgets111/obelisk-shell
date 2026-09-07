@@ -362,7 +362,9 @@ pub fn render() -> String {
     for (capability, schema, actions) in &schemas {
         let class = capability_class(capability);
         let payload = payload_class(schema);
-        let commands = actions.as_ref().map_or_else(Vec::new, action_names);
+        let internal = internal_actions(capability);
+        let mut commands = actions.as_ref().map_or_else(Vec::new, action_names);
+        commands.retain(|command| !internal.contains(&command.as_str()));
         // Inherit `get`/`map` from `Capability<T>`: repeating them would need a class-specific
         // `self`, and an unbound `---@field` would check nothing.
         out.push_str(&format!("\n---@class {class}: Capability<{payload}>\n"));
@@ -429,6 +431,17 @@ const GENERATED_HEADER: &str = r#"---@meta
 ---@field invoke fun(self: Capability<T>, command: string, ...: any)
 ---@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 "#;
+
+/// Wire actions a config must not call, excluded from the generated `invoke` union. They reach the
+/// Supervisor on the same `CommandEnvelope` path as the rest, so the action enum has to carry them,
+/// but a config calling `forget_thresholds` would silently unregister its own idle thresholds
+/// (ADR-0158).
+fn internal_actions(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "idle" => &["forget_thresholds"],
+        _ => &[],
+    }
+}
 
 /// Methods no action schema can describe, appended to the generated class. Only `idle` has them:
 /// three Lua callbacks never cross the wire, so no `IdleAction` signature exists (ADR-0032,
@@ -528,6 +541,23 @@ mod tests {
     fn a_directory_with_no_stubs_has_no_version() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(crate::setup::stub_version(dir.path()), None);
+    }
+
+    /// A config calling `forget_thresholds` would drop its own idle registrations, so the union it
+    /// completes against must not offer it. It is on `IdleAction` because it crosses the socket as
+    /// an ordinary `idle` command (ADR-0158), which is exactly why the exclusion has to be here.
+    #[test]
+    fn the_idle_invoke_union_offers_no_action_only_the_renderer_sends() {
+        let generated = super::render();
+        let line = generated
+            .lines()
+            .find(|line| line.contains("invoke fun(self: IdleCapability"))
+            .expect("idle still has an invoke union");
+
+        assert!(!line.contains("forget_thresholds"), "a config must not be offered it: {line}");
+        for config_callable in ["register", "inhibit", "release_inhibit"] {
+            assert!(line.contains(config_callable), "{config_callable} must survive the exclusion: {line}");
+        }
     }
 
     #[test]

@@ -272,6 +272,21 @@ mod tests {
         );
     }
 
+    /// ADR-0158's ordering, as the two seams see it. A reload cleans the generation out, then its
+    /// new tree registers again. Reversing these two lines is the bug: the entry is added and then
+    /// deleted, and the config hears nothing for the rest of that generation's life.
+    #[test]
+    fn a_generation_that_registers_after_its_cleanup_is_listening_again() {
+        let mut fanout = HashMap::new();
+        register_threshold_entry(&mut fanout, 1, 1);
+
+        cleanup_generation_thresholds(&mut fanout, 1);
+        let created_new_listener = register_threshold_entry(&mut fanout, 1, 1);
+
+        assert_eq!(fanout.get(&Duration::from_secs(1)), Some(&vec![1]));
+        assert!(!created_new_listener, "the emptied duration keeps its listener, so the reload creates no second one");
+    }
+
     #[test]
     fn cleanup_generation_thresholds_is_a_no_op_for_an_unregistered_generation() {
         let mut fanout = HashMap::new();
