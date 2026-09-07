@@ -34,7 +34,9 @@ local lock_status = cell(util.label(oblisk.lock, function(l)
         return l.active and "type your password, then Enter" or "locking..."
     end
     return string.format("%s (%d)", l.error, l.attempts or 0)
-end), theme.RED)
+-- Wrap: the card is 380px and an unavailable-authentication line does not fit on one. Clipped, it
+-- read "could not start authentication: pam worker f" and the user had to guess the rest.
+end), theme.RED, nil, { width = "Fill", wrap = "Word", max_lines = 4 })
 
 -- Include the clock, both because lock screens have one and because it proves `system` still pushes
 -- while locked.
