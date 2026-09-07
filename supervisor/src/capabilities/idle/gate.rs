@@ -60,12 +60,16 @@ impl IdleGate {
     /// Starts unblocked: an unblocked first observation is `None` and logs nothing; an inhibitor
     /// already held at startup is a real change and logs.
     ///
-    /// Release replays nothing. If the seat is still idle, the compositor already sent `idled` and
-    /// will not send it again, so the screen stays awake until the next idle period.
+    /// Release replays nothing, and cannot: `observe` returns before recording, so a seat that went
+    /// idle *during* a block is not in `idled` either. That idle period is invisible for its whole
+    /// length -- seen live as a countdown that never started after a manual hold was dropped, which
+    /// is worse than ADR-0139 decision 4 judged it.
     ///
-    /// ponytail: Still wrong, but safe. The fix is querying current seat idleness on release;
-    /// `ext-idle-notifier-v1` has no such call. Recreating every notification would fire from zero,
-    /// not from when the user stopped.
+    /// ponytail: recreating every notification on release was tried and reverted (ADR-0159), and
+    /// nothing about that attempt was measured -- neither that it worked nor that it broke
+    /// anything. Until then the seat needs input and a fresh idle period. An upgrade wants the
+    /// rebuild driven from the dispatch thread that owns the queue rather than from the
+    /// `BlockInhibited` task, and a way to notice a dead listener so a reload rebuilds one.
     pub(crate) fn set_blocked(&mut self, blocked: bool) -> Option<Vec<shared::IdleEvent>> {
         if blocked == self.blocked {
             return None;
@@ -175,7 +179,11 @@ mod tests {
         gate.observe(event(1, 30, IdleState::Idled));
         gate.set_blocked(true);
 
-        assert_eq!(gate.set_blocked(false), Some(Vec::new()), "the seat's current idleness cannot be re-read");
+        assert_eq!(
+            gate.set_blocked(false),
+            Some(Vec::new()),
+            "a pair the gate never saw open cannot be replayed; ADR-0159 records what re-asking cost"
+        );
         assert_eq!(gate.observe(event(1, 30, IdleState::Idled)), Some(event(1, 30, IdleState::Idled)));
     }
 }

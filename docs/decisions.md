@@ -3140,6 +3140,39 @@ Not built: an acknowledgement for a registration. A lost `register` is still los
 roadmap's *Capability start acknowledgement* row for a different frame.
 
 
+## 0159. Re-arming the idle listeners on release was tried and reverted, on evidence that turned out to be something else
+
+`IdleGate::observe` returns before recording, so a seat that goes idle during a logind block is not
+in the `idled` set. There is nothing for `set_blocked(false)` to replay and no later event to
+expect, because a notification that has sent `idled` never sends it twice. That hole is real, and
+ADR-0139 decision 4's `ponytail:` calls it "still wrong, but safe".
+
+`notify::rearm_listeners` was written against it: destroy each live `ext_idle_notification_v1` on
+release and create a fresh one. It was reverted the same hour. Both the reason for writing it and
+the reason for reverting it were wrong.
+
+1. **The symptom that prompted it was not this hole.** A countdown that would not start after a
+   logind hold was dropped was read as the replay gap. ADR-0160 measured the same machine directly:
+   a browser held a Wayland surface idle inhibitor, so the compositor was withholding `idled` from
+   every gated listener, block or no block.
+2. **The symptom that prompted the revert was not the rearm.** Idle went silent after it ran and a
+   restart was needed, which read as a destroyed listener the process could not rebuild. Three
+   Supervisors were running against one config directory by then, each truncating the same log the
+   diagnosis was read from, and the Wayland inhibitor was up throughout.
+3. **Reverted and left reverted**, not because it is known bad but because nothing here was
+   measured. A release at one log line and the lock stage firing two lines later looked like
+   evidence that a compositor resolves a fresh notification against last input rather than creation
+   time. It is not: adjacent log lines carry no timestamps, and the stage's own deadline could have
+   arrived anyway. That question is open.
+4. **The hole goes to the roadmap** as what it is, a code-level gap with no demonstrated live cost,
+   since every symptom attributed to it has been explained.
+
+The method failure is worth more than the fix. Three diagnoses were stated as settled on
+correlation, each after a change that appeared to fix a symptom that moved on its own. What ended it
+was instrumenting the layer that tells "not being told" from "told and dropped": the Wayland event
+handler, the first layer and the last one reached.
+
+
 ## 0160. `oblisk.idle` reports that the compositor is withholding idle notifications, because nothing else can see a surface inhibitor
 
 ADR-0141 put foreign logind inhibitors in `IdleState` so the shell would stop claiming nothing held
