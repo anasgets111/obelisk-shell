@@ -287,12 +287,23 @@ impl<T> Drop for ReportOnDrop<T> {
     }
 }
 
-/// Re-execs this binary, using the `current_exe()` resolution shared with
-/// `renderer_binary_path()`, as a PAM worker for `username`, then calls [`exchange_over`].
+/// Path this process re-execs to reach [`crate::pam_worker`]'s worker branch.
+///
+/// The magic link, not `current_exe()`, and the difference is a session that cannot be unlocked.
+/// `current_exe()` *reads* the link into a pathname, and the kernel appends " (deleted)" once the
+/// binary is replaced, so the spawn fails with `ENOENT`. Executing the link resolves to the inode
+/// this process already pins, which Linux supports after unlinking. A `pacman -Syu` over a locked
+/// session used to strand it behind "could not start authentication"; seen twice here, once with
+/// the session locked, from `cargo build` doing the same thing to the same inode.
+///
+/// Not `renderer_binary_path()`'s problem: that one calls `with_file_name`, which drops the whole
+/// " (deleted)" filename and rebuilds a real sibling path.
+const SELF_EXE: &str = "/proc/self/exe";
+
+/// Re-execs this binary as a PAM worker for `username`, then calls [`exchange_over`].
 async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Result<shared::PamOutcome> {
-    let exe = std::env::current_exe()?;
     let child = crate::process::spawn_group_leader_stdio_piped(
-        &exe.to_string_lossy(),
+        SELF_EXE,
         &[],
         &[
             ("OBLISK_PAM_WORKER".to_string(), "1".to_string()),
@@ -345,6 +356,122 @@ async fn write_secret_then_read_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- SELF_EXE (ADR-0161) ----
+
+    /// The bug this constant exists for, reproduced without PAM: replace a running executable and
+    /// then spawn it again. Asserting the string would prove nothing, because `current_exe()`
+    /// returns the right path until the moment the inode is replaced.
+    ///
+    /// Uses `cp` as a stand-in for any binary: copy it, run the copy, unlink the copy, and check
+    /// that both routes to "run myself again" still work from inside that process. `current_exe()`
+    /// is what the shell used and what stranded a locked session.
+    #[tokio::test]
+    async fn a_replaced_binary_is_still_reachable_through_the_magic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("stand-in");
+        std::fs::copy("/bin/cp", &copy).expect("a binary to stand in for this one");
+
+        // Hold it open the way a running process holds its own image, then unlink it.
+        let running = std::fs::File::open(&copy).unwrap();
+        std::fs::remove_file(&copy).unwrap();
+
+        let read_back = std::fs::read_link(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&running)))
+            .expect("procfs names the open file");
+        assert!(
+            read_back.to_string_lossy().ends_with(" (deleted)"),
+            "the kernel marks a replaced binary's pathname, which is what made the spawn fail: {read_back:?}"
+        );
+        assert!(
+            !std::path::Path::new(&read_back).exists(),
+            "so the pathname `current_exe()` hands back cannot be spawned"
+        );
+        assert_eq!(SELF_EXE, "/proc/self/exe", "and the link itself is what stays executable");
+    }
+
+    /// The child half of [`a_process_whose_binary_was_unlinked_can_still_spawn_itself`]. Inert
+    /// unless that test asks for it by name and sets the variable, so the ordinary suite skips it
+    /// rather than re-execing itself.
+    ///
+    /// By the time this runs, the parent has unlinked the path this process was started from, so
+    /// `/proc/self/exe` here reads `... (deleted)`. That is the state a `pacman -Syu` leaves a
+    /// running shell in, and spawning through the link has to work anyway.
+    #[test]
+    fn self_exe_probe_child() {
+        if std::env::var_os("OBLISK_SELF_EXE_CHILD").is_none() {
+            return;
+        }
+        let own = std::fs::read_link("/proc/self/exe").expect("procfs names this process's binary");
+        assert!(
+            own.to_string_lossy().ends_with(" (deleted)"),
+            "the parent must have unlinked us first, or this proves nothing: {own:?}"
+        );
+
+        let ran = std::process::Command::new(SELF_EXE)
+            .args(["--exact", "a_name_no_test_here_has"])
+            .output()
+            .expect("a process whose binary was unlinked must still reach itself through the link");
+        assert!(ran.status.success(), "and the re-exec must run");
+    }
+
+    /// The bug end to end: unlink a running process's binary, then have it spawn itself the way
+    /// `spawn_worker_and_exchange` does. Before [`SELF_EXE`] this was `current_exe()`, which hands
+    /// back a pathname with " (deleted)" on it, and the spawn failed with `ENOENT` while a locked
+    /// session waited on it.
+    ///
+    /// Hard-links rather than copies: same inode, no 250MB of I/O, and unlinking the new name is
+    /// what marks the child's `/proc/self/exe`.
+    #[tokio::test]
+    async fn a_process_whose_binary_was_unlinked_can_still_spawn_itself() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = tempfile::tempdir_in(exe.parent().expect("it lives somewhere")).expect("a dir beside it");
+        let stand_in = dir.path().join("stand-in");
+        std::fs::hard_link(&exe, &stand_in).expect("the same filesystem, so a link rather than a copy");
+
+        let child = tokio::process::Command::new(&stand_in)
+            .args(["--exact", "pam_worker::tests::self_exe_probe_child", "--nocapture"])
+            .env("OBLISK_SELF_EXE_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the linked binary runs");
+
+        // Unlink while it runs, which is what an upgrade does.
+        std::fs::remove_file(&stand_in).expect("the name goes, the inode stays");
+
+        let done = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+            .await
+            .expect("the child must not hang")
+            .expect("and must report");
+        let out = format!("{}{}", String::from_utf8_lossy(&done.stdout), String::from_utf8_lossy(&done.stderr));
+        assert!(done.status.success(), "a process whose binary was unlinked must still spawn itself: {out}");
+        // A filter that matches nothing also exits zero, so the pass has to be a test that ran.
+        assert!(out.contains("1 passed"), "the child must have actually run the probe: {out}");
+    }
+
+    /// The other half: this process can spawn itself through [`SELF_EXE`] at all, using the
+    /// production helper. Selects no test by name, because the helper pipes stdio and a child that
+    /// fills its stdout pipe with output nobody reads deadlocks. `wait_with_output` drains it.
+    #[tokio::test]
+    async fn the_magic_link_spawns_this_test_binary_again() {
+        let child = crate::process::spawn_group_leader_stdio_piped(
+            SELF_EXE,
+            &["--exact".to_string(), "a_name_no_test_here_has".to_string()],
+            &[("OBLISK_SELF_EXE_PROBE".to_string(), "1".to_string())],
+        );
+        let child = child.expect("spawning /proc/self/exe must work for a live process");
+        let done = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("the re-exec must not hang")
+            .expect("and must report a status");
+
+        assert!(done.status.success(), "the re-exec ran and selected no test");
+        assert!(
+            String::from_utf8_lossy(&done.stdout).contains("0 passed"),
+            "it was this test binary that ran again, not something else: {}",
+            String::from_utf8_lossy(&done.stdout)
+        );
+    }
 
     // ---- pam_service_in ----
 

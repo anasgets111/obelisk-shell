@@ -3231,3 +3231,48 @@ in any protocol. A dedicated zero-timeout detector would answer live rather than
 and `timeout: 0` is explicitly valid. It is deferred because the always-idle behaviour it needs is
 compositor-specific, matching Hyprland while Smithay reinserts a timer, and the wakeup cost was
 never measured.
+
+
+## 0161. The PAM worker is reached through `/proc/self/exe`, because reading that link strands a locked session
+
+`spawn_worker_and_exchange` re-execs this binary to run PAM off tokio (ADR-0028). It resolved the
+path with `current_exe()`, which *reads* the magic link into a pathname. Once the binary on disk is
+replaced, the kernel appends " (deleted)" to that pathname, nothing exists at it, and the spawn
+fails with `ENOENT`. The lock screen then shows "could not start authentication" and the session
+cannot be unlocked at all.
+
+Seen twice on 2026-09-07, the second time with the session locked and the user on a TTY. Confirmed
+after the fact:
+
+```
+/proc/3342256/exe -> /mnt/Work/0Coding/1Rust/oblisk-shell/target/debug/oblisk (deleted)
+```
+
+A `cargo build` did it here. `pacman -Syu` over a locked session does the same thing to an installed
+`oblisk`, which is the ordinary case rather than an exotic one.
+
+1. **Execute the link, do not read it.** `SELF_EXE` is the literal `/proc/self/exe`. The kernel
+   follows it to the inode this process already pins, which Linux supports after unlinking, so the
+   worker starts from the same code the running Supervisor is. One line.
+2. **`renderer_binary_path` is not affected and is unchanged.** It calls `with_file_name`, which
+   replaces the whole " (deleted)" filename with `oblisk-renderer` and yields a real sibling path.
+3. **Rejected: an `O_PATH` fd pinned at startup, exec'd with `execveat`.** It works, and it is what
+   this needs only if procfs itself becomes unreachable. Against an ordinary upgrade it buys the
+   same survival for more machinery at the exec boundary.
+4. **Rejected: a long-lived worker started at boot.** It adds supervision, restart, and per-request
+   state, and a crash reintroduces the exec problem it was meant to avoid. A transaction per attempt
+   is right regardless.
+5. **Rejected: caching or re-resolving an install path.** It selects new worker code for an old
+   Supervisor's protocol, fails during the replacement gap, and re-resolution is a TOCTOU: a
+   writable install directory would let replacement code receive the password.
+
+Pinning the executable does not pin the whole PAM stack. A fresh exec loads shared libraries through
+the ELF interpreter, so libpam and its modules come from whatever is installed now. The Supervisor
+holding the unlock decision is already the old code; upgrading its file never patched it. Security
+fixes apply at a controlled restart after unlocking, and this only guarantees there is a way to
+unlock.
+
+Not fixed here: an upgrade that removes the loader or a library the old executable needs still stops
+the worker, and no exec strategy survives that. The failure path also deserves better than a
+truncated red line: keep the lock, clear `authenticating`, do not spend a bad-password allowance on
+an infrastructure failure, and say that a terminal login is the repair.
