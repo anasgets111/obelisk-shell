@@ -375,6 +375,10 @@ impl Supervisor {
 
     pub(crate) fn record_pam_outcome(&mut self, acquisition: u64, outcome: shared::PamOutcome) {
         let succeeded = outcome == shared::PamOutcome::Success;
+        // Every answer, not only the refusals below. A wrong password logged nothing at all, so a
+        // lock screen that would not open read the same in the log whether PAM said no or the
+        // attempt never arrived.
+        eprintln!("lock: pam answered {outcome:?} for acquisition {acquisition}");
         if !self.lock.record_authentication(acquisition, outcome) {
             // No push: refusal changed no state; `push_lock_state` would bump the revision anyway.
             eprintln!(

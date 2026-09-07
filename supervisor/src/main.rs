@@ -436,6 +436,9 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // `try_begin_authentication` rejects no-lock and concurrent submissions. Its
                     // acquisition travels through the worker so `pam_outcomes` matches this lock.
                     if let Some(acquisition) = supervisor.lock.try_begin_authentication() {
+                        // Pairs with `record_pam_outcome`'s answer. Without both, a worker that
+                        // never reports is indistinguishable from a submit that never arrived.
+                        eprintln!("lock: starting pam for acquisition {acquisition}");
                         supervisor.push_lock_state();
                         // `mem::take` gives plaintext to `run_authentication`, which zeroizes on
                         // panic and shutdown cancellation too. Spawn instead of await: Enter is
@@ -459,14 +462,14 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 }
                 RendererFrame::SecureSubmit(mut submit) => {
                     // Channel-forward/log placeholder for other capability/actions (ADR-0015's
-                    // textfield/IPC half), none implemented yet. Log only length, before zeroizing
-                    // so the read precedes the clear.
+                    // textfield/IPC half), none implemented yet. The length is deliberately absent:
+                    // a misaddressed password reaches this arm, and its length is the one thing
+                    // about it worth an attacker's time.
                     eprintln!(
-                        "generation {}'s secure_submit received: capability={:?} action={:?} secret_len={}",
+                        "generation {}'s secure_submit received: capability={:?} action={:?}",
                         submit.generation_id,
                         submit.capability,
-                        submit.action,
-                        submit.secret.len()
+                        submit.action
                     );
                     submit.secret.zeroize();
                 }

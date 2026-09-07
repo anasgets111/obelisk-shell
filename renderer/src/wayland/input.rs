@@ -275,6 +275,11 @@ fn edit_plain_buffer(buffer: &mut String, action: KeyAction<'_>, cancels: bool) 
 }
 /// A secure submit frame, or `None` without a destination (ADR-0050 decision 4). Do not send to
 /// `"unknown"/"unknown"`; the buffer is zeroized on both branches.
+///
+/// Both refusals say so. Dropping a submit here is indistinguishable from a lock screen that has
+/// stopped accepting the password: nothing reaches the Supervisor, so nothing downstream can
+/// report it, and a session that will not unlock leaves no line anywhere. Neither branch names the
+/// secret or its length.
 fn submit_frame_for(
     generation_id: u32,
     target: Option<&node::SecureSubmitTarget>,
@@ -282,7 +287,16 @@ fn submit_frame_for(
 ) -> Option<RendererFrame> {
     // An empty buffer would spend a PAM attempt and `pam_unix` failure delay, so reject it before
     // checking the destination.
-    let Some(target) = target.filter(|_| !buffer.is_empty()) else {
+    let empty = buffer.is_empty();
+    let Some(target) = target.filter(|_| !empty) else {
+        match target {
+            None => eprintln!(
+                "secure submit dropped: no field is focused to send it to, so a password typed here reaches nothing"
+            ),
+            Some(target) => {
+                eprintln!("secure submit to {}/{} dropped: the field is empty", target.capability, target.action)
+            }
+        }
         buffer.zeroize();
         return None;
     };
@@ -688,12 +702,22 @@ impl App {
     /// Apply one secure key (ADR-0005). Focus is the destination gate; masked fields without one
     /// are never focused. Bytes go `KeyEvent` → native `SecureBuffer` → Supervisor, never Lua.
     fn apply_secure_key(&mut self, event: &KeyEvent, repeat: bool) {
+        let action = key_action(event, repeat);
         if self.focused_secure_submit.is_none() {
+            // Enter with nothing focused is the shape a stuck lock screen takes: the keys went
+            // nowhere, `finish_secure_submit` is never reached, and every refusal log lives below
+            // this return. Only the submit key says so, or an unfocused keyboard would log per
+            // keystroke.
+            if matches!(action, KeyAction::Submit) {
+                eprintln!(
+                    "[oblisk-renderer] submit pressed while no secure field holds focus; nothing was typed into one and nothing was sent"
+                );
+            }
             return;
         }
         // Append/backspace/clear all change the drawn character count.
         self.field_input_changed = true;
-        match key_action(event, repeat) {
+        match action {
             KeyAction::Append(text) => self.secure_buffer.push_str(text),
             // `pop_char` zeroizes dropped bytes, not just the length.
             KeyAction::Backspace => {
@@ -836,11 +860,26 @@ impl App {
     /// Build and queue a completed `secure_submit`; [`submit_frame_for`] reads once and scrubs on
     /// both the destination-missing and empty-buffer paths (ADR-0050 decision 4).
     fn finish_secure_submit(&mut self) {
+        // Which of the two, not "one of these". A lock screen that will not open needs the log to
+        // separate "the password went nowhere" from "you submitted an empty field", and the old
+        // line named both and settled neither.
+        let addressed = self.focused_secure_submit.as_ref().map(|field| field.target.clone());
+        let nothing_typed = self.secure_buffer.is_empty();
         let target = self.focused_secure_submit.as_ref().map(|field| &field.target);
         let Some(frame) = submit_frame_for(self.generation_id, target, &mut self.secure_buffer) else {
-            eprintln!(
-                "[oblisk-renderer] secure_submit dropped: nothing had been typed, or no focused textfield named a capability/action to address it to; the buffer was zeroized and nothing was sent"
-            );
+            match addressed {
+                None => eprintln!(
+                    "[oblisk-renderer] secure_submit dropped: no focused textfield named a capability and action to address it to, so nothing was sent"
+                ),
+                Some(target) if nothing_typed => eprintln!(
+                    "[oblisk-renderer] secure_submit to {}/{} dropped: nothing had been typed",
+                    target.capability, target.action
+                ),
+                Some(target) => eprintln!(
+                    "[oblisk-renderer] secure_submit to {}/{} dropped for no recorded reason; this is a bug",
+                    target.capability, target.action
+                ),
+            }
             return;
         };
         if let Err(e) = self.outbound_tx.send(frame) {
