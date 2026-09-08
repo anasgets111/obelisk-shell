@@ -334,6 +334,7 @@
 ---@field attempts integer PAM answers against the held lock, including success. Resets to `0` only on a new confirmed lock, so it is per-acquisition, not per-failure; lockout rules read it with `error`.
 ---@field authenticating boolean A password is with PAM and unanswered. `pam_unix` takes about a second, so this drives a spinner; `lock:authenticate` is refused while true.
 ---@field error string Drawable reason for the last failure, e.g. `"too many attempts"`. Empty before attempts or after success; rewritten on every PAM answer and cleared on a new lock.
+---@field unlocking boolean PAM has said yes and the lock is still on the glass, which is the window a config animates its lock screen out in (ADR-0190). True between a successful password and the Renderer's `Unlocked` report. With no `unlock_animation` configured that window is as short as the round trip; with one it is at least that long. Nothing a config does can extend it: the release is scheduled by the Supervisor the moment PAM answers, and this is a readout of that, not a handle on it.
 
 ---@class MprisState
 ---@field players PlayerState[] Every MPRIS player, longest-running first. New players append and position updates do not move entries, so `players[1]` keeps its meaning. Empty when no player is running, which is valid, not an error.
@@ -465,7 +466,7 @@ local BatteryCapability = {}
 ---@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
 
 ---@class LockCapability: Capability<LockState>
----@field invoke fun(self: LockCapability, command: "lock", ...: any)
+local LockCapability = {}
 
 ---@class MprisCapability: Capability<MprisState>
 ---@field invoke fun(self: MprisCapability, command: "control"|"seek"|"seek_relative", ...: any)

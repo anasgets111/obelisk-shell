@@ -36,12 +36,50 @@ local NAME_SIZE     = theme.s(24, 18)
 -- and the wallpaper is still the desktop underneath. Here the wallpaper is scenery: the card has to
 -- read against a photograph with no blur to soften it.
 local SCRIM         = theme.with_opacity(theme.BG, 0.6)
--- `Theme.lockClosedScale`, where the card starts its entry.
-local CLOSED_SCALE  = 0.94
 
-local full_name     = identity.full_name
-local account       = identity.account
-local initials      = identity.initials
+-- How long this screen takes to leave, and what the engine is told to wait.
+--
+-- The lock comes down when the *engine* says so, not when the tween ends: the user has already
+-- authenticated, and a config is not allowed to keep them looking at a lock screen (ADR-0190).
+-- So this number has to cover the exit rather than describe it, and it is derived from the two
+-- animations below instead of written twice.
+--
+-- The card fades over `animation_slow_ms`; the ground waits `animation_ms` and then fades over
+-- `animation_ms`, so the pair ends at whichever of those runs longer.
+local EXIT_MS       = math.max(theme.animation_slow_ms, theme.animation_ms * 2)
+-- Slack, because the window opens when the Supervisor schedules the release and not when this
+-- config hears about it: a state push has to reach the Renderer and a first frame be scheduled
+-- before anything moves. Without it the exit is cut off by exactly that round trip, which is the
+-- kind of shortfall that looks like a rendering bug rather than a timing one.
+local LEAVE_SLACK   = 60
+local LEAVE_MS      = EXIT_MS + LEAVE_SLACK
+oblisk.lock:invoke("set_unlock_animation", LEAVE_MS)
+
+-- True from the moment PAM says yes until the lock is off the glass.
+local leaving      = oblisk.lock:map(function(l)
+    return l ~= nil and l.unlocking
+end)
+
+-- True exactly while the card should be up: the compositor has granted the lock and PAM has not yet
+-- answered. Both edges of the card's motion are this one flag changing value.
+--
+-- `animate`'s `from` is not enough, and that is the difference between the two directions. `from`
+-- applies only where a node has no previously displayed value; this subtree outlives the lock, so
+-- it already displayed `opacity = 1` and the entry had nothing to move. Leaving worked for exactly
+-- the reason arriving did not -- it is a value *change* on a node that is already there.
+--
+-- Keyed on `active` rather than on the surface existing, because `ext_session_lock_v1` withholds
+-- `locked` until every output has presented a frame. A fade run during that handshake would be over
+-- before the screen it introduces was ever shown.
+local up           = oblisk.lock:map(function(l)
+    return l ~= nil and l.active and not l.unlocking
+end)
+-- `Theme.lockClosedScale`, where the card starts its entry.
+local CLOSED_SCALE = 0.94
+
+local full_name    = identity.full_name
+local account      = identity.account
+local initials     = identity.initials
 
 -- Read from `oblisk.lock`, not `rescue`, per ADR-0052 decision 4: while lock surfaces are mapped
 -- the bar's `rescue_cell` is unreachable.
@@ -50,7 +88,7 @@ local initials      = identity.initials
 -- the Renderer has confirmed the lock. Print `attempts` because capability state is sampled at
 -- layout time (ADR-0044); identical consecutive `error` strings would otherwise hide the second
 -- failure.
-local hint          = util.label(oblisk.lock, function(l)
+local hint         = util.label(oblisk.lock, function(l)
     if l.error ~= nil and l.error ~= "" then
         return string.format("%s (%d)", l.error, l.attempts or 0)
     end
@@ -63,14 +101,14 @@ local hint          = util.label(oblisk.lock, function(l)
     return "Press Enter to unlock"
 end)
 
-local failed        = util.shown_when(oblisk.lock, function(l)
+local failed       = util.shown_when(oblisk.lock, function(l)
     return l.error ~= nil and l.error ~= ""
 end)
 
 -- `passwordInput`'s three border colours, and the same colour on the hint below it, so a failure is
 -- one change of state rather than two unrelated reds. `Theme.ColorTransition` is `animate` on the
 -- pill.
-local field_border  = oblisk.lock:map(function(l)
+local field_border = oblisk.lock:map(function(l)
     if l == nil then
         return theme.GLASS_BORDER
     end
@@ -80,13 +118,13 @@ local field_border  = oblisk.lock:map(function(l)
     return l.authenticating and theme.ACCENT or theme.GLASS_BORDER
 end)
 
-local caps          = oblisk.keyboard:map(function(k)
+local caps         = oblisk.keyboard:map(function(k)
     return k ~= nil and k.caps_lock == true
 end)
 
 -- Black on yellow, chosen by the same helper the bar's buttons use rather than hard-coding the
 -- ground's opposite here.
-local BADGE_FG      = theme.text_contrast(theme.YELLOW)
+local BADGE_FG     = theme.text_contrast(theme.YELLOW)
 
 -- One icon-and-reading pair from the row under the divider. The mirror's `statusItems` is a list
 -- through a `Repeater`; three literal children need no `list`.
@@ -314,6 +352,15 @@ local function content(output)
     return rect {
         width = "Fill",
         height = "Fill",
+        -- The ground leaves a stage after the card, which is the mirror's `phase` 1 -> 0 following
+        -- its 2 -> 1: the screen behind the card is the last thing to go, so the session does not
+        -- appear through a card that is still on its way out.
+        opacity = leaving:map(function(out)
+            return out and 0 or 1
+        end),
+        animate = {
+            opacity = { duration = theme.animation_ms, easing = "InCubic", delay = theme.animation_ms },
+        },
         -- Under the image, as `modules/global/wallpaper.lua` is: a failed decode leaves the lock
         -- dark rather than transparent, which on a lock screen is the difference between a mistake
         -- and a hole through to the session.
@@ -338,8 +385,16 @@ local function content(output)
                 -- Both spelled out, because a property the node never sets has no target for a
                 -- tween to reach and the entry is skipped (`Animatable::from_value` on an absent
                 -- property answers "nothing to animate").
-                opacity = 1,
-                scale = 1,
+                --
+                -- On the way out both run backwards, which is `leaving` doing the same job the
+                -- `from` does on the way in: the card shrinks back to `CLOSED_SCALE` and fades,
+                -- and the ground below follows it a stage later.
+                opacity = up:map(function(on)
+                    return on and 1 or 0
+                end),
+                scale = up:map(function(on)
+                    return on and 1 or CLOSED_SCALE
+                end),
                 animate = {
                     opacity = { duration = theme.animation_slow_ms, easing = "OutCubic", from = 0 },
                     scale = { duration = theme.animation_slow_ms, easing = "OutBack", from = CLOSED_SCALE },

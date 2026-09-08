@@ -4515,3 +4515,56 @@ its text through `on_change` alone.
 
 Found by probing the running config rather than by reading it. The read said the config was right,
 twice, and it was.
+
+## 0190. A config declares how long its lock screen takes to leave, and the Supervisor still owns the leaving
+
+`LockScreen.qml` animates in and out of a lock. Its exit is two 147ms stages, and the last thing the
+sequence does is call `LockService.finalizeUnlock()` -- the QML holds the lock open and releases it
+itself when the animation is done.
+
+That shape cannot be copied here. ADR-0042 gives `oblisk.lock` no `unlock` action on purpose: a Lua
+callback that releases the session lock is a one-click path past PAM, and a `finalize_unlock` would
+be that action wearing a different name. It would also make a config's correctness load-bearing for
+whether the user can get back into their session -- a config that throws mid-animation, or never
+reaches its last stage, leaves the lock up forever with the right password already given.
+
+So the direction is inverted. The config declares *how long* it needs, once, with
+`("lock", "set_unlock_animation")`, and the Supervisor schedules the release itself the moment PAM
+answers. `LockState.unlocking` is a readout of that window, not a handle on it: nothing a config
+does afterwards can extend, cancel, or fail to end it.
+
+The delayed release names the acquisition it was scheduled for. `record_authentication` already
+refuses a PAM answer for a lock that is no longer on the glass, but a release that *waits* outlives
+that check: a lock can end and another begin while the timer sleeps, and an unconditional unlock
+would then open a lock nobody authenticated for. Reaching ADR-0042's forbidden unlock by waiting is
+still reaching it. So the timer re-reads the acquisition and the `unlocking` flag before sending,
+and does nothing if either has moved on -- the lock it was authorized to release is already gone.
+
+What this does not survive is a runtime shutdown inside the window: the sleeping task is dropped and
+the release with it, leaving the compositor holding a lock the user has answered. The window is at
+most 600ms, so it is a shutdown landing in a small hole, but it is a real way to be locked out and
+is marked as such in the code. The fix is to hold the pending release in `main.rs`'s loop, which can
+flush it on the way down.
+
+`MAX_UNLOCK_ANIMATION` is 600ms, and it is a ceiling rather than a preference. This window is time
+the user has authenticated and is still looking at a lock screen; a config that asked for ten
+seconds of it, by typo or by deriving the number from something that went wrong, would be
+indistinguishable from a shell that has hung. A malformed argument is no animation rather than a
+refusal, for the same reason: the lock still comes down.
+
+The entry animation was supposed to need nothing, and that was wrong. `dev-config`'s lock declared
+its card's entry through `animate`'s `from` (ADR-0146) and it had never once played: `from` applies
+only where a node has no previously displayed value, and this subtree outlives the lock, so the card
+already displayed `opacity = 1` and the entry had nothing to move. Locking was instant and had
+always been instant.
+
+Both edges are one flag now. A computed `up` -- the compositor has granted the lock and PAM has not
+yet answered -- drives opacity and scale in both directions, so arriving and leaving are the same
+mechanism: a value change on a node that is already there, which is the mechanism that was working
+for the exit while the entry did nothing. It is keyed on `active` rather than on the surface
+existing because `ext_session_lock_v1` withholds `locked` until every output has presented a frame,
+and a fade run during that handshake would be over before the screen it introduces was shown.
+
+Every way a lock can end shuts the window, including a relock during one: an idle timer can fire
+while the last unlock is still playing, and the new lock screen must not come up already playing
+its own exit.

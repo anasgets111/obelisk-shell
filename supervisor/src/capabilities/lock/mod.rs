@@ -5,7 +5,9 @@
 //! and the only unlock call site. [`LockEvent`]s go through pure [`apply`], testable without socket
 //! or PAM.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -28,6 +30,14 @@ pub struct LockState {
     /// Drawable reason for the last failure, e.g. `"too many attempts"`. Empty before attempts or
     /// after success; rewritten on every PAM answer and cleared on a new lock.
     pub error: String,
+    /// PAM has said yes and the lock is still on the glass, which is the window a config animates
+    /// its lock screen out in (ADR-0190).
+    ///
+    /// True between a successful password and the Renderer's `Unlocked` report. With no
+    /// `unlock_animation` configured that window is as short as the round trip; with one it is at
+    /// least that long. Nothing a config does can extend it: the release is scheduled by the
+    /// Supervisor the moment PAM answers, and this is a readout of that, not a handle on it.
+    pub unlocking: bool,
     /// `SetSessionLock { locked: true }` is in flight before Renderer confirmation.
     /// `#[serde(skip)]`:
     /// swap-gate state, not payload. `active` must mean only Renderer confirmation, but the gate
@@ -73,6 +83,9 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
         LockEvent::Authenticated(shared::PamOutcome::Success) => {
             state.authenticating = false;
             state.error.clear();
+            // The password was right and the lock is still up: the whole of the out-animation's
+            // window, and true whether or not one is configured (ADR-0190).
+            state.unlocking = true;
         }
         LockEvent::Authenticated(outcome) => {
             state.authenticating = false;
@@ -91,6 +104,9 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.authenticating = false;
             state.attempts = 0;
             state.error.clear();
+            // A fresh lock is not a lock being left: an idle timer can lock again while the last
+            // unlock's animation is still playing, and the new screen must come up locked.
+            state.unlocking = false;
             state.acquisition += 1;
         }
         // Nothing was taken or protected (ADR-0052 decision 3).
@@ -106,6 +122,8 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.requested = false;
             state.authenticating = false;
             state.error.clear();
+            // The lock is off the glass, so there is nothing left to animate out of.
+            state.unlocking = false;
         }
         // Clear `active` so a replacement can re-acquire (`lock` drops requests while active), and
         // clear `authenticating` (see [`accepts_outcome`]); keep acquisition and error.
@@ -113,8 +131,19 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.active = false;
             state.requested = false;
             state.authenticating = false;
+            // The screen that was animating out is gone with its Renderer. Left true this survives
+            // into the replacement's first push, and a config that reads it draws a lock screen
+            // permanently mid-exit; `LockRequested` and `Refused` do not clear it either, so
+            // nothing short of a *successful* reacquisition would.
+            state.unlocking = false;
         }
     }
+}
+
+/// Whether a release scheduled for `acquisition` still applies (ADR-0190). Pure so the stale-timer
+/// case can be checked without sleeping: the task re-reads exactly this before it sends.
+pub fn releases(state: &LockState, acquisition: u64) -> bool {
+    state.acquisition == acquisition && state.unlocking
 }
 
 /// ADR-0042 swap gate. One client may hold a session lock, so candidate N+1 cannot acquire N while
@@ -233,15 +262,22 @@ pub(crate) fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
 /// Owns [`LockState`] and the outbound `SetSessionLock` queue. Not `Clone`: `main.rs` mutates it
 /// inline in `select!` (unlike `KeyboardController`).
 pub struct LockController {
-    state: Mutex<LockState>,
+    /// Shared so a scheduled release can re-read the acquisition it was scheduled for; see
+    /// [`LockController::unlock_after_animation`].
+    state: Arc<Mutex<LockState>>,
     commands_tx: UnboundedSender<shared::SetSessionLock>,
+    /// Milliseconds [`LockController::unlock_after_animation`] waits before releasing, clamped to
+    /// [`MAX_UNLOCK_ANIMATION`] by the setter. Zero, and so unchanged from before ADR-0190, until a
+    /// config sets it. An atomic rather than a second mutex: it is written once at config load and
+    /// read once per unlock, and it has no invariant tying it to the lock state beside it.
+    unlock_animation_ms: AtomicU64,
 }
 
 impl LockController {
     /// `commands_tx` returns commands to `main.rs`, the only holder of the authoritative generation
     /// id, which a swap reassigns.
     pub fn new(commands_tx: UnboundedSender<shared::SetSessionLock>) -> Self {
-        Self { state: Mutex::new(LockState::default()), commands_tx }
+        Self { state: Arc::new(Mutex::new(LockState::default())), commands_tx, unlock_animation_ms: AtomicU64::new(0) }
     }
 
     /// Sends `lock()`, unless a lock is already active. Renderer answers `Nothing` for
@@ -269,6 +305,68 @@ impl LockController {
     /// Records no event: Renderer `Unlocked` clears `active`.
     pub fn unlock(&self) {
         self.send(shared::SetSessionLock { locked: false });
+    }
+
+    /// Records how long a lock stays up after a correct password, clamped to
+    /// [`MAX_UNLOCK_ANIMATION`] (ADR-0190).
+    pub fn set_unlock_animation(&self, window: Duration) {
+        let clamped = window.min(MAX_UNLOCK_ANIMATION);
+        self.unlock_animation_ms.store(clamped.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// What [`LockController::set_unlock_animation`] last accepted.
+    pub fn unlock_animation(&self) -> Duration {
+        Duration::from_millis(self.unlock_animation_ms.load(Ordering::Relaxed))
+    }
+
+    /// Releases the lock the password answered, after the configured window if there is one.
+    ///
+    /// **The release names its acquisition.** `record_authentication` checks that a PAM answer
+    /// belongs to the lock on the glass (`accepts_outcome`), but a *delayed* release outlives that
+    /// check: a lock can end and another begin while the timer sleeps, and an unconditional unlock
+    /// would then release a lock nobody authenticated for -- the ADR-0042 bypass, arrived at by
+    /// waiting instead of by a Lua action. So the acquisition is captured here and re-read when the
+    /// timer fires; if it has moved on, the lock this was authorized to release is already gone and
+    /// there is nothing to do.
+    ///
+    /// A poisoned state lock refuses to send. It cannot tell which lock it would be releasing, and
+    /// a wrong release is worse than a late one -- the panic that poisoned it will already have
+    /// taken this process down, which leaves the compositor holding the lock either way.
+    ///
+    /// ponytail: a runtime shutdown inside the window drops the sleeping task and the release with
+    /// it, leaving the compositor holding a lock the user has already answered. The window is at
+    /// most [`MAX_UNLOCK_ANIMATION`], so this is a shutdown landing in a 600ms hole, but it is a
+    /// real way to be locked out. Upgrade path: hold the pending release in `main.rs`'s loop, which
+    /// can flush it on the way down; that is where the generation id already lives.
+    pub fn unlock_after_animation(&self) {
+        let window = self.unlock_animation();
+        if window.is_zero() {
+            self.unlock();
+            return;
+        }
+        let Ok(acquisition) = self.state.lock().map(|state| state.acquisition) else {
+            // Nothing to name the release with, so take the immediate one rather than a blind one.
+            self.unlock();
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let commands_tx = self.commands_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            let release = match state.lock() {
+                Ok(state) => releases(&state, acquisition),
+                Err(_) => {
+                    eprintln!("lock: the lock state is poisoned; refusing to release a lock it cannot identify");
+                    false
+                }
+            };
+            if !release {
+                return;
+            }
+            if commands_tx.send(shared::SetSessionLock { locked: false }).is_err() {
+                eprintln!("lock: the command channel is closed; the unlock after its animation was dropped");
+            }
+        });
     }
 
     pub fn record(&self, event: LockEvent) {
@@ -322,7 +420,19 @@ impl LockController {
 #[serde(rename_all = "snake_case")]
 pub enum LockAction {
     Lock,
+    /// How long the Supervisor holds a lock open after PAM says yes, so a config can animate its
+    /// lock screen out (ADR-0190). Milliseconds, clamped to [`MAX_UNLOCK_ANIMATION`].
+    SetUnlockAnimation,
 }
+
+/// The longest a lock may stay up after a correct password.
+///
+/// A ceiling and not a preference: this window is time the user has authenticated and is still
+/// looking at a lock screen, and a config that asked for ten seconds of it -- by typo, or by
+/// deriving the number from something that went wrong -- would be indistinguishable from a shell
+/// that has hung. Quickshell's own out-animation is two 147ms stages, so 600ms is comfortably past
+/// anything that reads as an animation rather than a fault.
+pub const MAX_UNLOCK_ANIMATION: Duration = Duration::from_millis(600);
 
 /// `oblisk.lock` action dispatch (ADR-0037). `lock` takes no arguments, so it has no `parse_*_args`
 /// sibling.
@@ -331,6 +441,12 @@ pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope)
     let Some(action) = crate::parse_action::<LockAction>(params) else { return };
     match action {
         LockAction::Lock => controller.lock(),
+        // A malformed or missing argument is no animation rather than a refusal: the lock screen
+        // still comes down, which is the property that matters. The clamp is the setter's.
+        LockAction::SetUnlockAnimation => {
+            let millis = params.arguments.first().and_then(serde_json::Value::as_u64).unwrap_or(0);
+            controller.set_unlock_animation(Duration::from_millis(millis));
+        }
     }
 }
 
@@ -419,6 +535,7 @@ mod tests {
             error: "authentication failed".to_string(),
             requested: false,
             acquisition: 4,
+            unlocking: false,
         }
     }
 
@@ -566,7 +683,8 @@ mod tests {
                 attempts: 0,
                 error: String::new(),
                 requested: false,
-                acquisition: 1
+                acquisition: 1,
+                unlocking: false
             }
         );
     }
@@ -583,7 +701,8 @@ mod tests {
                 attempts: 0,
                 error: "no lock node is declared".to_string(),
                 requested: false,
-                acquisition: 0
+                acquisition: 0,
+                unlocking: false
             }
         );
     }
@@ -600,7 +719,8 @@ mod tests {
                 attempts: 0,
                 error: String::new(),
                 requested: false,
-                acquisition: 0
+                acquisition: 0,
+                unlocking: false
             }
         );
     }
@@ -617,7 +737,8 @@ mod tests {
                 attempts: 1,
                 error: "authentication failed".to_string(),
                 requested: false,
-                acquisition: 0
+                acquisition: 0,
+                unlocking: false
             }
         );
 
@@ -639,10 +760,81 @@ mod tests {
                 attempts: 1,
                 error: String::new(),
                 requested: false,
-                acquisition: 4
+                acquisition: 4,
+                // PAM said yes and the lock is still up: the window a config animates out in
+                // (ADR-0190).
+                unlocking: true
             },
             "active clears only when the Renderer reports Unlocked -- the lock is on the glass until unlock_and_destroy actually runs"
         );
+    }
+
+    /// ADR-0190. `unlocking` is the window a config animates its lock screen out in: open from the
+    /// moment PAM says yes, shut by the release. Every way the lock can come back must shut it, or
+    /// a screen that locks again mid-animation comes up already playing its own exit.
+    #[test]
+    fn unlocking_opens_on_a_correct_password_and_shuts_on_every_way_the_lock_ends() {
+        let mut state = locked_with_one_failure();
+        assert!(!state.unlocking, "a lock nobody has answered is not on its way out");
+
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::Success));
+        assert!(state.unlocking, "a correct password opens the window");
+        assert!(state.active, "and the lock is still on the glass while it is open");
+
+        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Unlocked));
+        assert!(!state.unlocking, "the release shuts it");
+
+        // A relock during the animation: an idle timer can fire while the last unlock is still
+        // playing, and the new lock screen must not come up mid-exit.
+        let mut state = locked_with_one_failure();
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::Success));
+        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
+        assert!(!state.unlocking, "a fresh lock is not a lock being left");
+
+        // A wrong password does not open it.
+        let mut state = locked_with_one_failure();
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::AuthFailed));
+        assert!(!state.unlocking);
+    }
+
+    /// ADR-0190. The window is time the user has authenticated and is still looking at a lock
+    /// screen, so the ceiling is the engine's and not the config's.
+    /// ADR-0190. The window is time the user has authenticated and is still looking at a lock
+    /// screen, so the ceiling is the engine's and not the config's.
+    #[test]
+    fn the_unlock_animation_is_clamped_to_the_engines_ceiling() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let controller = LockController::new(tx);
+        assert_eq!(controller.unlock_animation(), Duration::ZERO, "no animation until a config asks");
+
+        controller.set_unlock_animation(Duration::from_millis(300));
+        assert_eq!(controller.unlock_animation(), Duration::from_millis(300), "an ordinary window is taken");
+
+        controller.set_unlock_animation(Duration::from_secs(10));
+        assert_eq!(controller.unlock_animation(), MAX_UNLOCK_ANIMATION, "a config cannot hold an answered lock open");
+
+        controller.set_unlock_animation(Duration::ZERO);
+        assert_eq!(controller.unlock_animation(), Duration::ZERO, "and it can put the window back");
+    }
+
+    /// ADR-0190, and the reason the delayed release names its acquisition: a lock that has already
+    /// ended must not be released by the timer belonging to the one before it. Arriving at
+    /// ADR-0042's forbidden unlock by waiting is still arriving at it.
+    #[test]
+    fn a_release_scheduled_for_one_lock_does_not_apply_to_the_next() {
+        let mut state = locked_with_one_failure();
+        let authenticated = state.acquisition;
+        apply(&mut state, LockEvent::Authenticated(shared::PamOutcome::Success));
+        assert!(releases(&state, authenticated), "the lock the password answered is still the one to release");
+
+        // That lock ends and another takes its place while the timer is still sleeping.
+        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Finished));
+        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
+        assert!(
+            !releases(&state, authenticated),
+            "a lock nobody authenticated for must not be opened by the last lock's timer"
+        );
+        assert!(!releases(&state, state.acquisition), "and not by its own number either, with no password given");
     }
 
     #[test]
@@ -658,7 +850,8 @@ mod tests {
                     attempts: 1,
                     error: String::new(),
                     requested: false,
-                    acquisition: 4
+                    acquisition: 4,
+                    unlocking: false
                 },
                 "{outcome:?}"
             );

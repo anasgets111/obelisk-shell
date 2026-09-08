@@ -385,8 +385,11 @@ impl Supervisor {
                 "lock: dropping a pam outcome for acquisition {acquisition}, which is no longer the lock on the glass"
             );
         } else if succeeded {
-            // The command arm pushes its snapshot.
-            self.lock.unlock();
+            // Push before scheduling: `unlocking` is now true, and the config cannot animate a
+            // window it has not been told about (ADR-0190). The release is already committed by
+            // the time the config sees it.
+            self.push_lock_state();
+            self.lock.unlock_after_animation();
         } else {
             self.push_lock_state();
         }
