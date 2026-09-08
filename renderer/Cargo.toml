@@ -27,7 +27,7 @@ cosmic-text = { version = "0.19.0", default-features = false, features = ["std",
 # Three crates, and only in this crate's tree: swash, zeno, yazi. skrifa, read-fonts and font-types
 # arrive with cosmic-text either way, and sharing one swash across both actually unifies three
 # duplicate versions out of the workspace lock.
-femtovg = { version = "0.26.0", features = ["swash"] }
+femtovg = { version = "0.27.0", features = ["swash"] }
 fontdb = "0.23.0"
 freedesktop-icons = "0.4.0"
 glow = "0.18.0"
@@ -55,7 +55,7 @@ wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
-md-5 = "0.10"
+md-5 = "0.11"
 png = "0.18"
 
 [dev-dependencies]
