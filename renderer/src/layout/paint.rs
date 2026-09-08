@@ -443,12 +443,15 @@ fn run(painter: &mut TextPainter, walk: &mut Walk<'_, '_>, commands: &[DrawCmd],
                         }
                         let from = under.and_then(|under| file_texture(painter.canvas_mut(), walk.images, under, draw));
 
-                        // A config shader takes the whole cross, both endpoints at once, which is
-                        // the only way an effect can be anything but a fade (ADR-0184). It needs
-                        // both textures and a context; without any of those the dissolve below
-                        // takes the frame, which is why that was built first.
-                        let crossed = match (shader, walk.shaders.as_mut(), from, to) {
-                            (Some((path, params)), Some(shaders), Some((from, from_rect)), Some((to, to_rect))) => {
+                        // The stage takes the whole cross, both endpoints at once, which is the
+                        // only way an effect can be anything but a fade (ADR-0184) -- and, with no
+                        // effect named, the only way a fade composes exactly (ADR-0186). It needs
+                        // both textures and a context; without either, the two draws below take
+                        // the frame, which is why they were built first and why they stay.
+                        let crossed = match (walk.shaders.as_mut(), from, to) {
+                            (Some(shaders), Some((from, from_rect)), Some((to, to_rect))) => {
+                                let params: &[(String, f32)] =
+                                    shader.as_ref().map_or(&[], |(_, params)| params.as_slice());
                                 let run = image_shader::Run {
                                     from,
                                     to,
@@ -463,16 +466,22 @@ fn run(painter: &mut TextPainter, walk: &mut Walk<'_, '_>, commands: &[DrawCmd],
                                     progress: *progress,
                                     params,
                                 };
+                                let effect = shader.as_ref().map(|(path, _)| path.as_path());
                                 // SAFETY: `paint_surface` made this context current before calling
                                 // `execute`, and it is the one every GL object here belongs to.
-                                unsafe { shaders.stage.draw(shaders.gl, painter.canvas_mut(), path, &run) }
+                                unsafe { shaders.stage.draw(shaders.gl, painter.canvas_mut(), effect, &run) }
                             }
                             _ => false,
                         };
-                        // The outgoing at its own full alpha with the incoming fading in over it,
-                        // not both easing past each other: two source-over draws that each sit at
-                        // half alpha mid-cross compose to three quarters, and the last quarter is
-                        // the surface's ground showing through the middle (ADR-0181).
+                        // Last resort, and an approximation: the outgoing at its own full alpha
+                        // with the incoming fading in over it. Exact for opaque endpoints at full
+                        // opacity, and wrong otherwise -- at `alpha` 0.5 and `progress` 0.5 these
+                        // two draws compose to 0.625 where 0.5 is right, showing the surface's
+                        // ground through the middle (ADR-0181, corrected by ADR-0186).
+                        //
+                        // Reached when there is no GL context, when either endpoint has no texture
+                        // yet, or when even the engine's own shader would not build. The first is
+                        // the test harness; the rest are real and are why this stays.
                         if !crossed {
                             if let Some((id, fitted)) = from {
                                 fill_image(painter.canvas_mut(), id, fitted, *alpha);

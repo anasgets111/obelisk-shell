@@ -4370,3 +4370,38 @@ rather than left for the next surface, a cancelled decode reaching the invalidat
 and a stale surface surviving a repaint narrowed to a tick that named something else. The main
 loop's outer gate -- that a stale surface makes the turn reach a repaint at all -- is verified by
 reading `wayland/mod.rs`, because the loop needs a compositor.
+
+## 0186. The engine's cross-dissolve is a shader like any other, because two source-over draws are not a cross-dissolve
+
+ADR-0181 built the dissolve out of two femtovg draws: the outgoing at the node's `alpha`, the
+incoming over it at `alpha * progress`. ADR-0184 then added a real shader stage for config effects
+and left those two draws as the fallback, documenting them as "exact for opaque endpoints at full
+opacity and approximate otherwise".
+
+Approximate is the wrong word for what they do. At `alpha` 0.5 and `progress` 0.5 the pair composes
+to 0.625 opacity where 0.5 is correct, and the missing quarter is the surface's ground showing
+through the middle of the cross. A transparent pixel in the incoming picture also keeps the
+outgoing one underneath it, which no cross-dissolve should do.
+
+So the engine now owns an effect of its own, [`FADE`], written exactly as a config would write one
+and assembled through the same prelude and epilogue. Textures upload premultiplied (ADR-0184), so
+`mix` of the two endpoints *is* the composite, and the epilogue applies the node's opacity once
+afterwards. There is one sampling convention in the process, not one for effects and another for
+the case with no effect.
+
+A config shader that will not build now falls back to `FADE`, not to the two draws. Losing an effect
+is a reason to lose the effect; it is not a reason to lose correct compositing.
+
+The two draws are not deleted, and the claim that they could be was wrong. They still take the frame
+when there is no GL context, when either endpoint has no texture yet, and if the engine's own shader
+would not build. The first is the test harness; the others are real.
+
+The cost is deliberate: every transition now pays a `canvas.flush()`, a GL state capture and
+restore, and one quad, where an opaque wallpaper at full opacity used to pay two fills and get the
+right answer anyway. That was the reason ADR-0184 left this alone, with the stage an hour old. It
+buys correctness for every other case, and it puts the stage on a path that runs constantly, so a
+fault in it surfaces immediately instead of only under a config that names an effect.
+
+Not tested by construction: the composite itself. The stage needs a GL context and the paint
+harness has none, so this is verified live -- a translucent image mid-cross over a known ground,
+measured against the value the arithmetic predicts, with the old code as the control.

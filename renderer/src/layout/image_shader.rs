@@ -92,6 +92,21 @@ void main() {
 }
 "#;
 
+/// The engine's own effect: a straight cross-dissolve, and what a `transition` with no `shader`
+/// runs (ADR-0186). Written exactly as a config would write it, against the same contract and
+/// through the same [`assemble`], so there is one sampling convention and not two.
+///
+/// This replaced two source-over draws, which composed correctly only for opaque endpoints at full
+/// opacity: `from` at `alpha` with `to` at `alpha * progress` over it leaves `alpha=0.5`,
+/// `progress=0.5` showing 0.625 opacity where 0.5 is right, and the surface's ground through the
+/// middle. Textures upload premultiplied (ADR-0184), so mixing them *is* the composite, and the
+/// epilogue applies the node's opacity once afterwards.
+const FADE: &str = r#"
+void main() {
+    fragColor = mix(oblisk_from(v_uv), oblisk_to(v_uv), u_progress);
+}
+"#;
+
 /// One quad covering the node's box, in clip space, with the node-space `v_uv` the prelude reads.
 /// The engine owns the vertex stage so that a config shader is a fragment and nothing else.
 const VERTEX: &str = r#"#version 300 es
@@ -159,6 +174,10 @@ pub struct ShaderStage {
     /// its own effect looking at a program compiled minutes ago, with no way to reach it short of
     /// restarting the shell.
     programs: HashMap<PathBuf, (crate::image::FileVersion, Option<Program>)>,
+    /// [`FADE`], compiled on first use. `None` until then; `Some(None)` if the engine's own shader
+    /// would not build, which is not tried again -- the same shape `programs` uses, and the point
+    /// where a node drops back to the two-draw approximation.
+    fade: Option<Option<Program>>,
     /// Positions and texture coordinates for one quad, rewritten per draw because the corners carry
     /// the node's transform.
     quad: Option<(glow::VertexArray, glow::Buffer)>,
@@ -170,34 +189,89 @@ impl ShaderStage {
         Self::default()
     }
 
-    /// Draws `run` with the shader at `path`, or answers `false` for anything that stops it, which
-    /// leaves the caller's cross-dissolve to take the frame.
+    /// Draws `run` with the config shader at `effect`, or with the engine's own [`FADE`] when
+    /// `effect` is `None` *or* the config's would not build. Answers `false` for anything that
+    /// stops it, which leaves the caller's two-draw approximation to take the frame.
+    ///
+    /// A config shader that fails falls back to `FADE` rather than to the caller: an effect that
+    /// stops compiling is a reason to lose the effect, not a reason to lose correct compositing
+    /// (ADR-0186).
     ///
     /// # Safety
     ///
     /// `gl` must be the context current on this thread, and `canvas` the femtovg canvas sharing
     /// it. Neither can be checked here, and every GL object this stage owns belongs to that one
     /// context.
-    pub unsafe fn draw(&mut self, gl: &glow::Context, canvas: &mut Canvas<OpenGl>, path: &Path, run: &Run) -> bool {
+    pub unsafe fn draw(
+        &mut self,
+        gl: &glow::Context,
+        canvas: &mut Canvas<OpenGl>,
+        effect: Option<&Path>,
+        run: &Run,
+    ) -> bool {
         let (Ok(from), Ok(to)) = (canvas.get_native_texture(run.from), canvas.get_native_texture(run.to)) else {
             return false;
         };
+        // Before the program is borrowed, because this needs `self` mutably and that borrow would
+        // still be live.
         // SAFETY: caller's contract.
-        if !unsafe { self.ensure_program(gl, path) } {
-            return false;
-        }
+        let Some(quad) = (unsafe { self.ensure_quad(gl) }) else { return false };
+        // SAFETY: caller's contract.
+        let chosen = effect.filter(|path| unsafe { self.ensure_program(gl, path) });
+        let program = match chosen {
+            Some(path) => self.programs.get(path).and_then(|(_, program)| program.as_ref()),
+            None => {
+                // SAFETY: caller's contract.
+                unsafe { self.ensure_fade(gl) };
+                self.fade.as_ref().and_then(Option::as_ref)
+            }
+        };
+        let Some(program) = program else { return false };
 
         // Everything femtovg has recorded so far has to reach the framebuffer before this quad
         // does; `gl.flush()` would not, because the queue this drains is femtovg's own, on the CPU.
         canvas.flush();
 
         // SAFETY: caller's contract, and every value read here is put back below before femtovg
-        // records another command.
+        // records another command. The restore runs on the failing path too: a run that gives up
+        // inside `render` has already changed state.
         unsafe {
             let saved = State::capture(gl);
-            let drew = self.render(gl, path, from, to, run);
+            let drew = Self::render(gl, program, quad, from, to, run);
             saved.restore(gl);
             drew
+        }
+    }
+
+    /// Compiles [`FADE`] on first use. Reported once if it will not build, which would mean the
+    /// engine's own shader is broken rather than a config's.
+    ///
+    /// # Safety
+    ///
+    /// The context is current.
+    unsafe fn ensure_fade(&mut self, gl: &glow::Context) {
+        if self.fade.is_some() {
+            return;
+        }
+        // SAFETY: caller's contract.
+        let built = unsafe { self.build(gl, Path::new("<engine cross-dissolve>"), FADE) };
+        self.fade = Some(built);
+    }
+
+    /// The shared quad, created on first use.
+    ///
+    /// # Safety
+    ///
+    /// The context is current.
+    unsafe fn ensure_quad(&mut self, gl: &glow::Context) -> Option<(glow::VertexArray, glow::Buffer)> {
+        match self.quad {
+            Some(quad) => Some(quad),
+            None => {
+                // SAFETY: caller's contract.
+                let quad = unsafe { make_quad(gl) }?;
+                self.quad = Some(quad);
+                Some(quad)
+            }
         }
     }
 
@@ -300,27 +374,22 @@ impl ShaderStage {
         }
     }
 
+    /// Draws the chosen program's quad. Takes no `self`: the program arrives by reference, which
+    /// is what lets the caller pick between a config's and the engine's own without cloning either
+    /// or holding a borrow of the map across the draw.
+    ///
     /// # Safety
     ///
     /// The context is current and its state has been captured by the caller.
     unsafe fn render(
-        &mut self,
         gl: &glow::Context,
-        path: &Path,
+        program: &Program,
+        quad: (glow::VertexArray, glow::Buffer),
         from: glow::Texture,
         to: glow::Texture,
         run: &Run,
     ) -> bool {
-        let Some((_, Some(program))) = self.programs.get(path) else { return false };
-        let (vao, buffer) = match self.quad {
-            Some(quad) => quad,
-            None => {
-                // SAFETY: caller's contract.
-                let Some(quad) = (unsafe { make_quad(gl) }) else { return false };
-                self.quad = Some(quad);
-                quad
-            }
-        };
+        let (vao, buffer) = quad;
         let (Some(width), Some(height)) = (positive(run.rect.width), positive(run.rect.height)) else {
             return false;
         };
@@ -407,6 +476,9 @@ impl ShaderStage {
                 if let Some(program) = program {
                     gl.delete_program(program.program);
                 }
+            }
+            if let Some(Some(fade)) = self.fade.take() {
+                gl.delete_program(fade.program);
             }
             if let Some(vertex) = self.vertex.take() {
                 gl.delete_shader(vertex);
