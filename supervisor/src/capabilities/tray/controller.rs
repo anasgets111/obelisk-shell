@@ -7,17 +7,17 @@ use std::sync::{Arc, Mutex};
 use enumflags2::BitFlags;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::fdo::RequestNameFlags;
-use zbus::zvariant::Value;
+use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::item::TrayItem;
 use super::menu::fetch_menu_via;
 use super::proxies::{DBusMenuProxy, StatusNotifierItemProxy, StatusNotifierWatcherClientProxy};
-use super::registration::{resolve_registration, sanitize_unique_name};
+use super::registration::{ResolvedRegistration, item_id, resolve_registration};
 use super::registry::{ItemKey, ItemRegistry, ordered_items, register_item, spawn_name_owner_changed_forwarder};
 use super::watcher::StatusNotifierWatcher;
 use super::{
-    TrayActionError, TraySignal, TrayState, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH, should_call_activate,
-    unix_timestamp_u32,
+    DEFAULT_ITEM_OBJECT_PATH, TrayActionError, TraySignal, TrayState, WATCHER_BUS_NAME, WATCHER_OBJECT_PATH,
+    should_call_activate, unix_timestamp_u32,
 };
 
 #[derive(Clone)]
@@ -95,7 +95,7 @@ impl TrayController {
         let guard = self.registry.lock().unwrap();
         guard
             .iter()
-            .find(|(key, _)| sanitize_unique_name(key.0.as_str()) == id)
+            .find(|(key, _)| item_id(key.0.as_str(), key.1.as_str()) == id)
             .map(|(key, entry)| (key.clone(), entry.last_known.clone()))
     }
 
@@ -214,6 +214,22 @@ fn is_item_bus_name(name: &str) -> bool {
     ["org.kde.StatusNotifierItem-", "org.freedesktop.StatusNotifierItem-"].iter().any(|prefix| name.starts_with(prefix))
 }
 
+/// Object paths an item that never named one might be exporting at, tried in order until one
+/// answers (ADR-0171).
+///
+/// Adoption has no `RegisterStatusNotifierItem` argument to read, so ADR-0031's default is a guess,
+/// and it is the wrong guess for every Chromium application: Slack exports at
+/// `/StatusNotifierItem/1`. Until the liveness probe (ADR-0168) that guess produced a blank item
+/// instead of nothing, so the gap showed up as a duplicate-key freeze rather than as the missing
+/// icon it always was.
+///
+/// The list is the conventions a real session shows. An item exporting anywhere else still needs
+/// introspection, which ADR-0073 declined; the ayatana shape is deliberately absent, because its
+/// path ends in an application-chosen id no list can hold, and those clients re-register on
+/// `StatusNotifierHostRegistered` anyway.
+const ADOPTION_OBJECT_PATHS: [&str; 3] =
+    [DEFAULT_ITEM_OBJECT_PATH, "/StatusNotifierItem/1", "/org/chromium/StatusNotifierItem/1"];
+
 /// Registers tray items already on the bus when this host starts (ADR-0073). The spec expects
 /// clients to re-register after `StatusNotifierHostRegistered`, but Slack does not; without this
 /// bus scan, restarting the shell lost Slack until Slack restarted.
@@ -248,9 +264,27 @@ async fn adopt_existing_items(
                 continue;
             }
         };
-        match register_item(connection, registry, events, resolved).await {
-            Ok(()) => eprintln!("tray: adopted {name}, registered before this host started"),
-            Err(err) => eprintln!("tray: failed to adopt {name}: {err}"),
+        let mut refusals = Vec::new();
+        for candidate in ADOPTION_OBJECT_PATHS {
+            let object_path = match OwnedObjectPath::try_from(candidate) {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!("tray: {candidate} is not an object path: {err}");
+                    continue;
+                }
+            };
+            let attempt = ResolvedRegistration { object_path, ..resolved.clone() };
+            match register_item(connection, registry, events, attempt).await {
+                Ok(()) => {
+                    eprintln!("tray: adopted {name} at {candidate}, registered before this host started");
+                    refusals.clear();
+                    break;
+                }
+                Err(err) => refusals.push(err),
+            }
+        }
+        if !refusals.is_empty() {
+            eprintln!("tray: failed to adopt {name}: {}", refusals.join("; "));
         }
     }
 }
@@ -258,6 +292,98 @@ async fn adopt_existing_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::test_support::p2p_pair;
+
+    /// Answers the three daemon calls adoption makes: the name list it walks, the owner lookup
+    /// `resolve_registration` performs for a well-known name, and the liveness check
+    /// `register_item` runs before inserting.
+    struct StubDBusDaemon;
+
+    #[zbus::interface(name = "org.freedesktop.DBus")]
+    impl StubDBusDaemon {
+        #[zbus(name = "ListNames")]
+        fn list_names(&self) -> Vec<String> {
+            vec![":1.5".to_string(), "org.freedesktop.StatusNotifierItem-4242-1".to_string()]
+        }
+        #[zbus(name = "GetNameOwner")]
+        fn get_name_owner(&self, _name: String) -> String {
+            ":1.5".to_string()
+        }
+        #[zbus(name = "NameHasOwner")]
+        fn name_has_owner(&self, _name: String) -> bool {
+            true
+        }
+    }
+
+    /// A Chromium-shaped item: it exports nothing at the spec's default path, only at
+    /// `/StatusNotifierItem/1`.
+    struct StubChromiumItem;
+
+    #[zbus::interface(name = "org.kde.StatusNotifierItem")]
+    impl StubChromiumItem {
+        #[zbus(property, name = "Id")]
+        fn id(&self) -> String {
+            "chromium-item".to_string()
+        }
+        #[zbus(property, name = "Title")]
+        fn title(&self) -> String {
+            "Chromium Item".to_string()
+        }
+        #[zbus(property, name = "IconName")]
+        fn icon_name(&self) -> String {
+            String::new()
+        }
+        #[zbus(property, name = "IconPixmap")]
+        fn icon_pixmap(&self) -> Vec<super::super::RawIconPixmap> {
+            Vec::new()
+        }
+        #[zbus(property, name = "Status")]
+        fn status(&self) -> String {
+            "Active".to_string()
+        }
+        #[zbus(property, name = "ItemIsMenu")]
+        fn item_is_menu(&self) -> bool {
+            false
+        }
+        #[zbus(property, name = "ToolTip")]
+        fn tool_tip(&self) -> super::super::RawToolTip {
+            (String::new(), Vec::new(), String::new(), String::new())
+        }
+        #[zbus(property, name = "Menu")]
+        fn menu(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from("/").expect("\"/\" is a valid object path")
+        }
+    }
+
+    /// Adoption has no registration argument to read, so it guessed the spec default and stopped
+    /// there -- which is no path at all for a Chromium application, and cost Slack its icon on
+    /// every restart of the shell (ADR-0171).
+    #[tokio::test]
+    async fn adoption_finds_an_item_that_exports_only_the_chromium_path() {
+        let (connection, peer) = p2p_pair().await;
+        peer.object_server()
+            .at("/StatusNotifierItem/1", StubChromiumItem)
+            .await
+            .expect("failed to export the stub item");
+        peer.object_server()
+            .at("/org/freedesktop/DBus", StubDBusDaemon)
+            .await
+            .expect("failed to export the stub org.freedesktop.DBus");
+
+        let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dbus_proxy = zbus::fdo::DBusProxy::new(&connection).await.expect("failed to bind the stub daemon");
+
+        // The first method call on a fresh `p2p_pair` connection times out inside its 200ms budget
+        // and every later one answers, so spend the first here rather than on `ListNames`, which
+        // adoption gives up after.
+        let _ = dbus_proxy.list_names().await;
+        adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
+
+        let paths: Vec<String> =
+            registry.lock().unwrap().keys().map(|(_, object_path)| object_path.to_string()).collect();
+        assert_eq!(paths, vec!["/StatusNotifierItem/1".to_string()]);
+    }
 
     #[test]
     fn an_item_name_is_recognized_in_both_spellings() {

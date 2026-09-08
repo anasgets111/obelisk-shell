@@ -221,7 +221,7 @@
 ---@field attention_icon_path? string File half of the attention artwork, matching `attention_icon_name`.
 ---@field icon_name? string Theme icon name for `icon { name = ... }`; exclusive with [`TrayItem::icon_path`].
 ---@field icon_path? string Decoded, bounds-checked PNG in the runtime directory for `image { source = ... }`; set when the item sent pixels instead of a theme name.
----@field id string docs/oblisk-idl-api-specs.md §2.14 id: sanitized registering-process D-Bus unique name, e.g. `"1.234"`. Used by every `tray:` command.
+---@field id string docs/oblisk-idl-api-specs.md §2.14 id: sanitized D-Bus unique name with the item's object path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
 ---@field item_is_menu boolean `true` means left click opens the menu instead of activating the item.
 ---@field menu? MenuItem[] Top-level menu entries, or `nil` without `com.canonical.dbusmenu`. Fetched at registration and on layout updates.
 ---@field name string Display name: `Title`, falling back to `Id` when `Title` is empty.

@@ -3447,3 +3447,160 @@ player said belongs where the player is read.
 
 Rejected: polling `Position`. A round trip per tick for a number clients extrapolate. The recheck
 fires on a transition, not a cadence.
+
+## 0167. A signal read inside a `:map` is not a dependency
+
+`modules/bar/panels/media_panel.lua` picked its player with `chosen:get()` inside every map, so the
+switch-player button changed what those maps would answer without changing anything they declared.
+Nothing re-evaluated; the panel kept drawing the previous player until something unrelated moved.
+
+One `computed({ oblisk.mpris, chosen }, ...)` now resolves the player, and every reader takes that
+signal. `false` is the no-player value, because a `computed` yielding `nil` has no value to hold.
+
+The rule generalises: `:get()` inside a `:map` or `computed` callback reads a value the graph does
+not know was read. It is correct only for something that cannot change while the map is alive.
+Callbacks -- `on_click`, `on_commit`, `on_change` -- may read freely; they are not re-evaluated.
+
+`just types` cannot see this, and neither can `luac -p` or `oblisk check`: the code is valid and the
+scene resolves. It shows up only as a control that does nothing.
+
+## 0168. Chromium's tray object lives on one of its several connections
+
+ADR-0072 decision 1 keeps a tray item's registered name as the message destination, explaining it as
+"Chromium dispatches property reads on the message's destination field, not the owner". That
+explanation is wrong. The decision is right and stays.
+
+Measured against Slack 699047, varying destination and object path independently:
+
+| destination | object path | `Get Id` |
+| --- | --- | --- |
+| `org.freedesktop.StatusNotifierItem-699047-1` | `/StatusNotifierItem` | fails |
+| `org.freedesktop.StatusNotifierItem-699047-1` | `/StatusNotifierItem/1` | answers |
+| `:1.2656` (its owner) | `/StatusNotifierItem` | fails |
+| `:1.2656` (its owner) | `/StatusNotifierItem/1` | answers |
+
+The destination does not matter; the path does. What does matter is *which connection*: Slack holds
+two, `:1.2655` and `:1.2656`, and only the one owning the well-known name exports the object. The
+other answers "Object does not exist" at every path.
+
+So addressing the registered name is still the right call, for a different reason than recorded: the
+bus routes it to whichever connection owns it, and we never have to be right about which of a
+process's connections that is. ADR-0072's accepted risk -- a well-known name moving owners between
+lookup and read -- is smaller than the risk it avoids.
+
+This also explains the September observation behind ADR-0072, where reads addressed to the owner
+`:1.659` failed. That was Chromium's other connection, not evidence about destination fields.
+
+Rejected: collapsing `ResolvedRegistration` to a single name (~35 lines). The split is load-bearing.
+
+Rejected: keeping `DEFAULT_ITEM_OBJECT_PATH` as the well-known branch's path. Slack's object is at
+`/StatusNotifierItem/1`, so that default was never going to answer; the registration-string split
+above supplies the real path, and the default now applies only to a `service` that names none.
+
+## 0169. A lockout leaves evidence, or it is not a diagnosis
+
+On 2026-09-08 a lock screen refused a correct password with `pam worker failed: i/o error: early
+eof`. The worker had exited without writing its outcome frame, and that was the entire record:
+nothing on its inherited stderr, no coredump, nothing in the journal. The account was untouched --
+`faillock` empty, the previous acquisition a `Success` minutes earlier -- and the session came back
+only because a later attempt happened to work. The cause is still unknown.
+
+1. A failed exchange reports how the worker died. `reap_process_group` already collects the exit
+   status and `exchange_over` was dropping it; a signal number or an exit code now rides on the
+   error. It cannot say why, but it separates "killed" from "returned non-zero", which is the fork
+   the next occurrence turns on.
+
+2. Layout errors carry the walk that reached the node: `column[0] > row[1] > text[1] > ...`,
+   accumulated as the error unwinds. The surface name alone (ADR-0024) named a lock screen holding
+   a dozen `text` nodes and distinguished none of them.
+
+Correction: a `:map` returning `nil` does *not* reach the engine as `Integer(0)`.
+`resolve_properties` skips a nil-resolving signal and the property is simply absent, which is
+ADR-0044 decision 1 working as written; a probe config confirms it renders empty and raises
+nothing. The `Integer(0)` values seen are real zeroes -- a `delay`'s pre-change identity is `0`,
+which is the `util.linger` bug -- so a signal that has not produced a value yet is the shape to
+suspect, not a nil return. One comment asserting the wrong mechanism was removed.
+
+Not done: one bad property still discards the whole re-resolve, which is what froze the lock screen
+mid-authentication. Partial application is a larger decision than this incident settles.
+
+## 0170. A memo key is an identity, not an address
+
+The lock screen's keyboard label and its wallpaper path both resolved to `Integer(0)` on
+2026-09-08, from two Lua functions that cannot return an integer: one answers a string, `"--"` or
+`"!"`, the other a path or a default. ADR-0169's walk located the nodes; it could not explain them,
+and the guess recorded there -- a signal that had not produced a value yet -- was wrong.
+
+`EvaluationMemo` (ADR-0157) keyed each computed on `Rc::as_ptr(deps)`, reasoning that `computed()`
+and `Signal::mapped` each allocate a fresh `Rc<Vec<Signal>>`, so the address separates every
+distinct computed. It does, until one is dropped: the allocator hands the next same-sized
+allocation the address just freed, the memo holds a raw pointer and so keeps nothing alive, and the
+dead computed's value is served to the live one that landed on its grave. The memo's scope is a
+whole layout pass, and a pass builds and discards computeds continuously -- every `:map` inside a
+`list`'s `itemfn`, every one in a surface that rebuilds its tree, which is what a lock surface does
+per output on every resolve. Eight lines of Lua reproduce it: read a computed returning `0`, drop
+it, collect, build another returning a string, and the string comes back as `Integer(0)`.
+
+The key is now a counter handed out at construction and copied by `Signal::clone`, because a clone
+is the same computed and must share the entry. A counter cannot be recycled.
+
+This was never confined to the lock screen. Any pass that frees a computed could serve any other
+computed a stale value of any type, silently and only sometimes; a wrong colour or a wrong number
+would have drawn without complaint. It surfaced here only because the two victims were typed
+properties that refused an integer, and because ADR-0169 had just taught the error to name them.
+
+## 0171. Adoption tries the paths items actually use
+
+ADR-0073 adopts items already on the bus by walking well-known
+`org.{kde,freedesktop}.StatusNotifierItem-PID-N` names, and it has no
+`RegisterStatusNotifierItem` argument to read, so it guessed ADR-0031's default object path and
+stopped there. That is the wrong path for every Chromium application: Slack exports at
+`/StatusNotifierItem/1`. Until ADR-0168's liveness probe the guess produced a blank item rather
+than nothing, so the gap surfaced as a duplicate-key freeze in the bar instead of as the missing
+icon it always was -- and once the probe started refusing an object that answers nothing, Slack and
+vesktop simply vanished on every restart of the shell.
+
+Adoption now tries `/StatusNotifierItem`, `/StatusNotifierItem/1`, and
+`/org/chromium/StatusNotifierItem/1` in order, keeping the first that answers `Status`, and reports
+every refusal together when none does. Three round trips at startup for an item at the last of them,
+against an icon that was otherwise lost until the application itself restarted.
+
+The ayatana shape (`/org/ayatana/NotificationItem/<id>`) is deliberately not in the list: its last
+segment is an application-chosen id no fixed list can hold, and those clients re-register on
+`StatusNotifierHostRegistered` -- yerd, watched through a restart on 2026-09-08, came back on its
+own within the second. An item exporting at any other path still needs the connection introspection
+ADR-0073 declined.
+
+## 0172. An item is a connection and a path, the way KDE says it
+
+Reading how the established hosts do this (Qt's client, KDE's watcher, Plasma's system tray,
+Quickshell, Noctalia v5) settled a question ADR-0031 left open. Every one of them parses the
+`service` argument identically to us -- leading `/` means the sender plus that path, otherwise a bus
+name with `/StatusNotifierItem` as the default -- so the parsing was never the difference. The
+difference is what happens next.
+
+KDE's watcher composes `QString notifierItemId = service + path;` and publishes *that*, and Plasma's
+own host then rejects any id without a `/` as invalid. The resolution happens once, at registration,
+where the sender is still known, and no host downstream ever guesses.
+
+Ours resolved the same pair, keyed the registry on it, and then handed config the unique name alone.
+Two consequences, one latent and one that already bit:
+
+1. `RegisteredStatusNotifierItems` answered `":1.42"`, which Plasma's host would call an invalid
+   notifier id. It now answers `":1.42/StatusNotifierItem"`, and so does
+   `StatusNotifierItemRegistered`.
+
+2. `TrayItem.id` was the connection alone, so one connection exporting two items gave both the same
+   id -- and a `list` handed two rows with one key refuses the whole tray, which is the freeze of
+   2026-09-08. Chromium numbers its items `/StatusNotifierItem/1`, `/StatusNotifierItem/2` precisely
+   because one process can hold several. The id is now the sanitized name with the path appended,
+   `"1.42/StatusNotifierItem"`. Icon spooling folds the separators into a flat filename stem, and
+   doubles `_` first so no two ids can fold onto one file.
+
+Not taken from KDE: its watcher accepts every registration and lets `NameOwnerChanged` clean up,
+where ADR-0168 refuses an object that answers nothing. Refusing is still right -- the alternative is
+a blank icon in the strip for an item that is really somewhere else -- and this ADR makes the probe
+optional rather than load-bearing, since a duplicate id can no longer reach config.
+
+Still open: `StatusNotifierItemUnregistered` is declared and never emitted. Nothing consumes our
+watcher's signals but us, and the registry drops the entry on `NameOwnerChanged` regardless.

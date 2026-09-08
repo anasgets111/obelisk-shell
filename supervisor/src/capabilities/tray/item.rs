@@ -3,19 +3,21 @@
 
 use serde::Serialize;
 use zbus::names::OwnedUniqueName;
+use zbus::zvariant::OwnedObjectPath;
 
 use super::MAX_TRAY_TEXT_BYTES;
-use super::icon::{IconPixmap, IconSource, largest_valid_pixmap, resolve_icon_source, write_icon_png};
+use super::icon::{
+    IconPixmap, IconSource, icon_filename_stem, largest_valid_pixmap, resolve_icon_source, write_icon_png,
+};
 use super::menu::MenuItem;
 use super::proxies::StatusNotifierItemProxy;
-use super::registration::sanitize_unique_name;
+use super::registration::item_id;
 use crate::capabilities::truncate_utf8_bytes;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
-    /// docs/oblisk-idl-api-specs.md §2.14 id: sanitized registering-process D-Bus unique name,
-    /// e.g. `"1.234"`. Used by every
-    /// `tray:` command.
+    /// docs/oblisk-idl-api-specs.md §2.14 id: sanitized D-Bus unique name with the item's object
+    /// path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
     pub id: String,
     /// Display name: `Title`, falling back to `Id` when `Title` is empty.
     pub name: String,
@@ -71,6 +73,7 @@ fn flatten_tooltip(title: &str, text: &str) -> Option<String> {
 pub(super) async fn fetch_tray_item_base(
     item: &StatusNotifierItemProxy<'static>,
     unique_name: &OwnedUniqueName,
+    object_path: &OwnedObjectPath,
 ) -> TrayItem {
     // Every string below is whatever application owns this item; cap each on the way in
     // (`MAX_TRAY_TEXT_BYTES`) rather than trusting SNI, which bounds none of them.
@@ -84,7 +87,8 @@ pub(super) async fn fetch_tray_item_base(
     // `theme_path_file` bounds it at `PATH_MAX` where it is used instead.
     let theme_path = item.icon_theme_path().await.unwrap_or_default();
 
-    let sanitized = sanitize_unique_name(unique_name.as_str());
+    let id = item_id(unique_name.as_str(), object_path.as_str());
+    let stem = icon_filename_stem(&id);
     let name = resolve_display_name(&title, &id_prop);
     let tooltip_flat =
         tooltip.and_then(|(_, _, tt_title, tt_text)| flatten_tooltip(&capped(tt_title), &capped(tt_text)));
@@ -93,26 +97,26 @@ pub(super) async fn fetch_tray_item_base(
         item.icon_name().await.unwrap_or_default(),
         item.icon_pixmap().await.unwrap_or_default(),
         &theme_path,
-        &sanitized,
+        &stem,
         "",
     );
     let (attention_icon_name, attention_icon_path) = resolve_variant(
         item.attention_icon_name().await.unwrap_or_default(),
         item.attention_icon_pixmap().await.unwrap_or_default(),
         &theme_path,
-        &sanitized,
+        &stem,
         "-attention",
     );
     let (overlay_icon_name, overlay_icon_path) = resolve_variant(
         item.overlay_icon_name().await.unwrap_or_default(),
         item.overlay_icon_pixmap().await.unwrap_or_default(),
         &theme_path,
-        &sanitized,
+        &stem,
         "-overlay",
     );
 
     TrayItem {
-        id: sanitized,
+        id,
         name,
         icon_name,
         icon_path,
@@ -135,7 +139,7 @@ fn resolve_variant(
     icon_name_prop: String,
     pixmaps_raw: Vec<(i32, i32, Vec<u8>)>,
     theme_path: &str,
-    sanitized: &str,
+    stem: &str,
     spool_suffix: &str,
 ) -> (Option<String>, Option<String>) {
     let pixmaps: Vec<IconPixmap> =
@@ -146,10 +150,10 @@ fn resolve_variant(
         IconSource::ThemePathFile(path) => (None, Some(path)),
         IconSource::Name(name) => (Some(name), None),
         IconSource::Pixmap => match largest_valid_pixmap(&pixmaps) {
-            Some(pixmap) => match write_icon_png(&format!("{sanitized}{spool_suffix}"), pixmap) {
+            Some(pixmap) => match write_icon_png(&format!("{stem}{spool_suffix}"), pixmap) {
                 Ok(path) => (None, Some(path)),
                 Err(err) => {
-                    eprintln!("tray: failed to spool icon PNG for {sanitized}{spool_suffix}: {err}");
+                    eprintln!("tray: failed to spool icon PNG for {stem}{spool_suffix}: {err}");
                     (None, None)
                 }
             },

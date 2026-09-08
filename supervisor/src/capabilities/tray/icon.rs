@@ -112,6 +112,12 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
 /// Writes a validated pixmap to `/dev/shm/oblisk-$UID/tray/{filename_stem}.png`
 /// ([`shm_icons::write_png`]), creating the tree and overwriting the same path (no cache-busting,
 /// ADR-0031). Base, attention, and overlay stems differ so their files do not collide (ADR-0074).
+/// An item id as a flat filename stem: [`super::registration::item_id`] ends in an object path and
+/// the spool is one directory. `_` doubles first, so no two ids fold onto one file.
+pub(super) fn icon_filename_stem(id: &str) -> String {
+    id.replace('_', "__").replace('/', "_")
+}
+
 pub(super) fn write_icon_png(filename_stem: &str, pixmap: &IconPixmap) -> std::io::Result<String> {
     let png_bytes = encode_argb32_to_png(pixmap.width as u32, pixmap.height as u32, &pixmap.bytes)
         .map_err(std::io::Error::other)?;
@@ -121,6 +127,14 @@ pub(super) fn write_icon_png(filename_stem: &str, pixmap: &IconPixmap) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spool is flat, so an id's path separators fold into the stem; two ids must not fold
+    /// onto one file and serve each other's artwork.
+    #[test]
+    fn no_two_item_ids_share_an_icon_filename() {
+        assert_eq!(icon_filename_stem("1.42/StatusNotifierItem"), "1.42_StatusNotifierItem");
+        assert_ne!(icon_filename_stem("1.42/a/b"), icon_filename_stem("1.42/a_b"));
+    }
 
     // ---- theme_path_file / IconThemePath (ADR-0074) ----
 

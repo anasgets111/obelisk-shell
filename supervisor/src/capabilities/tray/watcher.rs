@@ -33,14 +33,17 @@ impl StatusNotifierWatcher {
             eprintln!("tray: RegisterStatusNotifierItem({service:?}) could not be resolved: {err}");
             zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) could not be resolved: {err}"))
         })?;
-        let unique_name = resolved.unique_name.clone();
+        // KDE's watcher answers `RegisterStatusNotifierItem` by storing `service + path` and
+        // publishing that, so a host never has to guess where an item sits. Ours resolves the same
+        // pair and now says so (ADR-0172).
+        let registered_id = format!("{}{}", resolved.unique_name.as_str(), resolved.object_path.as_str());
 
         register_item(&self.connection, &self.registry, &self.events, resolved).await.map_err(|err| {
             eprintln!("tray: RegisterStatusNotifierItem({service:?}) failed: {err}");
             zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}"))
         })?;
 
-        let _ = emitter.status_notifier_item_registered(unique_name.as_str()).await;
+        let _ = emitter.status_notifier_item_registered(&registered_id).await;
         Ok(())
     }
 
@@ -65,7 +68,14 @@ impl StatusNotifierWatcher {
 
     #[zbus(property, name = "RegisteredStatusNotifierItems")]
     async fn registered_status_notifier_items(&self) -> Vec<String> {
-        self.registry.lock().unwrap().keys().map(|(unique_name, _)| unique_name.to_string()).collect()
+        // `":1.42/StatusNotifierItem"`, the shape KDE's watcher publishes and Plasma's own host
+        // parses; a bare bus name is what that host rejects as an invalid id (ADR-0172).
+        self.registry
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(unique_name, object_path)| format!("{unique_name}{object_path}"))
+            .collect()
     }
 
     #[zbus(property, name = "IsStatusNotifierHostRegistered")]

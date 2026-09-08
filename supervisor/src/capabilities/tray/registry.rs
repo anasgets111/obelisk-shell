@@ -62,7 +62,24 @@ pub(super) async fn register_item(
         .await
         .map_err(|err| format!("failed to bind StatusNotifierItem: {err}"))?;
 
-    let mut tray_item = fetch_tray_item_base(&item, &unique_name).await;
+    // An object that answers nothing is not an item. `bind_item` performs no I/O and
+    // `fetch_tray_item_base` falls back to a default for every property, so without this probe a
+    // path nobody exports still produced a blank `TrayItem` and got inserted.
+    //
+    // That is not hypothetical: startup adoption (ADR-0073) has no registration string to read a
+    // path out of and can only guess `DEFAULT_ITEM_OBJECT_PATH`, while Chromium exports its item
+    // one level down (ADR-0168). Slack was therefore registered twice from one connection -- the
+    // phantom at the guessed path and the real one at `/StatusNotifierItem/1` -- and since
+    // `TrayItem::id` is the unique name alone, both reached Lua as one id. The bar's `list` refused
+    // the duplicate key and every re-resolve was dropped, freezing the whole bar.
+    //
+    // `Status` because SNI makes it mandatory and it is the one property whose absence is
+    // unambiguous: a live item always answers it.
+    if let Err(err) = item.status().await {
+        return Err(format!("{destination} exports no StatusNotifierItem at {object_path}: {err}"));
+    }
+
+    let mut tray_item = fetch_tray_item_base(&item, &unique_name, &object_path).await;
 
     let menu_path = item.menu().await.ok();
     let menu = match &menu_path {
@@ -176,7 +193,7 @@ fn spawn_item_signal_forwarder(
                 break;
             }
 
-            let refreshed = fetch_tray_item_base(&item, &unique_name).await;
+            let refreshed = fetch_tray_item_base(&item, &unique_name, &key.1).await;
 
             let mut guard = registry.lock().unwrap();
             let Some(entry) = guard.get_mut(&key) else { break };
