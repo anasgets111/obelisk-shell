@@ -17,9 +17,14 @@ end, {
     slot = SLOT,
     selected = ui_state.panel_showing(network_panel.kind),
     -- Lit for a link carrying the default route, not a bare association: `connected` answers the
-    -- question the bar asks.
+    -- question the bar asks. A wifi link then takes its band's colour, as `networkBandColor` gives
+    -- it: the band is the one fact about a connection worth a glance, and ethernet carries none.
     foreground = oblisk.network:map(function(n)
-        return (n ~= nil and n.connected) and theme.FG or theme.TEXT_OFF
+        if n == nil or not n.connected then
+            return theme.TEXT_OFF
+        end
+        local _, colour = util.band_of(util.active_access_point(n))
+        return colour
     end),
 })
 

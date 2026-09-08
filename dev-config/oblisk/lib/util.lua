@@ -128,11 +128,11 @@ function util.volume_glyph(a)
         return icons.vol_muted
     end
     local percent = (a.volume or 0) * 100
-    if percent == 0 then
+    if percent < 1 then
         return icons.vol_zero
-    elseif percent < 34 then
+    elseif percent < 33 then
         return icons.vol_low
-    elseif percent < 67 then
+    elseif percent < 66 then
         return icons.vol_mid
     end
     return icons.vol_high
@@ -156,8 +156,45 @@ function util.network_glyph(n)
     if n.ssid == nil then
         return icons.wifi_none
     end
-    local tier = math.floor(((n.strength or 0) / 100) * 3.999) + 1
-    return icons.wifi[math.max(1, math.min(4, tier))]
+    -- Match `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0; Lua is 1-indexed.
+    local strength = n.strength or 0
+    local tier = strength >= 95 and 4 or strength >= 80 and 3 or strength >= 50 and 2 or 1
+    return icons.wifi[tier]
+end
+
+-- `Theme.networkBandColor` plus the short label the panel draws beside the bars: "6G", "5G", "2.4".
+-- Shared because the bar tints its glyph by the associated band and the panel tints every row, and
+-- two copies of the mapping had already drifted apart -- one had 2.4 GHz yellow, the mirror's is
+-- `warning`. Shaped like `volume_glyph`: raw payload in, no signal, caller decides about `nil`.
+-- `nil` label with `FG` is the honest answer for ethernet and for a band nothing reported.
+---@param ap AccessPointInfo?
+---@return string? # Short band label, or `nil` when there is no band to name.
+---@return Color # The band's colour, or `FG`.
+function util.band_of(ap)
+    local theme = require("config.theme")
+    local number = ap and ap.band and ap.band:match("^[%d%.]+")
+    if number == "6" then
+        return "6G", theme.GREEN
+    elseif number == "5" then
+        return "5G", theme.ACCENT
+    elseif number == "2.4" then
+        return "2.4", theme.PEACH
+    end
+    return nil, theme.FG
+end
+
+-- The `available_networks` entry the link is actually on. `NetworkState` carries `ssid` and
+-- `strength` for the association but not its band, so anything band-shaped has to come back through
+-- the AP list. A wired link has no entry here, which is why callers need no separate ethernet case.
+---@param n NetworkState?
+---@return AccessPointInfo? # The associated access point, or `nil`.
+function util.active_access_point(n)
+    for _, ap in ipairs((n and n.available_networks) or {}) do
+        if ap.active then
+            return ap
+        end
+    end
+    return nil
 end
 
 function util.volume_icon_name(a)
@@ -436,7 +473,12 @@ end
 -- tween runs (ADR-0146).
 function util.linger(signal, ms)
     return computed({ signal, delay(signal, ms) }, function(now, was)
-        return now or was
+        -- `== true` rather than `now or was`, which returned whatever `delay` held. `delay` answers
+        -- the source's older value, and before the first change settles that is the property's
+        -- identity, `0` -- a number Lua calls truthy and the engine refuses, so `modal_host`'s
+        -- `visible` got `Integer(0)` and the whole re-resolve was dropped. Every caller here feeds
+        -- a `visible`, so the boolean is the helper's job to guarantee.
+        return now == true or was == true
     end)
 end
 

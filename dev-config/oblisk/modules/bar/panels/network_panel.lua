@@ -49,18 +49,6 @@ local function strength_glyph(strength)
     return icons.wifi[1]
 end
 
--- `Theme.networkBandColor`: band colour plus a short label. `band` is `"2.4 GHz"`, `"5 GHz"`, or
--- `"6 GHz"` (§ 2.5), so two 5 GHz networks remain distinguishable.
-local BAND_COLOR = { ["2.4"] = theme.YELLOW, ["5"] = theme.ACCENT, ["6"] = theme.GREEN }
-
-local function band_of(ap)
-    local number = ap.band and ap.band:match("^[%d%.]+")
-    if not number then
-        return nil, theme.FG
-    end
-    return number == "2.4" and "2.4" or (number .. "G"), BAND_COLOR[number] or theme.FG
-end
-
 -- Header subtitle, in priority order: an off stack speaks before its radios.
 local function state_line(n)
     if not n.networking_enabled then
@@ -109,7 +97,7 @@ end)
 
 local function access_point_row(entry)
     local ap = entry.ap
-    local band, color = band_of(ap)
+    local band, color = util.band_of(ap)
 
     local leading = { glyph(strength_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
     if band then
@@ -123,7 +111,7 @@ local function access_point_row(entry)
         end, { slot = "network-forget-" .. tostring(ap.ssid), tint = theme.RED })
     end
     if ap.secure then
-        trailing[#trailing + 1] = glyph(icons.lock, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
+        trailing[#trailing + 1] = glyph(icons.lock, theme.DIM, theme.font.xs, { align_v = "Center" })
     end
 
     local clickable = not ap.active and not entry.blocked
@@ -192,12 +180,12 @@ local body = {
                     if not n.wifi_enabled or n.ssid == nil or n.ssid == "Ethernet" then
                         return ""
                     end
-                    for _, ap in ipairs(access_points(n)) do
-                        if ap.active then
-                            return string.format("%d%% · %s", ap.strength or 0, ap.band or "")
-                        end
+                    local ap = util.active_access_point(n)
+                    if ap == nil then
+                        return ""
                     end
-                    return ""
+                    local band = util.band_of(ap)
+                    return string.format("%d%% · %s", ap.strength or 0, band or "")
                 end),
                 signal = oblisk.network,
                 read = function(n)

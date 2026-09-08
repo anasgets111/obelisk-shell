@@ -65,6 +65,9 @@ return panel {
                         },
                     },
                 },
+                -- `PolkitDialog.qml:112` draws polkitd's own `inputPrompt` here and hides the line
+                -- when it is empty. `PolkitState` carries no such field, so this stays the fixed
+                -- label the prompt always is in practice; see ADR-0163.
                 cell("Password:", theme.FG, theme.font.sm),
                 column {
                     width = "Fill",
@@ -77,7 +80,7 @@ return panel {
                         textfield {
                             width = "Fill",
                             height = theme.control.md,
-                            placeholder = "password",
+                            placeholder = "Password",
                             mask_character = "*",
                             secure_submit = { capability = "polkit", action = "authenticate" },
                             font_size = theme.font.sm,

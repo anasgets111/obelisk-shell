@@ -3281,3 +3281,71 @@ limit from `attempts` would otherwise have shut the user out for something they 
 
 Not fixed: an upgrade that removes the loader or a library the old executable needs still stops the
 worker, and no exec strategy survives that.
+
+## 0162. The network panel's missing facts are capability gaps, not config workarounds
+
+`NetworkPanel.qml` draws six things `oblisk.network` cannot answer. The config currently fakes two
+of them and drops four. Recording the list so the fakes are removed when the capability grows,
+rather than hardened into config idiom.
+
+`NetworkState` carries `available_networks`, `connect_error`, `connected`, `connecting_ssid`,
+`ethernet_enabled`, `networking_enabled`, `password_ssid`, `scanning`, `ssid`, `strength` and
+`wifi_enabled`; `AccessPointInfo` carries `active`, `band`, `secure`, `ssid` and `strength`;
+`invoke` accepts `set_networking_enabled`, `set_wifi_enabled`, `set_ethernet_enabled`, `scan`,
+`connect`, `cancel_connect` and `forget`.
+
+1. **`AccessPointInfo.saved`.** The mirror shows forget only on a known network
+   (`network.known`). Without it every row offers to forget a network NetworkManager has no profile
+   for, which is a no-op the user cannot predict.
+2. **A `disconnect` command.** The mirror separates leaving a network from deleting its profile.
+   The config offers only `forget`, so the sole way to drop a link also destroys the credentials.
+3. **`NetworkState.link_type`.** The mirror reads `linkType`; the config infers wired from the
+   `ssid == "Ethernet"` sentinel, which is a display string doing a type's job and breaks against a
+   real SSID of that name.
+4. **`NetworkState.ip_address`.** The mirror's wi-fi tile shows the address. The config shows
+   strength again, which the glyph beside it already says.
+5. **Ethernet `speed`.** The mirror's wired tile shows the negotiated rate; the config shows no
+   detail.
+6. **`ethernet_interface` and a `ready` flag.** The mirror disables the wired tile with no
+   interface and says "Unavailable"; the config cannot tell absent hardware from a disabled radio
+   and says "off" for both.
+
+1 and 2 are the pair worth doing first: together they are the difference between a panel that can
+manage saved networks and one that can only join. 4, 5 and 6 are readouts, and 3 removes a
+workaround rather than adding a feature.
+
+Rejected: deriving any of these in config from what already arrives. `saved` is not implied by
+`active` or `strength`, and the wired sentinel is the existing attempt at deriving 3 — it is the
+bug, not the pattern to extend. NetworkManager holds every one of these facts already (ADR-0037's
+reasoning for `password_ssid`: what NetworkManager knows does not belong in config).
+
+Rejected: one `network_details` blob added at once. Each field has an independent consumer, and the
+panel drift they cause is separately visible, so they can land one at a time.
+
+## 0163. `PolkitState` cannot describe polkitd's prompt, so the dialog hardcodes it
+
+`PolkitDialog.qml` draws three things `oblisk.polkit` cannot answer, all of them properties of the
+authentication request rather than of our dialog. `PolkitState` carries `action_id`, `active`,
+`authenticating`, `error`, `icon_name` and `message`; `invoke` accepts `authenticate` and `cancel`.
+
+1. **`input_prompt`.** The mirror draws polkitd's own prompt string and hides the line when it is
+   empty (`inputPrompt`, `visible: text !== ""`). The config prints a fixed "Password:", which is
+   what pam_unix asks for and nothing else. A fingerprint or one-time-code module asks a different
+   question and would be labelled wrongly.
+2. **`response_visible`.** polkitd says whether the answer should echo. The mirror switches
+   `echoMode` on it; the config always masks, so a prompt whose answer is not secret is still typed
+   blind.
+3. **Whether the field holds text.** The mirror disables Authenticate until the field is non-empty
+   (`passwordField.text.length > 0`). `textfield` keeps its content in a native buffer no callback
+   can read (ADR-0092's reason the mask stays server-side), so the button is always live and an
+   empty submit costs a PAM round trip.
+
+1 is the one worth doing: it is a string already in hand at the agent boundary, and without it the
+dialog can only ever serve password authentication. 2 rides along with it from the same message. 3
+is not a payload field but a `textfield` question, and answering it means giving the config a way
+to observe a buffer that is deliberately opaque; if it is ever wanted, an `empty` boolean signal is
+the smallest thing that does not leak the text.
+
+Rejected: reusing `message` as the prompt. It is the sentence explaining why authorization is
+needed, drawn above; polkitd sends both, and collapsing them loses the one the field is labelled
+with.
