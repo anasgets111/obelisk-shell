@@ -7,6 +7,7 @@
 local theme = require("config.theme")
 local privacy_module = require("modules.bar.indicators.privacy")
 local volume_module = require("modules.bar.indicators.volume")
+local screen_recorder = require("modules.bar.indicators.screen_recorder")
 local network = require("modules.bar.indicators.network")
 local bluetooth = require("modules.bar.indicators.bluetooth")
 local tray_module = require("modules.bar.indicators.sys_tray")
@@ -76,6 +77,7 @@ return row {
     children = {
         privacy_module,
         volume_module,
+        screen_recorder.indicator,
         network.indicator,
         bluetooth.indicator,
         tray_module,

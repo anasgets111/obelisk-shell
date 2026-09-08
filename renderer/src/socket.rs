@@ -1213,6 +1213,7 @@ mod tests {
                 ("wallpaper_tooltip", "popup"),
                 ("network_tooltip", "popup"),
                 ("bluetooth_tooltip", "popup"),
+                ("screen_recorder_tooltip", "popup"),
                 ("idle_tooltip", "popup"),
                 ("modal_host", "panel"),
                 ("lock_screen", "lock"),

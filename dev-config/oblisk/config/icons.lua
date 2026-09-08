@@ -124,6 +124,23 @@ icons.info            = "\u{F02FD}"
 icons.trash           = "\u{F0A7A}"
 icons.disconnect      = "\u{F1616}"
 
+-- Screen recorder. `ScreenRecorder.qml` uses three states on the bar -- idle, recording, paused --
+-- and `ScreenRecorderPanel.qml` names the two captures it can start. `record` is the header's
+-- glyph; `record_start` is the bar's idle circle, which is the one that says "this button records".
+icons.record          = "\u{F044A}"
+icons.record_start    = "\u{F07A1}"
+icons.record_stop     = "\u{F04DB}"
+icons.record_paused   = "\u{F03E7}"
+icons.region          = "\u{F019E}"
+icons.folder          = "\u{F024B}"
+-- The three quality words, ranked by the same needle the mirror uses: a slow gauge for the
+-- smallest files, a fast one for the sharpest.
+icons.quality_low     = "\u{F0F86}"
+icons.quality_medium  = "\u{F0F85}"
+icons.quality_high    = "\u{F04C5}"
+icons.file_mp4        = "\u{F022B}"
+icons.file_mkv        = "\u{F0FCE}"
+
 icons.warning         = "\u{F0026}"
 icons.close           = "\u{F0156}"
 

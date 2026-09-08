@@ -38,6 +38,10 @@ return persistent_table {
         -- `state.json` on first run, and true could blank a screen while its owner reads. The
         -- modal's
         -- master switch is one click and says "automation paused" until enabled.
+        -- `Settings.data.screenRecorder` verbatim: the four choices `ScreenRecorderPanel.qml`
+        -- offers. Kept as one table rather than four keys because the panel reads and writes them
+        -- as a group, and because they belong to one subject.
+        screen_recorder = { audio = "desktop", quality = "high", fps = 60, container = "mp4" },
         idle = {
             enabled = false,
             video_auto_inhibit = true,

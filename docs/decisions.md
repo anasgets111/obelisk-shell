@@ -3716,3 +3716,154 @@ Reading the name meant `modules/global/lock.lua`'s identity block -- `getent pas
 `uname -n` for the host -- moving to `lib/identity.lua`. Two readers is the extraction rule, and it
 matters more than usual here: the guard that stops a reload spawning more processes is a `state`,
 so the two subprocesses must run once for the session rather than once per module that asks.
+
+
+## 0175. A process the user would notice stopping belongs to the session, not the generation
+
+`process.run` gives a config one lifetime: the child belongs to the generation that spawned it, and
+`reap_generations_processes` kills its group on every swap. That is right for a helper that answers
+a question and exits, and wrong for anything the user would notice stopping. A screen recorder is
+the case that forced this, and the mirror shows what the wrong lifetime costs.
+
+`Services/SystemInfo/ScreenRecordingService.qml` is 223 lines, and about 180 of them are one
+workaround. Because Quickshell replaces its singletons on reload, the recorder has to be orphaned
+rather than held: a 900-character `sh` script backgrounds `gpu-screen-recorder`, reads
+`/proc/$pid/exe` to check the right binary came up, reads field 22 of `/proc/$pid/stat` for the
+kernel start time, and writes pid, start time, path and launch epoch to a lock file. Every later
+signal re-runs that probe first, because a pid alone can name a process that has already been
+recycled. A two-second `Timer` polls the same probe to notice a crash. `PersistentProperties` and
+the lock file's launch epoch between them reconstruct elapsed time, disagreeing about paused
+seconds depending on which one survived.
+
+None of that is about recording. It is the cost of the owner dying while the owned keeps running.
+
+Copying it was the obvious move -- it is the mirror's own design, it works on this machine, and
+`setsid` is enough to escape our `killpg` where Quickshell needed nothing. What decided against it
+is that the Supervisor does not restart on a config edit. It already holds a `Child` for every
+`process.run`. The workaround exists to answer "is that still my process?", and the Supervisor never
+has to ask.
+
+1. **`oblisk.processes` is a roster capability, and `session_process { name, stop_signal }` is its
+   declaration.** Exactly the `oblisk.storage`/`persistent_table` pair in shape: the config names the
+   thing, the Supervisor owns what sits behind it, and state comes back keyed by that name. It is
+   that pair's opposite in what it holds -- `storage` keeps a file the config could have read
+   itself, this keeps a handle the config *cannot* hold.
+
+   Not an option on `process.run`. A `detached = true` flag spawns something whose exit reports to
+   callbacks in a VM that no longer exists, and hands back a handle nothing can re-find. Detachment
+   without an owner is the workaround with a nicer spelling.
+
+2. **One task per running program owns its `Child` and is the only place its pid is signalled.**
+   `supervise` selects between `child.wait()` -- cancel-safe, so it re-arms after each request --
+   and a request channel. Every signal is therefore sent by the task that has not yet reaped the
+   process, so the kernel still reserves that pid and it cannot have been recycled underneath.
+   Keeping a pid in the controller's map and signalling from there would have reopened the exact
+   window the start-time check exists to cover.
+
+3. **The stop signal is declared, and shutdown uses it.** `SIGTERM` is the default and wrong for the
+   first program that will use this: `gpu-screen-recorder` finalises its container on `SIGINT`, and
+   a reap that skips that step leaves an unplayable file. The grace is five seconds rather than
+   § 10's 100 ms for the same reason -- a program is declared this way because it is doing something
+   long, and closing it out takes longer than closing a helper that had nothing to finish.
+
+4. **stdio is inherited, not piped.** A session process outlives the generation that started it, so
+   there is no callback left for its output to reach. Piping it would mean either dropping the lines
+   or inventing an owner for them across generations; the shell's own log is the honest destination,
+   and a config that wants a program's output wants `process.run`.
+
+5. **`start_error` is state, not just a log line.** A config waits on `running`. A command that is
+   not on `PATH` never sets it, and without a readable reason that is indistinguishable from a slow
+   start -- a spinner that never resolves, with the explanation only in the Supervisor's stderr.
+
+6. **`start` on an undeclared name is refused rather than creating one.** Declaring is what makes a
+   name exist, so a typo reads `nil` instead of looking like a program that never manages to start.
+
+The wire name is `processes`, one letter from the existing off-roster `process`, and the two route
+through different arms of `main.rs`. A test pins both: `from_name("process")` is still `None`, and
+`from_name("processes")` resolves.
+
+What this deletes from the config that has yet to be written: the launch script, the lock file, the
+`/proc` probe, the liveness poll, the restore-on-restart path, and the split elapsed-time
+accounting. What replaces them is `rec.running` and `rec.started_at`.
+
+
+## 0176. The recorder is argv, a file name and pause arithmetic; everything else was the lock file
+
+`ScreenRecordingService.qml` is 223 lines. `lib/screen_recording.lua` mirrors it in about 250, and
+the two files have almost nothing in common, because ADR-0175 deleted the mirror's subject. Gone:
+the 900-character launch script, the `/proc/$pid/exe` check, the kernel start time, the lock file,
+the re-probe before every signal, the two-second liveness poll, and the restore-on-restart path.
+What is left is the part that was always the config's -- which argv to build, what to call the file,
+and how to count a pause.
+
+The panel and indicator are `ScreenRecorderPanel.qml` and `ScreenRecorder.qml` as they stand.
+
+### Where this deliberately leaves the mirror
+
+1. **`-w <WxH+X+Y>`, not `-w region -region <WxH+X+Y>`.** The installed gpu-screen-recorder prints
+   *"option -region is deprecated, use -w with region directly instead"* and then fails:
+   `gsr_encoder_receive_packets: failed to write frame index 1 to muxer, Invalid argument (-22)`,
+   with nothing written. The same geometry through `-w` records cleanly. Found by running the
+   mirror's own form on this machine, not by reading.
+
+2. **The exit status picks the notification.** `_clearRecording(true)` announces "Recording saved"
+   however the recorder ended. Observed live: a bad `-a` argument killed it at once and the popup
+   offered to play a file that did not exist. `gpu-screen-recorder` answers `SIGINT` by writing the
+   container index and exiting 0, so zero means there is something to offer and anything else gets
+   a failure notice naming the code.
+
+3. **Three mouse buttons on the indicator.** `components/icon_button.lua` guards left-click only, on
+   the argument that a stray right-click should not act. This is the mirror's design and it is the
+   right one here: the two captures differ only in extent, so one click each beats a panel round
+   trip, and the panel still names everything for anyone who does not remember which button is
+   which. It takes `on_button` rather than `on_activate`, which is the escape hatch that already
+   existed for exactly this.
+
+4. **Four buttons in two slots.** `OButton` binds `bgColor` and `variant` live; `action_button`
+   picks its grounds from a static `tone`. Making `tone` a signal means mapping rest, hover, border
+   and ink through it, for one caller. An invisible node takes no size and no spacing gap, so a pair
+   per state costs the same row and every button keeps one label, one tone and one job.
+
+5. **The settings section stays open across a close.** `onIsOpenChanged` collapses it; ours matches
+   `modules/bar/indicators/system_info.lua`, the config's other expandable section. There is also no
+   close edge to hang the reset on that would not make `lib/ui_state.lua` require a panel back.
+
+### Components that grew, and why each was the mirror's own parameter
+
+`panel_header` gains `accent`. `PanelHeader.qml` has `property color accent` and our boolean
+`active` was a simplification of it -- fine while every subject was on or off, wrong for a recorder
+where a live capture is `critical` and a ready one `activeColor`, and neither is "off".
+`info_badge`'s ink now follows a live ground for the same reason: `badgeColor: paused ? warning :
+critical` swaps peach for red mid-capture. `action_button` gains `danger`, `height` and a `glyph`
+slot; `panel_toggle_card`'s icon and height become optional, because a frame-rate tile has no glyph
+and the mirror's `modelData.icon ?? ""` draws an empty line where a missing one is the same intent.
+
+### Every glyph on the bar was a third too large
+
+Reported as "the stop icon doesn't look right compared to the QML version". It was not the stop
+icon. `components/icon_button.lua` defaulted its glyph to `theme.icon.lg`, under a comment claiming
+that matched `iconSizeFor("md")`. It does not: `IconButton.qml` defaults `size: "md"` and no bar
+indicator overrides it, so the mirror draws `iconSizeMd`, `s(18, 14)`, while `icon.lg` is
+`s(24, 18)` -- the mirror's `iconSizeLg`.
+
+So every circle on the bar had been drawing its glyph a third oversize since the component was
+extracted. A wifi arc or a bell hides that; a filled square does not, which is why the recorder is
+where it surfaced. One number, and the comment that had been asserting it was right.
+
+### The hole, and the one thing not built
+
+Pause arithmetic is `state`, so it survives an in-place reload and resets on a generation swap,
+after which paused seconds count as recorded ones. The mirror has the same hole across a Quickshell
+restart. A debounced disk write per pause is not worth closing it.
+
+`IPC.qml`'s `rec toggle` has no equivalent. `oblisk set` writes a value, and a surface reading that
+value re-renders; starting a recording is a call, not a value, and the only place a config can run
+code at a moment is a capability's `on_change`. Built on `oblisk.system` that is a keybind answering
+up to a second late, which is worse than not having one. It is a roadmap row instead.
+
+Verified live rather than by inspection, because the pointer cannot be moved from here: a capture
+started, paused, resumed and stopped from a temporary CLI door in this file, since removed. The
+elapsed badge read `1:47` seven seconds apart while paused and `1:51` four seconds after resuming;
+the stopped file is 9.3 MB and `ffprobe` reads `duration=112.905512`, so `SIGINT` closed the
+container and gpu-screen-recorder's own duration agrees with the arithmetic here to within two
+seconds.

@@ -12,7 +12,8 @@ local glyph = require("components.glyph")
 
 ---@class PanelToggleCardOpts
 ---@field slot string The hover region's name; one per tile.
----@field icon string|Bound
+---@field icon? string|Bound Omitted draws the label alone. `PanelToggleCard.qml` takes `modelData.icon ?? ""`, so a group whose options have no glyph -- the recorder's frame rates -- draws an empty line above each word there; a missing line is the same intent without the gap.
+---@field height? integer The tile's height. Default `theme.panel_toggle_height`, which is the radio pair in the power menu; a four-across settings group is `control.lg`, as the mirror sets.
 ---@field label string
 ---@field detail? string|Bound A second line under the label -- a band, an address. Hidden while it reads empty.
 ---@field signal Signal The capability whose payload `read` inspects.
@@ -54,10 +55,11 @@ return function(opts)
         return hot and theme.FG or theme.DIM
     end)
 
-    local lines = {
-        glyph(opts.icon, ink, theme.icon.md, { align = "Center" }),
-        cell(opts.label, ink, theme.font.xs, { align = "Center" }),
-    }
+    local lines = {}
+    if opts.icon ~= nil and opts.icon ~= "" then
+        lines[#lines + 1] = glyph(opts.icon, ink, theme.icon.md, { align = "Center" })
+    end
+    lines[#lines + 1] = cell(opts.label, ink, theme.font.xs, { align = "Center" })
     if opts.detail then
         local detail = opts.detail
         ---@cast detail -nil
@@ -74,7 +76,7 @@ return function(opts)
 
     return button {
         width = "Fill",
-        height = theme.panel_toggle_height,
+        height = opts.height or theme.panel_toggle_height,
         radius = theme.radius.lg,
         hover = hovered,
         background = ground,

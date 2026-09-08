@@ -17,7 +17,8 @@ local icon_button = require("components.icon_button")
 ---@field title string
 ---@field subtitle? string|Bound One line of state under the title: the joined network, "2 connected · P30i · 90%", "off".
 ---@field icon? string|Bound A glyph on a plate; the plate and glyph take `active`'s colour.
----@field active? boolean|Bound Accent while true, dim while false. Default true.
+---@field active? boolean|Bound Accent while true, dim while false. Default true. Ignored when `accent` is given.
+---@field accent? Color|Bound The plate and glyph colour outright, for a subject whose state is not on/off. `PanelHeader.qml` has this as `property color accent` and the boolean is the common case built on top of it; the recorder needs the parameter itself, because a live capture is `critical` and a ready one `activeColor` -- two colours, neither of them "off".
 ---@field trailing? Node[] Controls at the far edge, in order.
 ---@field on_close? fun() Adds a close button after `trailing`.
 ---@field title_size? integer The title's font size. Default `theme.font.lg`, which is a bar panel's masthead; a modal's is bigger, and so is a section header inside one.
@@ -35,7 +36,20 @@ return function(opts)
     local accent
     ---@type Color|Signal
     local plate
-    if type(active) == "userdata" then
+    if opts.accent ~= nil then
+        accent = opts.accent
+        -- `withOpacity(accent, opacitySubtle)`, the mirror's own plate, so a caller supplies one
+        -- colour rather than a matched pair it could get wrong.
+        if type(accent) == "userdata" then
+            ---@cast accent Signal
+            plate = accent:map(function(colour)
+                return theme.with_opacity(colour, theme.opacity.subtle)
+            end)
+        else
+            ---@cast accent Color
+            plate = theme.with_opacity(accent, theme.opacity.subtle)
+        end
+    elseif type(active) == "userdata" then
         ---@cast active Signal
         accent = active:map(function(on)
             return on and theme.ACCENT or theme.DIM

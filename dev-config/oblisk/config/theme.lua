@@ -204,6 +204,9 @@ theme.ACCENT_MEDIUM             = theme.with_opacity(theme.ACCENT, theme.opacity
 -- Hover for an opaque `ACCENT` ground. The three alpha tints cannot lift an opaque colour; the
 -- mirror's `OButton` primary variant lightens it instead.
 theme.ACCENT_HOVER              = lighten(theme.ACCENT, 0.16)
+-- The same lift for the one opaque `RED` ground: `ScreenRecorderPanel.qml`'s stop button, whose
+-- `bgColor: Theme.critical` goes through `OButton`'s primary hover the same way accent does.
+theme.RED_HOVER                 = lighten(theme.RED, 0.16)
 -- Mirror's `bgSubtle`, used as the plate behind a notification card's application icon.
 theme.BG_SUBTLE                 = theme.with_opacity(theme.BG, theme.opacity.subtle)
 

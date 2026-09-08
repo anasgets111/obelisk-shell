@@ -20,12 +20,20 @@ local GROUND = {
         border = theme.ACCENT,
         text = theme.text_contrast(theme.ACCENT),
     },
+    -- `bgColor: Theme.critical` on `ScreenRecorderPanel.qml`'s stop button: solid's shape with the
+    -- alert colour, for the one action in a panel that ends something already running.
+    danger = {
+        rest = theme.RED,
+        hover = theme.RED_HOVER,
+        border = theme.RED,
+        text = theme.text_contrast(theme.RED),
+    },
 }
 
 ---@param label string|Bound
 ---@param on_activate? fun() Absent on a `submit` button, whose click is the field's Enter.
 ---@param slot string A `hover` slot unique to this button; two buttons sharing one light up together.
----@param opts? { icon?: string, tone?: "accent"|"quiet"|"solid", width?: integer|"Fill", visible?: boolean|Bound, submit?: boolean }
+---@param opts? { icon?: string, glyph?: string|Bound, tone?: "accent"|"quiet"|"solid"|"danger", width?: integer|"Fill", height?: integer, visible?: boolean|Bound, submit?: boolean, on_button?: fun(rect: Rect, button: string) }
 return function(label, on_activate, slot, opts)
     opts = opts or {}
     local ground = GROUND[opts.tone or "accent"]
@@ -44,6 +52,18 @@ return function(label, on_activate, slot, opts)
             foreground = ground.text,
         }
     end
+    -- `opts.glyph` is the Nerd Font half of the same slot. A notification's action icon is a theme
+    -- name (ADR-0090) and has to stay an `icon` node; a panel's own control is a codepoint from
+    -- `config/icons.lua`, which is a `text` node and takes the button's ink like the label does.
+    if opts.glyph then
+        children[#children + 1] = text {
+            content = opts.glyph,
+            foreground = ground.text or theme.FG,
+            font_size = theme.icon.sm,
+            font = theme.icon_font,
+            align_v = "Center",
+        }
+    end
     if label and label ~= "" then
         local label_content = type(label) == "string" and { { text = label, bold = true } } or label
         children[#children + 1] = cell(label_content, ground.text or theme.FG, theme.font.sm, {
@@ -55,7 +75,7 @@ return function(label, on_activate, slot, opts)
     return button {
         submit = opts.submit,
         width = opts.width,
-        height = theme.control.md,
+        height = opts.height or theme.control.md,
         align_v = "Center",
         radius = theme.radius.md,
         visible = opts.visible,

@@ -58,6 +58,7 @@ local wallpaper_tooltip = require("modules.bar.indicators.wallpaper_button").too
 -- the labels they lost.
 local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
+local screen_recorder_tooltip = require("modules.bar.indicators.screen_recorder").tooltip
 -- The idle tooltip counts down to the next stage, which the bar has no room to show.
 local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
 local lock_screen = require("modules.global.lock")
@@ -83,6 +84,7 @@ return {
     wallpaper_tooltip,
     network_tooltip,
     bluetooth_tooltip,
+    screen_recorder_tooltip,
     idle_tooltip,
     modal_host,
     lock_screen,
