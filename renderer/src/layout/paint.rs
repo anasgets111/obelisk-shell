@@ -53,7 +53,10 @@ pub enum Draw {
     },
     /// Node box in physical pixels, used as the `ImageCache` key; the cache downscales a raster to
     /// cover it (ADR-0122).
-    Image { source: String, fit: Fit, box_px: (u32, u32), alpha: f32, load: Load },
+    /// `retained` is the source this node last had a texture for, carried when `retain` is set
+    /// and `source` has not caught up to it yet (ADR-0180); [`run`] draws it if `source` has no
+    /// texture. Present only while the two differ, so a settled node's list stops changing.
+    Image { source: String, fit: Fit, box_px: (u32, u32), alpha: f32, load: Load, retained: Option<String> },
     /// A subtree masked by the declaring node's rounded arc. Rectangular clips flatten into each
     /// command; rounded clips stay grouped for [`execute`].
     Clipped { radius: f32, commands: Vec<DrawCmd> },
@@ -87,7 +90,10 @@ impl DisplayList {
     pub fn draws_any_of(&self, files: &[std::path::PathBuf]) -> bool {
         fn walk(commands: &[DrawCmd], files: &[std::path::PathBuf]) -> bool {
             commands.iter().any(|command| match &command.draw {
-                Draw::Image { source, .. } => files.iter().any(|file| file.as_os_str() == source.as_str()),
+                Draw::Image { source, retained, .. } => files.iter().any(|file| {
+                    file.as_os_str() == source.as_str()
+                        || retained.as_ref().is_some_and(|cover| file.as_os_str() == cover.as_str())
+                }),
                 Draw::Clipped { commands, .. } | Draw::Transformed { commands, .. } => walk(commands, files),
                 _ => false,
             })
@@ -101,7 +107,12 @@ impl DisplayList {
         fn walk(commands: &[DrawCmd], out: &mut Vec<(std::path::PathBuf, (u32, u32))>) {
             for command in commands {
                 match &command.draw {
-                    Draw::Image { source, box_px, .. } => out.push((std::path::PathBuf::from(source), *box_px)),
+                    Draw::Image { source, box_px, retained, .. } => {
+                        out.push((std::path::PathBuf::from(source), *box_px));
+                        // Pinned on the same box it is drawn at, or `trim` frees the very texture
+                        // covering the gap and the node blinks after all (ADR-0180).
+                        out.extend(retained.iter().map(|cover| (std::path::PathBuf::from(cover), *box_px)));
+                    }
                     Draw::Clipped { commands, .. } | Draw::Transformed { commands, .. } => walk(commands, out),
                     _ => {}
                 }
@@ -187,7 +198,10 @@ fn build_node(
     // avoids the passwordless black lock screen ADR-0052 decision 3 rejects. Opacity is baked into
     // the list because ADR-0063 skips unchanged lists; applying it in `execute` would be invisible.
     let opacity = inherited_opacity * node.opacity;
-    let draw = node.paint.as_ref().and_then(|style| draw_for(style, node.id, rect, scale, opacity, focus));
+    let draw = node
+        .paint
+        .as_ref()
+        .and_then(|style| draw_for(style, node.id, rect, scale, opacity, focus, node.displayed_source.as_deref()));
 
     // A transformed node paints itself and its subtree as one group under its matrix
     // (ADR-0149), so the group is built into `out` and lifted out of it afterwards. Coordinates
@@ -343,12 +357,20 @@ fn run(
                         tint: *color,
                         load: Load::Inline,
                     };
-                    draw_file(painter.canvas_mut(), images, &path, draw);
+                    let _ = draw_file(painter.canvas_mut(), images, &path, draw);
                 }
             }
-            Draw::Image { source, fit, box_px, alpha, load } => {
+            Draw::Image { source, fit, box_px, alpha, load, retained } => {
                 let draw = FileDraw { fit: *fit, rect, box_px: *box_px, alpha: *alpha, tint: None, load: *load };
-                draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw)
+                let drew = draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw);
+                // The named source has no texture: still decoding, or a failure the cache has
+                // already logged once. Either way the node keeps its last picture rather than
+                // showing the surface behind it (ADR-0180). A cover that is itself gone -- evicted
+                // despite the pin, or deleted from disk -- draws nothing, which is the old
+                // behaviour.
+                if !drew && let Some(cover) = retained {
+                    draw_file(painter.canvas_mut(), images, std::path::Path::new(cover), draw);
+                }
             }
             Draw::Clipped { radius, commands } => {
                 draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch)
@@ -447,6 +469,8 @@ fn draw_for(
     scale: f32,
     opacity: f32,
     focus: Option<&FieldFocus>,
+    // The source the node last had a texture for; see `ResolvedNode::displayed_source`.
+    retained: Option<&str>,
 ) -> Option<Draw> {
     match style {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
@@ -495,12 +519,15 @@ fn draw_for(
 
         // Image source and fit (ADR-0054 decision 3). Empty source draws nothing; both physical
         // edges enter the cache because `Cover` may scale an SVG past the shorter edge (ADR-0122).
-        PaintStyle::Image { source, fit, load } => (!source.is_empty()).then(|| Draw::Image {
+        PaintStyle::Image { source, fit, load, retain } => (!source.is_empty()).then(|| Draw::Image {
             source: source.clone(),
             fit: *fit,
             box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
             alpha: opacity,
             load: *load,
+            // Dropped once the node draws what it names: an equal pair in the list would be one
+            // more thing to compare, and its disappearance is what ends the cover.
+            retained: retained.filter(|_| *retain).filter(|last| *last != source.as_str()).map(str::to_string),
         }),
 
         // A `textfield` shows its placeholder until focused, then one mask character per typed
@@ -569,18 +596,21 @@ struct FileDraw {
 /// Cache lookup and one `fill_path` over the fitted rect. Filling the full box with a `Contain`
 /// paint would let femtovg clamp the outer pixel row into the letterbox; `Cover` is cropped by the
 /// run's scissor.
-fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, draw: FileDraw) {
+/// Answers whether it drew, which is how an `image` learns its source has no texture yet and its
+/// `retain` cover should take the frame (ADR-0180).
+fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, draw: FileDraw) -> bool {
     let FileDraw { fit, rect, box_px, alpha, tint, load } = draw;
     let Some(id) = images.image(canvas, file, box_px, tint, load) else {
-        return;
+        return false;
     };
     let Ok((width, height)) = canvas.image_size(id) else {
-        return;
+        return false;
     };
     let fitted = image::fitted_rect(rect, width as f32, height as f32, fit);
     let mut path = Path::new();
     path.rect(fitted.x, fitted.y, fitted.width, fitted.height);
     canvas.fill_path(&path, &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, alpha));
+    true
 }
 
 /// One logical edge in physical pixels, rounded and floored at 1. `ImageCache` keys on this
@@ -948,6 +978,55 @@ mod tests {
                 _ => None,
             })
             .expect("expected a text draw")
+    }
+
+    /// ADR-0180. The cover only reaches the list while the node is behind its own source, it is
+    /// pinned so `trim` cannot free the texture it is covering with, and `retain` is what turns it
+    /// on: without the property the same stale `displayed_source` says nothing.
+    #[test]
+    fn a_retaining_image_carries_the_source_it_still_shows_until_the_named_one_catches_up() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = image { id = "wp", source = "/tmp/new.png", async = true, retain = true,
+                width = "Fill", height = "Fill" } }"##;
+        let mut tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+
+        // Nothing has landed yet, so there is nothing to cover the gap with.
+        let cover_of = |tree: &ResolvedNode| {
+            build(tree, 1.0, None).commands.iter().find_map(|cmd| match &cmd.draw {
+                Draw::Image { retained, .. } => Some(retained.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(cover_of(&tree), Some(None), "an image that never drew has no cover");
+
+        tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
+        assert_eq!(cover_of(&tree), Some(Some("/tmp/old.png".to_string())));
+        let list = build(&tree, 1.0, None);
+        let mut pinned = Vec::new();
+        list.drawn_images(&mut pinned);
+        assert_eq!(
+            pinned,
+            vec![
+                (std::path::PathBuf::from("/tmp/new.png"), (200, 40)),
+                (std::path::PathBuf::from("/tmp/old.png"), (200, 40)),
+            ],
+            "both are pinned on the box they are drawn at, or the cover is evicted mid-cover"
+        );
+        assert!(list.draws_any_of(&[std::path::PathBuf::from("/tmp/old.png")]));
+
+        // Caught up: the pair is equal, so the list settles instead of carrying a second copy.
+        tree.children[0].displayed_source = Some("/tmp/new.png".to_string());
+        assert_eq!(cover_of(&tree), Some(None));
+
+        // The same stale state without the property draws nothing while the source decodes, which
+        // is the behaviour every image had before this.
+        let plain = r##"return panel { id = "bar", width = 200, height = 40,
+            child = image { id = "wp", source = "/tmp/new.png", async = true,
+                width = "Fill", height = "Fill" } }"##;
+        let mut tree = resolved_surface(&lua, plain, LogicalSize { width: 200.0, height: 40.0 });
+        tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
+        assert_eq!(cover_of(&tree), Some(None), "`retain` is what carries the cover, not the state");
     }
 
     #[test]

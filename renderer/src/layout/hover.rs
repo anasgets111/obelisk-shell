@@ -117,6 +117,7 @@ mod tests {
             properties.insert("on_hover".to_string(), on_hover);
         }
         ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: crate::layout::node::Transform::default(),

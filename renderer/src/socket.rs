@@ -440,6 +440,13 @@ impl RendererClient {
         &self.scene
     }
 
+    /// Relays `ImageCache::poll`'s landed files into the retained scene, where a `retain`ing
+    /// `image` stops covering the gap once the source it names has pixels (ADR-0180). Narrow on
+    /// purpose: the scene is not handed out mutably for a caller to walk itself.
+    pub fn note_landed_images(&mut self, landed: &[std::path::PathBuf]) {
+        self.scene.note_landed_images(landed);
+    }
+
     /// Drops a departed instance's retained tree. Called by topology handling when an output goes
     /// away, which is the one path that removes a surface without a reload replacing the process.
     pub fn forget_surface(&mut self, instance_id: &str) {

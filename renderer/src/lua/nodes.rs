@@ -80,7 +80,7 @@ const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     // `foreground` is CSS `color`: the resolved SVG's `currentColor` fill (ADR-0072). Full-colour
     // icons name no `currentColor`, so this is safe.
     ("icon", &["foreground", "name", "size"]),
-    ("image", &["async", "fit", "source"]),
+    ("image", &["async", "fit", "retain", "source"]),
     ("button", &["children", "on_click", "on_drag", "on_wheel", "submit"]),
     ("list", &["direction", "itemfn", "key", "scroll", "source", "spacing"]),
     // `node::paint_style` reads these for `textfield`, which draws a placeholder or masked content.
@@ -552,7 +552,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 743, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 745, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when

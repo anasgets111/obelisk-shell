@@ -2,9 +2,11 @@
 -- `lib/wallpaper.lua`. `child` is keyed by output name (ADR-0121), so each screen gets its own file
 -- and fit, including monitors plugged in later without a reload.
 --
--- Keep `async` off: decode inside the first frame makes the presented frame whole (ADR-0122). A
--- change stalls its landing frame instead of flashing the ground; ADR-0002's crossfade awaits an
--- animation model.
+-- `async` with `retain` (ADR-0180): the decode leaves the render thread, and the picture already up
+-- holds the screen until the replacement is ready to take over in one frame. ADR-0122 kept `async`
+-- off here because a pending image drew nothing and a change flashed the ground; ADR-0179 measured
+-- what that bought -- 162.7ms of decode on the render thread at every change, 114ms in release --
+-- and `retain` is what removes the flash the stall was paying for.
 local wallpaper = require("lib.wallpaper")
 
 -- Anchor all four edges so the compositor sizes both axes over the output.
@@ -24,8 +26,14 @@ return panel {
     background = "#11111bff",
     child = function(output)
         return image {
+            -- `retain` holds the last picture across a source change, so the node has to be the
+            -- same node across it: a stable `id`, with the path in `source` rather than in the
+            -- identity.
+            id = "wallpaper_image",
             source = wallpaper.path_of(output),
             fit = wallpaper.fit_of(output),
+            async = true,
+            retain = true,
             width = "Fill",
             height = "Fill",
         }

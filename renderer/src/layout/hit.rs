@@ -214,6 +214,7 @@ mod tests {
 
     fn node(kind: &str, (x, y, width, height): (f32, f32, f32, f32), children: Vec<ResolvedNode>) -> ResolvedNode {
         ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: crate::layout::node::Transform::default(),

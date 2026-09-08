@@ -53,7 +53,7 @@ Recommendations, not accepted API designs. Correctness comes before feature expa
 | Audio spectrum | Stream Cava output into Lua state; render with available drawing operations | A native FFT service merely to replace Cava |
 | Screen recording | Declare the recorder with `session_process` so it survives a reload, and drive it from config | Video encoding inside the shell |
 | Input display | Stream an external input backend | Global input capture inside the renderer |
-| Wallpaper UI | Background `panel`, `image`, watched folders and persisted preferences | A wallpaper service or fixed wallpaper surfaces |
+| Wallpaper UI | Background `panel`, `image` with `async`/`retain`, watched folders and persisted preferences | A wallpaper service or fixed wallpaper surfaces |
 | Compound controls | Lua components over existing nodes | Rust sliders, calendars, launchers or settings panels |
 | Preferences | `persistent_table` with config-declared files | A framework-owned settings schema or fixed state file |
 | Simple keybinds | `oblisk set` / `oblisk toggle` | Dedicated IPC commands for each panel |

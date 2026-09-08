@@ -4036,3 +4036,57 @@ chose for complete first frames and a wallpaper-sized box is past the largest th
 3.4 is 54.5ms, so there is no scale-on-decode shortcut: covering a 1920x1200 box from 5162x2160
 needs 2868x1200, and the next DCT step down undershoots it. Moving it off the frame, not making it
 faster, is the fix, and which way costs a blank first frame.
+
+Amendment (ADR-0180): closed. `retain` moves it off the frame without the blank one, by drawing the
+picture the node already has until the replacement lands. The first paint after a cold start still
+shows the panel's ground while the first file decodes, because there is nothing yet to hold.
+
+## 0180. An `image` can hold the picture it already has while the next one decodes, because the alternative to a stalled frame was a blank one
+
+ADR-0122 gave `image` an `async` flag and left the wallpaper without it, on the reasoning that a
+complete first frame beats a fast one. ADR-0179 priced that: 162.7ms of decode on the render thread
+in a dev build and 114ms in release, at every wallpaper change, and left it open because both ways
+out were bad. Turning `async` on moves the decode off the frame and draws nothing until it lands,
+so the change flashes the panel's ground; leaving it off keeps the stall. Nothing in between
+existed, because a pending image had no memory of what it drew last.
+
+1. `retain = true` on an `image`. While the `source` a pass resolved has no texture, the node draws
+   the source it last had one for. It is a property and not the default: a picker tile whose
+   source changes to a different file should not show the previous file's picture for a frame, and
+   a wallpaper should.
+2. The memory is `ResolvedNode::displayed_source`, carried across passes beside `tweens`, not a
+   node table the `ImageCache` keeps. The cache is keyed by path, box and file version and knows
+   nothing about nodes; teaching it node identity to answer "what did *this* node draw" inverts
+   that. What the node shows is the node's.
+3. `ImageCache::poll` already names the files whose pixels arrived, and `App` already invalidates
+   every list drawing one of them. `Scene::note_landed_images` reads the same list one line
+   earlier, so the repaint that cue forces is already building from the source the node has caught
+   up to. No second readiness channel, and no restructuring of `paint_surface` around the
+   list-equality check that makes an unchanged surface cost one tree walk.
+4. The cover reaches the display list only while it differs from `source`, so a settled node's list
+   stops changing and ADR-0063's repaint skip still holds. It is pinned for `ImageCache::trim` on
+   the box it is drawn at, or the 16MB idle budget frees the very texture covering the gap.
+5. A source that fails to decode keeps the old picture up. `Load::Background` returning `None` does
+   not say whether the file is still decoding, already failed, or was refused admission to the
+   pool, and for this the three want the same answer: show what you have. The failure is already
+   logged once by the cache.
+6. Inert under `Load::Inline`, which finishes its decode before the draw asks and leaves no gap.
+   `retain` without `async` is accepted and does nothing rather than erroring, because `async` is a
+   signal-valued property a config may flip.
+
+The node has to survive the change for any of this to work, so the config gives the wallpaper
+`image` a stable `id` and puts the path in `source`. An `image` keyed by its path is a different
+node on every change and has nothing to hold; that is the right shape for a picker tile and the
+wrong one here.
+
+Rejected: starting the transition from the scene rather than the cue, by giving `Scene::apply` the
+cache to ask. The layout pass and the paint share a thread, so it would work, and it threads a
+cache reference through a file whose whole subject is that paint properties are parsed once per
+apply and read every frame. The cue already exists.
+
+Rejected: making retention the default for every `async` image. It is right for a wallpaper and
+wrong for album art, and both are real.
+
+This is the first of the wallpaper-transition commits. It is worth having on its own: it closes
+ADR-0179's open item without any transition at all, and a cross-dissolve needs exactly the moment
+this establishes -- the frame the incoming texture exists -- to start on.

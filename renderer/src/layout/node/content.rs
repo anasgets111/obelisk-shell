@@ -205,6 +205,17 @@ pub fn parse_load(properties: &HashMap<String, Value>) -> Result<Load, LayoutErr
     }
 }
 
+/// `image.retain` (ADR-0180): while a new `source` decodes, keep drawing the one this node last
+/// had pixels for instead of nothing. Inert without `async = true`, because an inline decode is
+/// finished by the time the draw asks for it and never leaves a gap to cover.
+pub fn parse_retain(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
+    match properties.get("retain") {
+        None | Some(Value::Boolean(false)) => Ok(false),
+        Some(Value::Boolean(true)) => Ok(true),
+        Some(other) => Err(invalid("retain", format!("expected a boolean, got {}", preview_for_error(other)))),
+    }
+}
+
 fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) -> Result<String, LayoutError> {
     let Some(value) = properties.get(property) else {
         return Ok(String::new());

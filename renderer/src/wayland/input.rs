@@ -1608,6 +1608,7 @@ mod tests {
             properties.insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
         }
         layout::ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: crate::layout::node::Transform::default(),

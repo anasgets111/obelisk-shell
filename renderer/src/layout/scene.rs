@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use mlua::{Lua, Value};
@@ -141,6 +142,11 @@ pub struct ResolvedNode {
     /// This node's paint properties, parsed here rather than by `layout::paint` on every frame
     /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
     pub paint: Option<PaintStyle>,
+    /// The `source` this node last had a texture for, for an `image` declaring `retain`
+    /// (ADR-0180). `layout::paint` draws it while a newly named source is still decoding, so the
+    /// node holds its last picture instead of going blank; [`Scene::note_landed_images`] moves it
+    /// forward as decodes land. `None` for every other kind, and until the first one lands.
+    pub displayed_source: Option<String>,
     pub children: Vec<ResolvedNode>,
     /// Properties in flight between two resolved targets (ADR-0145). `properties` holds what is
     /// displayed this frame, each tween the target it is heading for; `Scene::tick` advances them
@@ -350,6 +356,29 @@ impl Scene {
         publish_geometry(&solved, 0.0, 0.0, lua, false).map_err(|e| node::invalid("geometry", e.to_string()))?;
         self.surfaces.insert(key, solved);
         Ok(())
+    }
+
+    /// Moves every retaining `image` whose current `source` is among `landed` onto that source
+    /// (ADR-0180). `ImageCache::poll` names the files whose pixels arrived; the paint that follows
+    /// uploads them before it draws, so a file in this list is what the node is about to show, and
+    /// the source it was covering the gap with is no longer needed.
+    ///
+    /// Matching is by path alone, which is the same coarseness `App::forget_painted_lists_drawing`
+    /// already invalidates lists with: two nodes drawing one file at different sizes land together
+    /// or not at all. The consequence of being early is one frame drawn from the cover source,
+    /// which is the frame it was there for.
+    pub fn note_landed_images(&mut self, landed: &[PathBuf]) {
+        fn walk(node: &mut ResolvedNode, landed: &[PathBuf]) {
+            if let Some(PaintStyle::Image { source, retain: true, .. }) = &node.paint
+                && landed.iter().any(|file| file.as_os_str() == source.as_str())
+            {
+                node.displayed_source = Some(source.clone());
+            }
+            node.children.iter_mut().for_each(|child| walk(child, landed));
+        }
+        for tree in self.surfaces.values_mut() {
+            walk(tree, landed);
+        }
     }
 
     /// Advances every tween to `now` and lays the affected instances out again from their retained
@@ -653,7 +682,7 @@ fn prepare_retained(
 ) -> Result<PreparedNode, LayoutError> {
     node::advance(&mut node.tweens, &mut node.properties, now, lua)?;
     let style = LayoutStyle::parse(&node.properties)?;
-    let ResolvedNode { id, kind, properties, children, tweens, .. } = node;
+    let ResolvedNode { id, kind, properties, children, tweens, displayed_source, .. } = node;
     let paint = node::paint_style(&kind, &properties)?;
     let measure = measure_for(&kind, paint.as_ref(), &properties)?;
     let taffy_id = new_solver_node(tree, &kind, &properties, &style, parent_axis, measure)?;
@@ -663,6 +692,7 @@ fn prepare_retained(
         style,
         properties,
         paint,
+        displayed_source,
         taffy: taffy_id,
         children: Vec::with_capacity(if style.visible { children.len() } else { 0 }),
         frozen: children,
@@ -792,6 +822,8 @@ struct PreparedNode {
     style: LayoutStyle,
     properties: HashMap<String, Value>,
     paint: Option<PaintStyle>,
+    /// Carried across the pass untouched; see [`ResolvedNode::displayed_source`].
+    displayed_source: Option<String>,
     taffy: taffy::NodeId,
     children: Vec<PreparedNode>,
     /// The retained children of a node that is not `visible` this pass, carried through untouched
@@ -1151,6 +1183,7 @@ fn prepare(
     ensure_node_admissible(kind, depth)?;
 
     let id = retained.as_ref().map(|r| r.id);
+    let displayed_source = retained.as_ref().and_then(|r| r.displayed_source.clone());
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
     // Already leaving children are not paired again: a re-added id is a new node beside the one
@@ -1179,6 +1212,7 @@ fn prepare(
         style,
         properties,
         paint,
+        displayed_source,
         taffy: taffy_id,
         children: Vec::new(),
         frozen: old_children,
@@ -1274,8 +1308,19 @@ fn finish(
     prepared: PreparedNode,
     shaping: &ShapingHandle,
 ) -> Result<ResolvedNode, LayoutError> {
-    let PreparedNode { id, kind, style, properties, mut paint, taffy: taffy_id, children, frozen, tweens, leaving } =
-        prepared;
+    let PreparedNode {
+        id,
+        kind,
+        style,
+        properties,
+        mut paint,
+        displayed_source,
+        taffy: taffy_id,
+        children,
+        frozen,
+        tweens,
+        leaving,
+    } = prepared;
     let layout = tree.layout(taffy_id).map_err(taffy_failed)?;
     let size = LogicalSize { width: layout.size.width, height: layout.size.height };
 
@@ -1292,6 +1337,7 @@ fn finish(
             transform: style.transform,
             properties,
             paint,
+            displayed_source,
             children: frozen,
             tweens,
             leaving: false,
@@ -1356,6 +1402,7 @@ fn finish(
         transform: style.transform,
         properties,
         paint,
+        displayed_source,
         children,
         tweens,
         leaving: false,
@@ -2107,6 +2154,44 @@ pub(super) mod tests {
 
         let child = &scene.surface("bar@TEST").unwrap().children[0];
         assert_eq!(child.rect.width, 40.0, "a Signal-valued width must resolve at layout time");
+    }
+
+    /// ADR-0180. The landing cue moves a retaining image onto the source it named, and reaches
+    /// only images that asked to retain: everything else keeps drawing what a pass resolved.
+    #[test]
+    fn a_landed_decode_moves_a_retaining_image_onto_the_source_it_named() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let table: mlua::Table = lua
+            .load(
+                r#"return panel { id = "bar", child = rect { children = {
+                    image { id = "held", source = "/tmp/new.png", async = true, retain = true },
+                    image { id = "plain", source = "/tmp/new.png", async = true },
+                } } }"#,
+            )
+            .eval()
+            .unwrap();
+        let surface = deserialize_lua_table(&table).unwrap();
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+
+        let image = |scene: &Scene, index: usize| {
+            scene.surface("bar@TEST").unwrap().children[0].children[index].displayed_source.clone()
+        };
+        let held = |scene: &Scene| image(scene, 0);
+        let plain = |scene: &Scene| image(scene, 1);
+        assert_eq!(held(&scene), None, "nothing has landed yet");
+
+        // A file nobody named moves nothing, which is what stops one surface's decode advancing
+        // another's cover.
+        scene.note_landed_images(&[PathBuf::from("/tmp/other.png")]);
+        assert_eq!(held(&scene), None);
+
+        scene.note_landed_images(&[PathBuf::from("/tmp/new.png")]);
+        assert_eq!(held(&scene), Some("/tmp/new.png".to_string()));
+        assert_eq!(plain(&scene), None, "an image that did not ask to retain holds nothing");
     }
 
     #[test]
@@ -4933,6 +5018,7 @@ pub(super) mod tests {
         children: Vec<ResolvedNode>,
     ) -> ResolvedNode {
         ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -4992,6 +5078,7 @@ pub(super) mod tests {
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5006,6 +5093,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let hidden_child = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5020,6 +5108,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let root = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5042,6 +5131,7 @@ pub(super) mod tests {
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5056,6 +5146,7 @@ pub(super) mod tests {
             children: Vec::new(),
         };
         let mut root = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5078,6 +5169,7 @@ pub(super) mod tests {
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
+            displayed_source: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5090,6 +5182,7 @@ pub(super) mod tests {
             properties: HashMap::new(),
             paint: None,
             children: vec![ResolvedNode {
+                displayed_source: None,
                 tweens: Vec::new(),
                 leaving: false,
                 transform: node::Transform::default(),
