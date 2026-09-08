@@ -50,3 +50,18 @@ strip = true
 # `classify_departure` reads the signal, logs it, and restarts behind the crash-loop brake
 # (ADR-0058 decision 3). Cheaper than being wrong quietly.
 overflow-checks = true
+
+# Dependencies at full optimization in a dev build; this workspace's own crates stay at `dev`'s
+# `opt-level = 0`, so debugging and incremental rebuilds are unaffected.
+#
+# The Renderer's per-frame cost is mostly other people's tight pixel loops. Rasterizing a glyph
+# through femtovg/swash, decoding a JPEG through `image`, rasterizing an SVG through `resvg`: none
+# of it is workspace code, and all of it is exactly what `opt-level = 0` punishes hardest. Measured
+# on the first paint of the panel host, which rasterizes every glyph it shows into femtovg's atlas:
+# 272.8ms of text drawing unoptimized against 6.2ms optimized, and a 5162x2160 wallpaper 9636ms
+# against 114ms. A dev build was dropping frames that release never would, which turns every
+# animation judgement made against it into a guess.
+#
+# Dependencies rebuild only when one changes, so this is paid once rather than per edit.
+[profile.dev.package."*"]
+opt-level = 3

@@ -3994,3 +3994,45 @@ surface being destroyed and recreated, so it is a process-wide cache filling rat
 the tick does, and it is not attributed yet: the repaint phase spans every mapped surface, EGL
 binding, the swap, and `ImageCache::upload_landed`, which charges every landed background decode to
 whichever surface paints first.
+
+## 0179. A dev build optimizes its dependencies, because the frame is mostly their code
+
+ADR-0178 left the first frame that reveals a large surface unattributed: 204ms of repaint on the
+update panel's first open, against 5.84ms for its later ticks. Splitting `layout::paint::execute` by
+draw kind named it. Text drawing was 272.8ms of a 301.5ms frame; `ImageCache::upload_landed` was
+0.0ms on every frame, and `draw_clipped` 37.1ms on the one frame with scratch targets and about
+0.3ms elsewhere. So it is femtovg rasterizing each glyph into its atlas the first time that glyph
+and size are drawn, which is why the cost survives the panel's surface being destroyed and
+recreated -- `TextPainter` and its warm atlas outlive the surface -- and why the second open is
+smooth. The `draw_clipped` pool its own `ponytail:` comment proposes is not worth doing: it has no
+cold/warm distinction and is not where the time is.
+
+The same split ruled out the two other candidates. Layout measurement does not warm this: it goes
+to the cosmic-text worker, while paint hands the string to femtovg separately, so a cheap resolve
+phase says nothing about paint-side glyph cost.
+
+None of that work is workspace code, and all of it is what `opt-level = 0` punishes hardest.
+Building dependencies at `opt-level = 3` while this workspace's crates stay unoptimized takes the
+same first paint from 272.8ms to 9.3ms, and a 5162x2160 wallpaper decode from 9636ms to 162.7ms --
+within about 1.5x of a release build for both. Dependencies rebuild only when one changes: the
+one-time cost was 3m52s, and an incremental workspace rebuild stayed at 0.7s.
+
+This is worth a decision entry rather than a config tweak because a dev build was dropping frames a
+release build never would, which made every animation judgement taken against it a guess. The
+measurements in ADR-0178 were taken before this and are all `dev` figures; they compare against
+each other, not against a release shell.
+
+Rejected: warming the atlas by drawing the chrome's text before it is shown. It relocates the cost
+to startup rather than removing it, needs a list of what to warm that nothing keeps in step with
+the config, and does nothing for text a config produces at runtime.
+
+Rejected: `opt-level` on the workspace crates too. The debug experience is the point of a dev
+build, and the measurements say the workspace's own code was never the expense.
+
+Still open: the wallpaper. 162.7ms in dev and 114ms in release, on the render thread, at every
+startup and every wallpaper change, because `Load::Inline` is the default that ADR-0122 decision 2
+chose for complete first frames and a wallpaper-sized box is past the largest thumbnail size
+(`image::thumbnails::size_for`). The decode is 40.7ms and the resize of 11.1 megapixels down to
+3.4 is 54.5ms, so there is no scale-on-decode shortcut: covering a 1920x1200 box from 5162x2160
+needs 2868x1200, and the next DCT step down undershoots it. Moving it off the frame, not making it
+faster, is the fix, and which way costs a blank first frame.
