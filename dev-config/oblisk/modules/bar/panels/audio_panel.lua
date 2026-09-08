@@ -94,7 +94,7 @@ local function audio_control(opts)
         return m and opts.glyph_off or opts.glyph_on
     end)
     local tint = is_muted:map(function(m)
-        return m and theme.TEXT_OFF or theme.ACCENT
+        return m and theme.DIM or theme.ACCENT
     end)
 
     local children = {
@@ -111,11 +111,13 @@ local function audio_control(opts)
                         cell({ { text = opts.title, bold = true } }, theme.FG, theme.font.sm, { width = "Fill" }),
                         cell(util.label(oblisk.audio, function(a)
                             return device_name(opts.device(a)) or "no device"
-                        end), theme.TEXT_OFF, theme.font.xs, { width = "Fill" }),
+                        end), theme.DIM, theme.font.xs, { width = "Fill" }),
                     },
                 },
                 cell(util.label(oblisk.audio, function(a)
                     return percent(opts.volume(a))
+                end):map(function(s)
+                    return { { text = s, bold = true } }
                 end), tint, theme.font.sm, { align_v = "Center" }),
                 icon_button(mute_glyph, function()
                     oblisk.audio:invoke(opts.toggle_mute)
@@ -212,7 +214,7 @@ local function stream_row(app)
     local entry = util.app_entry(oblisk.applications:get(), app.process_name or app.name)
     local leading = entry and entry.icon and icon { name = entry.icon, size = theme.icon.md, align_v = "Center" }
         or glyph(icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
-    local tint = app.muted and theme.TEXT_OFF or theme.ACCENT
+    local tint = app.muted and theme.DIM or theme.ACCENT
     return column {
         width = "Fill",
         spacing = theme.spacing.xs,
@@ -339,7 +341,7 @@ local body = {
             end),
             trailing = cell(mixer_open:map(function(open)
                 return open and icons.chevron_up or icons.chevron_down
-            end), theme.TEXT_OFF, theme.font.sm),
+            end), theme.DIM, theme.font.sm),
             on_activate = function()
                 mixer_open:set(not mixer_open:get())
             end,

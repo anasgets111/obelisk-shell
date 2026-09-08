@@ -41,13 +41,14 @@ local ui_state = require("lib.ui_state")
 local power_menu = require("modules.bar.panels.power_menu")
 local network_panel = require("modules.bar.panels.network_panel")
 local bluetooth_panel = require("modules.bar.panels.bluetooth_panel")
-local calendar_panel = require("modules.bar.panels.minimal_calendar")
 local notification_history = require("modules.bar.panels.notification_history")
 local update_panel = require("modules.bar.panels.update_panel")
 local audio_panel = require("modules.bar.panels.audio_panel")
+local media_panel = require("modules.bar.panels.media_panel")
+local tray_menu = require("modules.bar.panels.tray_menu")
 
-local panels = { power_menu, network_panel, bluetooth_panel, calendar_panel, notification_history, update_panel,
-    audio_panel }
+local panels = { power_menu, network_panel, bluetooth_panel, notification_history, update_panel, audio_panel,
+    media_panel, tray_menu }
 
 -- Build every body, but show only the matching `kind`. Invisible children contribute no size
 -- (`resolve_sizes` in scene.rs), so stacked bodies cost the visible panel's height, not their sum.
@@ -70,12 +71,15 @@ for _, panel in ipairs(panels) do
     })
 end
 
--- Shared width except history, updates, and audio. Those use their own widths because history is a
--- list, package rows need two version strings, and audio sliders need length.
+-- Shared width except history, updates, audio, and media. Those use their own widths because
+-- history is a list, package rows need two version strings, audio sliders need length, and media
+-- puts artwork beside the track rather than above it.
 local PANEL_WIDTHS = {
     [notification_history.kind] = theme.notification_panel_width,
     [update_panel.kind] = theme.update_panel_width,
     [audio_panel.kind] = theme.audio_panel_width,
+    [media_panel.kind] = theme.media_panel_width,
+    [tray_menu.kind] = theme.tray_menu_width,
 }
 
 local card_width = ui_state.panel_kind:map(function(kind)
@@ -126,7 +130,13 @@ end)
 -- that changes a measurement earns one follow-up pass (ADR-0147), which is what keeps the card
 -- from sitting one pass behind a section that grew. A section never measured leaves the card
 -- content-sized, which snaps that once.
-local CARD_CHROME = theme.spacing.sm * 2 + theme.border_width * 2
+-- `NotificationHistoryPanel.qml` sets `readonly property int padding: Theme.spacingMd` and puts it
+-- on all four sides (`anchors.margins: root.padding`), sizing itself as
+-- `contentColumn.implicitHeight + padding * 2`. `panel_card`'s default is `sm` top and bottom, `md`
+-- left and right, which left every panel's first line -- the greeting, a section heading -- sitting
+-- on the card's top edge. The mirror's number, on every edge.
+local CARD_PADDING = theme.spacing.md
+local CARD_CHROME = CARD_PADDING * 2 + theme.border_width * 2
 local card_height = computed({ ui_state.panel_kind, table.unpack(section_rects) }, function(kind, ...)
     for index, panel in ipairs(panels) do
         if panel.kind == kind then
@@ -232,6 +242,12 @@ return panel {
                         background = theme.GLASS,
                         border_width = theme.border_width,
                         border_color = theme.BORDER,
+                        padding = {
+                            top = CARD_PADDING,
+                            right = CARD_PADDING,
+                            bottom = CARD_PADDING,
+                            left = CARD_PADDING,
+                        },
                     }),
                 },
             },

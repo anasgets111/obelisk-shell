@@ -214,9 +214,7 @@ local function slot(index)
                     end
                     return action.icon
                 end),
-                foreground = role:map(function(what)
-                    return what == "action" and theme.RED or theme.FG
-                end),
+                foreground = theme.FG,
                 font_size = role:map(function(what)
                     return what == "countdown" and theme.font.sm or theme.icon.lg
                 end),

@@ -1,6 +1,6 @@
--- The bell half of DateTimeDisplay. The bell opens history; the date opens the calendar. Returned
--- as parts so `right_side.lua` can put bell and clock in one control while they open different
--- panels.
+-- The bell half of DateTimeDisplay: the readout, and the panel the whole control opens. Returned as
+-- parts rather than a finished node because `right_side.lua` builds the pill -- one ground, one
+-- click target over bell and clock together, as the mirror's single `MouseArea` is.
 --
 -- The readout is a glyph with an inline count while waiting, or the plain bell.
 --

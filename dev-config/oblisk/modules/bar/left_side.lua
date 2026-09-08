@@ -4,10 +4,12 @@
 -- `rescue` has no counterpart and goes first so a config error cannot be pushed off the edge. It
 -- occupies no width unless configuration failed.
 --
--- `privacy` follows it despite the mirror putting it right: both are intermittent alerts.
+-- `privacy` used to follow it here, on the argument that both are intermittent alerts. It is back
+-- where `RightSide.qml` puts it, leading that row: a camera or microphone in use is a fact about
+-- the session's hardware, which is what the right side is, and grouping it with `rescue` grouped it
+-- with a config error instead.
 local theme = require("config.theme")
 local rescue_cell = require("modules.bar.indicators.rescue")
-local privacy_module = require("modules.bar.indicators.privacy")
 local power_menu = require("modules.bar.panels.power_menu")
 local updates_module = require("modules.bar.indicators.updates")
 local idle_inhibitor = require("modules.bar.indicators.idle_inhibitor")
@@ -28,7 +30,6 @@ return row {
     spacing = theme.spacing.sm,
     children = {
         rescue_cell,
-        privacy_module,
         power_menu.button,
         updates_module,
         idle_inhibitor.indicator,

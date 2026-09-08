@@ -44,6 +44,15 @@ local MAIN_WIDTH = (function()
     return 1920
 end)()
 
+-- Only for the aspect ratio behind `title_limit`; every vertical token comes from `SCALE` below.
+local MAIN_HEIGHT = (function()
+    local screen = main_screen()
+    if screen ~= nil and screen.height ~= nil then
+        return screen.height
+    end
+    return FALLBACK_HEIGHT
+end)()
+
 local SCALE = (function()
     local screen = main_screen()
     -- Use `screen.height` directly. `wayland/output.rs` already divides once: a 3840x2160 panel at
@@ -126,6 +135,21 @@ function theme.text_contrast(hex)
     return luminance > 0.179 and "#000000ff" or "#ffffffff"
 end
 
+-- ## Opacity steps
+--
+-- `opacity` is a base property (§ 5.1) that multiplies down the subtree, so disabling a control
+-- needs one property rather than dimmer colours on each part.
+theme.opacity                   = {
+    subtle   = 0.15,
+    light    = 0.25,
+    medium   = 0.35,
+    disabled = 0.5,
+    solid    = 0.6,
+    muted    = 0.7,
+    strong   = 0.8,
+    full     = 0.95,
+}
+
 -- ## Colours
 --
 -- Keep the ten original names: matching `Theme.qml`'s `textActiveColor`/`bgElevated` would rename
@@ -138,6 +162,11 @@ theme.HOVER                     = "#45475aff"
 theme.FG                        = "#cdd6f4ff"
 -- Catppuccin subtext0, `Theme.qml`'s `textInactiveColor`. The old overlay0 (#6c7086), two steps
 -- darker, made the keyboard layout and date look disabled instead of secondary.
+--
+-- This is the mirror's one secondary-text colour: 73 uses against a single `textDisabled`. Every
+-- subtitle, every off state, every unlit heading is this swatch at full strength, and a control the
+-- mirror wants faded gets `opacity` on the node instead. Reach for a dimmer colour only with a QML
+-- line that asks for one.
 theme.DIM                       = "#a6adc8ff"
 -- Mauve, not blue: the mirror's `activeColor` and every accent are #cba6f7. This config's old
 -- #89b4fa made the bars look like different themes. `MAUVE` exposes the same swatch by colour name.
@@ -157,8 +186,11 @@ theme.DISABLED                  = "#232634ff"
 -- Derived steps from the eleven swatches, so a scheme swap remains eleven edits.
 theme.ELEVATED                  = lighten(theme.BG, 0.12)
 theme.ELEVATED_HOVER            = lighten(theme.BG, 0.18)
--- `textDisabled`: `withOpacity(textInactiveColor, opacityMedium)`, dimmer than DIM.
-theme.TEXT_OFF                  = theme.with_opacity(theme.DIM, 0.35)
+-- `textDisabled`: `withOpacity(textInactiveColor, opacityMedium)`, dimmer than DIM. Nearly unused,
+-- and deliberately so -- the mirror spends it once, on `OToggle`'s disabled border, and this config
+-- has no disabled toggle. It had spread to thirty-one places that the mirror draws in plain
+-- `textInactiveColor`, which is why so much secondary text sat at 35% alpha. Use `DIM`.
+theme.TEXT_OFF                  = theme.with_opacity(theme.DIM, theme.opacity.medium)
 theme.BORDER                    = theme.with_opacity(theme.SURFACE, 0.75)
 theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
 -- Shared translucent card ground formerly hand-written as `"#181825ee"`; naming it avoids a twelfth
@@ -166,14 +198,14 @@ theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
 theme.GLASS                     = "#181825ee"
 theme.GLASS_CONTENT             = theme.with_opacity(theme.ELEVATED, 0.46)
 theme.GLASS_HOVER               = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
-theme.ACCENT_SUBTLE             = theme.with_opacity(theme.ACCENT, 0.15)
-theme.ACCENT_LIGHT              = theme.with_opacity(theme.ACCENT, 0.25)
-theme.ACCENT_MEDIUM             = theme.with_opacity(theme.ACCENT, 0.35)
+theme.ACCENT_SUBTLE             = theme.with_opacity(theme.ACCENT, theme.opacity.subtle)
+theme.ACCENT_LIGHT              = theme.with_opacity(theme.ACCENT, theme.opacity.light)
+theme.ACCENT_MEDIUM             = theme.with_opacity(theme.ACCENT, theme.opacity.medium)
 -- Hover for an opaque `ACCENT` ground. The three alpha tints cannot lift an opaque colour; the
 -- mirror's `OButton` primary variant lightens it instead.
 theme.ACCENT_HOVER              = lighten(theme.ACCENT, 0.16)
 -- Mirror's `bgSubtle`, used as the plate behind a notification card's application icon.
-theme.BG_SUBTLE                 = theme.with_opacity(theme.BG, 0.15)
+theme.BG_SUBTLE                 = theme.with_opacity(theme.BG, theme.opacity.subtle)
 
 -- ## The glass layer
 --
@@ -193,18 +225,6 @@ theme.ALERT_BG                  = "#45253aff"
 -- `modalScrimColor` is 0.45 rather than the mirror's 0.88: it lays over wallpaper, where 0.88 is a
 -- blackout.
 theme.SCRIM                     = theme.with_opacity(theme.BG, 0.45)
-
--- ## Opacity steps
---
--- `opacity` is a base property (§ 5.1) that multiplies down the subtree, so disabling a control
--- needs one property rather than dimmer colours on each part.
-theme.opacity                   = {
-    disabled = 0.5,
-    muted    = 0.7,
-    solid    = 0.6,
-    strong   = 0.8,
-    full     = 0.95,
-}
 
 -- ## Scales
 --
@@ -252,12 +272,17 @@ theme.icon                      = {
 }
 
 -- Control heights keep adjacent toggles and buttons aligned without pixel literals.
+--
+-- `Theme.qml`'s `_controlHeights`, step for step. These used to sit one step low -- this `sm` was
+-- the mirror's `xs` -- so a module asking for the size the mirror asks for got the size below it,
+-- and `IconButton`'s `size: "sm"` came out at 24px against the mirror's 28. Every call site named
+-- the right step already; only the numbers behind the names were wrong.
 theme.control                   = {
-    xs = s(18, 16),
-    sm = s(24, 20),
-    md = s(28, 24),
-    lg = s(34, 28),
-    xl = s(44, 36),
+    xs = s(24, 20),
+    sm = s(28, 24),
+    md = s(34, 28),
+    lg = s(42, 34),
+    xl = s(52, 42),
 }
 
 theme.border_width              = 1
@@ -277,6 +302,16 @@ theme.bar_height                = s(42, 28)
 -- the clock. They diverged when the bar got its own height. `item_radius` is half of `item_height`
 -- by construction and has its own `s()` call: the mirror rounds it independently, and 18 vs 15.5
 -- separates a circle from a round square.
+-- `ActiveWindow.qml`'s `maxLength`, and `Theme.qml`'s `isUltrawide: (width / height) > 2.1`. A
+-- character budget rather than a box: "WWWW" and "iiii" are both four characters and twice the
+-- width apart, and the centre zone must stay content-sized so its midpoint is the bar's.
+theme.title_limit               = (MAIN_WIDTH / math.max(1, MAIN_HEIGHT)) > 2.1 and 74 or 47
+
+-- `CenterSide.qml` gives the zone `parent.width / 3` while media is up, so the spectrum has a span
+-- to fill. Static: `s()` does not follow hotplug either, and the note at the top of this file
+-- covers both.
+theme.center_zone_width         = math.floor(MAIN_WIDTH / 3)
+
 theme.item_height               = s(34, 20)
 theme.item_width                = s(34, 20)
 theme.item_radius               = s(18, 6)
@@ -316,6 +351,10 @@ theme.update_panel_width        = s(520, 400)
 
 -- `Theme.audioPanelWidth`: two named sliders and a mixer.
 theme.audio_panel_width         = s(380, 300)
+
+-- `trayMenuWidth`. A tray menu is an application's own words, so it needs more room than the
+-- shell's own panels: "Preferences and settings" is a normal entry and the 340px card elides it.
+theme.tray_menu_width           = s(300, 240)
 -- Idle modal: action rows plus AC and battery columns, each with a timeout and switch. The mirror's
 -- `Theme.idleModalWidth` is 820px; earlier 640px and 700px versions were cramped.
 theme.idle_modal_width          = s(820, 640)
@@ -367,6 +406,11 @@ theme.lock_card_width           = math.max(480, math.min(math.floor(MAIN_WIDTH *
 -- `controlHeightLg * 2.4`, the initials disc, measured off the mirror at 106px on a 1200px-tall
 -- screen.
 theme.lock_avatar               = s(112, 72)
+
+-- `mediaPanelWidth`/`mediaArtworkSize`. Wider than the shared 340px card because the artwork sits
+-- beside the title, transport row and seek bar rather than above them.
+theme.media_panel_width         = s(460, 380)
+theme.media_artwork             = s(96, 80)
 
 -- ## The launcher (`modules/global/launcher.lua`)
 --

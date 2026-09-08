@@ -5,103 +5,43 @@
 -- rather than faked: the wallpaper's `MultiEffect` blur, since the engine has no effect node and the
 -- scrim does the separating instead, and the weather status item, since there is no weather
 -- capability. Everything else on the card is the mirror's, reading the same facts.
-local theme = require("config.theme")
-local icons = require("config.icons")
-local util = require("lib.util")
-local wallpaper = require("lib.wallpaper")
-local cell = require("components.cell")
-local glyph = require("components.glyph")
-local panel_card = require("components.panel_card")
+local theme         = require("config.theme")
+local icons         = require("config.icons")
+local util          = require("lib.util")
+local wallpaper     = require("lib.wallpaper")
+local cell          = require("components.cell")
+local glyph         = require("components.glyph")
+local panel_card    = require("components.panel_card")
+local identity      = require("lib.identity")
 
-local PAD = theme.spacing.xl
+local PAD           = theme.spacing.xl
 -- What the card's children have to share, for the nodes that need a number rather than "Fill".
-local CONTENT = theme.lock_card_width - PAD * 2
-local FIELD_HEIGHT = theme.control.xl
+local CONTENT       = theme.lock_card_width - PAD * 2
+local FIELD_HEIGHT  = theme.control.xl
 -- `Layout.maximumWidth: shell.implicitWidth * 0.82`. The pill stops short of the card's own edges
 -- on both sides; run to `CONTENT` and it reads as a search bar in a window rather than a control on
 -- a card.
-local FIELD_WIDTH = math.floor(theme.lock_card_width * 0.82)
+local FIELD_WIDTH   = math.floor(theme.lock_card_width * 0.82)
 -- Half the height, the way `theme.item_radius` is half `item_height`. `radius.xl` is the fully
 -- round token, but it is sized for the card's corner and only happens to be close on this box.
-local FIELD_RADIUS = math.floor(FIELD_HEIGHT / 2)
-local BADGE_HEIGHT = theme.control.xs
+local FIELD_RADIUS  = math.floor(FIELD_HEIGHT / 2)
+local BADGE_HEIGHT  = theme.control.xs
 -- The mirror's own multipliers on `fontHero` and `fontXl`, checked against a recording of it: a
 -- 68px clock, 36px initials and a 23px name on a 1200px-tall screen. The shared steps are sized for
 -- the bar, where `hero` is a tooltip heading; this card's first line is read from across a room.
-local CLOCK_SIZE = theme.s(72, 44)
+local CLOCK_SIZE    = theme.s(72, 44)
 local INITIALS_SIZE = theme.s(36, 26)
-local NAME_SIZE = theme.s(24, 18)
+local NAME_SIZE     = theme.s(24, 18)
 -- Heavier than `theme.SCRIM`. That one is 0.45 because it lays a *panel's* modal over the wallpaper
 -- and the wallpaper is still the desktop underneath. Here the wallpaper is scenery: the card has to
 -- read against a photograph with no blur to soften it.
-local SCRIM = theme.with_opacity(theme.BG, 0.6)
+local SCRIM         = theme.with_opacity(theme.BG, 0.6)
 -- `Theme.lockClosedScale`, where the card starts its entry.
-local CLOSED_SCALE = 0.94
+local CLOSED_SCALE  = 0.94
 
-local USER = os.getenv("USER") or "user"
-
--- `MainService` reads the full name and host over D-Bus. A config has `os.getenv` and
--- `process.run` (ADR-0048), and the environment carries neither fact, so each is read once from the
--- tool that owns it: GECOS out of `getent passwd`, the node name out of `uname -n`. Both are
--- decoration -- the card draws `$USER` and "localhost" until they answer, and keeps them if they
--- never do.
---
--- Kept in `state` rather than a module local because a reload re-runs this file: the guard below is
--- what stops a save spawning two more processes, since the value outlives the evaluation that set
--- it and a table `initial` never re-seeds.
-local identity = state("lock_identity", { name = "", host = "" })
-
-local function remember(field, value)
-    value = value:match("^%s*(.-)%s*$")
-    if value == "" then
-        return
-    end
-    local current = identity:get()
-    -- Field at a time: the two processes finish in either order.
-    identity:set({
-        name = field == "name" and value or current.name,
-        host = field == "host" and value or current.host,
-    })
-end
-
-if identity:get().name == "" then
-    -- `anas:x:1000:1000:Anas Khalifa:/home/anas:/usr/bin/fish`. Field five is GECOS, whose first
-    -- comma-separated part is the full name; the rest is office and phone numbers nobody fills in.
-    process.run("getent", { "passwd", USER }, function(line)
-        local fields = {}
-        for field in (line .. ":"):gmatch("([^:]*):") do
-            fields[#fields + 1] = field
-        end
-        remember("name", (fields[5] or ""):match("^[^,]*") or "")
-    end, function() end)
-end
-
-if identity:get().host == "" then
-    process.run("uname", { "-n" }, function(line)
-        remember("host", line)
-    end, function() end)
-end
-
-local full_name = identity:map(function(i)
-    return i.name ~= "" and i.name or USER
-end)
-
-local account = identity:map(function(i)
-    return string.format("%s@%s", USER, i.host ~= "" and i.host or "localhost")
-end)
-
--- `userInitials`: the first letter of each of the first two words, so "Anas Khalifa" is "AK" and a
--- single-word name is one letter.
-local initials = full_name:map(function(name)
-    local letters = ""
-    for word in name:gmatch("%S+") do
-        letters = letters .. word:sub(1, 1):upper()
-        if #letters == 2 then
-            break
-        end
-    end
-    return letters ~= "" and letters or "U"
-end)
+local full_name     = identity.full_name
+local account       = identity.account
+local initials      = identity.initials
 
 -- Read from `oblisk.lock`, not `rescue`, per ADR-0052 decision 4: while lock surfaces are mapped
 -- the bar's `rescue_cell` is unreachable.
@@ -110,7 +50,7 @@ end)
 -- the Renderer has confirmed the lock. Print `attempts` because capability state is sampled at
 -- layout time (ADR-0044); identical consecutive `error` strings would otherwise hide the second
 -- failure.
-local hint = util.label(oblisk.lock, function(l)
+local hint          = util.label(oblisk.lock, function(l)
     if l.error ~= nil and l.error ~= "" then
         return string.format("%s (%d)", l.error, l.attempts or 0)
     end
@@ -123,14 +63,14 @@ local hint = util.label(oblisk.lock, function(l)
     return "Press Enter to unlock"
 end)
 
-local failed = util.shown_when(oblisk.lock, function(l)
+local failed        = util.shown_when(oblisk.lock, function(l)
     return l.error ~= nil and l.error ~= ""
 end)
 
 -- `passwordInput`'s three border colours, and the same colour on the hint below it, so a failure is
 -- one change of state rather than two unrelated reds. `Theme.ColorTransition` is `animate` on the
 -- pill.
-local field_border = oblisk.lock:map(function(l)
+local field_border  = oblisk.lock:map(function(l)
     if l == nil then
         return theme.GLASS_BORDER
     end
@@ -140,13 +80,13 @@ local field_border = oblisk.lock:map(function(l)
     return l.authenticating and theme.ACCENT or theme.GLASS_BORDER
 end)
 
-local caps = oblisk.keyboard:map(function(k)
+local caps          = oblisk.keyboard:map(function(k)
     return k ~= nil and k.caps_lock == true
 end)
 
 -- Black on yellow, chosen by the same helper the bar's buttons use rather than hard-coding the
 -- ground's opposite here.
-local BADGE_FG = theme.text_contrast(theme.YELLOW)
+local BADGE_FG      = theme.text_contrast(theme.YELLOW)
 
 -- One icon-and-reading pair from the row under the divider. The mirror's `statusItems` is a list
 -- through a `Repeater`; three literal children need no `list`.

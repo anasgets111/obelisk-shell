@@ -51,7 +51,7 @@ return function(opts)
         if on then
             return theme.ACCENT
         end
-        return hot and theme.FG or theme.TEXT_OFF
+        return hot and theme.FG or theme.DIM
     end)
 
     local lines = {
@@ -69,7 +69,7 @@ return function(opts)
                 return text ~= nil and text ~= ""
             end)
         end
-        lines[#lines + 1] = cell(detail, theme.TEXT_OFF, theme.font.xs, { align = "Center", visible = shown })
+        lines[#lines + 1] = cell(detail, theme.DIM, theme.font.xs, { align = "Center", visible = shown })
     end
 
     return button {

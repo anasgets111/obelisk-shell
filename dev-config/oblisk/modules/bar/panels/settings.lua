@@ -2,7 +2,6 @@ local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 local ui_state = require("lib.ui_state")
-local sysinfo_module = require("modules.bar.indicators.system_info")
 local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local section_header = require("components.section_header")
@@ -11,7 +10,13 @@ local section_header = require("components.section_header")
 -- gives a `window` no monitor, anchor, or size; inspect placement with `niri msg windows`.
 --
 -- This holds readouts without indicators. Bluetooth moved to `panels/bluetooth_panel.lua` when it
--- gained its own opener, matching Quickshell's control-behind-what-it-controls split.
+-- gained its own opener, matching Quickshell's control-behind-what-it-controls split. The system
+-- readout left the same way (ADR-0173): `SystemInfoWidget` belongs at the top of the notifications
+-- panel, where the mirror instantiates it, and a second copy here was the same numbers twice.
+--
+-- What is left is thin on purpose. This file is the config's only `window {}`, so it is also the
+-- only exercise of § 6's toplevel -- surviving a compositor that gives it no monitor, anchor or
+-- size. Deleting it for being thin would delete that.
 return window {
     id = "settings",
     title = "Oblisk settings",
@@ -38,7 +43,6 @@ return window {
         cell(util.label(oblisk.screens, function(s)
             return string.format("%d output(s)", #s)
         end), theme.DIM, theme.font.xs),
-        sysinfo_module,
     }, {
         width = "Fill",
         height = "Fill",

@@ -3,8 +3,9 @@
 -- No brightness module, matching the reference. Its level and controls live in
 -- `modules/bar/panels/power_menu.lua`, where there is room for labels.
 --
--- `privacy` is on the left beside `rescue`, unlike RightSide.qml; both are intermittent alerts.
+-- `privacy` leads this row, as in RightSide.qml. It had been on the left beside `rescue`.
 local theme = require("config.theme")
+local privacy_module = require("modules.bar.indicators.privacy")
 local volume_module = require("modules.bar.indicators.volume")
 local network = require("modules.bar.indicators.network")
 local bluetooth = require("modules.bar.indicators.bluetooth")
@@ -12,49 +13,58 @@ local tray_module = require("modules.bar.indicators.sys_tray")
 local bell = require("modules.bar.indicators.notification_bell")
 local date_time = require("modules.bar.indicators.date_time")
 local ui_state = require("lib.ui_state")
-local calendar_panel = require("modules.bar.panels.minimal_calendar")
 
--- One control holds bell and clock, as in `DateTimeDisplay.qml`. The bell opens history and the
--- date
--- opens the calendar; one ground makes them read as one clock.
---
--- The row owns the ground; transparent inner buttons remove the seam and shade the whole hover
--- area.
+-- One control holds bell and clock, as in `DateTimeDisplay.qml`, and one `MouseArea` fills it: the
+-- mirror's whole readout opens the notifications panel. Splitting it -- bell to history, date to a
+-- calendar panel -- meant the bar's one always-visible control opened a month grid half the time,
+-- and the calendar has gone back to the clock's hover tooltip where the mirror keeps it
+-- (ADR-0174).
 local clock_slot = date_time.slot
+local hovered = hover(clock_slot)
 
-local function transparent_button(child, on_click)
-    return button {
-        height = "Fill",
-        align_v = "Center",
-        padding = { left = theme.spacing.sm, right = theme.spacing.sm },
-        on_click = function(rect, mouse_button)
-            if mouse_button ~= "left" then
-                return
-            end
-            on_click(rect)
-        end,
-        children = { child },
-    }
-end
+-- `panelOpen` is the mirror's third state for this control, above hover: `border.color: panelOpen ?
+-- activeColor : ...` rings it while its own panel is up, so the pill says which panel is showing
+-- rather than leaving that to the panel's position.
+local panel_showing = computed({ ui_state.panel_open, ui_state.panel_kind }, function(open, kind)
+    return open and kind == bell.kind
+end)
 
-local clock_pill = row {
+local lit = computed({ hovered, panel_showing }, function(is_hovered, is_open)
+    return is_hovered or is_open
+end)
+
+local clock_pill = button {
     height = theme.item_height,
     align_v = "Center",
-    hover = hover(clock_slot),
+    hover = hovered,
     radius = theme.item_radius,
-    background = hover(clock_slot):map(function(is_hovered)
-        return is_hovered and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
+    background = lit:map(function(on)
+        return on and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
     end),
     border_width = theme.border_width,
-    border_color = hover(clock_slot):map(function(is_hovered)
+    border_color = computed({ hovered, panel_showing }, function(is_hovered, is_open)
+        if is_open then
+            return theme.ACCENT
+        end
         return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
     end),
-    children = {
-        transparent_button(bell.bell, bell.open),
-        transparent_button(date_time.clock, function(rect)
-            ui_state.toggle_panel(calendar_panel.kind, rect)
-        end),
-    },
+    animate = { background = theme.animation_ms },
+    on_click = function(rect, mouse_button)
+        if mouse_button == "left" then
+            bell.open(rect)
+        end
+    end,
+    children = { row {
+        height = "Fill",
+        align_v = "Center",
+        spacing = theme.spacing.xs,
+        -- `DateTimeDisplay.qml` insets its end children instead, `leftPadding` on the bell and
+        -- `rightPadding` on the clock, both `spacingSm`. One padding on the row is the same inset
+        -- and survives either child changing. Without it the bell and the minutes run under the
+        -- corner radius, which at half the item height is the whole end of the pill.
+        padding = { left = theme.spacing.sm, right = theme.spacing.sm },
+        children = { bell.bell, date_time.clock },
+    } },
 }
 
 return row {
@@ -64,6 +74,7 @@ return row {
     align_v = "Center",
     spacing = theme.spacing.sm,
     children = {
+        privacy_module,
         volume_module,
         network.indicator,
         bluetooth.indicator,

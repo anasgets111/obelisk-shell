@@ -10,9 +10,14 @@
 -- table cannot carry a tween; a bare-number spacer width can.
 local theme = require("config.theme")
 
-local TRACK_WIDTH = theme.s(34, 28)
+-- `OToggle.qml` derives the whole switch from one number: the track is
+-- `controlHeightFor(size) * scaleSmall` tall, which `control.xs` now equals, and
+-- `round(_trackHeight * 2.3)` wide, with `_thumbPadding: max(3, round(_trackHeight * 0.12))`.
+-- Deriving the width keeps the thumb's travel proportional when the scale moves; the fixed 34 it
+-- replaced left a 24px-tall track with almost no room for the thumb to slide in.
 local TRACK_HEIGHT = theme.control.xs
-local PAD = theme.s(2, 1)
+local TRACK_WIDTH = math.floor(TRACK_HEIGHT * 2.3 + 0.5)
+local PAD = math.max(3, math.floor(TRACK_HEIGHT * 0.12 + 0.5))
 local THUMB = TRACK_HEIGHT - 2 * PAD
 local TRAVEL = TRACK_WIDTH - 2 * PAD - THUMB
 
@@ -42,9 +47,15 @@ return function(signal, read, on_change)
             height = "Fill",
             radius = TRACK_HEIGHT / 2,
             padding = { top = PAD, right = PAD, bottom = PAD, left = PAD },
+            -- `OToggle.qml`'s `_trackOn`/`_trackOff`: `activeFull` and `glassControlColor`. The
+            -- track was green over flat surface, which read as a status light rather than a switch
+            -- and put a second accent in a shell whose every other lit control is mauve.
             background = on:map(function(v)
-                return v and theme.GREEN or theme.SURFACE
+                return v and theme.with_opacity(theme.ACCENT, theme.opacity.full) or theme.GLASS_CONTROL
             end),
+            -- `border.color: glassBorderColor`, the same hairline every other glass control carries.
+            border_width = theme.border_width,
+            border_color = theme.GLASS_BORDER,
             animate = { background = { duration = theme.animation_ms, easing = "OutCubic" } },
             children = {
                 rect {
@@ -59,6 +70,9 @@ return function(signal, read, on_change)
                     height = THUMB,
                     radius = THUMB / 2,
                     background = theme.FG,
+                    -- `borderMedium`, which separates the thumb from a lit track it nearly matches.
+                    border_width = theme.border_width,
+                    border_color = theme.BORDER_SUBTLE,
                     align_v = "Center",
                 },
             },

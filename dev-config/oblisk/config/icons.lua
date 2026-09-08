@@ -80,8 +80,20 @@ icons.screenshare     = "\u{F108}"
 
 icons.play            = "\u{F040A}"
 icons.pause           = "\u{F03E4}"
-icons.cpu             = "\u{F061A}"
-icons.ram             = "\u{F035B}"
+-- `MediaPanel.qml`'s transport row. Its note glyph is F0386, not the F075A `music_note` an audio
+-- stream row uses: the panel means "the media player", the stream row means "a sound".
+icons.media           = "\u{F0386}"
+icons.previous        = "\u{F04AE}"
+icons.next            = "\u{F04AD}"
+icons.rewind          = "\u{F11F9}"
+icons.fast_forward    = "\u{F11F8}"
+icons.player_switch   = "\u{F0CB0}"
+-- `SystemInfoWidget.qml`'s `MetricTile` icons, and its two are the way round they look: F035B is
+-- the square processor with pins, F061A the DIMM stick. This file had them swapped, so the system
+-- readout labelled a memory module "CPU".
+icons.cpu             = "\u{F035B}"
+icons.ram             = "\u{F061A}"
+icons.gpu             = "\u{F08AE}"
 icons.disk            = "\u{F02CA}"
 
 -- Bluetooth device categories, one per § 2.6 `category`, avoid using the generic glyph for a mouse
@@ -119,6 +131,9 @@ icons.close           = "\u{F0156}"
 -- field and `send` submits its text.
 icons.chevron_up      = "\u{F0143}"
 icons.chevron_down    = "\u{F0140}"
+-- `SystemInfoWidget.qml` and `PanelRow.qml` point right while collapsed rather than up, because
+-- the row opens downwards and nothing above it moves.
+icons.chevron_right   = "\u{F0142}"
 icons.reply           = "\u{F0468}"
 icons.send            = "\u{F048A}"
 icons.plus            = "\u{F0415}"

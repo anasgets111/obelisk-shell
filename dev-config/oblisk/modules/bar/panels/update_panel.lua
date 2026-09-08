@@ -190,14 +190,20 @@ end)
 -- Mirror `logColor`: red failures are findable in two hundred lines of pacman output.
 local function log_colour(line)
     local lowered = line:lower()
-    if lowered:find("error", 1, true) or lowered:find("failed", 1, true) then
+    if lowered:find("[fail]", 1, true) or lowered:find("error", 1, true) or lowered:find("failed", 1, true) then
         return theme.RED
     end
-    if lowered:find("warning", 1, true) then
+    if lowered:find("warning", 1, true) or lowered:find("[skip]", 1, true) then
         return theme.PEACH
     end
-    if lowered:find("installing", 1, true) or lowered:find("upgrading", 1, true) then
+    if lowered:find("downloading", 1, true) or lowered:find("retrieving", 1, true) or lowered:find("installing", 1, true) or lowered:find("upgrading", 1, true) or lowered:find("%(%s*%d+/%d+%)") then
         return theme.ACCENT
+    end
+    if lowered:find("[ ok ]", 1, true) or lowered:find("complete", 1, true) or lowered:find("up to date", 1, true) then
+        return theme.GREEN
+    end
+    if line:sub(1, 1) == "▶" or line:sub(1, 2) == "::" or line:sub(1, 3) == "==>" then
+        return theme.FG
     end
     return theme.DIM
 end
@@ -294,13 +300,12 @@ local body = {
                     children = {
                         cell(package.name or "?", theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
                         -- Old version ends at the arrow and new starts there, regardless of length.
-                        -- Use `DIM`, not `TEXT_OFF`: the version is not a disabled control.
                         cell(package.old_version or "", theme.DIM, theme.font.xs, {
                             width = theme.update_version_width,
                             align = "End",
                             align_v = "Center",
                         }),
-                        cell("→", theme.TEXT_OFF, theme.font.xs, { align_v = "Center" }),
+                        cell("→", theme.DIM, theme.font.xs, { align_v = "Center" }),
                         cell(package.new_version or "", theme.ACCENT, theme.font.xs, {
                             width = theme.update_version_width,
                             align_v = "Center",

@@ -284,13 +284,20 @@ end
 ---@param app AppSummary
 local function app_row(app)
     local selected = is_selected(app.id)
+    local title = selected:map(function(on)
+        if on then
+            return { { text = app.name, bold = true } }
+        else
+            return app.name
+        end
+    end)
     local lines = {
-        cell(app.name, selected:map(function(on)
+        cell(title, selected:map(function(on)
             return on and theme.ACCENT or theme.FG
         end), theme.font.md, { width = "Fill" }),
     }
     if app.comment and app.comment ~= "" then
-        lines[#lines + 1] = cell(app.comment, theme.TEXT_OFF, theme.font.xs, { width = "Fill" })
+        lines[#lines + 1] = cell(app.comment, theme.DIM, theme.font.xs, { width = "Fill" })
     end
     return row_shell(app.id, "launcher-app-" .. app.id, {
         -- `Utils.resolveIconSource(..., "application-x-executable")`: entries without `Icon=` still
@@ -309,17 +316,28 @@ local function app_row(app)
     })
 end
 
+local web_selected = is_selected(WEB)
+local web_title = computed({ trimmed, web_selected }, function(text, selected)
+    if selected then
+        return { { text = text, bold = true } }
+    else
+        return text
+    end
+end)
+local web_title_color = web_selected:map(function(on)
+    return on and theme.ACCENT or theme.FG
+end)
 local web_row = row_shell(WEB, "launcher-web", {
-    glyph(icons.web, theme.TEXT_OFF, theme.launcher_icon, { align_v = "Center" }),
+    glyph(icons.web, theme.DIM, theme.launcher_icon, { align_v = "Center" }),
     column {
         width = "Fill",
         align_v = "Center",
         children = {
-            cell(trimmed, theme.FG, theme.font.md, { width = "Fill" }),
+            cell(web_title, web_title_color, theme.font.md, { width = "Fill" }),
             cell(trimmed:map(function(text)
                 local _, what = web_target(text)
                 return what
-            end), theme.TEXT_OFF, theme.font.xs, { width = "Fill" }),
+            end), theme.DIM, theme.font.xs, { width = "Fill" }),
         },
     },
 }, { visible = web_shown })

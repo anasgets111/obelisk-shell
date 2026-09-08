@@ -21,7 +21,7 @@ local icon_button = require("components.icon_button")
 ---@field trailing? Node[] Controls at the far edge, in order.
 ---@field on_close? fun() Adds a close button after `trailing`.
 ---@field title_size? integer The title's font size. Default `theme.font.lg`, which is a bar panel's masthead; a modal's is bigger, and so is a section header inside one.
----@field subtitle_color? Color|Bound The state line's colour. Default `theme.TEXT_OFF`.
+---@field subtitle_color? Color|Bound The state line's colour. Default `theme.DIM`.
 ---@field subtitle_size? integer The state line's font size. Default `theme.font.xs`, which is right under a bar panel's 16px title and unreadably small under a modal's 28px one.
 ---@field plate? integer The icon plate's side. Default `theme.control.lg`, and it tracks `title_size` in the mirror rather than being set on its own.
 
@@ -38,13 +38,13 @@ return function(opts)
     if type(active) == "userdata" then
         ---@cast active Signal
         accent = active:map(function(on)
-            return on and theme.ACCENT or theme.TEXT_OFF
+            return on and theme.ACCENT or theme.DIM
         end)
         plate = active:map(function(on)
             return on and theme.ACCENT_SUBTLE or theme.GLASS_CONTENT
         end)
     else
-        accent = active and theme.ACCENT or theme.TEXT_OFF
+        accent = active and theme.ACCENT or theme.DIM
         plate = active and theme.ACCENT_SUBTLE or theme.GLASS_CONTENT
     end
 
@@ -67,7 +67,7 @@ return function(opts)
     -- the plain title string's node.
     local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, title_size, { width = "Fill" }) }
     if opts.subtitle then
-        lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.TEXT_OFF,
+        lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.DIM,
             opts.subtitle_size or theme.font.xs, { width = "Fill" })
     end
     children[#children + 1] = column { width = "Fill", align_v = "Center", children = lines }

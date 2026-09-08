@@ -33,4 +33,11 @@ return icon_button(oblisk.keyboard:map(layout_short), nil, {
     foreground = caps:map(function(on)
         return on and theme.PEACH or theme.FG
     end),
+    -- `visible: KeyboardLayoutService.hasMultipleLayouts`. One configured layout has nothing to
+    -- switch to and nothing to disambiguate, so the code is noise; `layout_count` says so directly.
+    visible = oblisk.keyboard:map(function(k)
+        -- `or 0` because a payload that predates the compositor's answer carries no count at all,
+        -- and `nil >= 2` raises rather than reading as false. `caps` above guards the same way.
+        return k ~= nil and (k.layout_count or 0) >= 2
+    end),
 })

@@ -28,6 +28,17 @@ local function alert(glyph, field, on_activate)
     })
 end
 
+-- The microphone is the one alert with two states. `PrivacyIndicator.qml` gives it a `warning`
+-- ground and the struck-through glyph while the source is muted, `critical` and the plain glyph
+-- while it is live, and shows it on `microphoneActive || microphoneMuted` -- so a muted microphone
+-- keeps a circle to unmute from even when nothing is capturing.
+local mic_muted = oblisk.audio:map(function(a)
+    return a ~= nil and a.source_muted == true
+end)
+local mic_shown = computed({ oblisk.privacy, mic_muted }, function(p, muted)
+    return users_of("microphone_users")(p) or muted
+end)
+
 -- The camera and the screencast are readouts: there is no "stop using my camera" to hang off a
 -- click, and the mirror's own circles do nothing either. The microphone is the one the mirror
 -- makes a control, and `audio:toggle_source_mute` is the command behind it -- muting the source
@@ -37,14 +48,23 @@ return row {
     spacing = theme.spacing.sm,
     -- Invisible children leave the layout entirely, but this row would still earn a spacing gap.
     -- Hide the group too, or `left_side.lua` still gives the empty row that gap.
-    visible = util.shown_when(oblisk.privacy, function(p)
-        return users_of("camera_users")(p) or users_of("microphone_users")(p) or users_of("screencast_users")(p)
+    -- `mic_shown` rather than `microphone_users`: the muted microphone is the one child that
+    -- appears without a user, and a row hidden under it would take the child down with it.
+    visible = computed({ oblisk.privacy, mic_shown }, function(p, mic)
+        return mic or users_of("camera_users")(p) or users_of("screencast_users")(p)
     end),
     children = {
         alert(icons.camera, "camera_users"),
-        alert(icons.mic_on, "microphone_users", function()
+        icon_button(mic_muted:map(function(muted)
+            return muted and icons.mic_off or icons.mic_on
+        end), function()
             oblisk.audio:invoke("toggle_source_mute")
-        end),
+        end, {
+            background = mic_muted:map(function(muted)
+                return muted and theme.PEACH or theme.RED
+            end),
+            visible = mic_shown,
+        }),
         alert(icons.screenshare, "screencast_users"),
     },
 }

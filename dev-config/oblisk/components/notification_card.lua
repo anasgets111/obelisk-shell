@@ -79,7 +79,7 @@ local function message(notification, ui, opts)
     -- Only when requested (`showTimestamp`): history is about when; a popup is about now, so a
     -- timestamp beside every fresh summary added nothing.
     if opts.age then
-        heading[#heading + 1] = cell(opts.age, theme.TEXT_OFF, theme.font.xs, { align_v = "Center" })
+        heading[#heading + 1] = cell(opts.age, theme.DIM, theme.font.xs, { align_v = "Center" })
     end
     -- Show a chevron only when something is hidden; one on a one-line notification visibly does
     -- nothing.
@@ -110,9 +110,6 @@ local function message(notification, ui, opts)
     } }
 
     if body_length > 0 then
-        -- `DIM`, the mirror's `textInactiveColor`, keeps the body secondary rather than switched
-        -- off;
-        -- `TEXT_OFF` at 35% alpha read as the latter.
         lines[#lines + 1] = cell(body, theme.DIM, theme.font.sm, {
             width = "Fill",
             wrap = "Word",

@@ -19,6 +19,7 @@ local section_header = require("components.section_header")
 local panel_header = require("components.panel_header")
 local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
+local info_badge = require("components.info_badge")
 local panel_empty_state = require("components.panel_empty_state")
 
 local KIND = "bluetooth"
@@ -75,6 +76,7 @@ local function state_line(b)
 end
 
 -- `BatteryBadge`: the level as a small filled pill, red under 10%, amber under 20%, accent above.
+-- The capsule itself is `components/info_badge.lua`; only the level's colour is bluetooth's.
 local function battery_badge(device)
     local text = battery_text(device)
     if not text then
@@ -82,16 +84,7 @@ local function battery_badge(device)
     end
     local level = device.battery
     local color = level <= 10 and theme.RED or (level <= 20 and theme.YELLOW or theme.ACCENT)
-    return row {
-        height = theme.control.xs,
-        align_v = "Center",
-        padding = { left = theme.spacing.sm, right = theme.spacing.sm },
-        radius = theme.control.xs / 2,
-        background = color,
-        border_width = theme.border_width,
-        border_color = theme.GLASS_BORDER,
-        children = { cell({ { text = text, bold = true } }, theme.text_contrast(color), theme.font.xs, { align_v = "Center" }) },
-    }
+    return info_badge(text, color, { opacity = theme.opacity.strong })
 end
 
 -- Mirror `OButton { text: "Pair" }`: an accented word whose ground appears on hover.

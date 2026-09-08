@@ -45,7 +45,7 @@ return function(opts)
     end
     local title_lines = { cell(title, title_color, theme.font.sm, { width = "Fill" }) }
     if opts.subtitle then
-        title_lines[#title_lines + 1] = cell(opts.subtitle, theme.TEXT_OFF, theme.font.xs, { width = "Fill" })
+        title_lines[#title_lines + 1] = cell(opts.subtitle, theme.DIM, theme.font.xs, { width = "Fill" })
     end
 
     local children = {}
@@ -83,11 +83,10 @@ return function(opts)
     local hovered = (opts.on_activate and opts.slot) and hover(opts.slot) or nil
     ---@type Color|Signal|nil
     local ground = opts.selected and theme.ACCENT_SUBTLE or nil
-    if hovered then
+    -- `PanelRow.qml`'s `color: selected ? activeSubtle : hovered ? glassContentHoverColor : ...`:
+    -- selection outranks the pointer, so a selected row keeps one ground and never lifts on hover.
+    if hovered and not opts.selected then
         ground = hovered:map(function(is_hovered)
-            if opts.selected then
-                return is_hovered and theme.ACCENT_LIGHT or theme.ACCENT_SUBTLE
-            end
             return is_hovered and theme.GLASS_HOVER or nil
         end)
     end

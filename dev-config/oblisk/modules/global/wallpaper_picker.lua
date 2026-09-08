@@ -281,7 +281,7 @@ local function tile(entry)
             rect {
                 width = theme.control.xs,
                 height = theme.control.xs,
-                radius = theme.radius.xl,
+                radius = theme.control.xs / 2,
                 margin = { left = theme.spacing.sm, top = theme.spacing.sm },
                 background = theme.ACCENT,
                 visible = applied,
@@ -490,13 +490,13 @@ local sidebar = panel_card({
             icon_button(icons.close, close, { slot = "wallpaper-close", size = theme.control.sm, icon_size = theme.icon.sm }),
         },
     },
-    cell("Monitor", theme.TEXT_OFF, theme.font.xs),
+    cell("Monitor", theme.DIM, theme.font.xs),
     monitor_row,
     cell(current_fit:map(function(fit)
         return fit == "" and "Fill mode · mixed" or "Fill mode"
-    end), theme.TEXT_OFF, theme.font.xs),
+    end), theme.DIM, theme.font.xs),
     fit_row,
-    cell("Folder", theme.TEXT_OFF, theme.font.xs),
+    cell("Folder", theme.DIM, theme.font.xs),
     cell(wallpaper.FOLDER, theme.DIM, theme.font.xs, { width = "Fill" }),
     cell(filtered:map(function(entries)
         return string.format("%d file(s)", #entries)

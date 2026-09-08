@@ -113,8 +113,7 @@ local header = panel_header {
     -- like a window at 820px wide.
     title_size = theme.font.xxl,
     plate = theme.control.xl,
-    -- The live count is not put under a 28px title at 10px. Use `theme.DIM`, not `TEXT_OFF`: a
-    -- counter at 35% opacity is unreadable.
+    -- The live count is not put under a 28px title at 10px.
     subtitle_size = theme.font.md,
     subtitle_color = theme.DIM,
     active = computed({ settings, idle.inhibited }, function(resolved, held)
@@ -173,7 +172,7 @@ local function chamber(entry)
     end)
     -- Lit once this stage's clock runs or has run; dim during another stage's turn.
     local ink = progress:map(function(fraction)
-        return fraction > 0 and theme.FG or theme.TEXT_OFF
+        return fraction > 0 and theme.FG or theme.DIM
     end)
     return rect {
         width = "Fill",
@@ -255,7 +254,7 @@ local paused_banner = banner(
     settings:map(function(resolved)
         return resolved.enabled and "nothing is scheduled on this profile" or "automatic actions are off"
     end),
-    theme.TEXT_OFF,
+    theme.DIM,
     theme.GLASS_CONTENT,
     computed({ counting_down, idle.inhibited }, function(counting, held)
         return not counting and not held
@@ -309,7 +308,7 @@ local function duration_button(profile, stage)
                         width = "Fill",
                         align_v = "Center",
                     }),
-                    glyph(icons.chevron_down, theme.TEXT_OFF, theme.icon.xs, { align_v = "Center" }),
+                    glyph(icons.chevron_down, theme.DIM, theme.icon.xs, { align_v = "Center" }),
                 },
             },
         },
@@ -335,16 +334,28 @@ local function profile_control(profile, stage)
     }
 end
 
+-- `PanelHeader`'s `titleBold`, which every row here binds to its own on-state (`:316`, `:563`).
+-- `components/panel_row.lua` bolds a title too, but only for its static `selected` boolean; these
+-- rows follow a signal, so the weight has to be decided inside the map.
+---@param on Signal<boolean>
+---@param title string
+local function bold_when(on, title)
+    return on:map(function(enabled)
+        return enabled and { { text = title, bold = true } } or title
+    end)
+end
+
 -- `ProfileHeading`: accent and label the active column, so desk-side configuration still shows
 -- which
 -- profile is running.
 local function column_heading(profile, label)
     return cell(
         idle.active_profile:map(function(active)
-            return active == profile and label .. " · live" or label
+            local text = active == profile and label .. " · live" or label
+            return { { text = text, bold = true } }
         end),
         idle.active_profile:map(function(active)
-            return active == profile and theme.ACCENT or theme.TEXT_OFF
+            return active == profile and theme.ACCENT or theme.DIM
         end),
         theme.font.xs,
         { width = theme.idle_profile_column, align = "Center" }
@@ -357,7 +368,7 @@ local matrix_heading = row {
     spacing = theme.spacing.sm,
     padding = { left = theme.spacing.sm, right = theme.spacing.sm },
     children = {
-        cell("action · in order", theme.TEXT_OFF, theme.font.xs, { width = "Fill" }),
+        cell({ { text = "action · in order", bold = true } }, theme.DIM, theme.font.xs, { width = "Fill" }),
         column_heading("ac", "ac power"),
         row {
             width = theme.idle_profile_column,
@@ -397,10 +408,10 @@ local function stage_row(item)
         return false
     end)
     local ink = any:map(function(enabled)
-        return enabled and theme.ACCENT or theme.TEXT_OFF
+        return enabled and theme.ACCENT or theme.DIM
     end)
     local body = panel_row {
-        title = stage.title,
+        title = bold_when(any, stage.title),
         -- Use the stage's description, not "after <the row above>": the prior row may be off in one
         -- profile. The section states the rule, row order shows it, and the timeline gives the
         -- total.
@@ -457,11 +468,13 @@ local stage_list = list {
 local behaviour_rows = {
     panel_row {
         icon = icons.play,
-        title = "keep awake for media",
+        title = bold_when(settings:map(function(resolved)
+            return resolved.video_auto_inhibit
+        end), "keep awake for media"),
         subtitle = "video, camera, microphone, screen capture",
         height = theme.idle_row_height,
         icon_color = settings:map(function(resolved)
-            return resolved.video_auto_inhibit and theme.ACCENT or theme.TEXT_OFF
+            return resolved.video_auto_inhibit and theme.ACCENT or theme.DIM
         end),
         trailing = toggle(settings, function(resolved)
             return resolved.video_auto_inhibit
@@ -471,11 +484,11 @@ local behaviour_rows = {
     },
     panel_row {
         icon = icons.awake,
-        title = "keep awake now",
+        title = bold_when(idle.manual, "keep awake now"),
         subtitle = "the same hold the bar circle takes",
         height = theme.idle_row_height,
         icon_color = idle.manual:map(function(manual)
-            return manual and theme.ACCENT or theme.TEXT_OFF
+            return manual and theme.ACCENT or theme.DIM
         end),
         trailing = toggle(idle.manual, function(manual)
             return manual
@@ -495,7 +508,7 @@ local flow_strip = row {
     spacing = theme.spacing.sm,
     children = {
         glyph(icons.play, computed({ settings, idle.inhibited }, function(resolved, held)
-            return (resolved.enabled and not held) and theme.ACCENT or theme.TEXT_OFF
+            return (resolved.enabled and not held) and theme.ACCENT or theme.DIM
         end), theme.icon.sm, { align_v = "Center" }),
         cell(
             computed({ settings, idle.active_profile }, function(resolved, profile)

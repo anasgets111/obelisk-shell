@@ -10,15 +10,24 @@
 -- hover off, which is right for a tooltip. A hover-open panel needs its own hover region, OR-ed
 -- with the bar's,
 -- so the pointer can travel into it.
+--
+-- Nothing opens while a panel is up. `DateTimeDisplay.qml` gates its own loader that way
+-- (`requested: mouseArea.containsMouse && !panelOpen`), and the reason generalises to every slot on
+-- the bar: the panel card hangs directly under the bar, so a tooltip opening into the same space is
+-- a second sheet over the one the user just asked for. Gated on any panel, not this indicator's
+-- own, because it is the card's position that collides, not its subject.
 local theme = require("config.theme")
 local panel_card = require("components.panel_card")
+local ui_state = require("lib.ui_state")
 
 return function(opts)
     return popup {
         id = opts.id,
         parent = opts.parent or "bar",
         anchor_rect = hover_rect(opts.slot),
-        visible = hover(opts.slot),
+        visible = computed({ hover(opts.slot), ui_state.panel_open }, function(is_hovered, panel_open)
+            return is_hovered and not panel_open
+        end),
         width = opts.width,
         height = opts.height,
         -- § 6 defaults `grab` to `true`, but hover cannot produce the required input serial.
@@ -34,6 +43,15 @@ return function(opts)
             background = theme.GLASS,
             border_width = theme.border_width,
             border_color = theme.BORDER,
+            -- `padding_v` is per-tip because the surface is a fixed size: the one- and two-line
+            -- tips are sized with `xs` already counted in, and widening it for all of them would
+            -- squeeze their text rather than give it room. A tall body asks for its own.
+            padding = {
+                top = opts.padding_v or theme.spacing.xs,
+                right = theme.spacing.sm,
+                bottom = opts.padding_v or theme.spacing.xs,
+                left = theme.spacing.sm,
+            },
         }),
     }
 end

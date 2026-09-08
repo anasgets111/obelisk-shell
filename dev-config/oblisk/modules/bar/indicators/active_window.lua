@@ -11,18 +11,35 @@ local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
 
--- The same budget as `modules/bar/indicators/media.lua`: the centre zone shows one at a time, and
--- changing width when playback stops would move the whole bar.
---
--- A character budget, not `components/cell.lua`'s bounded box: "WWWW" and "iiii" are both four
--- characters, but "WWWW" is twice the width. This node must stay content-sized so the centre
--- midpoint remains the bar midpoint; an elision box fixes the zone width.
-local TITLE_LIMIT = 44
-
 -- `nil` before the first snapshot and whenever nothing holds focus; the supervisor omits the key
 -- rather than sending null (`workspaces/controller.rs`).
 local function focused(workspaces)
     return workspaces and workspaces.active_client
+end
+
+-- `text: hasActive ? baseLabel : "Desktop"`, lowercased for this shell's voice. The mirror captions
+-- an empty desktop rather than leaving a hole, and `CenterSide.qml` anchors this node
+-- unconditionally, so hiding the row on an empty workspace would move the bar's midpoint every time
+-- the last window closed.
+local EMPTY_LABEL = "desktop"
+
+-- `iconSource`'s fallback, `resolveIconSource("", "", "applications-system")`.
+local EMPTY_ICON = "applications-system"
+
+-- `baseLabel: title || displayName`, where `displayName` is the desktop entry's name and then the
+-- raw `app_id`. A window that sets no title -- a splash, a freshly mapped terminal -- otherwise
+-- captions as nothing at all while still holding focus.
+local function label(applications, workspaces)
+    local client = focused(workspaces)
+    if client == nil then
+        return EMPTY_LABEL
+    end
+    local title = client.title
+    if title ~= nil and title ~= "" then
+        return title
+    end
+    local entry = util.app_entry(applications, client.class)
+    return (entry and entry.name) or client.class or EMPTY_LABEL
 end
 
 -- The second `oblisk.applications` consumer (ADR-0061). `active_client.class` is the toplevel
@@ -31,10 +48,15 @@ end
 local focused_icon = icon {
     name = computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
         local client = focused(workspaces)
-        local entry = util.app_entry(applications, client and client.class)
-        return (entry and entry.icon) or ""
+        if client == nil then
+            return EMPTY_ICON
+        end
+        local entry = util.app_entry(applications, client.class)
+        return (entry and entry.icon) or EMPTY_ICON
     end),
-    size = theme.icon.lg,
+    -- `height: Theme.controlHeightSm`, a step above the `icon.lg` this used: the centre caption is
+    -- the bar's one piece of prose and its icon reads as an app rather than a status glyph.
+    size = theme.control.sm,
     align_v = "Center",
 }
 
@@ -44,17 +66,11 @@ local focused_icon = icon {
 return row {
     height = theme.item_height,
     align_v = "Center",
-    spacing = theme.spacing.sm,
-    -- Nothing focused means nothing to caption. Hiding the row returns its width and spacing
-    -- because invisible children cost neither (`layout::scene`'s row arm).
-    visible = oblisk.workspaces:map(function(workspaces)
-        return focused(workspaces) ~= nil
-    end),
+    spacing = theme.spacing.xs,
     children = {
         focused_icon,
-        cell(oblisk.workspaces:map(function(workspaces)
-            local client = focused(workspaces)
-            return util.truncate(client and client.title or "", TITLE_LIMIT)
+        cell(computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
+            return { { text = util.truncate(label(applications, workspaces), theme.title_limit), bold = true } }
         end), theme.FG, theme.font.sm, { align_v = "Center" }),
     },
 }

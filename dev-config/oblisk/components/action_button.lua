@@ -45,7 +45,8 @@ return function(label, on_activate, slot, opts)
         }
     end
     if label and label ~= "" then
-        children[#children + 1] = cell(label, ground.text or theme.FG, theme.font.sm, {
+        local label_content = type(label) == "string" and { { text = label, bold = true } } or label
+        children[#children + 1] = cell(label_content, ground.text or theme.FG, theme.font.sm, {
             align = "Center",
             align_v = "Center",
             width = fill,
@@ -65,6 +66,7 @@ return function(label, on_activate, slot, opts)
         border_width = theme.border_width,
         border_color = ground.border,
         padding = { left = theme.spacing.md, right = theme.spacing.md },
+        animate = { background = theme.animation_ms },
         on_click = function(_, mouse_button)
             if mouse_button == "left" then
                 if on_activate then

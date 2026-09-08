@@ -9,11 +9,15 @@ local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local ui = require("lib.ui_state")
+local cell = require("components.cell")
 local section_header = require("components.section_header")
 local panel_header = require("components.panel_header")
 local panel_empty_state = require("components.panel_empty_state")
 local icon_button = require("components.icon_button")
 local notification_card = require("components.notification_card")
+local info_badge = require("components.info_badge")
+local identity = require("lib.identity")
+local system_info = require("modules.bar.indicators.system_info")
 
 local KIND = "notifications"
 local SCROLL = scroll("notification_feed")
@@ -67,7 +71,57 @@ local function summary(n)
     return table.concat(parts, " · ")
 end
 
+-- `criticalCount`, the number behind the header's urgent badge. Transients are excluded for the
+-- same reason as `kept`: they never reach this list, so counting them would badge rows that are
+-- not here.
+local function critical_count(n)
+    local count = 0
+    for _, notification in ipairs(feed(n)) do
+        if not notification.transient and notification.urgency == "critical" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- "1st", "2nd", "3rd", "4th"; the teens are the exception, all "th".
+local function ordinal(day)
+    local tens = day % 100
+    if tens >= 11 and tens <= 13 then
+        return "th"
+    end
+    local ones = day % 10
+    return ones == 1 and "st" or ones == 2 and "nd" or ones == 3 and "rd" or "th"
+end
+
+-- "Tuesday 08th of September 2026 03:07 PM". The bar's clock is abbreviated to fit a pill; this has
+-- a panel's width, so it spells the day and month out and there is no second place to look.
+local function long_date(seconds)
+    local day = tonumber(os.date("%d", seconds)) or 0
+    return string.format("%s%s of %s", os.date("%A %d", seconds), ordinal(day),
+        os.date("%B %Y %I:%M %p", seconds))
+end
+
 local body = {
+    -- Not the mirror's. `NotificationHistoryPanel.qml` opens straight into the weather, having no
+    -- greeting anywhere; this panel is wide enough to be read as a sidebar, and a sidebar that
+    -- never says whose session it is or what day it is was the gap.
+    column {
+        width = "Fill",
+        children = {
+            cell(identity.full_name:map(function(name)
+                return { { text = name, bold = true } }
+            end), theme.FG, theme.font.lg, { width = "Fill" }),
+            cell(util.label(oblisk.system, function(s)
+                return long_date(s.time)
+            end), theme.DIM, theme.font.xs, { width = "Fill" }),
+        },
+    },
+    -- `NotificationHistoryPanel.qml` opens with the weather, then the system readout, and only then
+    -- the notifications masthead: the panel is the shell's status sheet, and the feed is its
+    -- longest section rather than its subject. The weather half has no § 2.x capability behind it
+    -- and is absent; the system half is `SystemInfoWidget`.
+    system_info("notifications"),
     -- Shared masthead shape: bell, DND-dimmed when silenced, summary, and two trailing controls.
     panel_header {
         title = "notifications",
@@ -79,6 +133,16 @@ local body = {
         end),
         subtitle = util.label(oblisk.notifications, summary),
         trailing = {
+            -- `InfoBadge`, ahead of the two controls and shown only while something is critical.
+            -- Critical notifications bypass DND and never expire, so the count is what the panel
+            -- most needs to say before its list is read.
+            info_badge(oblisk.notifications:map(function(n)
+                return string.format("%d urgent", critical_count(n))
+            end), theme.RED, {
+                visible = util.shown_when(oblisk.notifications, function(n)
+                    return critical_count(n) > 0
+                end),
+            }),
             -- DND is the mirror's third bell state and this control is lit while on. The Supervisor
             -- gates sound (ADR-0033), and the popup reads the same flag, standing down except for
             -- critical notifications.
@@ -134,9 +198,22 @@ local body = {
             },
         },
     },
-    panel_empty_state("nothing waiting", util.shown_when(oblisk.notifications, function(n)
-        return kept(n) == 0
-    end)),
+    panel_empty_state(
+        "no notifications",
+        util.shown_when(oblisk.notifications, function(n)
+            return kept(n) == 0
+        end),
+        {
+            icon = oblisk.notifications:map(function(n)
+                return (n and n.dnd) and icons.bell_off or icons.bell
+            end),
+            -- An empty feed under DND means something different from an empty feed without it, and
+            -- the struck-through bell alone does not say which; the mirror spells it out here.
+            subtext = oblisk.notifications:map(function(n)
+                return (n and n.dnd) and "do not disturb is on" or "you're all caught up"
+            end),
+        }
+    ),
 }
 
 return { kind = KIND, body = body }
