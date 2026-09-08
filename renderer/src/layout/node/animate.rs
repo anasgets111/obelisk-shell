@@ -1153,7 +1153,7 @@ pub fn retarget(
         // run, played out or not; a different list is a new one, from its first frame.
         if let Motion::Sequence(sequence) = &spec.motion {
             let carried = running.filter(|prior| prior.spec.motion == spec.motion);
-            let tween = match carried {
+            let mut tween = match carried {
                 Some(prior) => Tween { spec, ..prior.clone() },
                 None => Tween {
                     property: property.clone(),
@@ -1164,6 +1164,13 @@ pub fn retarget(
                     resting: false,
                 },
             };
+            // Against `now`, not against what the carried run was resting on: `advance` is the only
+            // other place this is decided, and a pass can both finish a run it never ticked and
+            // hand a played-out one a fresh `delay`. Carrying the old flag through either of those
+            // leaves the tree disagreeing with the clock -- a finished run still asking for frame
+            // callbacks, or a re-delayed one resting so hard that `animating` never asks for the
+            // first.
+            tween.resting = tween.done(now);
             properties.insert(property, tween.at(now).to_value(lua).map_err(|e| invalid("animate", e.to_string()))?);
             tweens.push(tween);
             continue;
@@ -1213,6 +1220,26 @@ pub fn retarget(
         tweens.push(tween);
     }
     Ok(tweens)
+}
+
+/// The properties a tween can move without asking the solver anything: what they change is what a
+/// node paints, never the box it was given. `layout::scene::taffy_style` reads none of them, and
+/// `layout::scene::measure_for` reads a text's content, size, family and wrapping but not its
+/// colour, so a tick whose every running tween names one of these can re-derive the paint in place
+/// and leave the taffy pass out entirely (`layout::scene::Scene::tick`).
+///
+/// `opacity` is in `LayoutStyle` and still belongs here: the solver never receives it, `finish`
+/// only copies it onto the node, and `layout::paint` multiplies it down the subtree.
+///
+/// The transform properties are deliberately absent even though the solver ignores them too.
+/// ADR-0149 maps the pointer back through a node's inverse transform, so moving one changes what
+/// the pointer hits, and the input regions have to be rebuilt with it. They stay on the layout
+/// path until something rebuilds those regions without a full pass.
+const PAINT_ONLY: &[&str] = &["opacity", "background", "border_color", "foreground", "radius"];
+
+/// Whether a tween on `property` can be advanced by a paint-only tick; see [`PAINT_ONLY`].
+pub fn is_paint_only(property: &str) -> bool {
+    PAINT_ONLY.contains(&property)
 }
 
 /// Advances every tween in `tweens` to `now`, writing the displayed values into `properties` and

@@ -3917,3 +3917,80 @@ Three deviations, all of them ours and all documented at the time:
 
 Measured rather than eyeballed throughout: the power glyph is 13x15px here against the mirror's
 14x16, which is what said the size was already right and sent the search to the face.
+
+## 0178. A tween that only changes what a node paints does not lay the tree out again
+
+ADR-0145 made a compositor frame callback the tween clock and `Scene::tick` the frame. That tick
+answers one question -- what size is everything now -- by cloning the retained tree, building a
+fresh taffy tree, re-parsing every node's `LayoutStyle` and `PaintStyle`, solving, and measuring.
+Most of what a config animates cannot change the answer. `opacity`, `background`, `border_color`,
+`foreground` and `radius` are read by neither `taffy_style` nor `measure_for`, which takes a text's
+content, size, family and wrapping but not its colour. The shipped `dev-config` names `background`
+in eight `animate` blocks and `border_color` in four, against five for `width`.
+
+So a tick whose every running tween names one of those properties advances the tree where it
+stands: `node::advance` writes the displayed values into the retained map, and the node's `opacity`
+and parsed paint are re-derived from them. No clone, no solver, no measurement, no geometry
+publish. Anything else -- a `width`, a `padding`, a leaving node whose exit ends by dropping it --
+falls back to the relayout unchanged.
+
+`transform` is excluded although the solver ignores it too. ADR-0149 maps the pointer back through
+a node's inverse transform, so moving one changes what the pointer hits, and the input regions have
+to be rebuilt with it. It stays on the layout path until something rebuilds those regions without a
+full pass.
+
+**The clone was rollback, and the fast path still needs one.** `node::advance` writes into the
+retained map, and a value it writes can be refused: a spring overshoots its target, and
+`parse_opacity` rejects anything outside `[0, 1]` rather than clamping (ADR-0068). Working on a
+clone made a refusal free, because the half-advanced tree was a copy. In place it is not: a refused
+value left in the retained map would be re-read by the next pass and fail that too, one bad frame
+becoming a scene that stops updating. The fast path therefore keeps the values it is about to move
+and puts them back on refusal, bounded by that node's tweens rather than by its subtree's
+properties.
+
+**`Scene::tick` returns the instances it advanced, not whether any did.** The poll loop repainted
+every mapped surface on any turn that resolved, so each unticked surface built a display list --
+copying a text draw's content and style runs, an icon's name -- only to have it rejected as equal
+to the one it last painted. A tick knows which trees it touched. Recorded before the advance, not
+after: the frame that ends a tween is the one that shows its target, and by then the tree is no
+longer `animating`.
+
+**A mid-tween surface whose list is unchanged commits without drawing.** The commit is what makes
+the frame request effective, so it cannot be skipped, but re-drawing identical pixels can be. A
+hold, a lead-in `delay`, or a step easing sitting on one value now costs a commit instead of
+make-current, clear, every draw call and a swap.
+
+Measured on the real `dev-config` under a continuous keyframe tween, debug build, 60Hz, machine
+idle. Tick turns fell from p50 4.98ms / p90 6.27ms / max 30.41ms to p50 1.42ms / p90 2.15ms / max
+3.83ms, and tick turns over the 16.6ms frame budget from 2 in 2959 to 0 in 2670. Every dropped
+frame in the run after the change was a full capability pass; none came from a tick.
+
+Rejected: replacing the whole-scene rollback clone at the head of `Scene::apply_admitting` with
+borrowed preparation. Timed directly at p50 0.38ms against a p50 10.79ms pass -- about 4% -- so the
+ownership and staging it would take buys nothing worth the risk.
+
+Rejected: per-surface dirtiness in place of ADR-0044 decision 2's single flag. It needs a set of
+sources read by each surface, and a config's getters are arbitrary Lua that may read the clock or a
+mutable upvalue, so a declared dependency vector cannot be assumed to capture everything. That
+needs a reactivity contract or a conservative fallback, not an accounting change.
+
+Rejected: taking the tween clock from the frame callback's `time` argument instead of
+`Instant::now()`. It is milliseconds against an undefined epoch, needing wrap handling and a rule
+for multiple surfaces, and the sampled step between presented frames already measured p10 16.34ms /
+p90 16.83ms. Its target is the residual 2.9% of outlier steps, which is not where the time is.
+
+**Amends ADR-0152.** A sequence's `resting` flag is now re-derived from the clock a pass ran on
+rather than carried from the tick that set it. `delay` sits on the spec beside the motion, not in
+it, so a played-out run handed a fresh `delay` still matched as the same list and carried
+`resting = true` across; `advance` skips a resting tween and `animating` does not count one, so
+nothing asked for the frame that would have started it and the run sat on its old last frame. Under
+one monotonic clock a counted sequence that is done stays done, so re-deriving costs nothing and
+only differs where carrying was wrong.
+
+**What this does not fix.** The first frame that reveals a large surface still costs far more than
+a steady one -- 204ms of repaint on the update panel's first open, 97ms then 50ms for the
+notification area, against 5.84ms for that panel's subsequent tween ticks. That cost survives the
+surface being destroyed and recreated, so it is a process-wide cache filling rather than anything
+the tick does, and it is not attributed yet: the repaint phase spans every mapped surface, EGL
+binding, the swap, and `ImageCache::upload_landed`, which charges every landed background decode to
+whichever surface paints first.

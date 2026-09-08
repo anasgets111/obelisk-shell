@@ -26,7 +26,7 @@ use style::{parse_background, parse_border_color, parse_border_width, parse_clip
 
 #[cfg(test)]
 pub use animate::Animatable;
-pub use animate::{Tween, advance, depart, retarget};
+pub use animate::{Tween, advance, depart, is_paint_only, retarget};
 pub use content::{
     Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
     segments,

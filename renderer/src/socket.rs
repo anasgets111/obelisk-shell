@@ -630,7 +630,8 @@ impl RendererClient {
         }
     }
 
-    pub fn tick_animations(&mut self, now: std::time::Instant) -> bool {
+    /// Returns the instance ids it advanced, so the caller repaints those surfaces and no others.
+    pub fn tick_animations(&mut self, now: std::time::Instant) -> Vec<String> {
         self.scene.tick(&self.instances, &self.shaping, self.loader.lua(), now)
     }
 }

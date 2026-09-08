@@ -650,15 +650,22 @@ impl App {
             let focus = self.field_focus_for(&surface_id);
             tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
         };
-        // A mid-tween surface always commits, even an unchanged list: the frame callback below
-        // is only answered after a commit, and a tween whose first tick moved nothing visible
-        // would otherwise never get its second (ADR-0145).
-        if !animating
-            && self.surfaces[index]
-                .last_painted
-                .as_ref()
-                .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list)
-        {
+        let unchanged = self.surfaces[index]
+            .last_painted
+            .as_ref()
+            .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list);
+        if unchanged {
+            // A mid-tween surface still has to commit: a frame callback is only answered after
+            // one, and a tween whose tick moved nothing visible would otherwise never get its
+            // next (ADR-0145). What it does not have to do is draw the same pixels again. A
+            // commit with no new buffer re-commits the state the surface already has, which is
+            // what makes the frame request below effective -- so a hold, a lead-in `delay`, or
+            // a step easing sitting on one value costs a commit instead of make-current, clear,
+            // every draw call, and a swap.
+            if animating && let Some(surface) = self.surfaces[index].role.wl_surface() {
+                surface.frame(&self.queue_handle, FrameCallbackData(surface.clone()));
+                surface.commit();
+            }
             return;
         }
 
@@ -759,8 +766,25 @@ impl App {
     }
 
     pub(super) fn repaint_mapped_surfaces(&mut self) {
+        self.repaint_mapped_surfaces_where(|_| true);
+    }
+
+    /// The surfaces a tween tick just advanced, by the instance ids `Scene::tick` returned.
+    ///
+    /// A tick changes only the trees it names, so the others would each build a display list and
+    /// have it rejected as equal to the one they last painted. That build is not free: a text draw
+    /// copies its content and style runs, an image or icon its name. This is the same repaint,
+    /// asked of the surfaces that can actually differ.
+    pub(super) fn repaint_surfaces_with_instance_ids(&mut self, instance_ids: &[String]) {
+        self.repaint_mapped_surfaces_where(|surface_id| instance_ids.iter().any(|id| id == surface_id));
+    }
+
+    fn repaint_mapped_surfaces_where(&mut self, wanted: impl Fn(&str) -> bool) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].map_state != MapState::Mapped {
+                continue;
+            }
+            if !wanted(&self.surfaces[index].surface_id) {
                 continue;
             }
             if self.surfaces[index].bound.is_none() {

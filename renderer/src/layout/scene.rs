@@ -170,6 +170,23 @@ impl ResolvedNode {
             && (self.tweens.iter().any(|tween| !tween.resting) || self.children.iter().any(ResolvedNode::animating))
     }
 
+    /// Whether every tween still running in this tree moves a paint-only property, which is what
+    /// lets [`Scene::tick`] advance it in place instead of laying it out again
+    /// (`node::is_paint_only`).
+    ///
+    /// A hidden subtree answers `true` because nothing advances it either way: it is frozen
+    /// (ADR-0124) and `animating` does not count it. A leaving node answers `false` whatever its
+    /// exit moves, because the end of that exit drops the node, and changing the shape of the tree
+    /// is `prepare_retained`'s to do (ADR-0150).
+    fn tick_is_paint_only(&self) -> bool {
+        if !self.visible {
+            return true;
+        }
+        !self.leaving
+            && self.tweens.iter().all(|tween| tween.resting || node::is_paint_only(&tween.property))
+            && self.children.iter().all(ResolvedNode::tick_is_paint_only)
+    }
+
     /// This node's margin along `axis`, both edges.
     fn margin_on(&self, axis: MainAxis) -> f32 {
         match axis {
@@ -337,24 +354,47 @@ impl Scene {
 
     /// Advances every tween to `now` and lays the affected instances out again from their retained
     /// property maps, without running Lua (ADR-0145): the only Lua the retained walk touches is a
-    /// plain table read. Returns whether any tree changed. An instance whose relayout fails keeps
-    /// its last tree and loses its tweens, so a bug there is one log line and a snap rather than a
-    /// log line per frame; the values a tick writes are ones a pass already accepted, so that
-    /// should not happen.
-    pub fn tick(&mut self, instances: &[SurfaceInstance], shaping: &ShapingHandle, lua: &Lua, now: Instant) -> bool {
+    /// plain table read. Returns the instances it advanced, which is what the caller owes the
+    /// screen this frame. An instance whose relayout fails keeps its last tree and loses its
+    /// tweens, so a bug there is one log line and a snap rather than a log line per frame; the
+    /// values a tick writes are ones a pass already accepted, so that should not happen.
+    ///
+    /// A tree whose every running tween only changes what it paints skips the relayout entirely
+    /// and is advanced where it stands ([`advance_paint_only`]). That is most of what a config
+    /// animates -- a fade, a hover colour, a border lighting up -- and none of it can move a rect.
+    pub fn tick(
+        &mut self,
+        instances: &[SurfaceInstance],
+        shaping: &ShapingHandle,
+        lua: &Lua,
+        now: Instant,
+    ) -> Vec<String> {
         // The retained maps keep a resolved edge table's handle, so its `__index` runs on the
         // parse a tick repeats; the pass budget is what bounds it here as in `apply_admitting`.
         let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
             Ok(budget) => budget,
             Err(err) => {
                 eprintln!("[oblisk-renderer] tick: no pass budget, skipping the frame: {err}");
-                return false;
+                return Vec::new();
             }
         };
-        let mut relaid = false;
+        let mut relaid = Vec::new();
         for instance in instances {
             let key = instance.instance_id.as_str();
             let Some(retained) = self.surfaces.get_mut(key).filter(|tree| tree.animating()) else { continue };
+            // Recorded before the advance, not after: the frame that ends a tween is the one that
+            // shows its target, and by the time it has been written the tree is no longer
+            // `animating`. Selecting afterwards would drop exactly that frame.
+            relaid.push(key.to_string());
+            if retained.tick_is_paint_only() {
+                let advanced = advance_paint_only(retained, now, lua)
+                    .and_then(|()| if budget.exceeded() { Err(LayoutError::PassBudgetExceeded) } else { Ok(()) });
+                if let Err(err) = advanced {
+                    eprintln!("[oblisk-renderer] {key}: advancing a paint-only tween failed, stopping it: {err}");
+                    strip_tweens(retained);
+                }
+                continue;
+            }
             // ponytail: the clone is the rollback for a failure that should not happen; the same
             // shape `apply_admitting` uses per pass. Drop it once a tick has never failed in use.
             let outcome = relayout_retained(retained.clone(), instance.available, shaping, lua, now)
@@ -372,7 +412,6 @@ impl Scene {
                     strip_tweens(retained);
                 }
             }
-            relaid = true;
         }
         relaid
     }
@@ -764,6 +803,81 @@ struct PreparedNode {
     leaving: Vec<ResolvedNode>,
 }
 
+/// A node's paint re-read from the values it now displays, keeping the text it was fitted to.
+///
+/// No pass measures a node this is called for, so the ellipsized prefix or the wrapped lines that
+/// `Scene::finish` wrote still describe the box the node has. Everything else about the paint is
+/// re-read like any other node's, which is what lets a tween move a label's `foreground` rather
+/// than freeze it at the colour it last laid out with.
+fn repainted_keeping_fitted_text(old: Option<PaintStyle>, fresh: Option<PaintStyle>) -> Option<PaintStyle> {
+    match (old, fresh) {
+        (
+            Some(PaintStyle::Text { content, runs, .. }),
+            Some(PaintStyle::Text { font_size, font, color, align, elide, wrap, max_lines, .. }),
+        ) => Some(PaintStyle::Text { content, runs, font_size, font, color, align, elide, wrap, max_lines }),
+        (_, fresh) => fresh,
+    }
+}
+
+/// One frame of a tree whose every running tween is paint-only, advanced where it stands.
+///
+/// The [`relayout_retained`] this replaces exists to answer one question -- what size is everything
+/// now -- and `node::is_paint_only` is the set of properties that cannot change the answer. So this
+/// walks the tree the tweens are already in, advances them, and re-derives the two things they do
+/// change: the node's own `opacity` and its parsed paint. No clone, no solver tree, no measurement,
+/// and no geometry to publish, because no rect moved.
+fn advance_paint_only(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> Result<(), LayoutError> {
+    // Frozen, tweens included (ADR-0124): `animating` does not count a hidden subtree, and
+    // `tick_is_paint_only` passes over it for the same reason.
+    if !node.visible {
+        return Ok(());
+    }
+    if !node.tweens.is_empty() {
+        advance_paint_only_node(node, now, lua)?;
+    }
+    for child in &mut node.children {
+        advance_paint_only(child, now, lua)?;
+    }
+    Ok(())
+}
+
+/// One node of [`advance_paint_only`], all-or-nothing.
+///
+/// `node::advance` writes into the retained map, and a value it writes can still be refused: a
+/// spring overshoots its target, and `parse_opacity` rejects anything outside `[0, 1]` rather than
+/// clamping it (ADR-0068). The tick this came from used to work on a clone, so a refusal cost
+/// nothing and the retained map never saw the value. In place it would, and the next pass would
+/// re-read it and fail too -- one refused frame becoming a scene that stops updating. So the
+/// values about to move are kept and put back on refusal. That is bounded by this node's tweens,
+/// not by the properties of its subtree, which is the whole point of not cloning.
+fn advance_paint_only_node(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> Result<(), LayoutError> {
+    let restore: Vec<(String, Value)> = node
+        .tweens
+        .iter()
+        .filter(|tween| !tween.resting)
+        .filter_map(|tween| node.properties.get_key_value(&tween.property))
+        .map(|(property, value)| (property.clone(), value.clone()))
+        .collect();
+    // Nothing is assigned to the node until all three have succeeded, so a refusal leaves its
+    // `opacity` and `paint` describing the same frame its properties do.
+    let advanced = node::advance(&mut node.tweens, &mut node.properties, now, lua)
+        .and_then(|()| node::parse_opacity(&node.properties))
+        .and_then(|opacity| Ok((opacity, node::paint_style(&node.kind, &node.properties)?)));
+    match advanced {
+        Ok((opacity, fresh)) => {
+            node.opacity = opacity;
+            node.paint = repainted_keeping_fitted_text(node.paint.take(), fresh);
+            Ok(())
+        }
+        Err(err) => {
+            for (property, value) in restore {
+                node.properties.insert(property, value);
+            }
+            Err(err)
+        }
+    }
+}
+
 /// One pass of a leaving node (ADR-0150): its tweens move, the paint and the box they name
 /// follow, and the node is gone once nothing is in flight. Its subtree is frozen the way a hidden
 /// node's is (ADR-0124).
@@ -777,17 +891,7 @@ fn advance_leaving(mut node: ResolvedNode, now: Instant, lua: &Lua) -> Result<Op
     }
     let style = LayoutStyle::parse(&node.properties)?;
     let fresh = node::paint_style(&node.kind, &node.properties)?;
-    node.paint = match (node.paint.take(), fresh) {
-        // A leaving `text` keeps the string it was fitted to: no pass measures it again, so the
-        // ellipsis or the wrap it was given still describes the box it is leaving in. Everything
-        // else about its paint is re-read like any other node's, which is what lets an exit fade
-        // a label's `foreground` rather than freeze it at the colour it was dropped with.
-        (
-            Some(PaintStyle::Text { content, runs, .. }),
-            Some(PaintStyle::Text { font_size, font, color, align, elide, wrap, max_lines, .. }),
-        ) => Some(PaintStyle::Text { content, runs, font_size, font, color, align, elide, wrap, max_lines }),
-        (_, fresh) => fresh,
-    };
+    node.paint = repainted_keeping_fitted_text(node.paint.take(), fresh);
     node.opacity = style.opacity;
     node.transform = style.transform;
     node.margin = style.margin;
@@ -2067,14 +2171,16 @@ pub(super) mod tests {
         assert_eq!(tween.to, node::Animatable::Number(90.0));
 
         let instances = [instance_at(&surface, full())];
-        assert!(scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_millis(50)));
+        assert!(
+            !scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_millis(50)).is_empty()
+        );
         assert_eq!(child_width(&scene), 65.0, "halfway through a linear tween is the midpoint");
         assert!(scene.surface("bar@TEST").unwrap().animating());
 
         scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_millis(100));
         assert_eq!(child_width(&scene), 90.0);
         assert!(!scene.surface("bar@TEST").unwrap().animating(), "an arrived tween is dropped");
-        assert!(!scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_secs(1)));
+        assert!(scene.tick(&instances, &shaping, &lua, tween.started + std::time::Duration::from_secs(1)).is_empty());
     }
 
     #[test]
@@ -2091,7 +2197,7 @@ pub(super) mod tests {
         lua.load(r#"state("w", 0):set(90) state("open", true):set(false)"#).exec().unwrap();
         apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
         assert!(!scene.surface("bar@TEST").unwrap().animating());
-        assert!(!scene.tick(&[instance_at(&surface, full())], &shaping, &lua, Instant::now()));
+        assert!(scene.tick(&[instance_at(&surface, full())], &shaping, &lua, Instant::now()).is_empty());
 
         lua.load(r#"state("open", true):set(true)"#).exec().unwrap();
         apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
@@ -2168,7 +2274,7 @@ pub(super) mod tests {
         assert!(leaver.leaving, "the label is on its way out");
         let started = leaver.tweens[0].started;
         let instances = [instance_at(&surface, full())];
-        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+        assert!(!scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)).is_empty());
 
         let leaver = &scene.surface("bar@TEST").unwrap().children[0].children[0];
         let Some(PaintStyle::Text { content, color, .. }) = leaver.paint.as_ref() else { panic!("{leaver:?}") };
@@ -2222,7 +2328,7 @@ pub(super) mod tests {
 
         let started = a.tweens[0].started;
         let instances = [instance_at(&surface, full())];
-        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+        assert!(!scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)).is_empty());
         let a = &scene.surface("bar@TEST").unwrap().children[0].children[1];
         assert!((a.opacity - 0.5).abs() < 0.01 && a.transform.translate == (0.0, 4.0), "halfway out: {a:?}");
         let root = scene.surface("bar@TEST").unwrap();
@@ -2359,13 +2465,13 @@ pub(super) mod tests {
         let started = pulse.tweens[0].started;
         let instances = [instance_at(&surface, full())];
 
-        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)));
+        assert!(!scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)).is_empty());
         let row = &scene.surface("bar@TEST").unwrap().children[0];
         assert!((row.children[0].opacity - 0.6).abs() < 0.01, "halfway down the pulse");
         assert!((row.children[1].opacity - 0.5).abs() < 0.01, "halfway through the flash");
 
         // Past the counted one's single loop: it rests, the endless one carries on wrapping.
-        assert!(scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(250)));
+        assert!(!scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(250)).is_empty());
         let root = scene.surface("bar@TEST").unwrap();
         let (pulse, flash) = (&root.children[0].children[0], &root.children[0].children[1]);
         assert!((pulse.opacity - 0.6).abs() < 0.01, "a quarter of the way round again");
@@ -2373,15 +2479,130 @@ pub(super) mod tests {
         assert!(flash.tweens[0].resting && !pulse.tweens[0].resting);
         assert!(root.animating(), "the endless one still wants frames");
 
-        // A pass for something else entirely must not restart the run that finished. `apply` reads
-        // the real clock while the ticks above are told a time, so what proves it is the run's own
-        // start instant and its resting flag, not the opacity a wall-clock `at` would compute.
+        // A pass for something else entirely must not restart the run that finished. What proves
+        // that is the run's own start instant: `apply` reads the real clock while the ticks above
+        // are told a time, so an opacity a wall-clock `at` would compute says nothing here.
+        //
+        // `resting` is not asserted alongside it, because a pass re-derives it against the clock
+        // it ran on rather than carrying the flag the last tick left. Under this test's two
+        // clocks those disagree -- the ticks are 250ms in, the pass is microseconds in -- while in
+        // a live shell both read the same monotonic clock and a counted sequence that is done
+        // stays done. Carrying the flag instead is what left a re-delayed sequence resting so
+        // hard that `animating` never asked for the frame that would start it.
         let began = flash.tweens[0].started;
         lua.load(r#"state("w", 10):set(20)"#).exec().unwrap();
         apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
         let flash = &scene.surface("bar@TEST").unwrap().children[0].children[1];
         assert_eq!(flash.rect.width, 20.0, "the pass did land");
-        assert!(flash.tweens[0].resting && flash.tweens[0].started == began, "the same run, still played out");
+        assert_eq!(flash.tweens[0].started, began, "the same run, not a new one");
+    }
+
+    /// A re-delayed sequence used to carry the `resting` flag its last tick left, so `animating`
+    /// never asked for the frame that would have started it and it sat on its old last frame
+    /// forever. `delay` lives on the spec beside the motion, not in it, so the run still matches
+    /// as "the same list going round again" and is carried across.
+    #[test]
+    fn a_played_out_sequence_handed_a_fresh_delay_stops_resting_and_asks_for_frames_again() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"local held = state("held", 0)
+            return panel { id = "bar", child = rect { width = 10, height = 10, opacity = 1,
+              animate = held:map(function(d)
+                  return { opacity = { duration = 100, easing = "Linear", loops = 1,
+                                       keyframes = { 1, 0 }, delay = d } }
+              end) } }"#,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let instances = [instance_at(&surface, full())];
+        let started = scene.surface("bar@TEST").unwrap().children[0].tweens[0].started;
+
+        // Play it out, then confirm it has stopped asking for frames.
+        scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(200));
+        let node = &scene.surface("bar@TEST").unwrap().children[0];
+        assert!(node.tweens[0].resting && node.opacity == 0.0, "played out and resting on its last frame");
+        assert!(!scene.surface("bar@TEST").unwrap().animating(), "a finished run wants no more frames");
+
+        // The same list, now with a lead-in in front of it: that is a run still to come.
+        lua.load(r#"state("held", 0):set(200)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let node = &scene.surface("bar@TEST").unwrap().children[0];
+        assert!(!node.tweens[0].resting, "the delay put the run back in front of the clock");
+        assert!(scene.surface("bar@TEST").unwrap().animating(), "so the surface asks for frames again");
+    }
+
+    /// The paint-only tick has to leave a tree indistinguishable from the relayout it replaces,
+    /// including the values a `text` node paints, and it has to name the instance it advanced so
+    /// the poll loop knows which surface to repaint.
+    #[test]
+    fn a_paint_only_tick_moves_the_same_values_a_relayout_would_and_names_its_instance() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local lit = state("lit", false)
+            return panel { id = "bar", child = row { width = 100, height = 20, children = {
+              rect { width = 10, height = 10,
+                     background = lit:map(function(o) return o and "#ffffff" or "#000000" end),
+                     opacity = lit:map(function(o) return o and 1 or 0.2 end),
+                     animate = { background = { duration = 100, easing = "Linear" },
+                                 opacity = { duration = 100, easing = "Linear" } } },
+              text { content = "abc", foreground = lit:map(function(o) return o and "#ffffff" or "#000000" end),
+                     animate = { foreground = { duration = 100, easing = "Linear" } } } } } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        let before = scene.surface("bar@TEST").unwrap().children[0].children[0].rect;
+        lua.load(r#"state("lit", false):set(true)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+
+        let root = scene.surface("bar@TEST").unwrap();
+        assert!(root.tick_is_paint_only(), "a colour and an opacity ask the solver nothing");
+        let started = root.children[0].children[0].tweens[0].started;
+        let instances = [instance_at(&surface, full())];
+        assert_eq!(
+            scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50)),
+            vec!["bar@TEST".to_string()],
+            "the tick names the instance it advanced"
+        );
+
+        let row = &scene.surface("bar@TEST").unwrap().children[0];
+        let (block, label) = (&row.children[0], &row.children[1]);
+        assert!((block.opacity - 0.6).abs() < 0.01, "halfway from 0.2 to 1, got {}", block.opacity);
+        let Some(PaintStyle::Box { background: Some(background), .. }) = block.paint else {
+            panic!("a rect paints a box, got {:?}", block.paint)
+        };
+        assert!((background.r - 0.5).abs() < 0.02, "halfway from black to white, got {}", background.r);
+        let Some(PaintStyle::Text { content, color, .. }) = &label.paint else {
+            panic!("a text paints text, got {:?}", label.paint)
+        };
+        assert_eq!(content, "abc", "the string it was fitted to survives a tick that never measured it");
+        assert!((color.r - 0.5).abs() < 0.02, "the label's colour moved too, got {}", color.r);
+        assert_eq!(block.rect, before, "nothing a paint-only tick writes can move a rect");
+    }
+
+    /// `width` is not paint-only, so a tree carrying one has to take the relayout path even when
+    /// every other tween in it is a colour.
+    #[test]
+    fn a_tween_the_solver_reads_keeps_the_tree_on_the_relayout_path() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r##"local wide = state("wide", false)
+            return panel { id = "bar", child = row { width = 100, height = 20, children = {
+              rect { height = 10, background = "#ffffff",
+                     width = wide:map(function(w) return w and 40 or 10 end),
+                     animate = { width = { duration = 100, easing = "Linear" } } } } } }"##,
+        );
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+        lua.load(r#"state("wide", false):set(true)"#).exec().unwrap();
+        apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+
+        let root = scene.surface("bar@TEST").unwrap();
+        assert!(!root.tick_is_paint_only(), "a width is the solver's business");
+        let started = root.children[0].children[0].tweens[0].started;
+        let instances = [instance_at(&surface, full())];
+        scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(50));
+        let block = &scene.surface("bar@TEST").unwrap().children[0].children[0];
+        assert!((block.rect.width - 25.0).abs() < 0.5, "halfway from 10 to 40, got {}", block.rect.width);
     }
 
     #[test]

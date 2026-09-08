@@ -448,10 +448,12 @@ pub fn run(
         // arrives with a push is answered by this repaint, not repeated next turn. A turn that
         // re-resolved skips the tick: the pass's `retarget` already advanced every visible tween
         // to its own instant, and the repaint asks for the next callback either way.
-        let ticked = std::mem::take(&mut app.animation_frame_due)
-            && !re_resolved
-            && app.client.tick_animations(std::time::Instant::now());
-        let re_resolved = re_resolved || ticked;
+        let ticked = if std::mem::take(&mut app.animation_frame_due) && !re_resolved {
+            app.client.tick_animations(std::time::Instant::now())
+        } else {
+            Vec::new()
+        };
+        let re_resolved = re_resolved || !ticked.is_empty();
         phases.mark_resolve();
         // Take unconditionally so a keystroke arriving with a push is covered by this repaint, not
         // repeated next turn.
@@ -468,7 +470,13 @@ pub fn run(
             app.refresh_hover_after_layout();
         }
         phases.mark_surface_state();
-        if re_resolved || typed || !landed.is_empty() {
+        // A turn that only ticked owes the screen exactly the surfaces it advanced, and `tick`
+        // just named them. Every other reason to repaint is scene-wide: a pass can change any
+        // tree, a keystroke moves a caret through `field_focus_for`, and a landed decode
+        // invalidates by file across every list that draws it.
+        if !ticked.is_empty() && !typed && landed.is_empty() {
+            app.repaint_surfaces_with_instance_ids(&ticked);
+        } else if re_resolved || typed || !landed.is_empty() {
             app.repaint_mapped_surfaces();
         }
         phases.mark_repaint();
@@ -514,7 +522,7 @@ pub fn run(
                 idle_profile::Turn {
                     dispatched,
                     re_resolved,
-                    ticked,
+                    ticked: !ticked.is_empty(),
                     typed,
                     decoded: !landed.is_empty(),
                     draws: draw_nonces.len(),
