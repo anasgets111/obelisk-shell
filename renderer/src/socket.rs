@@ -1891,6 +1891,137 @@ mod tests {
         assert!(probe::<bool>(&client.loader, setup, "same"), "the joined path is the identity");
     }
 
+    #[test]
+    fn a_declared_session_process_declares_the_name_and_the_stop_signal_the_config_chose() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+
+        client
+            .loader
+            .lua()
+            .load(r#"rec = session_process { name = "screen-recorder", stop_signal = "INT" }"#)
+            .exec()
+            .unwrap();
+
+        let RendererFrame::Command(envelope) = queued_frame(&mut outbound_rx) else {
+            panic!("declaring a session process must queue a RendererFrame::Command");
+        };
+        assert_eq!(envelope.params.capability, "processes");
+        assert_eq!(envelope.params.action, "declare");
+        assert_eq!(envelope.params.arguments, vec![serde_json::json!("screen-recorder"), serde_json::json!("INT")]);
+    }
+
+    #[test]
+    fn a_session_processs_fields_read_what_the_supervisor_pushed_for_that_name() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+        client.loader.lua().load(r#"rec = session_process { name = "recorder" }"#).exec().unwrap();
+
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "processes".to_string(),
+                revision: 1,
+                payload: serde_json::json!({
+                    "sessions": {
+                        "recorder": { "running": true, "pid": 4321, "started_at": 1700000000,
+                                      "exit_code": null, "start_error": "" }
+                    }
+                }),
+            })
+            .unwrap();
+
+        let setup = r#"
+            running = rec.running:get()
+            pid = rec.pid:get()
+            started = rec.started_at:get()
+            code = rec.exit_code:get()
+        "#;
+        assert!(probe::<bool>(&client.loader, setup, "running"));
+        assert_eq!(probe::<i64>(&client.loader, setup, "pid"), 4321);
+        assert_eq!(probe::<i64>(&client.loader, setup, "started"), 1_700_000_000);
+        assert_eq!(
+            probe::<Option<i64>>(&client.loader, setup, "code"),
+            None,
+            "a run still going has no exit status, and nil is what a config must be able to test"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_names_fields_read_nil_rather_than_a_stopped_program() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+        client.loader.lua().load(r#"rec = session_process { name = "recorder" }"#).exec().unwrap();
+
+        client
+            .apply_state_snapshot(StateSnapshot {
+                capability: "processes".to_string(),
+                revision: 1,
+                payload: serde_json::json!({ "sessions": {} }),
+            })
+            .unwrap();
+
+        assert_eq!(
+            probe::<Option<bool>>(&client.loader, "running = rec.running:get()", "running"),
+            None,
+            "before the Supervisor has answered, `running` is unknown rather than false"
+        );
+    }
+
+    #[test]
+    fn a_session_processs_methods_name_the_program_the_declaration_did() {
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, mut outbound_rx) = test_client(&missing);
+        client.loader.lua().load(r#"rec = session_process { name = "recorder" }"#).exec().unwrap();
+        let _declare = queued_frame(&mut outbound_rx);
+
+        client
+            .loader
+            .lua()
+            .load(
+                r#"
+                rec:start("gpu-screen-recorder", { "-w", "DP-1" })
+                rec:signal("USR2")
+                rec:stop()
+            "#,
+            )
+            .exec()
+            .unwrap();
+
+        let actions: Vec<(String, Vec<serde_json::Value>)> = (0..3)
+            .map(|_| match queued_frame(&mut outbound_rx) {
+                RendererFrame::Command(envelope) => (envelope.params.action, envelope.params.arguments),
+                other => panic!("a session-process method must queue a Command, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(actions[0].0, "start");
+        assert_eq!(
+            actions[0].1,
+            vec![
+                serde_json::json!("recorder"),
+                serde_json::json!("gpu-screen-recorder"),
+                serde_json::json!(["-w", "DP-1"])
+            ]
+        );
+        assert_eq!(actions[1], ("signal".to_string(), vec![serde_json::json!("recorder"), serde_json::json!("USR2")]));
+        assert_eq!(actions[2], ("stop".to_string(), vec![serde_json::json!("recorder")]));
+    }
+
+    #[test]
+    fn two_declarations_of_one_program_are_one_handle() {
+        // The same reason `persistent_table` caches: a module and `shell.lua` may both declare it,
+        // and in-place reload reruns both. Two handles would mean two sets of field signals, one of
+        // them stale.
+        let missing = std::path::PathBuf::from("/no/such/shell.lua");
+        let (client, _outbound_rx) = test_client(&missing);
+
+        let setup = r#"
+            first = session_process { name = "recorder" }
+            second = session_process { name = "recorder", stop_signal = "INT" }
+            same = rawequal(first, second)
+        "#;
+        assert!(probe::<bool>(&client.loader, setup, "same"), "the declared name is the identity");
+    }
+
     /// A config `on_click` invoking lock queues a real § 7 envelope.
     #[test]
     fn a_config_calling_the_lock_action_queues_a_command_for_the_supervisor() {

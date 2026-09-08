@@ -208,6 +208,14 @@
 ---three "who" lists identical.
 ---@field app_name string Process name from its PipeWire node, then `/proc/<pid>/comm`, then `"pid 1234"`; never empty.
 
+---@class SessionProcess
+---One declared program: its current run, or what is left of its last one.
+---@field exit_code? integer How the last finished run ended: its exit status, `nil` while running, before the first run, or when a signal ended it rather than an exit. Cleared by the next `start`.
+---@field pid? integer Its process id, which is also its process group. `nil` until the first `start`, and kept after an exit so a log line can still name what died.
+---@field running boolean Whether it is up now. Every field below describes the current run while this is true, and the finished one while it is false.
+---@field start_error string Why the last `start` produced no process at all -- a command that is not on `PATH`, most often. Empty when it spawned, and cleared by the next `start`. Without this a config waiting on `running` would wait forever with the reason only in the Supervisor's stderr.
+---@field started_at? integer Unix seconds when the current or last run began; `nil` until the first `start`. Elapsed time is this subtracted from `oblisk.system`'s clock, so nothing here needs a second timer.
+
 ---@class SpecialWorkspace
 ---One special workspace (ADR-0119), identified by `name`, the argument to
 ---`workspaces:toggle_special(name)`; Hyprland uses names and negative ids.
@@ -300,6 +308,10 @@
 ---`oblisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
 ---`oblisk.files.folders[folder]` reads back with the string the config wrote.
 ---@field folders table<string, Folder> One entry per active `files:watch(path)`, keyed by `path` with trailing slashes stripped. Absent until watched, so an unrequested folder is not an empty list.
+
+---@class ProcessesState
+---`oblisk.processes`'s payload.
+---@field sessions table<string, SessionProcess> One entry per name a config declared with `session_process`, keyed by that name. A name nothing declared is absent rather than stopped, so a typo reads `nil` instead of quietly looking like a program that never starts.
 
 ---@class KeyboardState
 ---`oblisk.keyboard`'s combined payload. `backlight_pct` is `-1` without keyboard-backlight
@@ -446,6 +458,9 @@ local BatteryCapability = {}
 ---@class FilesCapability: Capability<FilesState>
 ---@field invoke fun(self: FilesCapability, command: "watch"|"unwatch", ...: any)
 
+---@class ProcessesCapability: Capability<ProcessesState>
+---@field invoke fun(self: ProcessesCapability, command: "declare"|"start"|"signal"|"stop", ...: any)
+
 ---@class KeyboardCapability: Capability<KeyboardState>
 ---@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
 
@@ -537,6 +552,7 @@ local SystemCapability = {}
 ---@field files FilesCapability The files in each folder a config asked to watch, kept current through inotify.
 ---@field storage StorageCapability Every JSON file a config declared with `persistent_table`, keyed by its absolute path.
 ---@field idle IdleCapability Whether anything is holding the session awake, and which application it is. Its thresholds and the inhibit pair are methods on the same member.
+---@field processes ProcessesCapability Every long-running program a config declared with `session_process`: whether it is up, since when, and how the last run ended.
 ---@field screens Signal<Screen[]> Renderer-sourced, seeded to an empty list, and the one signal with a value at first evaluation (ADR-0041).
 ---@field rescue Signal<RescueState> Renderer-sourced, no commands (ADR-0046).
 ---@field version ObliskVersion Three integers a config can compare. Not a signal.

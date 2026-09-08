@@ -162,6 +162,17 @@ Generation retirement and Supervisor shutdown reap managed children using SIGTER
 before SIGKILL. In-place reload preserves the generation without restarting processes.
 See [process registry](../supervisor/src/process/registry.rs).
 
+`session_process` declares the other lifetime. Those programs are held by `oblisk.processes` rather
+than by a generation, so the retirement sweep never sees them; they survive every reload and are
+reaped only at shutdown, with the signal each declaration named and a five-second grace before
+SIGKILL. The longer grace is deliberate: a program is declared this way because it is doing
+something long, and the first one to use it writes a video container it has to close on the way out.
+
+One task per running program owns its `Child` and is the only place its pid is signalled, so no
+signal can reach a recycled pid. That is what replaces the pid-plus-kernel-start-time bookkeeping a
+config would otherwise need to re-find a program it had to orphan.
+See [session processes](../supervisor/src/capabilities/processes/controller.rs).
+
 ## 11. Other capabilities
 
 | Capability | Source / responsibility |
@@ -173,6 +184,7 @@ See [process registry](../supervisor/src/process/registry.rs).
 | `applications` | Desktop entry indexing, app launching and URL opening |
 | `updates` | Package-manager checking and install progress via backend trait |
 | `files` | Config-requested directory listings followed through inotify |
+| `processes` | Programs declared with `session_process`, owned across generation swaps |
 
 See [capability registry](../supervisor/src/capabilities/mod.rs).
 

@@ -57,6 +57,11 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             Some(schema_for!(crate::capabilities::files::FilesAction)),
         ),
         (
+            "processes",
+            schema_for!(crate::capabilities::processes::controller::ProcessesState),
+            Some(schema_for!(crate::capabilities::processes::ProcessesAction)),
+        ),
+        (
             "keyboard",
             schema_for!(crate::capabilities::keyboard::controller::KeyboardState),
             Some(schema_for!(crate::capabilities::keyboard::KeyboardAction)),

@@ -35,6 +35,7 @@ use network::{NetworkController, NetworkSignal};
 use notifications::{NotificationsController, NotificationsSignal};
 use power::{PowerController, PowerSignal};
 use privacy::{PrivacyController, PrivacySignal};
+use processes::{ProcessesController, ProcessesSignal};
 use storage::{StorageController, StorageSignal};
 use sysinfo::{SysinfoController, SysinfoSignal};
 use system::{SystemController, SystemSignal};
@@ -57,6 +58,7 @@ pub mod notifications;
 pub mod polkit;
 pub mod power;
 pub mod privacy;
+pub mod processes;
 pub mod scale;
 mod shm_icons;
 pub mod storage;
@@ -115,6 +117,7 @@ pub enum Signal {
     Applications,
     Files,
     Storage,
+    Processes,
     System,
     Privacy,
     Updates,
@@ -210,6 +213,7 @@ capability_channels! {
             Some(ApplicationsSignal::Changed) => Signal::Applications;
         Files => files: FilesSignal, Some(FilesSignal::Changed) => Signal::Files;
         Storage => storage: StorageSignal, Some(StorageSignal::Changed) => Signal::Storage;
+        Processes => processes: ProcessesSignal, Some(ProcessesSignal::Changed) => Signal::Processes;
             // `idle/controller.rs`'s inhibitor watch owns and sends state, like `Audio` (ADR-0141).
         Idle => idle: IdleState, Some(state) => Signal::Idle(state);
     }
@@ -238,6 +242,7 @@ pub struct Capabilities {
     applications: Option<ApplicationsController>,
     files: Option<FilesController>,
     storage: Option<StorageController>,
+    processes: Option<ProcessesController>,
     audio: Option<audio::mixer::AudioCommandSender>,
     idle: Option<IdleController>,
 
@@ -283,6 +288,7 @@ impl Capabilities {
             applications: None,
             files: None,
             storage: None,
+            processes: None,
             audio: None,
             idle: None,
             senders,
@@ -293,6 +299,19 @@ impl Capabilities {
             privacy_sources: Some(privacy_sources),
         };
         (capabilities, signals)
+    }
+
+    /// Stops every program declared with `session_process` and waits for it, the session-lifetime
+    /// counterpart to `reap_all_processes`. A no-op on most shutdowns: the controller exists only
+    /// once a config has read `oblisk.processes`.
+    ///
+    /// Awaited rather than dropped because these are the processes whose exit path was worth
+    /// declaring a signal for; a shell that exits without giving them theirs is the reason the
+    /// signal is configurable.
+    pub async fn reap_sessions(&self) {
+        if let Some(processes) = &self.processes {
+            processes.reap_all().await;
+        }
     }
 
     /// Live `idle` controller for resetting generation threshold registrations on reload
@@ -479,6 +498,12 @@ impl Capabilities {
                     self.storage = Some(StorageController::new(self.senders.storage.clone()));
                 }
             }
+            // `session_process` declares on demand, the way `persistent_table` opens storage.
+            Capability::Processes => {
+                if self.processes.is_none() {
+                    self.processes = Some(ProcessesController::new(self.senders.processes.clone()));
+                }
+            }
             Capability::Audio => self.ensure_mixer_thread(),
             // On the roster since ADR-0141. Push immediately after lazy start because a quiet
             // inhibitor watch may never speak.
@@ -608,6 +633,12 @@ impl Capabilities {
                     push!(Capability::Storage, &storage.snapshot());
                 }
             }
+            // Every declare, start, signal answered, and exit noticed.
+            Signal::Processes => {
+                if let Some(processes) = &self.processes {
+                    push!(Capability::Processes, &processes.snapshot());
+                }
+            }
             // Only timer-driven capability: once per wall-clock second when epoch changes
             // (ADR-0053 decision 2).
             Signal::System => {
@@ -658,6 +689,7 @@ impl Capabilities {
             Capability::Applications => to!(self.applications, applications::dispatch),
             Capability::Files => to!(self.files, files::dispatch),
             Capability::Storage => to!(self.storage, storage::dispatch),
+            Capability::Processes => to!(self.processes, processes::dispatch),
             Capability::Audio => to!(self.audio, audio::dispatch),
             Capability::Idle => to!(self.idle, idle::dispatch),
             Capability::Lock => lock::dispatch(lock, envelope),

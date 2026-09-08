@@ -75,6 +75,7 @@ roster! {
     Files => "files", "The files in each folder a config asked to watch, kept current through inotify.",
     Storage => "storage", "Every JSON file a config declared with `persistent_table`, keyed by its absolute path.",
     Idle => "idle", "Whether anything is holding the session awake, and which application it is. Its thresholds and the inhibit pair are methods on the same member.",
+    Processes => "processes", "Every long-running program a config declared with `session_process`: whether it is up, since when, and how the last run ended.",
 }
 
 impl Capability {
@@ -733,7 +734,7 @@ mod capability_tests {
     fn every_entry_round_trips_through_its_name() {
         // One `roster!` list makes omission from `ALL` or `as_str` unrepresentable; this pins
         // `from_name` agreeing with the two wire-facing matches.
-        assert_eq!(Capability::ALL.len(), 21, "a variant was added or removed; check every iterator over ALL");
+        assert_eq!(Capability::ALL.len(), 22, "a variant was added or removed; check every iterator over ALL");
         for capability in Capability::ALL {
             assert_eq!(Capability::from_name(capability.as_str()), Some(*capability));
         }
@@ -760,8 +761,12 @@ mod capability_tests {
 
     #[test]
     fn a_name_that_is_not_on_the_roster_resolves_to_nothing() {
-        // `process` is command-addressable, not a capability, and never starts.
+        // `process` is command-addressable, not a capability, and never starts. It sits one
+        // letter from `processes`, which is a capability, and the two route through different
+        // arms of `main.rs`; a config's `process.run` reaching the session-process controller
+        // would spawn something nothing reaps per generation.
         assert_eq!(Capability::from_name("process"), None);
+        assert_eq!(Capability::from_name("processes"), Some(Capability::Processes));
         assert_eq!(Capability::from_name("screens"), None);
         assert_eq!(Capability::from_name(""), None);
         assert_eq!(Capability::from_name("Audio"), None);

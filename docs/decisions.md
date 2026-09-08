@@ -3604,3 +3604,184 @@ optional rather than load-bearing, since a duplicate id can no longer reach conf
 
 Still open: `StatusNotifierItemUnregistered` is declared and never emitted. Nothing consumes our
 watcher's signals but us, and the registry drops the entry on `NameOwnerChanged` regardless.
+
+## 0173. The notifications panel is the shell's status sheet, not a feed
+
+`NotificationHistoryPanel.qml` opens with three things above its masthead: `WeatherWidget`, then
+`SystemInfoWidget`, and only then the bell, the summary line and the list. Ours had the masthead and
+the list. Two thirds of the panel were missing, and the readout that should have been at the top of
+it was instead a two-glyph pill inside the settings toplevel -- a window the mirror does not have.
+
+Restored:
+
+1. `SystemInfoWidget` is a factory (`modules/bar/indicators/system_info.lua`), instantiated by
+   `modules/bar/panels/notification_history.lua` where the mirror instantiates it. Each instance
+   names its own `expanded` state, which is what QML gets for free from instantiation. The settings
+   toplevel does not take a second instance: the same numbers in two places is what this ADR is
+   removing, not something to reproduce. That window stays, thin, because it is the config's only
+   `window {}` and so the only exercise of § 6's toplevel.
+2. `Components/InfoBadge.qml` became `components/info_badge.lua` and carries the header's urgent
+   count. `bluetooth_panel.lua` had already written the same capsule as a local `battery_badge`;
+   that was the second call site the extraction rule wants, and the mirror had made it a shared
+   component for six.
+
+### What is absent, and why absent beats faked
+
+The mirror's `SystemInfoService` shells out for GPU load, per-disk usage, uptime and boot time.
+§ 2.12 is `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu` -- "CPU, memory
+and temperatures", exactly as the capability table names it, and nothing here proposes to grow it.
+So the GPU usage tile, the disk rows and the uptime footer have no data and are not drawn. Their
+space is spent on what § 2.12 does push: swap as the memory tile's second line, where the mirror
+prints `used / total`, and the GPU's temperature where the GPU tile stood -- already conditional in
+the mirror (`visible: gpuTemp > 0`), and `temp_gpu` is `-1` with no sensor, so one test covers both.
+The collapsed summary is `CPU`/`RAM`/`SWAP` where the mirror's is `CPU`/`RAM`/`GPU`/`DISK`.
+
+`temp_cores` is one entry per hwmon sensor rather than per core, and the mirror's single `cpuTemp`
+is a package figure. The tile shows the hottest sensor: a mean over a list that may include a
+chipset probe reads cooler than any core actually is.
+
+### Polling has no off switch here
+
+The mirror ref-counts `SystemInfoService.refCount` from the widget's `active`, so the pollers only
+run while the panel is open. § 2.12's `configure` sets an interval and nothing else -- zero stops a
+poller for every reader, not for one widget -- so the choice is polling always or polling never.
+Two `/proc` reads every couple of seconds is the cheaper mistake, and `temp_interval` now rides with
+RAM at 5s because a tile's second line is not a number anyone watches move.
+
+### An unrelated swap this uncovered
+
+`config/icons.lua` had `cpu` and `ram` the wrong way round: F035B is the square processor with pins
+and F061A the DIMM stick, and `SystemInfoWidget.qml` uses them that way. The old system readout
+labelled a memory module "CPU". Nothing else referenced either name.
+
+### Still a deviation
+
+`DateTimeDisplay.qml` opens the notifications panel from the whole clock and hangs `MinimalCalendar`
+off its hover tooltip. Here the bell opens the panel and the clock opens the calendar as a panel of
+its own, because a hover-revealed calendar cannot be exercised in this session at all. The panel's
+contents now match; its opener does not.
+
+## 0174. The clock is one control, and the calendar is a tooltip
+
+`DateTimeDisplay.qml` is a `Rectangle`, a `Row` holding the bell and the clock, and one `MouseArea`
+filling the whole thing whose click opens the notifications panel. The calendar is not a panel at
+all: `MinimalCalendar` hangs off the same item's hover tooltip, under the weather description.
+
+Ours had split the control down the middle -- bell to history, date to a calendar panel of its own.
+So the bar's one always-visible readout opened a month grid half the time, and the panel that
+carries the system readout, the greeting and the feed was reachable only by hitting a glyph two
+characters wide.
+
+Now: one `button` over the pill, opening `notification_history`, with `MinimalCalendar` moved into
+`date_time.lua`'s tooltip and dropped from `panel_host.lua`'s list. The pill also takes the mirror's
+third state, `border.color: panelOpen ? activeColor : ...`, so it rings while its own panel is up.
+
+### Tooltips stand down while a panel is open
+
+The mirror gates this item's tooltip on `mouseArea.containsMouse && !panelOpen`. That gate is now in
+`components/tooltip.lua`, so it covers all seven slots that use it, and on any panel rather than the
+hovering indicator's own: the panel card hangs directly under the bar, so a tooltip opening into
+that space is a second sheet over the one just asked for, whichever indicator opened it.
+
+`MinimalCalendar` is sized by its month, not padded to a fixed six weeks: `rowCount:
+Math.ceil((firstDayOffset + daysInMonth) / 7)` is four to six, and a fixed six drew a row of seven
+blank cells under September 2026. A `popup` surface is sized explicitly (§ 6), so the height is a
+`Bound` -- which is why § 6 takes `integer|Bound` there -- and the tooltip's own height follows it.
+Its vertical padding is `spacing.md` rather than the shared `xs`, per-tip because the one- and
+two-line tips have their `xs` already counted into a fixed height and widening it for all of them
+would squeeze their text.
+
+The panel card took the same number on every edge. `NotificationHistoryPanel.qml` is
+`readonly property int padding: Theme.spacingMd` with `anchors.margins: root.padding`, sizing itself
+as `contentColumn.implicitHeight + padding * 2`; `panel_card`'s default is `sm` top and bottom
+against `md` left and right, so every panel's first line -- the greeting here, a section heading
+elsewhere -- sat on the card's top edge. `panel_host.lua` now names the padding once and derives
+`CARD_CHROME` from it, since the card's animated height is a number rather than its content.
+
+### Twelve-hour, decided rather than derived
+
+`TimeService.qml` asks `Qt.locale().timeFormat(Locale.ShortFormat)` whether an `AP` marker is
+present and picks `HH:mm` or `hh:mm AP` from the answer. A config has `os.date` and no locale to
+ask, so the format is chosen here: `%I:%M %p` on the bar and in the tooltip's seconds line.
+
+### A greeting the mirror does not have
+
+The notifications panel opens with the account's full name and `Tuesday 08th of September 2026
+03:11 PM` above the system readout. `NotificationHistoryPanel.qml` has neither. It is 420px of
+sheet hanging off the bar and reads as a sidebar; a sidebar that never says whose session it is,
+and abbreviates the date to `Tue 08 Sep` because the bar pill is narrow, was the gap. The bar keeps
+the abbreviation; the panel has room to spell it out.
+
+Reading the name meant `modules/global/lock.lua`'s identity block -- `getent passwd` for GECOS,
+`uname -n` for the host -- moving to `lib/identity.lua`. Two readers is the extraction rule, and it
+matters more than usual here: the guard that stops a reload spawning more processes is a `state`,
+so the two subprocesses must run once for the session rather than once per module that asks.
+
+
+## 0175. A process the user would notice stopping belongs to the session, not the generation
+
+`process.run` gives a config one lifetime: the child belongs to the generation that spawned it, and
+`reap_generations_processes` kills its group on every swap. That is right for a helper that answers
+a question and exits, and wrong for anything the user would notice stopping. A screen recorder is
+the case that forced this, and the mirror shows what the wrong lifetime costs.
+
+`Services/SystemInfo/ScreenRecordingService.qml` is 223 lines, and about 180 of them are one
+workaround. Because Quickshell replaces its singletons on reload, the recorder has to be orphaned
+rather than held: a 900-character `sh` script backgrounds `gpu-screen-recorder`, reads
+`/proc/$pid/exe` to check the right binary came up, reads field 22 of `/proc/$pid/stat` for the
+kernel start time, and writes pid, start time, path and launch epoch to a lock file. Every later
+signal re-runs that probe first, because a pid alone can name a process that has already been
+recycled. A two-second `Timer` polls the same probe to notice a crash. `PersistentProperties` and
+the lock file's launch epoch between them reconstruct elapsed time, disagreeing about paused
+seconds depending on which one survived.
+
+None of that is about recording. It is the cost of the owner dying while the owned keeps running.
+
+Copying it was the obvious move -- it is the mirror's own design, it works on this machine, and
+`setsid` is enough to escape our `killpg` where Quickshell needed nothing. What decided against it
+is that the Supervisor does not restart on a config edit. It already holds a `Child` for every
+`process.run`. The workaround exists to answer "is that still my process?", and the Supervisor never
+has to ask.
+
+1. **`oblisk.processes` is a roster capability, and `session_process { name, stop_signal }` is its
+   declaration.** Exactly the `oblisk.storage`/`persistent_table` pair in shape: the config names the
+   thing, the Supervisor owns what sits behind it, and state comes back keyed by that name. It is
+   that pair's opposite in what it holds -- `storage` keeps a file the config could have read
+   itself, this keeps a handle the config *cannot* hold.
+
+   Not an option on `process.run`. A `detached = true` flag spawns something whose exit reports to
+   callbacks in a VM that no longer exists, and hands back a handle nothing can re-find. Detachment
+   without an owner is the workaround with a nicer spelling.
+
+2. **One task per running program owns its `Child` and is the only place its pid is signalled.**
+   `supervise` selects between `child.wait()` -- cancel-safe, so it re-arms after each request --
+   and a request channel. Every signal is therefore sent by the task that has not yet reaped the
+   process, so the kernel still reserves that pid and it cannot have been recycled underneath.
+   Keeping a pid in the controller's map and signalling from there would have reopened the exact
+   window the start-time check exists to cover.
+
+3. **The stop signal is declared, and shutdown uses it.** `SIGTERM` is the default and wrong for the
+   first program that will use this: `gpu-screen-recorder` finalises its container on `SIGINT`, and
+   a reap that skips that step leaves an unplayable file. The grace is five seconds rather than
+   § 10's 100 ms for the same reason -- a program is declared this way because it is doing something
+   long, and closing it out takes longer than closing a helper that had nothing to finish.
+
+4. **stdio is inherited, not piped.** A session process outlives the generation that started it, so
+   there is no callback left for its output to reach. Piping it would mean either dropping the lines
+   or inventing an owner for them across generations; the shell's own log is the honest destination,
+   and a config that wants a program's output wants `process.run`.
+
+5. **`start_error` is state, not just a log line.** A config waits on `running`. A command that is
+   not on `PATH` never sets it, and without a readable reason that is indistinguishable from a slow
+   start -- a spinner that never resolves, with the explanation only in the Supervisor's stderr.
+
+6. **`start` on an undeclared name is refused rather than creating one.** Declaring is what makes a
+   name exist, so a typo reads `nil` instead of looking like a program that never manages to start.
+
+The wire name is `processes`, one letter from the existing off-roster `process`, and the two route
+through different arms of `main.rs`. A test pins both: `from_name("process")` is still `None`, and
+`from_name("processes")` resolves.
+
+What this deletes from the config that has yet to be written: the launch script, the lock file, the
+`/proc` probe, the liveness poll, the restore-on-restart path, and the split elapsed-time
+accounting. What replaces them is `rec.running` and `rec.started_at`.

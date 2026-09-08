@@ -537,6 +537,9 @@ impl Supervisor {
             );
         }
         reap_all_processes(&mut self.processes).await;
+        // Session processes are not in `self.processes`: they outlive generations by design, so
+        // the per-generation sweep never sees them and this is their only reap.
+        self.capabilities.reap_sessions().await;
     }
 
     /// Hands out unique generation ids for interleaved replacements and swaps.

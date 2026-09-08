@@ -50,6 +50,56 @@ function ProcessHandle:kill() end
 ---@return ProcessHandle # Live immediately. The process is already running when this returns.
 function process.run(cmd, args, out_cb, exit_cb) end
 
+---@class SessionProcessHandle
+---One program declared with [`session_process`]. Every field is a signal over this program's entry
+---in `oblisk.processes`, and the three methods are the only ways to move it: there is no handle to
+---hold, because holding one is exactly what a config cannot do across a reload.
+---@field running Signal<boolean> Whether it is up now. The other fields describe the current run while this is true and the finished one while it is false.
+---@field pid Signal<integer?> Its process id, which is also its process group. `nil` until the first `start`, and kept after an exit.
+---@field started_at Signal<integer?> Unix seconds when the current or last run began. Subtract it from `oblisk.system`'s clock for elapsed time; nothing here needs a second timer.
+---@field exit_code Signal<integer?> How the last finished run ended. `nil` while running, before the first run, and when a signal ended it rather than an exit.
+---@field start_error Signal<string> Why the last `start` produced no process -- usually a command that is not on `PATH`. Empty when it spawned. Without reading this, a config waiting on `running` waits forever.
+local SessionProcessHandle = {}
+
+---Runs the program, replacing whatever the last run left behind.
+---
+---A name already running is left alone rather than started twice; `running` says which case this
+---was. Nothing is returned: the outcome arrives as state, like every other capability
+---(docs/oblisk-idl-api-specs.md § 3).
+---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
+---@param args? string[] One element per argument, already split. Omitted means a bare command.
+function SessionProcessHandle:start(cmd, args) end
+
+---Sends one signal to the program itself, not its group: a pause belongs to the program that was
+---named, not to helpers it happened to spawn.
+---
+---Silently does nothing when it is not running, because acting on state one push old is ordinary.
+---@param signal "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT" Named without its `SIG` prefix. An unknown name is refused rather than guessed at.
+function SessionProcessHandle:signal(signal) end
+
+---Asks the program's whole group to stop with the signal its declaration named, escalating to
+---`SIGKILL` five seconds later. Session shutdown does the same thing to every declared program.
+function SessionProcessHandle:stop() end
+
+---Declares a program whose lifetime is the session's rather than this generation's.
+---
+---[`process.run`]'s child belongs to the generation that spawned it: a config edit that changes
+---topology swaps generations, and the swap reaps that child's process group. Right for a helper
+---that answers a question and exits, wrong for anything the user would notice stopping -- a
+---recorder mid-file, a stream a widget is reading. This declares the second kind. The Supervisor
+---holds it, does not restart on a config edit, and answers for it in `oblisk.processes`.
+---
+---What is given up in exchange is output: stdio is inherited rather than piped, because a program
+---that outlives the generation that started it has no callback left to deliver a line to. A config
+---that wants a program's output wants `process.run`.
+---
+---Re-declaring a name returns the same handle and keeps a running program running, so this call
+---belongs at a module's top level. Only `stop_signal` is re-read, which is what lets that be
+---edited without stopping anything.
+---@param spec { name: string, stop_signal?: "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT" } `name` keys the program in `oblisk.processes`; `stop_signal` is how it wants to be asked to finish, `"TERM"` by default. A program that writes a file it has to close on the way out says so here.
+---@return SessionProcessHandle # The same handle for every declaration of one name.
+function session_process(spec) end
+
 ---@class oslib
 ---The four `os` calls ADR-0048 keeps read process-local state without a waiting syscall. The rest,
 ---including `os.execute` and `os.remove`, is gone: the 5ms CPU cap counts instructions; a thread

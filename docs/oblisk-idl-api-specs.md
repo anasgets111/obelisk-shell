@@ -77,6 +77,7 @@ for the Supervisor's lifetime. These links lead to the actual serialized state d
 | `applications` | [Desktop entries and app-ID index](../supervisor/src/capabilities/applications/controller.rs) |
 | `files` | [Watched directory listings](../supervisor/src/capabilities/files/controller.rs) |
 | `storage` | [Declared JSON files](../supervisor/src/capabilities/storage/controller.rs) |
+| `processes` | [Declared session processes](../supervisor/src/capabilities/processes/controller.rs) |
 | `privacy` | [Camera, microphone and screencast users](../supervisor/src/capabilities/privacy/controller.rs) |
 | `idle` | [Inhibition and external holders](../supervisor/src/capabilities/idle/state.rs) |
 | `lock` | [Lock/authentication state](../supervisor/src/capabilities/lock/mod.rs) |
@@ -118,6 +119,7 @@ Positional arguments validated by capability dispatch. Read-only capabilities ha
 | `applications` | `refresh()`, `launch(id)`, `open_url(url)` |
 | `files` | `watch(path, extensions?)`, `unwatch(path)` |
 | `sysinfo` | `configure({ cpu_interval?, ram_interval?, temp_interval? })` |
+| `processes` | `declare(name, stop_signal?)`, `start(name, cmd, args?)`, `signal(name, signal)`, `stop(name)` |
 | `updates` | `check()`, `configure({ interval, checked_at?, packages? })`, `install()` |
 | `power` | `set_profile(name)` |
 | `tray` | `activate(id, x, y)`, `secondary_activate(id, x, y)`, `scroll(id, delta, orientation)`, `menu_will_show(id, submenu_id)`, `activate_menu_item(id, menu_item_id)` |
@@ -128,6 +130,8 @@ Device, player, app, tray and notification targets use snapshot IDs.
 Volumes use 0–1; percentages use 0–100; layout indices are zero-based.
 MPRIS commands accept `play`, `pause`, `play_pause`, `next`, `previous`; seeks take microseconds.
 File watches take an absolute directory path and optional dot-free extensions.
+Session-process signals are named without their `SIG` prefix, from a closed list:
+`TERM`, `INT`, `HUP`, `QUIT`, `USR1`, `USR2`, `KILL`, `STOP`, `CONT`.
 Authentication for `lock` and `polkit` uses native secure submission instead of action arguments.
 
 ### 3.3 Dedicated APIs
@@ -139,8 +143,17 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
+| `session_process { name, stop_signal? }` | Declares a program whose lifetime is the session's; returns a handle with `running`/`pid`/`started_at`/`exit_code`/`start_error` signals and `start`/`signal`/`stop` methods |
 
-See [idle wrapper](../renderer/src/lua/idle.rs), [store wrapper](../renderer/src/lua/store.rs) and [process API](../renderer/src/lua/process.rs).
+See [idle wrapper](../renderer/src/lua/idle.rs), [store wrapper](../renderer/src/lua/store.rs),
+[session-process wrapper](../renderer/src/lua/session_process.rs) and [process API](../renderer/src/lua/process.rs).
+
+`process.run` and `session_process` differ in lifetime, not in what they can launch. A
+`process.run` child belongs to the generation that spawned it and its group is reaped on a
+generation swap; a session process is held by the Supervisor, survives every reload, and is
+reaped only at shutdown. In exchange a session process has no output callbacks -- its stdio is
+inherited -- because the evaluation that started it is gone by the time most of its output
+arrives.
 Persistence debounce and process group reaping belong to [services](oblisk-supervisor-services-dbus.md).
 
 ## 4. Surface lifecycle

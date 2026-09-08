@@ -11,6 +11,7 @@ pub mod marshal;
 pub mod namespace;
 pub mod nodes;
 pub mod process;
+pub mod session_process;
 pub mod signal;
 pub mod store;
 pub mod surfaces;
@@ -126,6 +127,7 @@ impl Loader {
         fonts::register(&lua)?;
         signal::register(&lua, dirty)?;
         store::register(&lua)?;
+        session_process::register(&lua)?;
         let standard_modules = loaded_module_names(&lua)?;
         Ok(Loader { lua, standard_modules, idle: RefCell::new(None) })
     }
