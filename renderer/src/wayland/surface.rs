@@ -159,6 +159,24 @@ pub(super) struct TrackedSurface {
     /// landed, and unpinned everything again.
     pub(super) stale: bool,
 }
+/// Which surfaces a narrowed repaint must cover: the ones a tick advanced, plus every surface
+/// already marked `stale`.
+///
+/// Pure so the narrowing is testable -- `TrackedSurface` holds Wayland objects no test can build,
+/// and this is the part that was wrong. `stale` means a surface differs for a reason its tree
+/// cannot show, so a repaint chosen by tree identity alone passes it over: a decode refused for
+/// pool capacity armed a frame callback, ticked nothing, and was narrowed straight back out
+/// (ADR-0185).
+fn narrowed_repaint_targets(ticked: &[String], stale: &[String]) -> Vec<String> {
+    let mut targets = ticked.to_vec();
+    for id in stale {
+        if !targets.iter().any(|target| target == id) {
+            targets.push(id.clone());
+        }
+    }
+    targets
+}
+
 /// Initial § 5.1 `visible`, with a role-aware fallback when startup apply has no tree
 /// (`Scene::apply` rolled back): panels default visible to keep the shell up, painting nothing
 /// until the next re-resolve; windows/popups default hidden (ADR-0049 decision 1), and locks have
@@ -755,6 +773,9 @@ impl App {
                 animating |= self.client.scene().surface(&surface_id).is_some_and(layout::ResolvedNode::animating);
             }
         }
+        // Straight after this surface's `execute` and before any other paint runs, which is what
+        // scopes a cache-wide flag to the surface that earned it (ADR-0185).
+        let deferred = self.image_cache.take_deferred();
 
         // Before the swap, which is the commit it has to precede. Requested only while a tween is
         // running, so an idle shell arms nothing and the loop's timeout-free poll stays that way
@@ -770,7 +791,11 @@ impl App {
         // Record only after swap; otherwise an unpresented frame could make the next identical list
         // skip the paint the screen never received.
         self.surfaces[index].last_painted = Some(((width, height), list));
-        self.surfaces[index].stale = false;
+        // A request turned away for pool capacity recorded no slot, so asking again is the whole
+        // retry -- and only a repaint asks. Staying `stale` is what stops the next turn skipping
+        // this surface on an unchanged list, and `repaint_mapped_surfaces_where` is what stops a
+        // narrowed repaint passing it over (ADR-0185).
+        self.surfaces[index].stale = deferred;
         self.surfaces_drawn += 1;
         // Images absent from every current list are idle (ADR-0123); queue eviction for the next
         // paint.
@@ -804,14 +829,29 @@ impl App {
         self.repaint_mapped_surfaces_where(|_| true);
     }
 
-    /// The surfaces a tween tick just advanced, by the instance ids `Scene::tick` returned.
+    /// The surfaces a tween tick just advanced, by the instance ids `Scene::tick` returned, plus
+    /// any surface already marked `stale`.
     ///
     /// A tick changes only the trees it names, so the others would each build a display list and
     /// have it rejected as equal to the one they last painted. That build is not free: a text draw
     /// copies its content and style runs, an image or icon its name. This is the same repaint,
     /// asked of the surfaces that can actually differ.
+    ///
+    /// `stale` is exactly the flag that says a surface differs for a reason its tree cannot show
+    /// -- a decode turned away for capacity, whose retry *is* the next paint. Narrowing it out is
+    /// what made arming a frame callback insufficient (ADR-0185).
     pub(super) fn repaint_surfaces_with_instance_ids(&mut self, instance_ids: &[String]) {
-        self.repaint_mapped_surfaces_where(|surface_id| instance_ids.iter().any(|id| id == surface_id));
+        let stale: Vec<String> =
+            self.surfaces.iter().filter(|surface| surface.stale).map(|surface| surface.surface_id.clone()).collect();
+        let targets = narrowed_repaint_targets(instance_ids, &stale);
+        self.repaint_mapped_surfaces_where(|surface_id| targets.iter().any(|id| id == surface_id));
+    }
+
+    /// Whether any mapped surface owes a repaint its tree cannot ask for. The main loop's repaint
+    /// selection needs this: with nothing ticked, nothing typed and nothing landed, it would
+    /// otherwise reach no repaint at all and a deferred decode would never be asked for again.
+    pub(super) fn has_stale_surfaces(&self) -> bool {
+        self.surfaces.iter().any(|surface| surface.stale && surface.map_state == MapState::Mapped)
     }
 
     fn repaint_mapped_surfaces_where(&mut self, wanted: impl Fn(&str) -> bool) {
@@ -918,6 +958,32 @@ impl App {
 mod tests {
     use super::*;
     use crate::wayland::input::rect_table;
+
+    /// ADR-0185. A decode refused for pool capacity records no slot, so asking again is the whole
+    /// retry -- and only a paint asks. The surface is marked `stale` and arms a frame callback,
+    /// but the callback advances no tween, so `Scene::tick` names nothing and a repaint narrowed
+    /// to the ticked ids covers no surface at all. That is the stall, and this is the narrowing
+    /// that has to stop causing it.
+    #[test]
+    fn a_narrowed_repaint_still_covers_a_stale_surface_no_tick_named() {
+        let id = |s: &str| s.to_string();
+
+        // The bug: nothing ticked, one surface stale. Narrowing by tick alone repaints nothing.
+        assert_eq!(narrowed_repaint_targets(&[], &[id("wallpaper@eDP-1")]), vec![id("wallpaper@eDP-1")]);
+
+        // A tick elsewhere must not narrow the stale surface out, which is the case that actually
+        // happens: a clock ticks every second while a wallpaper waits on a refused decode.
+        assert_eq!(
+            narrowed_repaint_targets(&[id("bar@eDP-1")], &[id("wallpaper@eDP-1")]),
+            vec![id("bar@eDP-1"), id("wallpaper@eDP-1")]
+        );
+
+        // Both at once is one repaint, not two.
+        assert_eq!(narrowed_repaint_targets(&[id("bar@eDP-1")], &[id("bar@eDP-1")]), vec![id("bar@eDP-1")]);
+
+        // Nothing owed, nothing painted: the idle turn stays idle (ADR-0124).
+        assert!(narrowed_repaint_targets(&[], &[]).is_empty());
+    }
 
     #[test]
     fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_pba_ready_set() {

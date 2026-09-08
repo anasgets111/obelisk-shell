@@ -4326,3 +4326,47 @@ exist" forever.
 Rejected: a general shader node over an arbitrary subtree. Two endpoints and a progress number is a
 contract that can be held stable; an arbitrary subtree brings offscreen targets, clip interaction
 and a question about what the inputs even are. `docs/roadmap.md` keeps that parked.
+
+## 0185. A request the image cache drops has to say so, because the retry is a paint and an unchanged surface never paints again
+
+`ImageCache::image` turns a request away in two places without recording a slot: the pipeline is at
+`MAX_INFLIGHT_DECODES`, or the job channel is full. Both were written on the claim that "the next
+paint asks again", and one retry per frame is its own backoff.
+
+The claim was false. `paint_surface` builds the display list and returns before `execute` when it
+equals `last_painted` and the surface is not `stale` (ADR-0063). A wallpaper whose list has not
+changed is never painted again, so nothing ever asks again and the image never loads. The comment
+described a mechanism that did not exist.
+
+Two halves are needed and neither is sufficient:
+
+1. **A frame callback**, so a turn happens at all. `take_deferred` is read straight after the
+   surface's own `execute` and carried into `animating`.
+2. **The surface staying `stale`**, so that turn's paint does not skip on an unchanged list.
+
+That was the whole proposal, and it still did not work. Arming a frame callback only sets
+`animation_frame_due`; the callback advances no tween, so `Scene::tick` names nothing, and the
+repaint selection then chooses *by tick*: with nothing ticked, nothing typed and nothing landed, it
+reaches no repaint at all. A surface narrowed out by tree identity is exactly the surface that
+differs for a reason its tree cannot show. So `stale` is now its own reason to reach a repaint, and
+`narrowed_repaint_targets` is what stops the narrowing passing it over.
+
+The same stall arrives from the other side. A `Pending` entry evicted for capacity or budget leaves
+the pool's `wanted` set, the worker skips the job, and no result is ever sent -- so a surface
+holding a `retain` cover waits on a decode nobody will finish. `poll` already means "these files
+changed, invalidate the lists that draw them", which is the cue a cancelled decode owes, so
+cancellations drain through it alongside landings.
+
+A poisoned `wanted` lock is now a separate refusal from a full one. `std` poisoning is permanent:
+retrying it every frame would spin forever on a pool that cannot recover, which is worse than the
+quiet miss it replaces. Capacity clears on its own and says a repaint is owed; poison says nothing.
+
+The admission gate is a method rather than four lines inside `image`, and the repaint narrowing is a
+free function, because `image` needs a GL canvas and `TrackedSurface` holds Wayland objects -- no
+test can build either, and both are where the bug was. This is `victims`' precedent (ADR-0123).
+
+Tested by construction, not by reading: the ceiling refusing and saying so, the flag being taken
+rather than left for the next surface, a cancelled decode reaching the invalidation exactly once,
+and a stale surface surviving a repaint narrowed to a tick that named something else. The main
+loop's outer gate -- that a stale surface makes the turn reach a repaint at all -- is verified by
+reading `wayland/mod.rs`, because the loop needs a compositor.

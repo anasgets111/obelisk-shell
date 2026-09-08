@@ -482,7 +482,10 @@ pub fn run(
         // just named them. Every other reason to repaint is scene-wide: a pass can change any
         // tree, a keystroke moves a caret through `field_focus_for`, and a landed decode
         // invalidates by file across every list that draws it.
-        if !ticked.is_empty() && !typed && landed.is_empty() {
+        // A surface left `stale` by a decode turned away for capacity owes a repaint that no tree
+        // and no landing can ask for, so it has to be its own reason to reach one (ADR-0185).
+        let stale = app.has_stale_surfaces();
+        if (!ticked.is_empty() || stale) && !typed && landed.is_empty() {
             app.repaint_surfaces_with_instance_ids(&ticked);
         } else if re_resolved || typed || !landed.is_empty() {
             app.repaint_mapped_surfaces();

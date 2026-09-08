@@ -267,6 +267,19 @@ pub struct ImageCache {
     /// `wayland::output::texture_budget` (ADR-0182) and [`STARTING_TEXTURE_BUDGET`] until they are
     /// known.
     texture_budget: usize,
+    /// A request this paint turned away for [`MAX_INFLIGHT_DECODES`], recording no slot. Read and
+    /// cleared by [`ImageCache::take_deferred`] straight after the `execute` that set it, which is
+    /// what makes one flag enough for every surface: `image` is only ever called from a paint, and
+    /// paints are serialized on the dispatch thread.
+    deferred: bool,
+    /// Paths whose queued decode was cancelled by an eviction, drained by [`ImageCache::poll`].
+    ///
+    /// A `Pending` entry evicted for capacity or budget takes its job out of the pool's `wanted`
+    /// set, so the worker skips it and no result is ever sent. Without this the surface showing
+    /// that file waits on a decode that will never land: the same stall a refused request causes,
+    /// reached from the other side. `poll` already means "these files changed, invalidate the
+    /// lists that draw them", which is exactly the cue a cancelled decode owes.
+    cancelled: Vec<PathBuf>,
 }
 
 impl Default for ImageCache {
@@ -297,6 +310,8 @@ impl ImageCache {
             entries: HashMap::new(),
             evicted: Vec::new(),
             resident_bytes: 0,
+            deferred: false,
+            cancelled: Vec::new(),
             tick: 0,
             texture_budget: STARTING_TEXTURE_BUDGET,
             pool: Pool::spawn(waker),
@@ -354,7 +369,17 @@ impl ImageCache {
                 }
             }
         }
+        // Decodes cancelled by an eviction send no result, so they reach the invalidation the same
+        // way a landing does: as files whose lists are now wrong (ADR-0185).
+        files.append(&mut self.cancelled);
         files
+    }
+
+    /// Whether a request was turned away for capacity since this was last asked, clearing the
+    /// flag. The painting surface calls it straight after its own `execute` and carries the answer
+    /// into its `stale`, which is what gets that surface painted again (ADR-0185).
+    pub fn take_deferred(&mut self) -> bool {
+        std::mem::take(&mut self.deferred)
     }
 
     /// Uploads [`ImageCache::poll`] results at paint start, alongside
@@ -440,13 +465,8 @@ impl ImageCache {
                 // One gate for the whole pipeline, not just the queue: see `MAX_INFLIGHT_DECODES`.
                 // Marked before the send, because a worker that takes the job immediately must
                 // find it in the set.
-                match self.pool.wanted.lock() {
-                    Ok(mut wanted) if wanted.len() < MAX_INFLIGHT_DECODES => {
-                        wanted.insert(key.clone());
-                    }
-                    // At the ceiling, or the set is poisoned and cannot be reasoned about. Record
-                    // no slot, so the next paint asks again.
-                    _ => return None,
+                if !self.admit(&key) {
+                    return None;
                 }
                 match self.pool.jobs.try_send(Job { key: key.clone(), tint }) {
                     Ok(()) => {
@@ -454,7 +474,9 @@ impl ImageCache {
                     }
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
                         // The set has room but the channel does not, which the workers will clear.
+                        // No slot again, so this owes the same repaint the ceiling above does.
                         self.unwant(&key);
+                        self.deferred = true;
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         eprintln!("[oblisk-renderer] image: {}: no decode worker left to take it", key.path.display());
@@ -464,6 +486,30 @@ impl ImageCache {
                 }
                 None
             }
+        }
+    }
+
+    /// Reserves a pipeline slot for `key`, answering whether the caller may queue it.
+    ///
+    /// One gate for the whole pipeline, not just the queue: see [`MAX_INFLIGHT_DECODES`]. The
+    /// reservation is made before the send, because a worker that takes the job immediately must
+    /// find it in the set.
+    ///
+    /// Separate from [`ImageCache::image`] so the ceiling can be tested without a GL canvas, which
+    /// no test has. The two refusals differ and must not be merged: capacity clears on its own and
+    /// records that a repaint is owed, while a poisoned lock never clears and asking again every
+    /// frame would spin forever (ADR-0185).
+    fn admit(&mut self, key: &CacheKey) -> bool {
+        match self.pool.wanted.lock() {
+            Ok(mut wanted) if wanted.len() < MAX_INFLIGHT_DECODES => {
+                wanted.insert(key.clone());
+                true
+            }
+            Ok(_) => {
+                self.deferred = true;
+                false
+            }
+            Err(_) => false,
         }
     }
 
@@ -521,8 +567,13 @@ impl ImageCache {
                     self.resident_bytes -= *bytes;
                 }
                 // Its decode is still queued or running; stop it being spent on a slot that has
-                // just gone away.
-                Slot::Pending => self.unwant(key),
+                // just gone away. Say so: a surface may be showing a `retain` cover while it waits
+                // for exactly this file, and cancelling in silence leaves it waiting for a result
+                // no worker will ever send (ADR-0185).
+                Slot::Pending => {
+                    self.unwant(key);
+                    self.cancelled.push(key.path.clone());
+                }
                 Slot::Failed => {}
             }
         }
@@ -1211,6 +1262,56 @@ mod tests {
         // Consuming one frees exactly one.
         cache.unwant(&key(1));
         assert_eq!(cache.pool.wanted.lock().unwrap().len(), MAX_INFLIGHT_DECODES - 1);
+    }
+
+    /// ADR-0185. The refusal records no slot, so asking again is the whole retry -- and only a
+    /// paint asks. A surface whose display list has not changed is never painted again, so the
+    /// refusal has to say a repaint is owed or the image never loads at all.
+    #[test]
+    fn a_request_refused_for_pipeline_capacity_says_a_repaint_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+        let mut cache = ImageCache::new();
+        let key = |n: u32| CacheKey { path: png.clone(), box_px: (n, n), version: FileVersion::read(&png), tint: None };
+
+        // Admitted while there is room, and nothing is owed: the caller got its slot.
+        assert!(cache.admit(&key(1)), "the first request has the whole pipeline to itself");
+        assert!(!cache.take_deferred(), "an admitted request owes no repaint");
+
+        for n in 1..MAX_INFLIGHT_DECODES as u32 {
+            assert!(cache.admit(&key(n + 1)));
+        }
+        assert!(!cache.take_deferred(), "filling the pipeline is not a refusal");
+
+        // At the ceiling: refused, and the refusal is visible to the paint that has to retry it.
+        assert!(!cache.admit(&key(9999)), "a request past the ceiling must be refused");
+        assert!(cache.take_deferred(), "a refused request must say a repaint is owed");
+        assert!(!cache.take_deferred(), "and the flag is taken, not left set for the next surface");
+
+        // Room again: admitted, and it owes nothing.
+        cache.unwant(&key(1));
+        assert!(cache.admit(&key(9999)), "a freed slot admits the next request");
+        assert!(!cache.take_deferred());
+    }
+
+    /// ADR-0185, the same stall reached from the other side: nobody refused this request, an
+    /// eviction cancelled it after it was queued. The worker skips a job that has left `wanted`
+    /// and sends no result, so without a cue the surface waits on a decode that will never land.
+    #[test]
+    fn a_decode_cancelled_by_an_eviction_still_invalidates_the_lists_that_drew_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("fixture.png");
+        std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
+        let mut cache = ImageCache::new();
+        let key = CacheKey { path: png.clone(), box_px: (8, 8), version: FileVersion::read(&png), tint: None };
+        cache.insert(key.clone(), Slot::Pending);
+        cache.pool.wanted.lock().unwrap().insert(key.clone());
+
+        assert!(cache.poll().is_empty(), "nothing has landed and nothing has been cancelled");
+        cache.evict(&key);
+        assert_eq!(cache.poll(), vec![png.clone()], "a cancelled decode owes the same invalidation a landed one does");
+        assert!(cache.poll().is_empty(), "and it is reported once, not on every turn after");
     }
 
     #[test]
