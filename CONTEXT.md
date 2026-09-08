@@ -86,6 +86,8 @@ Current project vocabulary. Implementation contracts live in [docs](docs/oblisk-
 
 **Pulse**: A signal reading `true` for a fixed window after its source changes value, which is how a config fires a one-shot animation without an imperative call. _Avoid_: trigger, event, restart, edge signal
 
+**Cross-dissolve**: An `image` crossing over a duration from the picture it was holding to the one whose decode has just landed, rather than swapping between them in one frame. _Avoid_: fade, transition, crossfade
+
 **Spring**: A tween whose motion comes from stiffness and damping rather than a duration and a curve, and which hands its running speed to the run that replaces it when the target moves. _Avoid_: physics animation, damped tween, inertia
 
 ## Ownership

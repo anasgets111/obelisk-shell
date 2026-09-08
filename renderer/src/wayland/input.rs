@@ -1609,6 +1609,7 @@ mod tests {
         }
         layout::ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: crate::layout::node::Transform::default(),

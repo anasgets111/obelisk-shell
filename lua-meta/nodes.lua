@@ -122,11 +122,16 @@
 ---@field size? integer|Bound Bounding box diameter, default `12`.
 ---@field foreground? Color|Bound What a `currentColor` fill in the resolved SVG resolves to, which is what CSS `color` means (ADR-0072). A symbolic icon is drawn in this colour; a full-colour app icon names no `currentColor` and ignores it, so it is safe to pass unconditionally. Omitted leaves the file's own colours alone, which for a KDE symbolic icon means the near-black its stylesheet ships.
 
+---@class Transition
+---@field duration integer How long the cross-dissolve runs, in ms. Required: a dissolve with no length is a snap, which `retain` alone already does.
+---@field easing? Easing Default `"InOutQuad"`. The curve the incoming picture's alpha follows.
+
 ---@class ImageProps: NodeBase
 ---@field source? string|Bound An absolute path. Never a theme name; that is `icon`'s job.
 ---@field fit? "cover"|"contain"|"stretch"|Bound Default `"cover"`. An image has no intrinsic size and takes the box `width`/`height` give it.
 ---@field async? boolean|Bound Default `false`, which decodes the file inside the frame that first draws it, so the frame is whole: right for a wallpaper, whose first paint is what the swap waits on. `true` decodes on a worker pool and draws nothing until the pixels land, then repaints (ADR-0122): for a grid of thumbnails, where forty inline decodes would freeze the shell for a second. Either way a raster is stored scaled down to cover its box, so a 4K file drawn as a tile costs a tile's worth of texture.
 ---@field retain? boolean|Bound Default `false`. `true` keeps drawing the source this node last had pixels for while a newly named one decodes, instead of showing the surface behind it (ADR-0180). This is what lets a wallpaper change under `async = true`: the decode leaves the render thread, and the picture on screen holds until the replacement is ready to take over in one frame. It needs a node whose identity survives the change, so give the `image` a stable `id` and change its `source` -- a node keyed by its path is a different node and has nothing to hold. Inert without `async`, since an inline decode leaves no gap. A source that fails to decode leaves the old picture up rather than blanking.
+---@field transition? Transition Cross from the picture the node is holding to the one that just landed, instead of swapping in one frame (ADR-0181). Implies `retain`, which is where the outgoing picture comes from, and like it needs `async = true` and a node whose `id` survives the change. The first picture a node ever shows appears rather than crosses, having nothing to cross from. A cross-dissolve is the whole of it for now; the named wipes and discs arrive with a shader stage, under an `effect` key this build refuses.
 
 ---@class ButtonProps: NodeBase, BoxBase
 ---@field children? Node[] Drawn in order. A hole in the array truncates it, since `#` is undefined on a sparse table.

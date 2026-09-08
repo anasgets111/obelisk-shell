@@ -14,7 +14,7 @@
 //! after a full decode for later opens and other cache users.
 //!
 //! Eviction has two bounds (ADR-0123): [`CACHE_CAPACITY`] entries, oldest insert first, and
-//! [`TEXTURE_BUDGET`] bytes of textures not shown by a mapped surface, least recently asked-for
+//! [`ImageCache::set_texture_budget`] bytes of textures not shown by a mapped surface, least recently asked-for
 //! first. `wayland::App` triggers it after each paint using pins from surfaces' last lists.
 //! [`ImageCache::release_evicted`] frees textures at the next paint's start, never mid-frame.
 
@@ -33,16 +33,19 @@ use femtovg::{Canvas, ErrorKind, ImageFlags, ImageId, ImageSource};
 
 use crate::text::snap::LogicalRect;
 
-/// Maximum map entries, including `Failed` and `Pending`. [`TEXTURE_BUDGET`] bounds bytes; this
+/// Maximum map entries, including `Failed` and `Pending`. The texture budget bounds bytes; this
 /// keeps a config cycling through a thousand failing paths from growing the map without bound.
 const CACHE_CAPACITY: usize = 128;
 
-/// Idle texture bytes beyond mapped surfaces (ADR-0123). Last-painted textures are never evicted,
-/// so an oversized working set stays over budget rather than thrashing inline decodes. Before this,
-/// moved-on 1920x1200 wallpapers (12 MB each) survived the next 128 inserts; closed picker tiles
-/// did too. 16 MB keeps 54 closed-picker files (6.5 MB) plus the wallpaper left on 1920x1200 and
-/// returns the rest; a wallpaper left on 4K is 33 MB and goes at once.
-const TEXTURE_BUDGET: usize = 16 << 20;
+/// Starting idle-texture budget, replaced by [`ImageCache::set_texture_budget`] as soon as the
+/// outputs are known (ADR-0182). Idle means beyond what mapped surfaces show: last-painted textures
+/// are pinned and never evicted, so an oversized working set stays over budget rather than
+/// thrashing decodes. Before any budget, moved-on 1920x1200 wallpapers (12 MB each) survived the
+/// next 128 inserts and closed picker tiles did too.
+///
+/// `wayland::output::texture_budget` owns the real figure, because what fits is a property of the
+/// displays and not of this file.
+const STARTING_TEXTURE_BUDGET: usize = 16 << 20;
 
 /// Decode workers: machine parallelism capped so forty wallpapers arriving together do not take
 /// every compositor core.
@@ -166,7 +169,7 @@ struct Decoded {
 }
 
 /// Slot state. `Pending` draws and enqueues nothing after its first job until it lands. `Ready`
-/// carries texture bytes, width times height times four for RGBA8, counted by [`TEXTURE_BUDGET`].
+/// carries texture bytes, width times height times four for RGBA8, counted against the budget.
 enum Slot {
     Pending,
     Ready(ImageId, usize),
@@ -258,6 +261,10 @@ pub struct ImageCache {
     /// Decodes taken by [`ImageCache::poll`] but not uploaded: `poll` runs in the main-loop turn,
     /// where no canvas is current.
     landed: Vec<(CacheKey, Result<Decoded, String>)>,
+    /// What [`ImageCache::trim`] holds idle textures to, set from the displays by
+    /// `wayland::output::texture_budget` (ADR-0182) and [`STARTING_TEXTURE_BUDGET`] until they are
+    /// known.
+    texture_budget: usize,
 }
 
 impl Default for ImageCache {
@@ -272,6 +279,12 @@ impl ImageCache {
         Self::build(None)
     }
 
+    /// Holds idle textures to `budget` bytes from here on (ADR-0182). Called whenever the outputs
+    /// change, which is the only thing that changes the answer.
+    pub fn set_texture_budget(&mut self, budget: usize) {
+        self.texture_budget = budget;
+    }
+
     /// Renderer cache: a landing wakes the Wayland poll (ADR-0124).
     pub fn with_waker(waker: crate::wake::Waker) -> Self {
         Self::build(Some(waker))
@@ -284,6 +297,7 @@ impl ImageCache {
             evicted: Vec::new(),
             resident_bytes: 0,
             tick: 0,
+            texture_budget: STARTING_TEXTURE_BUDGET,
             pool: Pool::spawn(waker),
             landed: Vec::new(),
         }
@@ -360,12 +374,12 @@ impl ImageCache {
         }
     }
 
-    /// Evicts idle textures to [`TEXTURE_BUDGET`], oldest ask first (ADR-0123). `pinned` contains
+    /// Evicts idle textures to [`ImageCache::set_texture_budget`], oldest ask first (ADR-0123). `pinned` contains
     /// `(path, box)` pairs from mapped surfaces' last display lists, collected by `wayland::App`
     /// after paint. Compute it lazily because list walks matter only when evicting. Icons are not
     /// pinned: lists carry theme names, not paths; an icon costs a few KB and one inline reraster.
     pub fn trim(&mut self, pinned: impl FnOnce() -> Vec<(PathBuf, (u32, u32))>) {
-        if self.resident_bytes <= TEXTURE_BUDGET {
+        if self.resident_bytes <= self.texture_budget {
             return;
         }
         let pinned = pinned();
@@ -373,7 +387,7 @@ impl ImageCache {
             Slot::Ready(_, bytes) => Some((key.clone(), bytes, entry.last_hit)),
             Slot::Pending | Slot::Failed => None,
         });
-        for key in victims(candidates, self.resident_bytes, TEXTURE_BUDGET, &pinned) {
+        for key in victims(candidates, self.resident_bytes, self.texture_budget, &pinned) {
             self.evict(&key);
         }
     }

@@ -2,8 +2,9 @@
 -- `lib/wallpaper.lua`. `child` is keyed by output name (ADR-0121), so each screen gets its own file
 -- and fit, including monitors plugged in later without a reload.
 --
--- `async` with `retain` (ADR-0180): the decode leaves the render thread, and the picture already up
--- holds the screen until the replacement is ready to take over in one frame. ADR-0122 kept `async`
+-- `async` with `transition` (ADR-0180, ADR-0181): the decode leaves the render thread, the picture
+-- already up holds the screen until the replacement is ready, and then the two cross rather than
+-- swapping in one frame. ADR-0122 kept `async`
 -- off here because a pending image drew nothing and a change flashed the ground; ADR-0179 measured
 -- what that bought -- 162.7ms of decode on the render thread at every change, 114ms in release --
 -- and `retain` is what removes the flash the stall was paying for.
@@ -33,7 +34,10 @@ return panel {
             source = wallpaper.path_of(output),
             fit = wallpaper.fit_of(output),
             async = true,
-            retain = true,
+            -- `transition` implies `retain` (ADR-0181), so the hold and the cross are one
+            -- declaration. `WallpaperService.qml` runs its transitions at 1500ms on
+            -- `Easing.InOutCubic`; this is that, with the effect names still to come.
+            transition = { duration = 1500, easing = "InOutCubic" },
             width = "Fill",
             height = "Fill",
         }

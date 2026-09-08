@@ -4090,3 +4090,105 @@ wrong for album art, and both are real.
 This is the first of the wallpaper-transition commits. It is worth having on its own: it closes
 ADR-0179's open item without any transition at all, and a cross-dissolve needs exactly the moment
 this establishes -- the frame the incoming texture exists -- to start on.
+
+## 0181. A `transition` crosses an image from the picture it is holding to the one that landed, and femtovg draws the dissolve because two draws is all a dissolve is
+
+ADR-0180 left an `image` holding its last picture until the next one lands, then swapping in one
+frame. The swap is the part left to soften, and the plan for it was a GL stage: the reference
+config's six `.frag` files ported onto a glow program, with a cross-fade as the fallback when a
+shader will not compile. Reading the two draws that fallback needs said the fade is not a fallback.
+It is the whole of one of the six effects, it needs no GL at all, and building it first means the
+shader stage arrives with something to fail back to rather than a snap.
+
+1. `transition = { duration, easing }` on an `image`. It implies `retain`: a dissolve crosses *from*
+   the picture the node is holding, so declaring one is declaring retention, and making a config
+   write both would only let it write one.
+2. No `effect` key yet. A cross-dissolve is the whole of it until the masks arrive, and a key that
+   accepts one name is a key that reads like a menu. Unknown keys inside the block are refused, so a
+   config reaching for `effect = "Wipe"` is told it is not there rather than quietly getting a fade.
+3. The run is `ResolvedNode::dissolve`, holding the outgoing source, the instant it started and its
+   eased progress. `displayed_source` has already moved on to the incoming by the time it starts --
+   that is ADR-0180's landing behaviour, unchanged -- so the outgoing has nowhere else to live.
+4. Progress is stored on the node, not read off the clock at paint time, for the reason a tween
+   writes its value into `properties`: the display list is built once and compared for equality, so
+   a number in it that moved under the comparison would defeat the skip.
+5. It advances in the paint-only walk itself, *outside* that walk's `!node.tweens.is_empty()`
+   gate, and is dropped the moment its duration is up. It counts for `animating`, so the node asks
+   for its next frame, and it is not tested by `tick_is_paint_only`, because all it moves is an
+   alpha and ADR-0178's tick can carry it where it stands.
+
+   Written first as "advances wherever `node::advance` does", which put it behind that gate. An
+   `image` declaring a `transition` and no `animate` block -- which is every one the reference
+   config writes -- has no tweens, so the walk skipped it and the dissolve never moved: one frame
+   painted at progress zero, then a list that never changed again and a picture that never
+   crossed. Tests passed, because they drove `note_landed_images` and read the field rather than
+   ticking a node that had nothing else easing on it. A live run found it in a minute. The test
+   that now guards it ticks exactly that node.
+6. The outgoing is drawn at its own full alpha with the incoming fading in over it, not both easing
+   past each other. Two source-over draws that each sit at half alpha compose to three quarters,
+   and the missing quarter is the surface's ground showing through the middle of the dissolve. The
+   bottom layer never fades, so there is nothing to show through.
+7. One `Draw::Image` field carries both what ADR-0180 covers a gap with and what a dissolve crosses
+   from, because a node is never doing both: the cover exists only while `displayed_source` differs
+   from `source`, and a dissolve starts at the moment they stop differing. Both are pinned for
+   `ImageCache::trim`, or the outgoing is freed in the middle of the cross.
+
+Not built: a queue of parked sources. A change arriving mid-dissolve replaces the run on the next
+landing rather than joining a line, which is what the reference config's `pendingUrl` does with one
+slot. Not built either: holding the incoming decode until the running dissolve ends. The pool is
+already bounded and the cover keeps something on screen throughout, so the ordering buys nothing to
+look at.
+
+Rejected: shipping the plan's atomic-swap placeholder rendering under this commit and drawing the
+fade with the shader stage. It is more code to write, then delete, than the two `draw_file` calls
+that make the fade real, and it would leave a commit whose only visible effect is that nothing
+changed.
+
+Rejected: expressing the dissolve as a `Tween` on a synthetic property. Tweens write into the
+retained property map, which is the map `paint_style` re-reads and `lua::nodes` validates names
+against; a private key in there is a name collision waiting for the first config to use it.
+
+## 0182. The pin set is what a mapped surface shows, not what it last painted, and the texture budget is a property of the displays
+
+ADR-0181's dissolve made a picker's thumbnails blink out and return for the length of every
+wallpaper change. Instrumenting `ImageCache::trim` named it in one line:
+
+```
+trim resident=25807KB budget=16384KB pinned=2 evicting=33 first="kitty.svg"
+```
+
+`pinned=2`. The two wallpapers, and nothing else -- fifty-four thumbnails a mapped, visible picker
+was showing counted as idle.
+
+1. `forget_painted_lists_drawing` cleared `last_painted` to force a repaint, and that same list is
+   the pin set `trim` reads. So from a decode landing until the surface repainted, every image that
+   surface showed was evictable. A `stale` flag replaces the clear: the list survives to pin, and
+   `paint_surface`'s unchanged-list skip reads the flag. The two other places that clear
+   `last_painted` -- a destroyed surface, a fresh EGL surface -- are right to, because there the
+   pixels really are gone.
+2. This was always wrong and was never reachable. One landing invalidated one surface, which
+   repainted on the same turn; the window was a fraction of a frame. A wallpaper mid-dissolve
+   repaints every frame and `trim` runs at the end of each one, so it kept landing inside the
+   window, and the thumbnails it evicted re-decoded, landed, and unpinned everything again.
+3. `TEXTURE_BUDGET` becomes `wayland::output::texture_budget`: one screenful of RGBA per output, in
+   physical pixels, floored at the old 16 MB. Recomputed whenever the outputs change, which is the
+   only thing that changes the answer.
+4. `ImageCache` is told the number rather than working it out. What fits is a property of the
+   displays; the cache keys on paths and pixel boxes and has no business knowing about outputs.
+
+The constant is the more general mistake. 16 MB was measured on one 1920x1200 laptop against one
+config's 54-file picker, and this engine is a framework other people's shells run on: a single 4K
+wallpaper is 33 MB, so that machine sat permanently over budget while this one had room to spare,
+and a config changing every wallpaper across three monitors at once was never in the arithmetic at
+all. Display geometry is the one thing in reach that scales the way the working set does, because
+every texture here is sized by the box it is drawn into.
+
+Rejected: raising the constant. It moves the cliff to the next display size rather than removing
+it, and picking the new number needs exactly the geometry that is already available.
+
+Rejected: making `trim` skip eviction when the pinned set alone exceeds the budget. It is a real
+hole -- `victims` will evict every idle entry and still be over, gaining nothing -- but with the pin
+set correct there was nothing left to evict, so it has no consumer. Fix it when one turns up.
+
+Found by running it on Anas's own shell rather than the scratch config, which has one `image` node
+and no picker. Neither the tests nor the isolated rig could see this.

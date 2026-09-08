@@ -148,6 +148,16 @@ pub(super) struct TrackedSurface {
     /// buffers; clear on rebind or any branch that cannot prove the pixels still match, or a stale
     /// frame can remain with no redraw trigger.
     pub(super) last_painted: Option<((u32, u32), layout::paint::DisplayList)>,
+    /// The pixels on screen are stale although `last_painted` still describes them, so the next
+    /// paint must run even against an identical list (ADR-0182). Set when a decode lands for a
+    /// file this surface draws: the list is unchanged, the texture behind it is not.
+    ///
+    /// Kept apart from clearing `last_painted` because that list is also the pin set
+    /// `ImageCache::trim` reads. Dropping it unpinned every image a mapped surface was showing for
+    /// the width of one repaint, and a wallpaper mid-dissolve repaints every frame -- so `trim`
+    /// kept landing in that window, evicting a whole picker's thumbnails, which then re-decoded,
+    /// landed, and unpinned everything again.
+    pub(super) stale: bool,
 }
 /// Initial § 5.1 `visible`, with a role-aware fallback when startup apply has no tree
 /// (`Scene::apply` rolled back): panels default visible to keep the shell up, painting nothing
@@ -650,10 +660,11 @@ impl App {
             let focus = self.field_focus_for(&surface_id);
             tree.as_ref().map(|tree| layout::paint::build(tree, 1.0, focus.as_ref())).unwrap_or_default()
         };
-        let unchanged = self.surfaces[index]
-            .last_painted
-            .as_ref()
-            .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list);
+        let unchanged = !self.surfaces[index].stale
+            && self.surfaces[index]
+                .last_painted
+                .as_ref()
+                .is_some_and(|(painted_size, painted)| *painted_size == (width, height) && *painted == list);
         if unchanged {
             // A mid-tween surface still has to commit: a frame callback is only answered after
             // one, and a tween whose tick moved nothing visible would otherwise never get its
@@ -738,6 +749,7 @@ impl App {
         // Record only after swap; otherwise an unpresented frame could make the next identical list
         // skip the paint the screen never received.
         self.surfaces[index].last_painted = Some(((width, height), list));
+        self.surfaces[index].stale = false;
         self.surfaces_drawn += 1;
         // Images absent from every current list are idle (ADR-0123); queue eviction for the next
         // paint.
@@ -760,7 +772,9 @@ impl App {
     pub(super) fn forget_painted_lists_drawing(&mut self, files: &[std::path::PathBuf]) {
         for surface in &mut self.surfaces {
             if surface.last_painted.as_ref().is_some_and(|(_, list)| list.draws_any_of(files)) {
-                surface.last_painted = None;
+                // Marked, not cleared: this surface still shows those images until it repaints, so
+                // its list has to keep pinning them (ADR-0182).
+                surface.stale = true;
             }
         }
     }

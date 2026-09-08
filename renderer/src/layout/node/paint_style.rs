@@ -56,7 +56,11 @@ pub enum PaintStyle {
         load: Load,
         /// `retain = true` (ADR-0180): cover that gap with the source this node last had pixels
         /// for, rather than with nothing. Inert under [`Load::Inline`], which leaves no gap.
+        /// Implied by `transition`, which has nothing to cross from without it.
         retain: bool,
+        /// `transition` (ADR-0181): cross from the covering source to the landed one over a
+        /// duration, instead of swapping between them in one frame.
+        transition: Option<TransitionSpec>,
     },
     /// `target` is `None` when no `secure_submit` is declared. Malformed targets fail here instead
     /// of being skipped until the press path (`layout::secure_submit` used to do that).
@@ -98,12 +102,18 @@ pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Op
         "icon" => {
             PaintStyle::Icon { name: parse_icon_name(properties)?, color: parse_optional_foreground(properties)? }
         }
-        "image" => PaintStyle::Image {
-            source: parse_image_source(properties)?,
-            fit: parse_fit(properties)?,
-            load: parse_load(properties)?,
-            retain: parse_retain(properties)?,
-        },
+        "image" => {
+            let transition = parse_transition(properties)?;
+            PaintStyle::Image {
+                source: parse_image_source(properties)?,
+                fit: parse_fit(properties)?,
+                load: parse_load(properties)?,
+                // A dissolve crosses *from* the picture the node is holding, so declaring one is
+                // declaring retention; making a config write both would only let it write one.
+                retain: parse_retain(properties)? || transition.is_some(),
+                transition,
+            }
+        }
         "textfield" => PaintStyle::TextField {
             target: parse_secure_submit(properties)?,
             placeholder: parse_placeholder(properties)?,

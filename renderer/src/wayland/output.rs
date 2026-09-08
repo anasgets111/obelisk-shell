@@ -25,6 +25,32 @@ struct OutputFacts {
     current_mode: Option<((i32, i32), i32)>,
     scale_factor: i32,
 }
+/// Floor under [`texture_budget`], and what that budget was before it was derived: enough for one
+/// config's closed picker plus a 1920x1200 wallpaper (ADR-0123). It keeps a small display, or one
+/// whose size no output has reported yet, from getting a tighter budget than the constant did.
+const MIN_TEXTURE_BUDGET: usize = 16 << 20;
+
+/// The `ImageCache` idle-texture budget for this machine's displays (ADR-0182): one screenful of
+/// RGBA per output, floored at [`MIN_TEXTURE_BUDGET`].
+///
+/// A constant cannot be right for an engine other people's shells run on. 16 MB was measured
+/// against one 1920x1200 laptop and one config's 54-file picker, and a single 4K wallpaper is 33 MB
+/// on its own -- so that machine would sit permanently over budget while this one has room to
+/// spare. Every texture this cache holds is sized by the box it is drawn into, so display geometry
+/// is the one thing in reach that scales with the working set.
+///
+/// One screenful per output is the largest single image a shell draws, times the number of places
+/// it can draw one, which is what a config changing every wallpaper at once asks for. Physical
+/// pixels, not logical: that is what `ImageCache` keys on.
+pub(super) fn texture_budget(screens: &[Screen]) -> usize {
+    let screenful = |screen: &Screen| {
+        let scale = screen.scale.max(1) as usize;
+        let (width, height) = (screen.width.max(0) as usize, screen.height.max(0) as usize);
+        width.saturating_mul(scale).saturating_mul(height.saturating_mul(scale)).saturating_mul(4)
+    };
+    screens.iter().map(screenful).sum::<usize>().max(MIN_TEXTURE_BUDGET)
+}
+
 /// One `screens` entry, or `None` if size is unknown. Prefer `logical_size` (`xdg_output`/
 /// `wl_output` v4 compositor space), then the current `Mode` dimensions; never invent a size.
 /// ponytail: below `wl_output` v4, nameless outputs use positional `"output-{index}"` ids, so
@@ -117,6 +143,9 @@ impl App {
     /// Upgrade: defer like `apply_visibility` defers `visible`, when this is hit.
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
+        // Before the early return: an output arriving during the startup burst changes what the
+        // cache may hold even though nothing else here runs yet.
+        self.image_cache.set_texture_budget(texture_budget(&screens));
         if !self.client.set_screens(screens_payload(&screens)) || !self.startup_complete {
             // Seed from the initial output burst; `startup_complete` gates the rest.
             return;
@@ -274,6 +303,32 @@ mod tests {
             current_mode: Some(((1920, 1080), 60_000)),
             scale_factor: 1,
         }
+    }
+
+    /// ADR-0182. The budget is a property of the displays, so a bigger or a second screen gets a
+    /// bigger one, and the floor keeps a small or not-yet-reported display from getting less than
+    /// the constant this replaced.
+    #[test]
+    fn the_texture_budget_follows_the_displays_rather_than_a_constant() {
+        let screen = |width, height, scale| Screen { name: "TEST".to_string(), width, height, scale, refresh: 60.0 };
+        assert_eq!(texture_budget(&[]), MIN_TEXTURE_BUDGET, "no output yet is the floor, not zero");
+        assert_eq!(
+            texture_budget(&[screen(1920, 1200, 1)]),
+            MIN_TEXTURE_BUDGET,
+            "one 1920x1200 screenful is 9.2 MB, under the floor the old constant set"
+        );
+
+        // 3840x2160 is 33.2 MB of RGBA, which the constant could not hold even once.
+        let uhd = texture_budget(&[screen(3840, 2160, 1)]);
+        assert_eq!(uhd, 3840 * 2160 * 4);
+        assert!(uhd > MIN_TEXTURE_BUDGET);
+
+        // Physical pixels, which is what `ImageCache` keys on: the same panel driven at scale 2
+        // reports half the logical size and must come out the same.
+        assert_eq!(texture_budget(&[screen(1920, 1080, 2)]), 3840 * 2160 * 4);
+
+        // A config changing every wallpaper at once needs room on every output it draws to.
+        assert_eq!(texture_budget(&[screen(3840, 2160, 1), screen(3840, 2160, 1)]), 2 * 3840 * 2160 * 4);
     }
 
     #[test]

@@ -37,7 +37,7 @@ Recommendations, not accepted API designs. Correctness comes before feature expa
 | Windows and displays | Workspace summaries and one active client; screens are read-only | Select the required window actions and output settings, then define Niri/Hyprland differences and apply/revert behavior |
 | Service depth | MPRIS lacks stop/shuffle/repeat/rate/volume and capability flags; PipeWire lacks channel/peak/link detail; UPower exposes a composite battery | Extend existing capabilities for concrete controls; do not mirror every upstream property |
 | Bluetooth codecs | `codec` is nil; no codec command is accepted | Whether codec selection is needed, and how the audio capability should own device profiles/routes |
-| Blur and effects | No blur, shadows, arbitrary masks or shaders | Separate blurring our own images from capturing content behind a surface; settle compositor support and GPU cost |
+| Blur and effects | No blur, shadows, arbitrary masks or shaders. An `image.transition` cross-dissolves in femtovg (ADR-0181); the reference config's wipe, disc, portal, stripes and pixelate masks need a GL stage and are the narrow exception this row is being crossed for | Separate blurring our own images from capturing content behind a surface; settle compositor support and GPU cost. A built-in effect over textures the shell already owns is not an arbitrary shader API, and nothing here opens one to config |
 | Capture | No screen/window image or live texture | Build for previews/screenshots only when requested; external recording does not require renderer capture |
 | Large collections | Every list item is constructed; no viewport delegate reuse or grid layout | Measure the target workload before adding virtualization or layout vocabulary |
 | Wayland/input extras | No shortcut inhibition, per-surface idle inhibition, touch gestures or cross-app drag/drop | Pick supported hardware/protocols and an actual consumer; logind inhibition is already available |
@@ -53,7 +53,7 @@ Recommendations, not accepted API designs. Correctness comes before feature expa
 | Audio spectrum | Stream Cava output into Lua state; render with available drawing operations | A native FFT service merely to replace Cava |
 | Screen recording | Declare the recorder with `session_process` so it survives a reload, and drive it from config | Video encoding inside the shell |
 | Input display | Stream an external input backend | Global input capture inside the renderer |
-| Wallpaper UI | Background `panel`, `image` with `async`/`retain`, watched folders and persisted preferences | A wallpaper service or fixed wallpaper surfaces |
+| Wallpaper UI | Background `panel`, `image` with `async`/`retain`/`transition`, watched folders and persisted preferences | A wallpaper service or fixed wallpaper surfaces |
 | Compound controls | Lua components over existing nodes | Rust sliders, calendars, launchers or settings panels |
 | Preferences | `persistent_table` with config-declared files | A framework-owned settings schema or fixed state file |
 | Simple keybinds | `oblisk set` / `oblisk toggle` | Dedicated IPC commands for each panel |

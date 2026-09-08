@@ -311,6 +311,7 @@ pub fn run(
     // first pass, so seeding after evaluation would declare no per-monitor panels.
     let screens = app.screens(None);
     let outputs = geometries_from(&screens);
+    app.image_cache.set_texture_budget(output::texture_budget(&screens));
     app.client.set_screens(screens_payload(&screens));
     let specs = app.client.run_startup_evaluation().unwrap_or_default();
     // Set the declared font chain after evaluation but before first paint; `TextPainter` loads it
@@ -464,7 +465,7 @@ pub fn run(
         if !landed.is_empty() {
             // Before the invalidation, so the repaint it forces already builds its list from the
             // sources these nodes have caught up to (ADR-0180).
-            app.client.note_landed_images(&landed);
+            app.client.note_landed_images(&landed, std::time::Instant::now());
             app.forget_painted_lists_drawing(&landed);
         }
         if re_resolved {

@@ -211,6 +211,7 @@ impl App {
             null_buffered: false,
             configured_size: (0, 0),
             last_painted: None,
+            stale: false,
         });
     }
 

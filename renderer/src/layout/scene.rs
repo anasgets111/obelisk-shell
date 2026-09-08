@@ -12,7 +12,7 @@ use std::time::Instant;
 use mlua::{Lua, Value};
 
 use crate::layout::instance::SurfaceInstance;
-use crate::layout::node::{self, Align, EdgeInsets, LayoutError, PaintStyle, SizeMode, StyleRun, Tween};
+use crate::layout::node::{self, Align, Dissolve, EdgeInsets, LayoutError, PaintStyle, SizeMode, StyleRun, Tween};
 use crate::lua::nodes::VirtualNode;
 use crate::text::shaping::{self, ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
@@ -147,6 +147,10 @@ pub struct ResolvedNode {
     /// node holds its last picture instead of going blank; [`Scene::note_landed_images`] moves it
     /// forward as decodes land. `None` for every other kind, and until the first one lands.
     pub displayed_source: Option<String>,
+    /// The cross-dissolve this `image` is in the middle of (ADR-0181), from the source it was
+    /// covering the gap with to the one `displayed_source` has just moved to. `None` whenever the
+    /// node is showing one picture, which is nearly always.
+    pub dissolve: Option<Dissolve>,
     pub children: Vec<ResolvedNode>,
     /// Properties in flight between two resolved targets (ADR-0145). `properties` holds what is
     /// displayed this frame, each tween the target it is heading for; `Scene::tick` advances them
@@ -173,7 +177,9 @@ impl ResolvedNode {
     /// them.
     pub fn animating(&self) -> bool {
         self.visible
-            && (self.tweens.iter().any(|tween| !tween.resting) || self.children.iter().any(ResolvedNode::animating))
+            && (self.tweens.iter().any(|tween| !tween.resting)
+                || self.dissolve.is_some()
+                || self.children.iter().any(ResolvedNode::animating))
     }
 
     /// Whether every tween still running in this tree moves a paint-only property, which is what
@@ -188,6 +194,8 @@ impl ResolvedNode {
         if !self.visible {
             return true;
         }
+        // The dissolve is not tested: all it moves is the alpha the incoming source is drawn at,
+        // which is as paint-only as a property gets.
         !self.leaving
             && self.tweens.iter().all(|tween| tween.resting || node::is_paint_only(&tween.property))
             && self.children.iter().all(ResolvedNode::tick_is_paint_only)
@@ -367,17 +375,26 @@ impl Scene {
     /// already invalidates lists with: two nodes drawing one file at different sizes land together
     /// or not at all. The consequence of being early is one frame drawn from the cover source,
     /// which is the frame it was there for.
-    pub fn note_landed_images(&mut self, landed: &[PathBuf]) {
-        fn walk(node: &mut ResolvedNode, landed: &[PathBuf]) {
-            if let Some(PaintStyle::Image { source, retain: true, .. }) = &node.paint
+    pub fn note_landed_images(&mut self, landed: &[PathBuf], now: Instant) {
+        fn walk(node: &mut ResolvedNode, landed: &[PathBuf], now: Instant) {
+            if let Some(PaintStyle::Image { source, retain: true, transition, .. }) = &node.paint
                 && landed.iter().any(|file| file.as_os_str() == source.as_str())
             {
-                node.displayed_source = Some(source.clone());
+                let previous = node.displayed_source.replace(source.clone());
+                // A dissolve needs somewhere to come from, and a node that has just drawn its
+                // first picture has nowhere: it appears rather than crosses. A landing that does
+                // not change the source is a re-decode, not a change, and crossing a picture with
+                // itself is a blink at half alpha (ADR-0181).
+                if let (Some(spec), Some(previous)) = (transition, previous)
+                    && previous != *source
+                {
+                    node.dissolve = Some(Dissolve::start(previous, *spec, now));
+                }
             }
-            node.children.iter_mut().for_each(|child| walk(child, landed));
+            node.children.iter_mut().for_each(|child| walk(child, landed, now));
         }
         for tree in self.surfaces.values_mut() {
-            walk(tree, landed);
+            walk(tree, landed, now);
         }
     }
 
@@ -682,7 +699,7 @@ fn prepare_retained(
 ) -> Result<PreparedNode, LayoutError> {
     node::advance(&mut node.tweens, &mut node.properties, now, lua)?;
     let style = LayoutStyle::parse(&node.properties)?;
-    let ResolvedNode { id, kind, properties, children, tweens, displayed_source, .. } = node;
+    let ResolvedNode { id, kind, properties, children, tweens, displayed_source, dissolve, .. } = node;
     let paint = node::paint_style(&kind, &properties)?;
     let measure = measure_for(&kind, paint.as_ref(), &properties)?;
     let taffy_id = new_solver_node(tree, &kind, &properties, &style, parent_axis, measure)?;
@@ -693,6 +710,7 @@ fn prepare_retained(
         properties,
         paint,
         displayed_source,
+        dissolve: advanced_dissolve(dissolve, now),
         taffy: taffy_id,
         children: Vec::with_capacity(if style.visible { children.len() } else { 0 }),
         frozen: children,
@@ -824,6 +842,8 @@ struct PreparedNode {
     paint: Option<PaintStyle>,
     /// Carried across the pass untouched; see [`ResolvedNode::displayed_source`].
     displayed_source: Option<String>,
+    /// Advanced to the pass's instant before it is carried; see [`ResolvedNode::dissolve`].
+    dissolve: Option<Dissolve>,
     taffy: taffy::NodeId,
     children: Vec<PreparedNode>,
     /// The retained children of a node that is not `visible` this pass, carried through untouched
@@ -864,6 +884,11 @@ fn advance_paint_only(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> Resul
     if !node.visible {
         return Ok(());
     }
+    // Outside the tween gate below, and before it: a dissolve is the only motion on a node that
+    // has no `animate` block at all, which is every `image` the reference config declares one on.
+    // It also writes nothing into the property map, so it needs none of the save-and-restore that
+    // makes advancing a tween all-or-nothing.
+    node.dissolve = advanced_dissolve(node.dissolve.take(), now);
     if !node.tweens.is_empty() {
         advance_paint_only_node(node, now, lua)?;
     }
@@ -882,6 +907,14 @@ fn advance_paint_only(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> Resul
 /// re-read it and fail too -- one refused frame becoming a scene that stops updating. So the
 /// values about to move are kept and put back on refusal. That is bounded by this node's tweens,
 /// not by the properties of its subtree, which is the whole point of not cloning.
+/// Advances a dissolve to `now` and drops it once it is over (ADR-0181). Unlike a tween it writes
+/// nothing into the property map and cannot be refused, so it needs none of the save-and-restore
+/// below: the only thing it moves is a number `layout::paint` reads.
+fn advanced_dissolve(dissolve: Option<Dissolve>, now: Instant) -> Option<Dissolve> {
+    let mut dissolve = dissolve?;
+    dissolve.advance(now).then_some(dissolve)
+}
+
 fn advance_paint_only_node(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> Result<(), LayoutError> {
     let restore: Vec<(String, Value)> = node
         .tweens
@@ -918,6 +951,7 @@ fn advance_paint_only_node(node: &mut ResolvedNode, now: Instant, lua: &Lua) -> 
 // A relayout under an absolute-positioned solver node is the upgrade if a config needs the reflow.
 fn advance_leaving(mut node: ResolvedNode, now: Instant, lua: &Lua) -> Result<Option<ResolvedNode>, LayoutError> {
     node::advance(&mut node.tweens, &mut node.properties, now, lua)?;
+    node.dissolve = advanced_dissolve(node.dissolve.take(), now);
     if node.tweens.is_empty() {
         return Ok(None);
     }
@@ -1184,6 +1218,7 @@ fn prepare(
 
     let id = retained.as_ref().map(|r| r.id);
     let displayed_source = retained.as_ref().and_then(|r| r.displayed_source.clone());
+    let dissolve = retained.as_ref().and_then(|r| r.dissolve.clone());
     let old_children = retained.map(|r| r.children).unwrap_or_default();
     let id = id.unwrap_or_else(|| scene.alloc_id());
     // Already leaving children are not paired again: a re-added id is a new node beside the one
@@ -1213,6 +1248,7 @@ fn prepare(
         properties,
         paint,
         displayed_source,
+        dissolve: advanced_dissolve(dissolve, now),
         taffy: taffy_id,
         children: Vec::new(),
         frozen: old_children,
@@ -1315,6 +1351,7 @@ fn finish(
         properties,
         mut paint,
         displayed_source,
+        dissolve,
         taffy: taffy_id,
         children,
         frozen,
@@ -1338,6 +1375,7 @@ fn finish(
             properties,
             paint,
             displayed_source,
+            dissolve,
             children: frozen,
             tweens,
             leaving: false,
@@ -1403,6 +1441,7 @@ fn finish(
         properties,
         paint,
         displayed_source,
+        dissolve,
         children,
         tweens,
         leaving: false,
@@ -2186,12 +2225,83 @@ pub(super) mod tests {
 
         // A file nobody named moves nothing, which is what stops one surface's decode advancing
         // another's cover.
-        scene.note_landed_images(&[PathBuf::from("/tmp/other.png")]);
+        scene.note_landed_images(&[PathBuf::from("/tmp/other.png")], Instant::now());
         assert_eq!(held(&scene), None);
 
-        scene.note_landed_images(&[PathBuf::from("/tmp/new.png")]);
+        scene.note_landed_images(&[PathBuf::from("/tmp/new.png")], Instant::now());
         assert_eq!(held(&scene), Some("/tmp/new.png".to_string()));
         assert_eq!(plain(&scene), None, "an image that did not ask to retain holds nothing");
+    }
+
+    /// ADR-0181. A dissolve starts on the landing and not on the pass that named the source, it
+    /// starts at zero, it needs somewhere to come from, and while it runs the node owes the
+    /// compositor frames without owing it a layout.
+    #[test]
+    fn a_dissolve_starts_on_the_landing_that_replaces_a_picture_and_not_on_the_first_one() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let lua = mlua::Lua::new();
+        register_node_constructors(&lua).unwrap();
+        crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
+        let apply = |scene: &mut Scene, path: &str| {
+            let table: mlua::Table = lua
+                .load(format!(
+                    r#"return panel {{ id = "bar", child = image {{ id = "wp", source = "{path}",
+                        async = true, transition = {{ duration = 400, easing = "InOutCubic" }} }} }}"#
+                ))
+                .eval()
+                .unwrap();
+            let surface = deserialize_lua_table(&table).unwrap();
+            apply_at(scene, &[surface], full(), &shaping, &lua).unwrap();
+        };
+        let node = |scene: &Scene| scene.surface("bar@TEST").unwrap().children[0].clone();
+
+        apply(&mut scene, "/tmp/a.png");
+        assert!(node(&scene).dissolve.is_none(), "naming a source starts nothing; the landing does");
+        assert!(!scene.surface("bar@TEST").unwrap().animating());
+
+        // First landing: the node had no picture, so it appears rather than crosses.
+        scene.note_landed_images(&[PathBuf::from("/tmp/a.png")], Instant::now());
+        assert!(node(&scene).dissolve.is_none(), "the first picture has nothing to cross from");
+
+        apply(&mut scene, "/tmp/b.png");
+        assert!(node(&scene).dissolve.is_none(), "still nothing until b's pixels arrive");
+        let started = Instant::now();
+        scene.note_landed_images(&[PathBuf::from("/tmp/b.png")], started);
+        let dissolve = node(&scene).dissolve.expect("b replaced a, so it crosses");
+        assert_eq!(dissolve.from, "/tmp/a.png", "it crosses from the picture that was up");
+        assert_eq!(dissolve.progress, 0.0, "and it opens on the outgoing, not part way across");
+        assert_eq!(
+            node(&scene).displayed_source.as_deref(),
+            Some("/tmp/b.png"),
+            "while `displayed_source` has already moved on, which is why the dissolve carries `from`"
+        );
+
+        let tree = scene.surface("bar@TEST").unwrap();
+        assert!(tree.animating(), "a dissolve owes the compositor its next frame");
+        assert!(tree.tick_is_paint_only(), "and owes it no layout: all it moves is an alpha");
+
+        // A landing that does not change the source is a re-decode, not a change.
+        scene.note_landed_images(&[PathBuf::from("/tmp/b.png")], started);
+        assert_eq!(node(&scene).dissolve.map(|d| d.from), Some("/tmp/a.png".to_string()), "unchanged, not restarted");
+
+        // The tick has to reach it. This node has no `animate` block, so the walk's tween gate
+        // skips it entirely, and a dissolve advanced behind that gate never moves -- which is what
+        // the first live run of this showed: one frame at progress zero and then a stuck picture.
+        let instances = [SurfaceInstance {
+            instance_id: "bar@TEST".to_string(),
+            declared_id: "bar".to_string(),
+            output: "TEST".to_string(),
+            available: full(),
+        }];
+        let ticked = scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(100));
+        assert_eq!(ticked, ["bar@TEST"], "the surface it advanced is what the frame is owed to");
+        let progress = node(&scene).dissolve.expect("a quarter through, still crossing").progress;
+        assert!(progress > 0.0 && progress < 1.0, "a quarter of the way across, got {progress}");
+
+        scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(400));
+        assert!(node(&scene).dissolve.is_none(), "and it is dropped the moment its duration is up");
+        assert!(!scene.surface("bar@TEST").unwrap().animating(), "so the node stops asking for frames");
     }
 
     #[test]
@@ -5019,6 +5129,7 @@ pub(super) mod tests {
     ) -> ResolvedNode {
         ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5079,6 +5190,7 @@ pub(super) mod tests {
     fn overlay_input_regions_includes_only_visible_direct_children() {
         let visible_child = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5094,6 +5206,7 @@ pub(super) mod tests {
         };
         let hidden_child = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5109,6 +5222,7 @@ pub(super) mod tests {
         };
         let root = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5132,6 +5246,7 @@ pub(super) mod tests {
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
         let hidden_child = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5147,6 +5262,7 @@ pub(super) mod tests {
         };
         let mut root = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5170,6 +5286,7 @@ pub(super) mod tests {
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
         let root = ResolvedNode {
             displayed_source: None,
+            dissolve: None,
             tweens: Vec::new(),
             leaving: false,
             transform: node::Transform::default(),
@@ -5183,6 +5300,7 @@ pub(super) mod tests {
             paint: None,
             children: vec![ResolvedNode {
                 displayed_source: None,
+                dissolve: None,
                 tweens: Vec::new(),
                 leaving: false,
                 transform: node::Transform::default(),

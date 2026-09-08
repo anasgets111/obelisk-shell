@@ -56,7 +56,18 @@ pub enum Draw {
     /// `retained` is the source this node last had a texture for, carried when `retain` is set
     /// and `source` has not caught up to it yet (ADR-0180); [`run`] draws it if `source` has no
     /// texture. Present only while the two differ, so a settled node's list stops changing.
-    Image { source: String, fit: Fit, box_px: (u32, u32), alpha: f32, load: Load, retained: Option<String> },
+    Image {
+        source: String,
+        fit: Fit,
+        box_px: (u32, u32),
+        alpha: f32,
+        load: Load,
+        retained: Option<String>,
+        /// Mid-cross-dissolve (ADR-0181), the alpha `source` is drawn at over `retained`. `None`
+        /// when the node is showing one picture, which is when `retained` is a gap cover rather
+        /// than the source being crossed away from.
+        dissolve: Option<f32>,
+    },
     /// A subtree masked by the declaring node's rounded arc. Rectangular clips flatten into each
     /// command; rounded clips stay grouped for [`execute`].
     Clipped { radius: f32, commands: Vec<DrawCmd> },
@@ -198,10 +209,7 @@ fn build_node(
     // avoids the passwordless black lock screen ADR-0052 decision 3 rejects. Opacity is baked into
     // the list because ADR-0063 skips unchanged lists; applying it in `execute` would be invisible.
     let opacity = inherited_opacity * node.opacity;
-    let draw = node
-        .paint
-        .as_ref()
-        .and_then(|style| draw_for(style, node.id, rect, scale, opacity, focus, node.displayed_source.as_deref()));
+    let draw = draw_for(node, rect, scale, opacity, focus);
 
     // A transformed node paints itself and its subtree as one group under its matrix
     // (ADR-0149), so the group is built into `out` and lifted out of it afterwards. Coordinates
@@ -360,16 +368,32 @@ fn run(
                     let _ = draw_file(painter.canvas_mut(), images, &path, draw);
                 }
             }
-            Draw::Image { source, fit, box_px, alpha, load, retained } => {
+            Draw::Image { source, fit, box_px, alpha, load, retained, dissolve } => {
                 let draw = FileDraw { fit: *fit, rect, box_px: *box_px, alpha: *alpha, tint: None, load: *load };
-                let drew = draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw);
-                // The named source has no texture: still decoding, or a failure the cache has
-                // already logged once. Either way the node keeps its last picture rather than
-                // showing the surface behind it (ADR-0180). A cover that is itself gone -- evicted
-                // despite the pin, or deleted from disk -- draws nothing, which is the old
-                // behaviour.
-                if !drew && let Some(cover) = retained {
-                    draw_file(painter.canvas_mut(), images, std::path::Path::new(cover), draw);
+                let under = retained.as_deref().map(std::path::Path::new);
+                match dissolve {
+                    // The outgoing at its own full alpha with the incoming fading in over it, not
+                    // both easing past each other: two source-over draws that each sit at half
+                    // alpha mid-cross compose to three quarters, and the last quarter is the
+                    // surface's ground showing through the middle of the dissolve (ADR-0181).
+                    Some(progress) => {
+                        if let Some(under) = under {
+                            draw_file(painter.canvas_mut(), images, under, draw);
+                        }
+                        let over = FileDraw { alpha: *alpha * *progress, ..draw };
+                        draw_file(painter.canvas_mut(), images, std::path::Path::new(source), over);
+                    }
+                    // The named source has no texture: still decoding, or a failure the cache has
+                    // already logged once. Either way the node keeps its last picture rather than
+                    // showing the surface behind it (ADR-0180). A cover that is itself gone --
+                    // evicted despite the pin, or deleted from disk -- draws nothing, which is the
+                    // old behaviour.
+                    None => {
+                        let drew = draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw);
+                        if !drew && let Some(under) = under {
+                            draw_file(painter.canvas_mut(), images, under, draw);
+                        }
+                    }
                 }
             }
             Draw::Clipped { radius, commands } => {
@@ -460,19 +484,23 @@ fn fade_border(colors: BorderColor, opacity: f32) -> BorderColor {
     }
 }
 
-/// Converts parsed paint to a draw. `scale` supplies physical image size and `focus` supplies
-/// field content; malformed properties already failed `Scene::apply`.
+/// Converts a node's parsed paint to a draw. `scale` supplies physical image size and `focus`
+/// supplies field content; malformed properties already failed `Scene::apply`.
+///
+/// Takes the node rather than its `paint`, because an `image` reads three things off it -- the
+/// paint, the source it last had a texture for, and any dissolve crossing between them -- and the
+/// pass supplies only the geometry.
 fn draw_for(
-    style: &PaintStyle,
-    node_id: NodeId,
+    node: &ResolvedNode,
     rect: LogicalRect,
     scale: f32,
     opacity: f32,
     focus: Option<&FieldFocus>,
-    // The source the node last had a texture for; see `ResolvedNode::displayed_source`.
-    retained: Option<&str>,
 ) -> Option<Draw> {
-    match style {
+    let node_id = node.id;
+    let retained = node.displayed_source.as_deref();
+    let dissolve = node.dissolve.as_ref();
+    match node.paint.as_ref()? {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
         // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1). `clip` is not read here: it
         // decides what this node's *children* are cut to, `build_node`'s question, not this one's.
@@ -519,7 +547,11 @@ fn draw_for(
 
         // Image source and fit (ADR-0054 decision 3). Empty source draws nothing; both physical
         // edges enter the cache because `Cover` may scale an SVG past the shorter edge (ADR-0122).
-        PaintStyle::Image { source, fit, load, retain } => (!source.is_empty()).then(|| Draw::Image {
+        // `retained` is what goes *under* the draw, and it is one of two things: mid-dissolve the
+        // picture being crossed away from, otherwise the one the node is still covering a decoding
+        // source with. One field because the node is never doing both -- `displayed_source` has
+        // already moved on to `source` by the time a dissolve starts.
+        PaintStyle::Image { source, fit, load, retain, transition: _ } => (!source.is_empty()).then(|| Draw::Image {
             source: source.clone(),
             fit: *fit,
             box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
@@ -527,7 +559,11 @@ fn draw_for(
             load: *load,
             // Dropped once the node draws what it names: an equal pair in the list would be one
             // more thing to compare, and its disappearance is what ends the cover.
-            retained: retained.filter(|_| *retain).filter(|last| *last != source.as_str()).map(str::to_string),
+            retained: match dissolve {
+                Some(dissolve) => Some(dissolve.from.clone()),
+                None => retained.filter(|_| *retain).filter(|last| *last != source.as_str()).map(str::to_string),
+            },
+            dissolve: dissolve.map(|dissolve| dissolve.progress),
         }),
 
         // A `textfield` shows its placeholder until focused, then one mask character per typed
@@ -978,6 +1014,52 @@ mod tests {
                 _ => None,
             })
             .expect("expected a text draw")
+    }
+
+    /// ADR-0181. Mid-dissolve the list carries the outgoing picture and the alpha the incoming is
+    /// drawn over it at, in the same field the gap cover uses -- the node is never doing both.
+    #[test]
+    fn a_dissolving_image_carries_the_outgoing_picture_and_the_alpha_to_draw_the_incoming_at() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = image { id = "wp", source = "/tmp/new.png", async = true,
+                transition = { duration = 400, easing = "Linear" },
+                width = "Fill", height = "Fill" } }"##;
+        let mut tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let image_draw = |tree: &ResolvedNode| {
+            build(tree, 1.0, None).commands.iter().find_map(|cmd| match &cmd.draw {
+                Draw::Image { retained, dissolve, .. } => Some((retained.clone(), *dissolve)),
+                _ => None,
+            })
+        };
+        assert_eq!(image_draw(&tree), Some((None, None)), "nothing has landed, so nothing is crossing");
+
+        // What `note_landed_images` leaves behind: the source moved on, the outgoing on the run.
+        tree.children[0].displayed_source = Some("/tmp/new.png".to_string());
+        tree.children[0].dissolve = Some(node::Dissolve {
+            from: "/tmp/old.png".to_string(),
+            started: std::time::Instant::now(),
+            spec: node::TransitionSpec { duration: std::time::Duration::from_millis(400), easing: Default::default() },
+            progress: 0.25,
+        });
+        assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), Some(0.25))));
+
+        // Both are drawn, so both are pinned; losing the outgoing mid-cross is a hole in the frame.
+        let mut pinned = Vec::new();
+        build(&tree, 1.0, None).drawn_images(&mut pinned);
+        assert_eq!(
+            pinned,
+            vec![
+                (std::path::PathBuf::from("/tmp/new.png"), (200, 40)),
+                (std::path::PathBuf::from("/tmp/old.png"), (200, 40)),
+            ]
+        );
+
+        // `transition` implies `retain`, so the same node covers a gap without the property being
+        // written twice.
+        tree.children[0].dissolve = None;
+        tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
+        assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), None)));
     }
 
     /// ADR-0180. The cover only reaches the list while the node is behind its own source, it is
