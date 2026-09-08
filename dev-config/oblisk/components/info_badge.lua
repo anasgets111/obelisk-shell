@@ -16,9 +16,19 @@ local cell = require("components.cell")
 return function(label, ground, opts)
     opts = opts or {}
     ground = ground or theme.GLASS_CONTROL
-    -- Only a literal colour can be contrasted here; a mapped ground would need the same map again,
-    -- and no call site tints a badge live.
-    local ink = type(ground) == "string" and theme.text_contrast(ground) or theme.FG
+    -- A live ground maps the same contrast rule over itself, the way `components/icon_button.lua`
+    -- does. The recorder's elapsed badge is the call site that needs it: `badgeColor: paused ?
+    -- warning : critical` swaps peach for red under a running capture, and the ink has to follow or
+    -- one of the two is unreadable.
+    ---@type Color|Signal
+    local ink
+    if type(ground) == "userdata" then
+        ---@cast ground Signal
+        ink = ground:map(theme.text_contrast)
+    else
+        ---@cast ground Color
+        ink = theme.text_contrast(ground)
+    end
     -- A `TextRun` carries the weight, and its `text` is a plain string: a signal has to be mapped
     -- into the run rather than dropped inside one.
     ---@type TextRun[]|Bound

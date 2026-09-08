@@ -85,10 +85,16 @@ function util.battery_glyph(b)
     if b == nil or not b.present then
         return icons.battery_ac
     end
-    if b.state == "Charging" then
+    -- `BatteryIndicator.qml`'s order, which is not the obvious one: `isPendingCharge` is tested
+    -- *first* and gets the charging bolt, and everything else on mains gets the plug -- so a
+    -- battery that is actually charging draws the plug, and only one held at a charge limit draws
+    -- the bolt. That reads correctly on a machine with a limit set, where "plugged in and moving"
+    -- is the ordinary state and "plugged in and parked" is the one worth a distinct glyph. Ours had
+    -- the two swapped, which is why this laptop showed a plug where the mirror showed a bolt.
+    if b.state == "PendingCharge" then
         return icons.battery_pending
     end
-    if b.state == "PendingCharge" or b.state == "FullyCharged" then
+    if b.state == "Charging" or b.state == "FullyCharged" then
         return icons.battery_ac
     end
     -- Five buckets over 0..100. Lua's 1-based indexing makes 100% bucket 5, not an out-of-range 6.

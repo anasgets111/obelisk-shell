@@ -12,7 +12,6 @@
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
-local glyph = require("components.glyph")
 local tooltip = require("components.tooltip")
 
 local SLOT = "battery"
@@ -32,13 +31,25 @@ local function battery_color(b)
     if util.battery_at_most(b, util.battery_thresholds.low) then
         return theme.PEACH
     end
-    return theme.GREEN
+    -- `activeColor`, not green. `BatteryIndicator.qml` reads
+    -- `critical : warning : Theme.activeColor`, so a healthy battery is the same accent every other
+    -- "this is fine and on" thing on the bar wears; green is a fourth state the mirror does not
+    -- have. Side by side with the QML bar the green pill was the loudest difference between them.
+    return theme.ACCENT
 end
 
--- One readout colour works with the translucent fill. The old two-colour switch at 60% existed for
--- an opaque fill: solid `#a6e3a1` at 89% was the bar's brightest object. Tinting the ground removes
--- that contrast threshold and the second colour.
-local READOUT = theme.text_contrast(theme.GLASS_CONTROL)
+-- `textColor: Theme.textContrast(percentage > 0.6 ? batteryColor : bgColor)`. The readout sits over
+-- two grounds -- the fill on its left, the pill on its right -- and 60% is where the text's centre
+-- crosses from one to the other, so that is which ground it contrasts against.
+--
+-- This had been one colour against a fill tinted to 38%, on the argument that a solid `#a6e3a1` at
+-- 89% was the bar's brightest object. That was true of green. The mirror's fill is opaque and
+-- accent, which is the same weight as every other lit control here, so the tint and the single
+-- colour both go with it.
+local READOUT = oblisk.battery:map(function(b)
+    local over_fill = b ~= nil and b.present and (b.percent or 0) > 60
+    return theme.text_contrast(over_fill and battery_color(b) or theme.GLASS_CONTROL)
+end)
 
 -- `onIsPluggedInChanged: if (isPluggedIn) plugFlash.restart()`. `pulse` says a change just
 -- happened; the `computed` beside it keeps only the rising edge, so unplugging does not flash.
@@ -59,9 +70,7 @@ local fill = rect {
         return string.format("%d%%", math.floor(math.max(0, math.min(100, b.percent or 0)) + 0.5))
     end),
     height = "Fill",
-    background = oblisk.battery:map(function(b)
-        return theme.with_opacity(battery_color(b), 0.38)
-    end),
+    background = oblisk.battery:map(battery_color),
     -- `BatteryIndicator.qml`: the level slides and the threshold colour fades (ADR-0145), and the
     -- fill blinks twice when the cable goes in. The entry's presence is what runs the sequence
     -- (ADR-0152), so the whole table is bound rather than a `running` flag inside it. `PropertyAction`
@@ -89,12 +98,21 @@ local readout = row {
     align_v = "Center",
     spacing = theme.spacing.xs,
     children = {
-        glyph(oblisk.battery:map(util.battery_glyph), READOUT, theme.icon.md, { align_v = "Center" }),
+        -- `cell`, not `glyph`: both lines here are `OText`, which is `Theme.fontFamily`, and the
+        -- pill is a bar control rather than a panel row. `components/glyph.lua` would force
+        -- `iconFontFamily` and put this one glyph in a different face from the circles beside it.
+        -- Both `OText`s are `bold: true`. On an accent fill at full opacity the weight is what
+        -- keeps the dark ink readable, which is the same reason the mirror sets it.
+        cell(oblisk.battery:map(function(b)
+            return { { text = util.battery_glyph(b), bold = true } }
+        end), READOUT, theme.icon.md, { align_v = "Center" }),
         cell(util.label(oblisk.battery, function(b)
             if not b.present then
                 return "ac"
             end
             return string.format("%d%%", b.percent)
+        end):map(function(shown)
+            return { { text = shown, bold = true } }
         end), READOUT, theme.font.sm, { align_v = "Center" }),
     },
 }

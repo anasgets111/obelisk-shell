@@ -3867,3 +3867,53 @@ elapsed badge read `1:47` seven seconds apart while paused and `1:51` four secon
 the stopped file is 9.3 MB and `ffprobe` reads `duration=112.905512`, so `SIGINT` closed the
 container and gpu-screen-recorder's own duration agrees with the arithmetic here to within two
 seconds.
+
+
+## 0177. The bar draws glyphs in the body font; only panels use the icon font
+
+Two bars side by side, ours above and the Quickshell config below, and the report was "all icons in
+our bar look off". Not one icon -- all of them.
+
+It was not the codepoints. Extracting every private-use character from `Modules/Bar/Indicators/*.qml`
+and diffing against `config/icons.lua` found 25 of 26 already identical, down to the Font Awesome
+range the mirror mixes in for battery levels and update states. `wallpaper` was the only wrong one.
+
+It was not the size either, though that had to be fixed first to see past it (ADR-0176).
+
+`Config/Theme.qml` declares two faces:
+
+    readonly property string fontFamily:     "CaskaydiaCove Nerd Font Propo"
+    readonly property string iconFontFamily: "JetBrainsMono Nerd Font Mono"
+
+and the split between them is **bar versus panel**, not glyph versus text. `IconButton.qml`,
+`NetworkIndicator.qml`, `DateTimeDisplay.qml` and `BatteryIndicator.qml`'s `OText`s all draw their
+glyphs in `fontFamily`; `PanelRow`, `PanelHeader`, `PanelToggleCard`, `OSDCard`, `AppLauncher` and
+`LockContent` use `iconFontFamily`. Our `components/icon_button.lua` passed `theme.icon_font` to
+every circle on the bar, so each one drew the right Material codepoint in JetBrainsMono's lighter,
+narrower cut instead of CaskaydiaCove's. Correct glyph, wrong hand.
+
+`components/glyph.lua` keeps `icon_font` and needs no change: its callers are exactly the panel
+components that use `iconFontFamily` in the mirror. ADR-0144 said "a glyph is drawn in the icon
+font"; the rule is narrower than that, and the bar is the other half of it.
+
+### The battery pill, which the comparison also settled
+
+Three deviations, all of them ours and all documented at the time:
+
+1. **Green for a healthy battery.** `batteryColor` is `critical : warning : Theme.activeColor`.
+   Green was a fourth state the mirror does not have, and side by side it was the loudest difference
+   between the two bars.
+2. **A fill tinted to 38%, and one readout colour.** The tint was justified by green being too loud
+   opaque; accent at full opacity is the same weight as every other lit control here, so both go
+   back. The readout returns to `textContrast(percentage > 0.6 ? batteryColor : bgColor)` -- 60% is
+   where the text's centre crosses from the fill onto the pill, so that is which ground it
+   contrasts against -- and both lines are `bold: true`.
+3. **The charge glyphs were swapped.** `isPendingCharge` is tested *first* and gets the bolt;
+   everything else on mains gets the plug. So a battery that is actually charging draws the plug,
+   and only one parked at a charge limit draws the bolt. Not the obvious order, and right on a
+   machine with a limit set, where plugged-and-moving is ordinary and plugged-and-parked is the
+   state worth its own glyph. Ours had them the other way, which is why this laptop showed a plug
+   where the mirror showed a bolt.
+
+Measured rather than eyeballed throughout: the power glyph is 13x15px here against the mirror's
+14x16, which is what said the size was already right and sent the search to the face.

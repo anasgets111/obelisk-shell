@@ -137,12 +137,27 @@ return function(glyph, on_activate, opts)
             content = glyph,
             foreground = foreground,
             -- The glyph's own size, not an icon box. A `text` node measures the string, so this is
-            -- the face's rasterised em size. `icon.lg` matches the mirror's `iconSizeFor("md")`
-            -- after its
-            -- 24px base passes through scaling.
-            font_size = opts.icon_size or theme.icon.lg,
-            -- The same family `components/glyph.lua` names (ADR-0144).
-            font = theme.icon_font,
+            -- the face's rasterised em size.
+            --
+            -- `icon.md`, because `IconButton.qml` defaults `size: "md"` and no bar indicator
+            -- overrides it, so `iconSizeFor("md")` is `s(18, 14)`. This read `icon.lg` on a comment
+            -- claiming that was the same number; it is `s(24, 18)`, the mirror's `iconSizeLg`, so
+            -- every circle on the bar drew its glyph a third too large. Invisible on a wifi arc or
+            -- a bell, obvious the moment one of them was a filled square.
+            font_size = opts.icon_size or theme.icon.md,
+            -- The declared chain, *not* `theme.icon_font`. `Theme.qml` has both faces and
+            -- `IconButton.qml` picks the body one -- `font.family: Theme.fontFamily`,
+            -- CaskaydiaCove Nerd Font Propo -- while `iconFontFamily`, JetBrainsMono Nerd Font
+            -- Mono, is what the panel components use. `NetworkIndicator.qml` and
+            -- `DateTimeDisplay.qml` draw their glyphs the same way, so the split is bar versus
+            -- panel, not glyph versus text.
+            --
+            -- This passed `icon_font`, so every circle on the bar drew the mirror's codepoint in
+            -- the wrong face. The codepoints were already right, which is why it read as "all the
+            -- icons look off" rather than as any one wrong icon: JetBrainsMono's Material glyphs
+            -- are lighter and narrower than CaskaydiaCove's at the same pixel size.
+            -- `components/glyph.lua` keeps `icon_font`, because its callers are the panel
+            -- components that use `iconFontFamily` there.
             align_h = "Center",
             align_v = "Center",
         } },
