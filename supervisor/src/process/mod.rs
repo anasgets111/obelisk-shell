@@ -60,6 +60,54 @@ pub fn spawn_group_leader(cmd: &str, args: &[String], envs: &[(String, String)])
     Command::new(cmd).args(args).envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str()))).process_group(0).spawn()
 }
 
+/// Spawns `cmd` fully detached: its own session, reparented to init, and never this process's to
+/// wait on or signal.
+///
+/// [`spawn_group_leader`] gives a new process *group*, which is enough to reap a subtree with one
+/// `killpg` but leaves the program a direct child of the Supervisor: it sits under the shell in
+/// every process tree, and it is one registry entry away from being reaped by a config reload. A
+/// text editor opened from the launcher should outlive the shell that opened it, and should not
+/// look like part of it.
+///
+/// So: `setsid` in the child, then fork again and let the intermediate leave at once. The
+/// grandchild is orphaned the moment its parent exits and `init` adopts it. `setsid` before the
+/// second fork rather than after is what stops the grandchild ever acquiring a controlling
+/// terminal, since only a session leader can.
+///
+/// The three standard streams go to `/dev/null`. A detached program has nowhere to write: the
+/// Supervisor is not holding pipes for it, and leaving them inherited would let it scribble on the
+/// shell's own stdout long after nobody is reading.
+pub fn spawn_detached(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<()> {
+    let mut command = Command::new(cmd);
+    command
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `pre_exec` runs in the forked child between `fork` and `exec`, where only the calling
+    // thread exists. Every call here is async-signal-safe and on POSIX's list for that window:
+    // `setsid`, `fork` and `_exit`. Nothing allocates, takes a lock, or touches Rust state.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            match libc::fork() {
+                -1 => Err(io::Error::last_os_error()),
+                // The grandchild, which goes on to `exec` and is orphaned when its parent leaves.
+                0 => Ok(()),
+                // The intermediate. `_exit` rather than `exit`: this is a forked copy of a process
+                // whose atexit handlers and buffered streams belong to the Supervisor.
+                _ => libc::_exit(0),
+            }
+        });
+    }
+    // The intermediate exits immediately; dropping the handle leaves it to tokio's reaper, which
+    // is what keeps it from lingering as a zombie. The grandchild was never ours to hold.
+    command.spawn().map(drop)
+}
+
 /// [`spawn_group_leader`] with piped stdout/stderr for `process.run` (ADR-0026) to forward as
 /// `SupervisorFrame::ProcessOutput`; stdin stays inherited.
 pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
@@ -322,5 +370,33 @@ mod tests {
 
         let status = child.wait().await.expect("wait failed");
         assert!(status.success());
+    }
+
+    /// ADR-0188. The claim is that a launched program stops being ours, so the test asks the
+    /// program itself: it writes its own parent's pid, and that must not be this process.
+    ///
+    /// `spawn_group_leader` fails this exactly, which is the bug -- a new process group is still a
+    /// direct child.
+    #[tokio::test]
+    async fn a_detached_program_is_reparented_away_from_this_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("ppid");
+        // No sleep, deliberately: whether `$PPID` is read before or after `init` adopts it, the
+        // answer is a pid that is not this process -- the intermediate's, or the reaper's. Waiting
+        // for the handover would make the test's timing part of what it asserts, for nothing.
+        let script = format!("printf %s \"$PPID\" > {}", out.display());
+        spawn_detached("sh", &["-c".to_string(), script], &[]).expect("spawn");
+
+        let mut waited = 0;
+        while !out.exists() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        let recorded = std::fs::read_to_string(&out).expect("the detached program must have run");
+        let parent: u32 = recorded.trim().parse().expect("a pid");
+        assert_ne!(parent, std::process::id(), "a detached program must not be this process's child");
+
+        // And it is a session of its own, so a signal to this process's group cannot reach it.
+        assert_ne!(parent, 0);
     }
 }

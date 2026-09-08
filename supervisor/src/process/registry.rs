@@ -67,6 +67,20 @@ pub(crate) async fn dispatch(
                 );
             }
         },
+        // No registry entry, no handle, no callbacks: a detached program is not this shell's to
+        // reap, and a generation swap must leave it alone (ADR-0188). That is the whole difference
+        // from `run`, and it is why this sends no `ProcessExited` -- there is no `exit_cb` waiting.
+        "detach" => match process_run_args(&envelope.params.arguments) {
+            Some((cmd, args)) => {
+                if let Err(err) = crate::process::spawn_detached(&cmd, &args, &[]) {
+                    eprintln!("process.detach: spawning {cmd:?} failed: {err}");
+                }
+            }
+            None => eprintln!(
+                "malformed process.detach command from generation {generation_id}: {:?}",
+                envelope.params.arguments
+            ),
+        },
         "kill" => match kill_registered_process(processes, generation_id, id).await {
             KillOutcome::Reaped(code) => {
                 send_frame_logged(registry, generation_id, &SupervisorFrame::ProcessExited(ProcessExited { id, code }));

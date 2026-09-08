@@ -88,6 +88,15 @@ impl ProcessRegistry {
         ProcessHandle { id, registry: self.clone() }
     }
 
+    /// Queues a `"detach"` with no callbacks retained: a detached program has no handle, no
+    /// output and no exit code to deliver, so there is no pending pair to leak (ADR-0188). The
+    /// envelope still carries an id because every command does; nothing ever answers it.
+    fn detach(&self, cmd: String, args: Vec<String>) {
+        let id = self.allocate_id();
+        let generation_id = self.0.borrow().generation_id;
+        self.send(process_command(generation_id, "detach", vec![serde_json::json!(cmd), serde_json::json!(args)], id));
+    }
+
     fn kill(&self, id: u64) {
         let generation_id = self.0.borrow().generation_id;
         self.send(process_command(generation_id, "kill", Vec::new(), id));
@@ -136,14 +145,22 @@ impl UserData for ProcessHandle {
     }
 }
 
-/// Registers `process.run(cmd, args, out_cb, exit_cb)`; mlua's closure signature supplies § 3.2
-/// argument validation.
+/// Registers `process.run(cmd, args, out_cb, exit_cb)` and `process.detach(cmd, args)`; mlua's
+/// closure signature supplies § 3.2 argument validation.
 pub fn register(lua: &Lua, registry: ProcessRegistry) -> mlua::Result<()> {
     let table = lua.create_table()?;
+    let detach_registry = registry.clone();
     table.set(
         "run",
         lua.create_function(move |_, (cmd, args, out_cb, exit_cb): (String, Vec<String>, Function, Function)| {
             Ok(registry.run(cmd, args, out_cb, exit_cb))
+        })?,
+    )?;
+    table.set(
+        "detach",
+        lua.create_function(move |_, (cmd, args): (String, Vec<String>)| {
+            detach_registry.detach(cmd, args);
+            Ok(())
         })?,
     )?;
     lua.globals().set("process", table)
@@ -185,6 +202,26 @@ mod tests {
 
         let is_userdata: bool = lua.load("return type(handle) == \"userdata\"").eval().unwrap();
         assert!(is_userdata, "process.run must return a userdata ProcessHandle");
+    }
+
+    /// ADR-0188. `detach` returns nothing and retains nothing: there is no handle to hold and no
+    /// callback pair to leak, because a program this shell has let go of reports nothing back.
+    #[test]
+    fn process_detach_queues_a_command_and_retains_no_callbacks() {
+        let (lua, registry, mut rx) = lua_with_process(7);
+
+        let returned: mlua::Value = lua.load(r#"return process.detach("kate", {"notes.md"})"#).eval().unwrap();
+        assert!(returned.is_nil(), "a detached program has no handle to give back");
+
+        let envelope = queued_command(&mut rx).expect("a detach command must have been queued");
+        assert_eq!(envelope.params.capability, "process");
+        assert_eq!(envelope.params.action, "detach");
+        assert_eq!(envelope.params.generation_id, 7);
+        assert_eq!(envelope.params.arguments, vec![serde_json::json!("kate"), serde_json::json!(["notes.md"])]);
+        assert!(
+            registry.0.borrow().pending.is_empty(),
+            "nothing may be retained for a process that will never report an exit"
+        );
     }
 
     #[test]

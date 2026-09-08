@@ -156,6 +156,10 @@ impl ApplicationsController {
     /// `Child` for its exit code (ADR-0026). For a GUI app that keeps two pipes and a child alive
     /// for its whole run; a generation swap would reap it and close an editor when config reloads.
     ///
+    /// [`crate::process::spawn_detached`] rather than a new process group: a group leader is still
+    /// a direct child of the Supervisor, so every launched app sat under the shell in the process
+    /// tree and depended on nobody putting it in the reap registry (ADR-0188).
+    ///
     /// ponytail: `Terminal=true` reads `$TERMINAL` and refuses when unset. Probing `PATH` for
     /// known emulators is the upgrade; a set variable gets exactly that terminal, while guessing
     /// wrong is worse than naming the missing variable.
@@ -165,9 +169,8 @@ impl ApplicationsController {
             targets.get(id).cloned().ok_or(LaunchError::Unknown)?
         };
         let (command, args) = command_line(std::env::var("TERMINAL").ok(), target)?;
-        // Dropping rather than awaiting detaches it; tokio's background reaper handles the orphan.
-        match crate::process::spawn_group_leader(&command, &args, &[]) {
-            Ok(_) => Ok(()),
+        match crate::process::spawn_detached(&command, &args, &[]) {
+            Ok(()) => Ok(()),
             Err(err) => Err(LaunchError::Spawn(err.to_string())),
         }
     }
@@ -181,8 +184,8 @@ impl ApplicationsController {
     /// spawn error.
     pub fn open_url(&self, url: &str) -> Result<(), OpenUrlError> {
         openable_url(url).map_err(OpenUrlError::Refused)?;
-        match crate::process::spawn_group_leader("xdg-open", &[url.to_string()], &[]) {
-            Ok(_) => Ok(()),
+        match crate::process::spawn_detached("xdg-open", &[url.to_string()], &[]) {
+            Ok(()) => Ok(()),
             Err(err) => Err(OpenUrlError::Spawn(err.to_string())),
         }
     }

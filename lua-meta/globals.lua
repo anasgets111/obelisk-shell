@@ -50,6 +50,22 @@ function ProcessHandle:kill() end
 ---@return ProcessHandle # Live immediately. The process is already running when this returns.
 function process.run(cmd, args, out_cb, exit_cb) end
 
+---Spawns a program and lets go of it completely.
+---
+---The program gets its own session and is reparented to `init`, so it is not this shell's child in
+---any process tree, no reload can reap it, and killing the shell leaves it running. That is what a
+---launcher wants: an editor opened from one should outlive the config edit that follows.
+---
+---There is no handle, no output and no exit code, because none of those survive letting go. Use
+---[`process.run`] for anything whose output or exit you need, and this for anything you are
+---handing to the user (ADR-0188).
+---
+---Its three standard streams go to `/dev/null`: nothing is reading them, and leaving them
+---inherited lets a program write over the shell's own log long after it stopped being related.
+---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
+---@param args string[] One element per argument, already split. Passing `"a b"` is one argument containing a space.
+function process.detach(cmd, args) end
+
 ---@class SessionProcessHandle
 ---One program declared with [`session_process`]. Every field is a signal over this program's entry
 ---in `oblisk.processes`, and the three methods are the only ways to move it: there is no handle to

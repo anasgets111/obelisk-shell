@@ -4457,6 +4457,36 @@ last one looked untestable and is not -- the fixture is a solid colour at the re
 KB on disk and 19 ms to encode, because what the decoder charges for is the dimensions and not the
 entropy. Assuming a large decode needs a large file is the same mistake this ADR is about.
 
+## 0188. A program handed to the user is let go of, not merely put in its own process group
+
+`applications.launch` and `open_url` spawned through `spawn_group_leader` and dropped the handle,
+with a comment calling that detached. A new process *group* is not detachment. The program stayed a
+direct child of the Supervisor: it appeared under the shell in every process tree, and it stayed
+one registry entry away from being reaped by a config reload.
+
+`spawn_detached` is the real thing: `setsid` in the forked child, then fork again and let the
+intermediate exit immediately. The grandchild is orphaned the moment its parent leaves and `init`
+adopts it. `setsid` before the second fork rather than after is what stops the grandchild ever
+acquiring a controlling terminal, since only a session leader can.
+
+Its three standard streams go to `/dev/null`. Nothing is reading them, and leaving them inherited
+lets a launched program write over the shell's own log long after it stopped being related to it.
+
+The same capability is now a config's: `process.detach(cmd, args)`, beside `process.run`. Two
+actions rather than a flag on one, because the difference is not a switch -- `run` has a handle,
+streams both pipes and delivers an exit code, and every one of those is a thing that cannot survive
+letting go. A `detached = true` on `run` would make three of its four arguments meaningless and
+leave `ProcessHandle:kill` pointing at a process this shell can no longer name. So `detach` returns
+nothing, retains no callbacks, and registers nothing to reap.
+
+What this gives up, stated rather than discovered later: a detached program cannot be killed,
+waited on, or read from by the config that started it. That is the trade, and it is the right one
+for the case it exists to serve -- an editor opened from the launcher should outlive the config edit
+that follows, and a shell that dies should not take the user's work with it.
+
+Tested by asking the program itself: it writes its own `$PPID`, which must not be this process.
+`spawn_group_leader` fails that assertion, which is what makes it a test rather than a restatement.
+
 ## 0189. A submit reaches `on_submit` before the `on_change` that reports the field clearing
 
 Enter on a `textfield` empties the buffer, then reports that emptying through `on_change("")`. That
