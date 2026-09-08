@@ -837,24 +837,7 @@ impl App {
             self.focus_text_field(None);
         }
         self.field_input_changed = true;
-        if edit.changed
-            && let Some(on_change) = on_change
-            && let Err(e) = on_change.call::<()>(if edit.submitted { String::new() } else { text.clone() })
-        {
-            eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
-        }
-        if edit.submitted
-            && let Some(on_submit) = on_submit
-            && let Err(e) = on_submit.call::<()>(text)
-        {
-            eprintln!("[oblisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
-        }
-        if edit.cancelled
-            && let Some(on_cancel) = on_cancel
-            && let Err(e) = on_cancel.call::<()>(())
-        {
-            eprintln!("[oblisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
-        }
+        deliver_plain_edit(&surface_id, edit, text, PlainCallbacks { on_change, on_submit, on_cancel });
     }
 
     /// Build and queue a completed `secure_submit`; [`submit_frame_for`] reads once and scrubs on
@@ -1480,6 +1463,47 @@ impl KeyboardHandler for App {
     }
 }
 
+/// The three callbacks one plain-field edit may deliver. Grouped so [`deliver_plain_edit`] takes an
+/// argument per idea rather than one per callback.
+struct PlainCallbacks {
+    on_change: Option<Function>,
+    on_submit: Option<Function>,
+    on_cancel: Option<Function>,
+}
+
+/// Delivers one plain-field edit's callbacks in the order a config can rely on (ADR-0189).
+///
+/// `on_submit` before `on_change`. A submit clears the buffer, and the `on_change` that reports the
+/// clearing carries the empty string; delivering it first hands a config the empty field before the
+/// text that filled it. `dev-config`'s launcher derives its selection from its query, so that order
+/// wiped the query, resolved the rows against an empty needle, and launched the first entry of the
+/// unfiltered list rather than the row on screen. Submit carries the user's intent and goes first;
+/// the clear is bookkeeping and follows.
+///
+/// Free rather than a method so the ordering can be tested with recording closures; the dispatch it
+/// came out of needs a whole `App`, which is why this was never covered.
+fn deliver_plain_edit(surface_id: &str, edit: PlainEdit, text: String, callbacks: PlainCallbacks) {
+    let PlainCallbacks { on_change, on_submit, on_cancel } = callbacks;
+    if edit.submitted
+        && let Some(on_submit) = on_submit
+        && let Err(e) = on_submit.call::<()>(text.clone())
+    {
+        eprintln!("[oblisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
+    }
+    if edit.changed
+        && let Some(on_change) = on_change
+        && let Err(e) = on_change.call::<()>(if edit.submitted { String::new() } else { text })
+    {
+        eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
+    }
+    if edit.cancelled
+        && let Some(on_cancel) = on_cancel
+        && let Err(e) = on_cancel.call::<()>(())
+    {
+        eprintln!("[oblisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1771,6 +1795,66 @@ mod tests {
             FieldTarget::Masked(target) => Some(target),
             FieldTarget::Plain { .. } => None,
         }
+    }
+
+    /// ADR-0189. A submit clears the buffer and reports that clearing through `on_change("")`. If
+    /// that lands before `on_submit`, a config reading its own query at submit time sees an empty
+    /// one -- which launched the first entry of an unfiltered list instead of the row on screen.
+    #[test]
+    fn a_submit_reaches_on_submit_before_the_on_change_that_reports_the_clearing() {
+        let lua = mlua::Lua::new();
+        lua.load("log = {}").exec().unwrap();
+        let record = |name: &'static str| {
+            let lua_ref = &lua;
+            lua_ref
+                .create_function(move |lua, text: mlua::Value| {
+                    let seen = match text {
+                        mlua::Value::String(s) => s.to_str()?.to_owned(),
+                        _ => String::new(),
+                    };
+                    let log: mlua::Table = lua.globals().get("log")?;
+                    log.push(format!("{name}({seen})"))?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let callbacks =
+            PlainCallbacks { on_change: Some(record("change")), on_submit: Some(record("submit")), on_cancel: None };
+        let edit = PlainEdit { changed: true, submitted: true, ..PlainEdit::NONE };
+        deliver_plain_edit("launcher@eDP-1", edit, "calc".to_string(), callbacks);
+
+        let order: Vec<String> =
+            lua.globals().get::<mlua::Table>("log").unwrap().sequence_values().collect::<mlua::Result<_>>().unwrap();
+        assert_eq!(
+            order,
+            vec!["submit(calc)".to_string(), "change()".to_string()],
+            "submit must carry the text, and the empty change must follow it"
+        );
+    }
+
+    /// An ordinary keystroke is unaffected: `on_change` carries the text and nothing else fires.
+    #[test]
+    fn a_plain_keystroke_reports_the_text_through_on_change_alone() {
+        let lua = mlua::Lua::new();
+        lua.load("log = {}").exec().unwrap();
+        let on_change = lua
+            .create_function(|lua, text: String| {
+                let log: mlua::Table = lua.globals().get("log")?;
+                log.push(format!("change({text})"))?;
+                Ok(())
+            })
+            .unwrap();
+        let callbacks = PlainCallbacks { on_change: Some(on_change), on_submit: None, on_cancel: None };
+        deliver_plain_edit(
+            "launcher@eDP-1",
+            PlainEdit { changed: true, ..PlainEdit::NONE },
+            "cal".to_string(),
+            callbacks,
+        );
+
+        let order: Vec<String> =
+            lua.globals().get::<mlua::Table>("log").unwrap().sequence_values().collect::<mlua::Result<_>>().unwrap();
+        assert_eq!(order, vec!["change(cal)".to_string()]);
     }
 
     /// A `textfield` carrying `on_submit`, the plain half's minimum for being worth focusing.

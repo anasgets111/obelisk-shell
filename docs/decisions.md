@@ -4456,3 +4456,32 @@ decode abandoned because its entry was evicted during the wait; and the 78 MiB c
 last one looked untestable and is not -- the fixture is a solid colour at the real dimensions, 400
 KB on disk and 19 ms to encode, because what the decoder charges for is the dimensions and not the
 entropy. Assuming a large decode needs a large file is the same mistake this ADR is about.
+
+## 0189. A submit reaches `on_submit` before the `on_change` that reports the field clearing
+
+Enter on a `textfield` empties the buffer, then reports that emptying through `on_change("")`. That
+report was delivered *before* `on_submit`, so a config was handed the empty field before the text
+that filled it.
+
+`dev-config`'s launcher derives its selection from its query: type `calc`, press Enter, and the
+order was `on_change("")` -> query becomes empty -> results resolve against an empty needle to the
+full application list -> `on_submit` runs and launches the first entry of *that* list. Typing an
+app name and pressing Enter opened Avahi SSH Server Browser, every time, for any query.
+
+Nothing about this was visible from the outside. The list on screen had already been rebuilt
+against the empty query by the time anything drew, so it looked like "Enter ignores the selection"
+rather than "the selection was recomputed a moment ago". No error was raised, no callback failed,
+and the config was correct as written -- `on_change` fired with the right text on every keystroke,
+which is what made it look like a config bug for as long as it did.
+
+Submit carries the user's intent and goes first. The clear is bookkeeping about a field the user has
+already finished with, and follows. `on_change` still carries the empty string, because the field
+really is empty by then; only the order changed.
+
+The delivery is a free function rather than four blocks inside the key handler, because the handler
+needs a whole `App` and could not be tested. Two tests now pin it: a submit delivering
+`on_submit("calc")` then `on_change("")` in that order, and an ordinary keystroke still reporting
+its text through `on_change` alone.
+
+Found by probing the running config rather than by reading it. The read said the config was right,
+twice, and it was.
