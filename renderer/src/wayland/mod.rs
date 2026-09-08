@@ -463,9 +463,9 @@ pub fn run(
         // its own repaint/invalidation (ADR-0122).
         let landed = app.image_cache.poll();
         if !landed.is_empty() {
-            // Before the invalidation, so the repaint it forces already builds its list from the
-            // sources these nodes have caught up to (ADR-0180).
-            app.client.note_landed_images(&landed, std::time::Instant::now());
+            // The cue to repaint, and nothing more: what each node is now showing is settled by
+            // the paint that follows, which is the only thing holding the exact cache keys
+            // (ADR-0183).
             app.forget_painted_lists_drawing(&landed);
         }
         if re_resolved {

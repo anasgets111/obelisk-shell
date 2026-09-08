@@ -22,7 +22,7 @@ pub mod icons;
 pub mod thumbnails;
 
 use crate::layout::node::Rgba;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -37,11 +37,15 @@ use crate::text::snap::LogicalRect;
 /// keeps a config cycling through a thousand failing paths from growing the map without bound.
 const CACHE_CAPACITY: usize = 128;
 
-/// Starting idle-texture budget, replaced by [`ImageCache::set_texture_budget`] as soon as the
-/// outputs are known (ADR-0182). Idle means beyond what mapped surfaces show: last-painted textures
-/// are pinned and never evicted, so an oversized working set stays over budget rather than
-/// thrashing decodes. Before any budget, moved-on 1920x1200 wallpapers (12 MB each) survived the
+/// Starting texture budget, replaced by [`ImageCache::set_texture_budget`] as soon as the outputs
+/// are known (ADR-0182). Before any budget, moved-on 1920x1200 wallpapers (12 MB each) survived the
 /// next 128 inserts and closed picker tiles did too.
+///
+/// [`ImageCache::trim`] compares *total* resident bytes against it and then evicts only unpinned
+/// entries, so it is not an allowance for idle textures on top of what mapped surfaces show, which
+/// is what ADR-0182 and the comments around it claimed. A pinned working set larger than the budget
+/// leaves `trim` evicting every idle entry and still over -- correct, in that it never drops what a
+/// surface is showing, and wasteful, in that the eviction bought nothing.
 ///
 /// `wayland::output::texture_budget` owns the real figure, because what fits is a property of the
 /// displays and not of this file.
@@ -249,8 +253,6 @@ impl Pool {
 /// persisted: reload swaps the Renderer, so this is cold after every config edit (ADR-0054).
 pub struct ImageCache {
     entries: HashMap<CacheKey, Entry>,
-    /// Insertion order used by [`CACHE_CAPACITY`] eviction.
-    order: VecDeque<CacheKey>,
     /// Evicted since [`ImageCache::release_evicted`], not yet freed.
     evicted: Vec<ImageId>,
     /// Bytes across `Ready` slots, maintained by [`ImageCache::insert`] and [`ImageCache::evict`].
@@ -293,7 +295,6 @@ impl ImageCache {
     fn build(waker: Option<crate::wake::Waker>) -> Self {
         ImageCache {
             entries: HashMap::new(),
-            order: VecDeque::new(),
             evicted: Vec::new(),
             resident_bytes: 0,
             tick: 0,
@@ -412,8 +413,7 @@ impl ImageCache {
         let box_px = (box_px.0.max(1), box_px.1.max(1));
         let key = CacheKey {
             path: path.to_path_buf(),
-            // A vector texture uses its longest edge, so 24x30 shares the 30x30 slot.
-            box_px: if vector { (box_px.0.max(box_px.1), box_px.0.max(box_px.1)) } else { box_px },
+            box_px: cache_box(path, box_px),
             version: FileVersion::read(path),
             // Only vectors carry `currentColor`; drop PNG tint instead of splitting unused slots.
             tint: if vector { tint.map(packed_rgb) } else { None },
@@ -485,21 +485,34 @@ impl ImageCache {
     /// [`ImageCache::release_evicted`]: femtovg frees nothing by `ImageId` until told to, so losing
     /// the id leaks the GPU allocation permanently.
     fn insert(&mut self, key: CacheKey, slot: Slot) {
-        while self.order.len() >= CACHE_CAPACITY {
-            let Some(oldest) = self.order.pop_front() else {
+        // Its own tick, so an insert that did not come through `image` still orders after every
+        // earlier one and `last_hit` never ties. That makes the scan below fall back to insertion
+        // order exactly where nothing has been asked for twice.
+        self.tick += 1;
+        while self.entries.len() >= CACHE_CAPACITY {
+            // Least recently *asked for*, not oldest inserted (ADR-0183). This bound is the one
+            // eviction path that never sees the pin list, and the oldest insert is typically the
+            // wallpaper: put up first and asked for on every frame since, so a picker filling the
+            // map evicted the one texture certain to be on screen. `image` bumps `last_hit` on
+            // every hit, so whatever a mapped surface drew this frame is the newest thing here.
+            //
+            // ponytail: a linear scan of at most `CACHE_CAPACITY` entries, on the insert that hits
+            // the bound and not on the others. A heap would order it in log time and would have to
+            // be reordered on every hit, which is the common case; this is the rarer one.
+            let Some(coldest) = self.entries.iter().min_by_key(|(_, entry)| entry.last_hit).map(|(key, _)| key.clone())
+            else {
                 break;
             };
-            self.evict(&oldest);
+            self.evict(&coldest);
         }
         if let Slot::Ready(_, bytes) = slot {
             self.resident_bytes += bytes;
         }
-        self.order.push_back(key.clone());
         self.entries.insert(key, Entry { slot, last_hit: self.tick });
     }
 
     /// Drops one entry, queues its texture for [`ImageCache::release_evicted`], and subtracts its
-    /// bytes. Scanning `order` is the [`CACHE_CAPACITY`]-bounded eviction cost, paid off-frame.
+    /// bytes.
     fn evict(&mut self, key: &CacheKey) {
         if let Some(entry) = self.entries.remove(key) {
             match &entry.slot {
@@ -512,11 +525,20 @@ impl ImageCache {
                 Slot::Pending => self.unwant(key),
                 Slot::Failed => {}
             }
-            if let Some(at) = self.order.iter().position(|k| k == key) {
-                self.order.remove(at);
-            }
         }
     }
+}
+
+/// The box a source is *stored* under, which is not always the box it is drawn into: a vector
+/// texture uses its longest edge, so 24x30 shares the 30x30 slot (ADR-0122).
+///
+/// Public because a pin has to name the same thing the entry does. `DisplayList::drawn_images`
+/// collects the drawn box, and before this an `image` pointing at an SVG pinned 200x40 while the
+/// entry sat under 200x200, so the exact comparison in [`victims`] missed it and evicted a texture
+/// a mapped surface was showing (ADR-0183).
+pub fn cache_box(path: &Path, box_px: (u32, u32)) -> (u32, u32) {
+    let box_px = (box_px.0.max(1), box_px.1.max(1));
+    if is_vector(path) { (box_px.0.max(box_px.1), box_px.0.max(box_px.1)) } else { box_px }
 }
 
 /// Evictions from `(key, bytes, last_hit)` to bring `resident` under `budget`: oldest ask first,
@@ -1008,19 +1030,38 @@ mod tests {
         assert!(decode_raster(&fake, (8, 8), None).is_err());
     }
 
+    /// ADR-0183. The capacity bound never sees the pin list, so it evicts by what has been asked
+    /// for least recently rather than by what was inserted first -- otherwise the entry most
+    /// certain to be on screen, the wallpaper put up before everything else, is the first to go
+    /// when a picker fills the map.
     #[test]
-    fn the_cache_stays_at_its_capacity_and_keeps_the_keys_it_kept() {
+    fn the_capacity_bound_evicts_the_coldest_entry_and_not_the_oldest_one() {
         // Negative entries only: `ImageId` has no public constructor.
         let mut cache = ImageCache::new();
-        for n in 0..(CACHE_CAPACITY * 2) {
+        let first = key("/tmp/0.png", 0, FileVersion::default());
+        for n in 0..CACHE_CAPACITY {
+            cache.insert(key(&format!("/tmp/{n}.png"), 0, FileVersion::default()), Slot::Failed);
+        }
+
+        // Asked for again, the way a mapped surface asks for what it draws every frame.
+        cache.tick += 1;
+        let hit = cache.tick;
+        cache.entries.get_mut(&first).unwrap().last_hit = hit;
+
+        // Ten more at the bound, so ten entries have to go.
+        for n in CACHE_CAPACITY..(CACHE_CAPACITY + 10) {
             cache.insert(key(&format!("/tmp/{n}.png"), 0, FileVersion::default()), Slot::Failed);
         }
         assert_eq!(cache.entries.len(), CACHE_CAPACITY);
-        assert_eq!(cache.order.len(), CACHE_CAPACITY);
-        let newest = key(&format!("/tmp/{}.png", CACHE_CAPACITY * 2 - 1), 0, FileVersion::default());
-        let oldest = key("/tmp/0.png", 0, FileVersion::default());
+        let newest = key(&format!("/tmp/{}.png", CACHE_CAPACITY + 9), 0, FileVersion::default());
         assert!(cache.entries.contains_key(&newest));
-        assert!(!cache.entries.contains_key(&oldest));
+        assert!(cache.entries.contains_key(&first), "the oldest insert survives, because it is still being asked for");
+        for n in 1..=10 {
+            assert!(
+                !cache.entries.contains_key(&key(&format!("/tmp/{n}.png"), 0, FileVersion::default())),
+                "the ten coldest go instead, /tmp/{n}.png among them"
+            );
+        }
     }
 
     fn key(path: &str, px: u32, version: FileVersion) -> CacheKey {

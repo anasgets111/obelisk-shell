@@ -6,13 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::time::Instant;
 
 use mlua::{Lua, Value};
 
 use crate::layout::instance::SurfaceInstance;
 use crate::layout::node::{self, Align, Dissolve, EdgeInsets, LayoutError, PaintStyle, SizeMode, StyleRun, Tween};
+use crate::layout::paint::DrawnImage;
 use crate::lua::nodes::VirtualNode;
 use crate::text::shaping::{self, ShapeRequest, ShapingHandle};
 use crate::text::snap::{LogicalRect, PhysicalRect, snap_to_physical};
@@ -144,8 +144,9 @@ pub struct ResolvedNode {
     pub paint: Option<PaintStyle>,
     /// The `source` this node last had a texture for, for an `image` declaring `retain`
     /// (ADR-0180). `layout::paint` draws it while a newly named source is still decoding, so the
-    /// node holds its last picture instead of going blank; [`Scene::note_landed_images`] moves it
-    /// forward as decodes land. `None` for every other kind, and until the first one lands.
+    /// node holds its last picture instead of going blank; [`Scene::note_drawn_images`] moves it
+    /// forward as paint proves it has each texture. `None` for every other kind, and until the
+    /// first source is drawn.
     pub displayed_source: Option<String>,
     /// The cross-dissolve this `image` is in the middle of (ADR-0181), from the source it was
     /// covering the gap with to the one `displayed_source` has just moved to. `None` whenever the
@@ -366,35 +367,35 @@ impl Scene {
         Ok(())
     }
 
-    /// Moves every retaining `image` whose current `source` is among `landed` onto that source
-    /// (ADR-0180). `ImageCache::poll` names the files whose pixels arrived; the paint that follows
-    /// uploads them before it draws, so a file in this list is what the node is about to show, and
-    /// the source it was covering the gap with is no longer needed.
+    /// Moves every `image` named in `drawn` onto the source that paint had a texture for, and
+    /// starts a cross-dissolve where one is declared (ADR-0183). `layout::paint::execute` reports
+    /// these after drawing the surface, which is the only place the answer is knowable: it holds
+    /// the node's exact cache key, and it can tell a decode that landed from one that failed and
+    /// from one that was already cached and never landed at all.
     ///
-    /// Matching is by path alone, which is the same coarseness `App::forget_painted_lists_drawing`
-    /// already invalidates lists with: two nodes drawing one file at different sizes land together
-    /// or not at all. The consequence of being early is one frame drawn from the cover source,
-    /// which is the frame it was there for.
-    pub fn note_landed_images(&mut self, landed: &[PathBuf], now: Instant) {
-        fn walk(node: &mut ResolvedNode, landed: &[PathBuf], now: Instant) {
-            if let Some(PaintStyle::Image { source, retain: true, transition, .. }) = &node.paint
-                && landed.iter().any(|file| file.as_os_str() == source.as_str())
+    /// The dissolve captures both of its endpoints here. A pass resolving a third source while it
+    /// runs does not move them; that source waits, and crosses from wherever this run leaves the
+    /// node.
+    pub fn note_drawn_images(&mut self, instance_id: &str, drawn: &[DrawnImage], now: Instant) {
+        fn walk(node: &mut ResolvedNode, drawn: &[DrawnImage], now: Instant) {
+            if let Some(PaintStyle::Image { retain: true, transition, .. }) = &node.paint
+                && let Some(shown) = drawn.iter().find(|image| image.node == node.id)
+                && node.displayed_source.as_deref() != Some(shown.source.as_str())
             {
-                let previous = node.displayed_source.replace(source.clone());
-                // A dissolve needs somewhere to come from, and a node that has just drawn its
-                // first picture has nowhere: it appears rather than crosses. A landing that does
-                // not change the source is a re-decode, not a change, and crossing a picture with
-                // itself is a blink at half alpha (ADR-0181).
+                let previous = node.displayed_source.replace(shown.source.clone());
+                // A node that has just drawn its first picture has nothing to cross from: it
+                // appears. A dissolve already running keeps its endpoints -- this draw is that
+                // run's own incoming, not a new change.
                 if let (Some(spec), Some(previous)) = (transition, previous)
-                    && previous != *source
+                    && node.dissolve.is_none()
                 {
-                    node.dissolve = Some(Dissolve::start(previous, *spec, now));
+                    node.dissolve = Some(Dissolve::start(previous, shown.source.clone(), *spec, now));
                 }
             }
-            node.children.iter_mut().for_each(|child| walk(child, landed, now));
+            node.children.iter_mut().for_each(|child| walk(child, drawn, now));
         }
-        for tree in self.surfaces.values_mut() {
-            walk(tree, landed, now);
+        if let Some(tree) = self.surfaces.get_mut(instance_id) {
+            walk(tree, drawn, now);
         }
     }
 
@@ -2195,8 +2196,8 @@ pub(super) mod tests {
         assert_eq!(child.rect.width, 40.0, "a Signal-valued width must resolve at layout time");
     }
 
-    /// ADR-0180. The landing cue moves a retaining image onto the source it named, and reaches
-    /// only images that asked to retain: everything else keeps drawing what a pass resolved.
+    /// ADR-0180, ADR-0183. A drawn source moves a retaining image onto it, and reaches only images
+    /// that asked to retain: everything else keeps drawing what a pass resolved.
     #[test]
     fn a_landed_decode_moves_a_retaining_image_onto_the_source_it_named() {
         let mut scene = Scene::new();
@@ -2221,23 +2222,31 @@ pub(super) mod tests {
         };
         let held = |scene: &Scene| image(scene, 0);
         let plain = |scene: &Scene| image(scene, 1);
-        assert_eq!(held(&scene), None, "nothing has landed yet");
+        let id = |scene: &Scene, index: usize| scene.surface("bar@TEST").unwrap().children[0].children[index].id;
+        assert_eq!(held(&scene), None, "nothing has been drawn yet");
 
-        // A file nobody named moves nothing, which is what stops one surface's decode advancing
-        // another's cover.
-        scene.note_landed_images(&[PathBuf::from("/tmp/other.png")], Instant::now());
+        // A report for another node moves nothing. Node identity, not path: two images may draw
+        // one file, and only the one that drew it has caught up to it.
+        let (held_id, plain_id) = (id(&scene, 0), id(&scene, 1));
+        let drew = |node, source: &str| DrawnImage { node, source: source.to_string() };
+        scene.note_drawn_images("bar@TEST", &[drew(plain_id, "/tmp/new.png")], Instant::now());
         assert_eq!(held(&scene), None);
-
-        scene.note_landed_images(&[PathBuf::from("/tmp/new.png")], Instant::now());
-        assert_eq!(held(&scene), Some("/tmp/new.png".to_string()));
         assert_eq!(plain(&scene), None, "an image that did not ask to retain holds nothing");
+
+        scene.note_drawn_images("bar@TEST", &[drew(held_id, "/tmp/new.png")], Instant::now());
+        assert_eq!(held(&scene), Some("/tmp/new.png".to_string()));
+
+        // A report for another surface never reaches this tree.
+        scene.note_drawn_images("other@TEST", &[drew(held_id, "/tmp/later.png")], Instant::now());
+        assert_eq!(held(&scene), Some("/tmp/new.png".to_string()));
     }
 
-    /// ADR-0181. A dissolve starts on the landing and not on the pass that named the source, it
-    /// starts at zero, it needs somewhere to come from, and while it runs the node owes the
-    /// compositor frames without owing it a layout.
+    /// ADR-0181, ADR-0183. A dissolve starts when paint has the incoming texture and not on the
+    /// pass that named it, it starts at zero, it needs somewhere to come from, it keeps both of its
+    /// endpoints when a third source arrives, and while it runs the node owes the compositor frames
+    /// without owing it a layout.
     #[test]
-    fn a_dissolve_starts_on_the_landing_that_replaces_a_picture_and_not_on_the_first_one() {
+    fn a_dissolve_holds_its_two_endpoints_from_the_draw_that_starts_it_until_it_ends() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let lua = mlua::Lua::new();
@@ -2255,21 +2264,25 @@ pub(super) mod tests {
             apply_at(scene, &[surface], full(), &shaping, &lua).unwrap();
         };
         let node = |scene: &Scene| scene.surface("bar@TEST").unwrap().children[0].clone();
+        let drew = |scene: &Scene, source: &str| {
+            [DrawnImage { node: scene.surface("bar@TEST").unwrap().children[0].id, source: source.to_string() }]
+        };
 
         apply(&mut scene, "/tmp/a.png");
-        assert!(node(&scene).dissolve.is_none(), "naming a source starts nothing; the landing does");
+        assert!(node(&scene).dissolve.is_none(), "naming a source starts nothing; drawing it does");
         assert!(!scene.surface("bar@TEST").unwrap().animating());
 
-        // First landing: the node had no picture, so it appears rather than crosses.
-        scene.note_landed_images(&[PathBuf::from("/tmp/a.png")], Instant::now());
+        // First draw: the node had no picture, so it appears rather than crosses.
+        scene.note_drawn_images("bar@TEST", &drew(&scene, "/tmp/a.png"), Instant::now());
         assert!(node(&scene).dissolve.is_none(), "the first picture has nothing to cross from");
 
         apply(&mut scene, "/tmp/b.png");
-        assert!(node(&scene).dissolve.is_none(), "still nothing until b's pixels arrive");
+        assert!(node(&scene).dissolve.is_none(), "still nothing until a paint has b's texture");
         let started = Instant::now();
-        scene.note_landed_images(&[PathBuf::from("/tmp/b.png")], started);
+        scene.note_drawn_images("bar@TEST", &drew(&scene, "/tmp/b.png"), started);
         let dissolve = node(&scene).dissolve.expect("b replaced a, so it crosses");
         assert_eq!(dissolve.from, "/tmp/a.png", "it crosses from the picture that was up");
+        assert_eq!(dissolve.to, "/tmp/b.png", "and to the one the draw proved it has");
         assert_eq!(dissolve.progress, 0.0, "and it opens on the outgoing, not part way across");
         assert_eq!(
             node(&scene).displayed_source.as_deref(),
@@ -2281,9 +2294,17 @@ pub(super) mod tests {
         assert!(tree.animating(), "a dissolve owes the compositor its next frame");
         assert!(tree.tick_is_paint_only(), "and owes it no layout: all it moves is an alpha");
 
-        // A landing that does not change the source is a re-decode, not a change.
-        scene.note_landed_images(&[PathBuf::from("/tmp/b.png")], started);
+        // Every frame of the run redraws b and reports it again; that is this run's own incoming,
+        // not a change, and it must not restart anything.
+        scene.note_drawn_images("bar@TEST", &drew(&scene, "/tmp/b.png"), started);
         assert_eq!(node(&scene).dissolve.map(|d| d.from), Some("/tmp/a.png".to_string()), "unchanged, not restarted");
+
+        // A third source arriving mid-run leaves both endpoints alone. Before this the draw
+        // followed the node's latest `source`, so b vanished from the screen halfway across and
+        // took its cache pin with it (ADR-0183).
+        apply(&mut scene, "/tmp/c.png");
+        let running = node(&scene).dissolve.expect("still crossing a to b");
+        assert_eq!((running.from.as_str(), running.to.as_str()), ("/tmp/a.png", "/tmp/b.png"));
 
         // The tick has to reach it. This node has no `animate` block, so the walk's tween gate
         // skips it entirely, and a dissolve advanced behind that gate never moves -- which is what

@@ -744,10 +744,14 @@ pub fn parse_transition(properties: &HashMap<String, Value>) -> Result<Option<Tr
 /// landed on and dropped the moment its duration is up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dissolve {
-    /// The source being crossed away from: what the node displayed when the incoming landed.
-    /// `ResolvedNode::displayed_source` has already moved on to the incoming by then, so the
-    /// outgoing has nowhere else to live.
+    /// The source being crossed away from: what the node displayed when the incoming was first
+    /// drawn. `ResolvedNode::displayed_source` has already moved on to the incoming by then, so
+    /// the outgoing has nowhere else to live.
     pub from: String,
+    /// The source being crossed to. Held rather than read off the node, because a pass may resolve
+    /// a third source while this run is still going and a run whose destination moved under it
+    /// drops the picture it was halfway to (ADR-0183). The successor waits for this run to end.
+    pub to: String,
     pub started: Instant,
     pub spec: TransitionSpec,
     /// Eased 0..1 as of the last advance, and what `layout::paint` draws the incoming at. Held
@@ -758,8 +762,8 @@ pub struct Dissolve {
 }
 
 impl Dissolve {
-    pub fn start(from: String, spec: TransitionSpec, now: Instant) -> Self {
-        Self { from, started: now, spec, progress: 0.0 }
+    pub fn start(from: String, to: String, spec: TransitionSpec, now: Instant) -> Self {
+        Self { from, to, started: now, spec, progress: 0.0 }
     }
 
     /// Advances to `now`. `false` once the dissolve is over, which is the caller's cue to drop it
@@ -769,7 +773,11 @@ impl Dissolve {
         if elapsed >= self.spec.duration {
             return false;
         }
-        self.progress = self.spec.easing.apply(elapsed.as_secs_f32() / self.spec.duration.as_secs_f32());
+        // Clamped, unlike a tween's value: `Easing::apply` clamps its input and not its output, so
+        // Back, Elastic and Bounce all leave [0, 1], and this number is drawn as an alpha rather
+        // than handed to a property parser that would refuse it (ADR-0183).
+        let eased = self.spec.easing.apply(elapsed.as_secs_f32() / self.spec.duration.as_secs_f32());
+        self.progress = eased.clamp(0.0, 1.0);
         true
     }
 }
@@ -2352,7 +2360,7 @@ mod tests {
     fn a_dissolve_eases_across_its_duration_and_reports_when_it_is_over() {
         let spec = TransitionSpec { duration: Duration::from_millis(400), easing: Easing::Linear };
         let started = Instant::now();
-        let mut dissolve = Dissolve::start("/tmp/a.png".into(), spec, started);
+        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec, started);
         assert_eq!(dissolve.progress, 0.0, "it opens on the outgoing picture");
 
         assert!(dissolve.advance(started + Duration::from_millis(100)));
@@ -2361,10 +2369,19 @@ mod tests {
         assert!((dissolve.progress - 0.75).abs() < 1e-5);
 
         assert!(!dissolve.advance(started + Duration::from_millis(400)), "the end is the end, not a rest at 1.0");
+
+        // An overshooting curve is clamped before it is stored: this number is drawn as an alpha,
+        // and `Easing::apply` clamps its input, not its output (ADR-0183).
+        let overshoot = TransitionSpec { duration: Duration::from_millis(400), easing: Easing::OutBack };
+        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), overshoot, started);
+        for millis in [40, 120, 200, 280, 360] {
+            assert!(dissolve.advance(started + Duration::from_millis(millis)));
+            assert!((0.0..=1.0).contains(&dissolve.progress), "{millis}ms gave {}", dissolve.progress);
+        }
         assert!(!dissolve.advance(started + Duration::from_secs(9)));
 
         // A clock that has gone backwards saturates rather than wrapping into a huge progress.
-        let mut dissolve = Dissolve::start("/tmp/a.png".into(), spec, started);
+        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec, started);
         assert!(dissolve.advance(started - Duration::from_millis(50)));
         assert_eq!(dissolve.progress, 0.0);
     }

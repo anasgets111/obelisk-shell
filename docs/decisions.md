@@ -4192,3 +4192,76 @@ set correct there was nothing left to evict, so it has no consumer. Fix it when 
 
 Found by running it on Anas's own shell rather than the scratch config, which has one `image` node
 and no picker. Neither the tests nor the isolated rig could see this.
+
+## 0183. Readiness is what a paint drew, not what a decode landed, because only the draw holds the key
+
+ADR-0180 answered "has this source got pixels" with `ImageCache::poll`'s list of landed files.
+A review of the two shipped commits found three ways that answer is wrong, and they are one
+question badly placed rather than three bugs:
+
+- `poll` pushes a path for a **failed** decode as readily as a successful one
+  (`image/mod.rs`), so the node moved onto a source it could never draw and dropped the picture it
+  was holding -- the precise opposite of ADR-0180 decision 5, which promises a failed decode keeps
+  the old picture up.
+- A source **already in the cache** never lands, so nothing fired: no move, no dissolve, and a
+  later pending source covered with a picture two changes stale.
+- A landing names a **path**, and the cache keys on path *and* box, so a thumbnail's decode
+  declared the full-size image ready and started a dissolve whose incoming had no texture.
+
+1. `layout::paint::execute` returns the `image` nodes whose named source it actually drew, and
+   `Scene::note_drawn_images` moves those nodes on. The draw is the only place that holds the exact
+   key and can tell a landed decode from a failed one, a cached hit from a fresh one. `poll` goes
+   back to being only what it says it is: a cue to repaint.
+2. `Dissolve` carries **both** endpoints. It drew from the node's current `source`, so a pass
+   resolving a third source mid-run swapped the destination under it: the picture it was halfway to
+   vanished, its cache pin with it. A successor now waits, and crosses from wherever the run leaves
+   the node -- one slot, the way the reference config parks one `pendingUrl`.
+3. A declared transition that is still covering a gap draws the incoming at zero *before*
+   anything has proved its texture exists. Moving readiness to the draw made the frame that first
+   has the incoming the frame that drew it at full alpha, so the picture appeared whole, snapped
+   back to the outgoing when the run started, and only then crossed. Asking for the draw is the
+   only way to prove the texture, so the ask happens at the alpha the cross opens on.
+4. `animating` is re-read after the report. A dissolve now starts *during* a paint, after that
+   paint decided whether to ask for another frame, so the frame callback that advances it would
+   never have been requested. This is the ADR-0181 tween-gate mistake exactly: motion begun where
+   nothing was looking for it.
+5. Progress is clamped where it is stored. `Easing::apply` clamps its input, not its output, so
+   Back, Elastic and Bounce leave `[0, 1]`, and this number is drawn as an alpha rather than handed
+   to a property parser that would refuse it.
+6. `DisplayList::drawn_images` pins the box the *entry* is under, through a shared
+   `image::cache_box`. A vector's key is squared, so an SVG drawn at 200x40 pinned 200x40 while the
+   entry sat at 200x200 and the exact comparison in `victims` missed it -- a pin that named
+   something no cache entry could be.
+7. The `CACHE_CAPACITY` bound evicts the least recently asked-for entry rather than the oldest
+   insert. It is the one eviction path that never sees the pin list, and the oldest insert is
+   typically the wallpaper: up before everything else and asked for every frame since. The
+   insertion-order queue it replaces is deleted; `last_hit` ties break by insert order anyway, now
+   that `insert` takes a tick of its own.
+
+Amends ADR-0181 decision 7, which says a node is never both covering a gap and dissolving. It can
+be: a third source arrives while a run is going. What is true, and what the one `Draw::Image` field
+still rests on, is that the two never need drawing at once -- the run owns the frame until it ends.
+
+Amends ADR-0182's arithmetic twice. `texture_budget` no longer multiplies by `scale`:
+`App::paint_surface` builds and executes every list at scale `1.0`, so a box reaching `ImageCache`
+is in the units `Screen::width` reports, and squaring the scale budgeted four times what a HiDPI
+output can hold. And the budget is not an allowance for idle textures *beyond* what surfaces show,
+which is what that ADR and the comments around it claimed: `trim` compares total resident bytes and
+then evicts only unpinned entries, so a pinned working set over the budget leaves it evicting
+everything idle and still over.
+
+Not fixed, and stated rather than left to be discovered:
+
+- The cross-dissolve is two source-over draws, which is exact for opaque images at `opacity = 1`
+  and approximate otherwise: a transparent incoming pixel shows the outgoing one through it, and a
+  node `opacity` below 1 reads denser mid-cross than at either end. The exact form mixes the two
+  endpoints once and applies node opacity to the result, which needs either an offscreen target per
+  frame or the shader stage. The shader stage is coming; a full-screen render target allocated and
+  freed every frame is not worth buying the interval.
+- A request refused for pool capacity retries on "the next paint", and an unchanged list can skip
+  that paint indefinitely. Retention hides it -- the old picture stays up rather than a gap -- so it
+  is a stall, not a blank. It needs a retry when capacity frees.
+
+Every one of these came from a review of code that passed its own tests, on a shell that looked
+right. The tests were written against the mechanism as built rather than against the promise the
+ADR made, which is how a decision entry can state a failure guarantee the code never had.

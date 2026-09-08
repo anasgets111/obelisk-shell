@@ -440,11 +440,16 @@ impl RendererClient {
         &self.scene
     }
 
-    /// Relays `ImageCache::poll`'s landed files into the retained scene, where a `retain`ing
-    /// `image` stops covering the gap once the source it names has pixels (ADR-0180). Narrow on
-    /// purpose: the scene is not handed out mutably for a caller to walk itself.
-    pub fn note_landed_images(&mut self, landed: &[std::path::PathBuf], now: std::time::Instant) {
-        self.scene.note_landed_images(landed, now);
+    /// Relays what a surface's paint actually drew into the retained scene, where a `retain`ing
+    /// `image` stops covering the gap and a `transition` starts (ADR-0183). Narrow on purpose: the
+    /// scene is not handed out mutably for a caller to walk itself.
+    pub fn note_drawn_images(
+        &mut self,
+        instance_id: &str,
+        drawn: &[crate::layout::paint::DrawnImage],
+        now: std::time::Instant,
+    ) {
+        self.scene.note_drawn_images(instance_id, drawn, now);
     }
 
     /// Drops a departed instance's retained tree. Called by topology handling when an output goes

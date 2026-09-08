@@ -57,6 +57,10 @@ pub enum Draw {
     /// and `source` has not caught up to it yet (ADR-0180); [`run`] draws it if `source` has no
     /// texture. Present only while the two differ, so a settled node's list stops changing.
     Image {
+        /// Which retained node this is, so [`execute`] can report back the source it actually drew
+        /// (ADR-0183). Readiness is not knowable anywhere else: only the draw has the exact cache
+        /// key, and only it can tell a decode that landed from one that failed or was never asked.
+        node: NodeId,
         source: String,
         fit: Fit,
         box_px: (u32, u32),
@@ -119,10 +123,15 @@ impl DisplayList {
             for command in commands {
                 match &command.draw {
                     Draw::Image { source, box_px, retained, .. } => {
-                        out.push((std::path::PathBuf::from(source), *box_px));
-                        // Pinned on the same box it is drawn at, or `trim` frees the very texture
-                        // covering the gap and the node blinks after all (ADR-0180).
-                        out.extend(retained.iter().map(|cover| (std::path::PathBuf::from(cover), *box_px)));
+                        // The box the *entry* is under, not the box it is drawn into: a vector's
+                        // key is squared, and a pin that names the drawn box misses it (ADR-0183).
+                        // Both endpoints are pinned, or `trim` frees the very texture covering the
+                        // gap and the node blinks after all (ADR-0180).
+                        for path in std::iter::once(source).chain(retained.iter()) {
+                            let path = std::path::PathBuf::from(path);
+                            let key_box = image::cache_box(&path, *box_px);
+                            out.push((path, key_box));
+                        }
                     }
                     Draw::Clipped { commands, .. } | Draw::Transformed { commands, .. } => walk(commands, out),
                     _ => {}
@@ -292,13 +301,27 @@ pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &Res
 
 /// Executes an already-built list; keeping canvas work separate makes the list comparable and
 /// [`build`] EGL-free.
-pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &DisplayList, scale: f32) {
+/// One `image` node's source that this paint had a texture for. `layout::scene` moves the node onto
+/// it, which is how a `retain` cover ends and a `transition` begins (ADR-0183).
+///
+/// Reported from the draw rather than inferred from `ImageCache::poll`, because only the draw asks
+/// the cache with the node's exact key. The landing cue this replaces named a path: it fired for a
+/// decode that had *failed*, never fired at all when the source was already cached, and could not
+/// tell a thumbnail's landing from the full-size image's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawnImage {
+    pub node: NodeId,
+    pub source: String,
+}
+
+pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &DisplayList, scale: f32) -> Vec<DrawnImage> {
     // Before recording draws, after the previous flush: evicted textures cannot be queued draws.
     images.release_evicted(painter.canvas_mut());
     // Upload before any draw names the texture.
     images.upload_landed(painter.canvas_mut());
     let mut scratch = Vec::new();
-    run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch);
+    let mut drawn = Vec::new();
+    run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch, &mut drawn);
     painter.canvas_mut().reset_scissor();
     painter.canvas_mut().flush();
     // Delete scratch targets only after flush; femtovg still executes queued calls at flush, as
@@ -306,6 +329,7 @@ pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &Displa
     for id in scratch {
         painter.canvas_mut().delete_image(id);
     }
+    drawn
 }
 
 /// Runs commands against `target`, recursively restoring parent images for nested clips. `scratch`
@@ -317,6 +341,7 @@ fn run(
     scale: f32,
     target: RenderTarget,
     scratch: &mut Vec<ImageId>,
+    drawn: &mut Vec<DrawnImage>,
 ) {
     for command in commands {
         // `command.clip` already contains every ancestor intersection, so set the final scissor.
@@ -368,7 +393,7 @@ fn run(
                     let _ = draw_file(painter.canvas_mut(), images, &path, draw);
                 }
             }
-            Draw::Image { source, fit, box_px, alpha, load, retained, dissolve } => {
+            Draw::Image { node, source, fit, box_px, alpha, load, retained, dissolve } => {
                 let draw = FileDraw { fit: *fit, rect, box_px: *box_px, alpha: *alpha, tint: None, load: *load };
                 let under = retained.as_deref().map(std::path::Path::new);
                 match dissolve {
@@ -380,8 +405,13 @@ fn run(
                         if let Some(under) = under {
                             draw_file(painter.canvas_mut(), images, under, draw);
                         }
+                        // Asked for at the alpha it is drawn at, which at progress zero is
+                        // invisible but is still a real request with the real key: the answer is
+                        // about the texture, not about whether a pixel changed.
                         let over = FileDraw { alpha: *alpha * *progress, ..draw };
-                        draw_file(painter.canvas_mut(), images, std::path::Path::new(source), over);
+                        if draw_file(painter.canvas_mut(), images, std::path::Path::new(source), over) {
+                            drawn.push(DrawnImage { node: *node, source: source.clone() });
+                        }
                     }
                     // The named source has no texture: still decoding, or a failure the cache has
                     // already logged once. Either way the node keeps its last picture rather than
@@ -389,21 +419,22 @@ fn run(
                     // evicted despite the pin, or deleted from disk -- draws nothing, which is the
                     // old behaviour.
                     None => {
-                        let drew = draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw);
-                        if !drew && let Some(under) = under {
+                        if draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw) {
+                            drawn.push(DrawnImage { node: *node, source: source.clone() });
+                        } else if let Some(under) = under {
                             draw_file(painter.canvas_mut(), images, under, draw);
                         }
                     }
                 }
             }
             Draw::Clipped { radius, commands } => {
-                draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch)
+                draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch, drawn)
             }
             Draw::Transformed { matrix, commands } => {
                 let canvas = painter.canvas_mut();
                 canvas.save();
                 canvas.set_transform(&femtovg::Transform2D(*matrix));
-                run(painter, images, commands, scale, target, scratch);
+                run(painter, images, commands, scale, target, scratch, drawn);
                 painter.canvas_mut().restore();
             }
         }
@@ -431,6 +462,7 @@ fn draw_clipped(
     scale: f32,
     target: RenderTarget,
     scratch: &mut Vec<ImageId>,
+    drawn: &mut Vec<DrawnImage>,
 ) {
     let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
     // A box with no area shows nothing, and asking for a 0xN render target leaves GL with an
@@ -445,7 +477,7 @@ fn draw_clipped(
     let flags = ImageFlags::PREMULTIPLIED | ImageFlags::FLIP_Y;
     let Ok(image) = painter.canvas_mut().create_image_empty(width, height, PixelFormat::Rgba8, flags) else {
         // Out of texture memory: preserve the subtree unmasked rather than drop it.
-        run(painter, images, commands, scale, target, scratch);
+        run(painter, images, commands, scale, target, scratch, drawn);
         return;
     };
     scratch.push(image);
@@ -458,7 +490,7 @@ fn draw_clipped(
     // scissors transform with it, so absolute command coordinates need no extra math.
     canvas.reset_transform();
     canvas.translate(-clip.x0 as f32, -clip.y0 as f32);
-    run(painter, images, commands, scale, RenderTarget::Image(image), scratch);
+    run(painter, images, commands, scale, RenderTarget::Image(image), scratch, drawn);
 
     let canvas = painter.canvas_mut();
     canvas.restore();
@@ -551,19 +583,34 @@ fn draw_for(
         // picture being crossed away from, otherwise the one the node is still covering a decoding
         // source with. One field because the node is never doing both -- `displayed_source` has
         // already moved on to `source` by the time a dissolve starts.
-        PaintStyle::Image { source, fit, load, retain, transition: _ } => (!source.is_empty()).then(|| Draw::Image {
-            source: source.clone(),
-            fit: *fit,
-            box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
-            alpha: opacity,
-            load: *load,
-            // Dropped once the node draws what it names: an equal pair in the list would be one
-            // more thing to compare, and its disappearance is what ends the cover.
-            retained: match dissolve {
+        PaintStyle::Image { source, fit, load, retain, transition } => (!source.is_empty()).then(|| {
+            // What goes under the draw. Dropped once the node draws what it names: an equal pair in
+            // the list would be one more thing to compare, and its disappearance ends the cover.
+            let cover = match dissolve {
                 Some(dissolve) => Some(dissolve.from.clone()),
                 None => retained.filter(|_| *retain).filter(|last| *last != source.as_str()).map(str::to_string),
-            },
-            dissolve: dissolve.map(|dissolve| dissolve.progress),
+            };
+            Draw::Image {
+                node: node_id,
+                // Mid-dissolve the node draws the run's own destination, not whatever a later pass
+                // has since resolved: a third source arriving would otherwise drop the picture this
+                // run is halfway to and cross to one with no texture yet (ADR-0183).
+                source: dissolve.map_or_else(|| source.clone(), |dissolve| dissolve.to.clone()),
+                fit: *fit,
+                box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
+                alpha: opacity,
+                load: *load,
+                retained: cover.clone(),
+                dissolve: match dissolve {
+                    Some(dissolve) => Some(dissolve.progress),
+                    // A declared transition still covering a gap opens its cross *here*, at zero,
+                    // before anything has proved the incoming texture exists -- because asking for
+                    // the draw is the only way to prove it (ADR-0183). Drawing the incoming at full
+                    // alpha on that frame and starting the cross on the next one shows it whole,
+                    // snaps back to the outgoing, and only then crosses.
+                    None => (transition.is_some() && cover.is_some()).then_some(0.0),
+                },
+            }
         }),
 
         // A `textfield` shows its placeholder until focused, then one mask character per typed
@@ -1016,6 +1063,43 @@ mod tests {
             .expect("expected a text draw")
     }
 
+    /// ADR-0183. The frame that first has the incoming texture must already be drawing the cross,
+    /// or it shows the incoming at full alpha for one frame and the cross then starts by jumping
+    /// back to the outgoing. Readiness is only knowable by asking for the draw, so the ask happens
+    /// at zero.
+    #[test]
+    fn a_transition_waiting_on_its_incoming_texture_draws_it_at_zero_rather_than_at_full_alpha() {
+        let lua = Lua::new();
+        let src = r##"return panel { id = "bar", width = 200, height = 40,
+            child = image { id = "wp", source = "/tmp/new.png", async = true,
+                transition = { duration = 400, easing = "Linear" },
+                width = "Fill", height = "Fill" } }"##;
+        let mut tree = resolved_surface(&lua, src, LogicalSize { width: 200.0, height: 40.0 });
+        let image_draw = |tree: &ResolvedNode| {
+            build(tree, 1.0, None).commands.iter().find_map(|cmd| match &cmd.draw {
+                Draw::Image { retained, dissolve, .. } => Some((retained.clone(), *dissolve)),
+                _ => None,
+            })
+        };
+
+        // Holding the old picture, the new one not yet drawn: no dissolve has started, because
+        // nothing has proved the texture exists.
+        tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
+        assert_eq!(
+            image_draw(&tree),
+            Some((Some("/tmp/old.png".to_string()), Some(0.0))),
+            "the incoming is asked for at zero, so the frame that first has it still shows the outgoing"
+        );
+
+        // `retain` with no transition keeps the plain cover: it has no cross to open on.
+        let plain = r##"return panel { id = "bar", width = 200, height = 40,
+            child = image { id = "wp", source = "/tmp/new.png", async = true, retain = true,
+                width = "Fill", height = "Fill" } }"##;
+        let mut tree = resolved_surface(&lua, plain, LogicalSize { width: 200.0, height: 40.0 });
+        tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
+        assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), None)));
+    }
+
     /// ADR-0181. Mid-dissolve the list carries the outgoing picture and the alpha the incoming is
     /// drawn over it at, in the same field the gap cover uses -- the node is never doing both.
     #[test]
@@ -1038,6 +1122,7 @@ mod tests {
         tree.children[0].displayed_source = Some("/tmp/new.png".to_string());
         tree.children[0].dissolve = Some(node::Dissolve {
             from: "/tmp/old.png".to_string(),
+            to: "/tmp/new.png".to_string(),
             started: std::time::Instant::now(),
             spec: node::TransitionSpec { duration: std::time::Duration::from_millis(400), easing: Default::default() },
             progress: 0.25,
@@ -1056,10 +1141,11 @@ mod tests {
         );
 
         // `transition` implies `retain`, so the same node covers a gap without the property being
-        // written twice.
+        // written twice -- and covering with a transition declared opens the cross at zero, which
+        // is the subject of its own test below.
         tree.children[0].dissolve = None;
         tree.children[0].displayed_source = Some("/tmp/old.png".to_string());
-        assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), None)));
+        assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), Some(0.0))));
     }
 
     /// ADR-0180. The cover only reaches the list while the node is behind its own source, it is

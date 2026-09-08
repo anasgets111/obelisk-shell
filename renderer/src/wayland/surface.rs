@@ -653,7 +653,7 @@ impl App {
         // because the clock's seconds digit advanced (ADR-0044 decision 2's global dirty flag).
         // An absent tree becomes an empty list and still reaches clear/swap to erase old contents.
         let tree = self.client.scene().surface(&surface_id);
-        let animating = tree.is_some_and(layout::ResolvedNode::animating);
+        let mut animating = tree.is_some_and(layout::ResolvedNode::animating);
         // End the immutable field-focus borrow before mutably borrowing the painter; `Draw::Text`
         // owns its string.
         let list = {
@@ -732,7 +732,18 @@ impl App {
             if generation != painter.font_generation() {
                 painter.sync(&self.shaping.font_chain_data(), generation);
             }
-            layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
+            let drawn = layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
+            // After the draws that answered it, before the swap: the tree this reads is the one
+            // the next build walks, so a `retain` cover ends and a `transition` starts on the
+            // frame paint proved the texture exists (ADR-0183).
+            if !drawn.is_empty() {
+                self.client.note_drawn_images(&surface_id, &drawn, std::time::Instant::now());
+                // Re-read: a dissolve that started in this very paint was not running when
+                // `animating` was taken above, and the frame callback below is the only thing that
+                // will ever advance it. Missing this is the tween-gate mistake again -- motion
+                // begun where nothing was looking for it (ADR-0183).
+                animating |= self.client.scene().surface(&surface_id).is_some_and(layout::ResolvedNode::animating);
+            }
         }
 
         // Before the swap, which is the commit it has to precede. Requested only while a tween is
