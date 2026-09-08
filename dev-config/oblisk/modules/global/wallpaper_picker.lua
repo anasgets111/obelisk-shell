@@ -480,6 +480,55 @@ for _, fit in ipairs(wallpaper.FITS) do
 end
 local fit_row = row { width = "Fill", spacing = theme.spacing.xs, children = fit_buttons }
 
+-- The same segmented buttons as Monitor and Fill mode, wrapped into rows of three. Not the mirror's
+-- combo popup: this sidebar has no dropdowns, and three across is the width Fill/Fit/Stretch
+-- already sets, so the panel keeps one column rhythm however many effects the folder holds.
+local EFFECTS_PER_ROW = 3
+local current_effect = wallpaper.effect()
+
+-- Rows of names, padded with `false` so a short last row leaves gaps rather than stretching two
+-- buttons across three slots and breaking the grid the rows above it establish.
+local effect_rows = wallpaper.effects():map(function(names)
+    local rows = {}
+    for index = 1, #names, EFFECTS_PER_ROW do
+        local slots = {}
+        for offset = 0, EFFECTS_PER_ROW - 1 do
+            slots[offset + 1] = names[index + offset] or false
+        end
+        rows[#rows + 1] = slots
+    end
+    return rows
+end)
+
+local effect_grid = list {
+    width = "Fill",
+    direction = "Vertical",
+    spacing = theme.spacing.xs,
+    source = effect_rows,
+    itemfn = function(slots)
+        local buttons = {}
+        for _, name in ipairs(slots) do
+            if name then
+                buttons[#buttons + 1] = choice(
+                    name,
+                    -- The file's name is the value; its title is what a person reads.
+                    name:sub(1, 1):upper() .. name:sub(2),
+                    current_effect,
+                    wallpaper.set_effect,
+                    "wallpaper-effect-" .. name
+                )
+            else
+                -- An empty slot, holding its share of the row and drawing nothing.
+                buttons[#buttons + 1] = rect { width = "Fill", height = theme.control.md }
+            end
+        end
+        return row { width = "Fill", spacing = theme.spacing.xs, children = buttons }
+    end,
+    key = function(slots)
+        return table.concat(slots, "|")
+    end,
+}
+
 local sidebar = panel_card({
     row {
         width = "Fill",
@@ -496,6 +545,8 @@ local sidebar = panel_card({
         return fit == "" and "Fill mode · mixed" or "Fill mode"
     end), theme.DIM, theme.font.xs),
     fit_row,
+    cell("Transition", theme.DIM, theme.font.xs),
+    effect_grid,
     cell("Folder", theme.DIM, theme.font.xs),
     cell(wallpaper.FOLDER, theme.DIM, theme.font.xs, { width = "Fill" }),
     cell(filtered:map(function(entries)

@@ -19,6 +19,11 @@ return persistent_table {
     defaults = {
         -- One entry per output, `{ path = ..., fit = ... }`. `Settings.data.wallpapers` verbatim.
         wallpapers = {},
+        -- `Settings.data.wallpaperTransition`: one effect for every output, as the mirror stores it.
+        -- The name of a `.frag` in `wallpaper.SHADER_FOLDER`, or `"fade"` for the engine's built-in
+        -- cross-dissolve. Validated on read against what the folder actually holds, so an effect
+        -- whose file was deleted falls back instead of failing.
+        wallpaper_transition = "fade",
         -- Last successful check, its package list and already-announced package names
         -- (`UpdateService.qml`'s `lastSuccessfulCheck`, `packages` and `notifiedPackagesKey`). The
         -- list travels with the time: a restart inside the interval skips its check, and without

@@ -35,10 +35,9 @@ return panel {
             fit = wallpaper.fit_of(output),
             async = true,
             -- `transition` implies `retain` (ADR-0181), so the hold and the cross are one
-            -- declaration. The effect is a shader file in this directory, not a name the engine
-            -- knows (ADR-0184); `lib/wallpaper.lua` randomises its parameters per change the way
-            -- `AnimatedWallpaper.qml` does.
-            transition = wallpaper.transition_for("wipe"),
+            -- declaration. The effect is whichever `.frag` the picker last chose out of
+            -- `wallpaper.SHADER_FOLDER`, not a name the engine knows (ADR-0184).
+            transition = wallpaper.transition(),
             width = "Fill",
             height = "Fill",
         }

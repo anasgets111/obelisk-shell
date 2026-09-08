@@ -32,42 +32,111 @@ wallpaper.DEFAULT_FIT = "cover"
 -- `WallpaperService.availableTransitions`, as the config's own shader files (ADR-0184). The engine
 -- ships the cross-dissolve and the ability to run a fragment shader; which effects exist is this
 -- config's to say, exactly as the mirror keeps its own `Shaders/frag` directory.
-wallpaper.TRANSITIONS = { "fade", "wipe", "disc", "portal", "stripes", "pixelate" }
+-- Where the effects live. `WallpaperService.qml` scans its own `Shaders/qsb` with a
+-- `FolderListModel` and offers what it finds; this is that, through `oblisk.files` (ADR-0120), so a
+-- `.frag` dropped in here appears in the picker without a reload. Point it anywhere: nothing in the
+-- engine knows this directory exists.
+wallpaper.SHADER_FOLDER = oblisk.config_dir .. "/shaders"
+wallpaper.SHADER_EXTENSIONS = { "frag" }
+-- The engine's own cross-dissolve, which is no file and always available.
+wallpaper.NO_SHADER = "fade"
 -- `WallpaperService.qml`'s duration and curve.
 wallpaper.TRANSITION_MS = 1500
 wallpaper.TRANSITION_EASING = "InOutCubic"
 
----`AnimatedWallpaper.qml`'s `transitionParams.randomize`: a wipe picks a side, a disc and a portal
----pick a centre, stripes pick a count and an angle. Called per change, so no two are identical.
----@param effect string One of `TRANSITIONS`.
----@return table|nil params, string|nil shader
-local function shader_for(effect)
-    if effect == "wipe" then
-        return { direction = math.floor(math.random() * 4), softness = 0.1 }, "wipe"
-    elseif effect == "disc" or effect == "portal" then
-        return { center_x = math.random(), center_y = math.random(), softness = 0.1 }, effect
-    elseif effect == "stripes" then
-        return { count = math.random(4, 24), angle = math.random() * 360, softness = 0.1 }, "stripes"
-    elseif effect == "pixelate" then
-        return { softness = 0.35 }, "pixelate"
-    end
-    -- `fade`, and anything unrecognised: the engine's built-in cross-dissolve, which needs neither.
-    return nil, nil
+-- `AnimatedWallpaper.qml`'s `transitionParams.randomize`, by effect name: a wipe picks a side, a
+-- disc and a portal pick a centre, stripes pick a count and an angle. A shader with no row here --
+-- anything dropped into the folder -- runs with every uniform at zero, which is what the engine
+-- does with a parameter nothing supplies. Adding a row is how a config gives it knobs.
+local RANDOM_PARAMS = {
+    wipe = function()
+        return { direction = math.floor(math.random() * 4), softness = 0.1 }
+    end,
+    disc = function()
+        return { center_x = math.random(), center_y = math.random(), softness = 0.1 }
+    end,
+    portal = function()
+        return { center_x = math.random(), center_y = math.random(), softness = 0.1 }
+    end,
+    stripes = function()
+        return { count = math.random(4, 24), angle = math.random() * 360, softness = 0.1 }
+    end,
+    pixelate = function()
+        return { softness = 0.35 }
+    end,
+}
+
+---The watched shader folder from the last `oblisk.files` push, or `nil` before the first.
+---@param f FilesState|nil
+---@return Folder|nil
+function wallpaper.shader_folder_in(f)
+    return f and f.folders and f.folders[wallpaper.SHADER_FOLDER] or nil
 end
 
----The `transition` table for one wallpaper `image`, or `nil` for no transition at all.
----@param effect string|nil
-function wallpaper.transition_for(effect)
-    if effect == "none" then
-        return nil
+---Effect names from one `oblisk.files` push: the built-in first, then a name per `.frag`.
+---`WallpaperService.qml` strips `wp_` and `.frag.qsb`; these files carry no affix to strip.
+---@param f FilesState|nil
+---@return string[]
+function wallpaper.effects_in(f)
+    local names = { wallpaper.NO_SHADER }
+    local folder = wallpaper.shader_folder_in(f)
+    for _, entry in ipairs(folder and folder.entries or {}) do
+        names[#names + 1] = (entry.name:gsub("%.frag$", ""))
     end
-    local params, shader = shader_for(effect or "fade")
-    return {
-        duration = wallpaper.TRANSITION_MS,
-        easing = wallpaper.TRANSITION_EASING,
-        shader = shader and (oblisk.config_dir .. "/shaders/" .. shader .. ".frag") or nil,
-        params = params,
-    }
+    return names
+end
+
+---`WallpaperService.validate`: the stored effect if the folder still holds it, else the built-in.
+---@param stored string|nil
+---@param available string[]
+---@return string
+function wallpaper.effect_in(stored, available)
+    for _, name in ipairs(available) do
+        if name == stored then
+            return name
+        end
+    end
+    return wallpaper.NO_SHADER
+end
+
+---Every effect the folder offers right now.
+function wallpaper.effects()
+    return oblisk.files:map(wallpaper.effects_in)
+end
+
+---The chosen effect, as a name.
+function wallpaper.effect()
+    return computed({ store.wallpaper_transition, oblisk.files }, function(stored, f)
+        return wallpaper.effect_in(stored, wallpaper.effects_in(f))
+    end)
+end
+
+---`WallpaperService.setWallpaperTransition`.
+---@param name string
+function wallpaper.set_effect(name)
+    if type(name) == "string" and name ~= "" and store.wallpaper_transition:get() ~= name then
+        store:set("wallpaper_transition", name)
+    end
+end
+
+---The `transition` table for the wallpaper `image`, as a signal.
+---
+---Depends on the stored wallpapers as well as the effect, so the parameters are drawn again on
+---every wallpaper change the way `randomize` is called per change. A run already under way keeps
+---the parameters it started with, because the engine copies the spec when it starts.
+function wallpaper.transition()
+    return computed({ wallpaper.effect(), store.wallpapers }, function(effect, _w)
+        if effect == wallpaper.NO_SHADER then
+            return { duration = wallpaper.TRANSITION_MS, easing = wallpaper.TRANSITION_EASING }
+        end
+        local params = RANDOM_PARAMS[effect]
+        return {
+            duration = wallpaper.TRANSITION_MS,
+            easing = wallpaper.TRANSITION_EASING,
+            shader = wallpaper.SHADER_FOLDER .. "/" .. effect .. ".frag",
+            params = params and params() or nil,
+        }
+    end)
 end
 
 -- `Settings.defaultWallpaper`: file shipped beside `shell.lua` (ADR-0055 decision 5).
@@ -199,5 +268,7 @@ function wallpaper.randomize_all()
 end
 
 oblisk.files:invoke("watch", wallpaper.FOLDER, wallpaper.EXTENSIONS)
+-- The same call for the effects, for the same reason: the picker needs the list before it opens.
+oblisk.files:invoke("watch", wallpaper.SHADER_FOLDER, wallpaper.SHADER_EXTENSIONS)
 
 return wallpaper
