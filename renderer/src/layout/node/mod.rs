@@ -142,6 +142,27 @@ impl LayoutError {
             other => other,
         }
     }
+
+    /// Prepends one step of the walk that reached the failing node, added by `layout::scene`'s
+    /// `prepare` for each child it descends into. Segments accumulate as the error unwinds, so the
+    /// detail carries the whole path from the surface down.
+    ///
+    /// The surface alone was not enough. On 2026-09-08 a lock screen reported `invalid value for
+    /// \`content\`: on \`lock_screen@eDP-1\`: expected a string or an array of runs, got
+    /// Integer(0)` and froze on its last good scene; that surface holds a dozen `text` nodes and
+    /// the message distinguished none of them. Reading the config did not find it either, because
+    /// the value came from a capability payload no static check evaluates.
+    ///
+    /// Indices are positions among a parent's `children`, so they are stable to read against the
+    /// config but not identities: a `list` renumbers its rows as its source changes.
+    pub(crate) fn in_child(self, index: usize, kind: &str) -> Self {
+        match self {
+            Self::InvalidProperty { property, detail } => {
+                Self::InvalidProperty { property, detail: format!("{kind}[{index}] > {detail}") }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Crate-visible for `layout::scene::Scene::apply_one_instance`; all crate `InvalidProperty`

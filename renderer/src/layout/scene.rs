@@ -1092,7 +1092,11 @@ fn prepare(
     let own_axis = main_axis_of(kind, &node.properties)?;
 
     node.children.reserve(fresh_children.len());
-    for (fresh_child, candidate) in fresh_children.iter().zip(matched_candidates) {
+    for (index, (fresh_child, candidate)) in fresh_children.iter().zip(matched_candidates).enumerate() {
+        // Every failure below names this child, so the message that reaches a human is the path
+        // down to the node rather than a property name and a surface (`LayoutError::in_child`).
+        let here = |err: LayoutError| err.in_child(index, &fresh_child.kind);
+
         // Before this child's own getters run, not after: resolving its property map calls back
         // into Lua, and a child the walk is about to refuse must not execute anything on the way
         // to being refused. `depth + 1` is the level this child would occupy, so the error is the
@@ -1111,23 +1115,28 @@ fn prepare(
         // recursive call, because the style the call is handed is built from them and a second
         // read of an impure `margin` could answer differently. Tweens go between the two: the
         // parse must see the displayed value, not the target (ADR-0145).
-        let mut child_properties = node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua)?;
+        let mut child_properties =
+            node::resolve_properties(&fresh_child.properties, &fresh_child.kind, lua).map_err(here)?;
         let child_tweens =
-            node::retarget(&fresh_child.kind, reusable.as_ref().map(tween_state), &mut child_properties, now, lua)?;
-        let child_style = LayoutStyle::parse(&child_properties)?;
-        node.children.push(prepare(
-            scene,
-            tree,
-            reusable,
-            &fresh_child.kind,
-            child_properties,
-            child_style,
-            child_tweens,
-            own_axis,
-            lua,
-            now,
-            depth + 1,
-        )?);
+            node::retarget(&fresh_child.kind, reusable.as_ref().map(tween_state), &mut child_properties, now, lua)
+                .map_err(here)?;
+        let child_style = LayoutStyle::parse(&child_properties).map_err(here)?;
+        node.children.push(
+            prepare(
+                scene,
+                tree,
+                reusable,
+                &fresh_child.kind,
+                child_properties,
+                child_style,
+                child_tweens,
+                own_axis,
+                lua,
+                now,
+                depth + 1,
+            )
+            .map_err(here)?,
+        );
     }
 
     // The ones on their way out: those already leaving move on, those the tree just dropped
@@ -3588,6 +3597,30 @@ pub(super) mod tests {
         let (_lua, surface) = surface_from(r#"panel { id = "bar", child = rect { visible = false, background = 5 } }"#);
         let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
         assert!(matches!(err, LayoutError::InvalidProperty { property, .. } if property == "background"));
+    }
+
+    /// The 2026-09-08 lock screen: `on \`lock_screen@eDP-1\`` and a property name, on a surface
+    /// holding a dozen `text` nodes, named none of them.
+    #[test]
+    fn a_bad_property_names_the_walk_that_reached_it_not_just_the_surface() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (_lua, surface) = surface_from(
+            r#"panel { id = "bar", child = column { children = {
+                   text { content = "fine" },
+                   row { children = { text { content = "also fine" }, text { content = 5 } } },
+               } } }"#,
+        );
+
+        let err = apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap_err();
+
+        let LayoutError::InvalidProperty { property, detail } = &err else { panic!("got {err:?}") };
+        assert_eq!(property, "content");
+        assert_eq!(
+            detail,
+            "on `bar@TEST`: column[0] > row[1] > text[1] > expected a string or an array of runs, got Integer(5)",
+            "the path must lead to the guilty node, and neither sibling text node is on it"
+        );
     }
 
     #[test]
