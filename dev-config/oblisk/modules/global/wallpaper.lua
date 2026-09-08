@@ -35,9 +35,10 @@ return panel {
             fit = wallpaper.fit_of(output),
             async = true,
             -- `transition` implies `retain` (ADR-0181), so the hold and the cross are one
-            -- declaration. `WallpaperService.qml` runs its transitions at 1500ms on
-            -- `Easing.InOutCubic`; this is that, with the effect names still to come.
-            transition = { duration = 1500, easing = "InOutCubic" },
+            -- declaration. The effect is a shader file in this directory, not a name the engine
+            -- knows (ADR-0184); `lib/wallpaper.lua` randomises its parameters per change the way
+            -- `AnimatedWallpaper.qml` does.
+            transition = wallpaper.transition_for("wipe"),
             width = "Fill",
             height = "Fill",
         }

@@ -107,14 +107,14 @@ struct CacheKey {
 /// content hash: tmpfs mtime is nanosecond-precise, length is free, and hashing reads the file to
 /// decide whether to read it. Unstatable files use the default, so *missing* files retry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-struct FileVersion {
+pub struct FileVersion {
     mtime_secs: i64,
     mtime_nanos: i64,
     len: u64,
 }
 
 impl FileVersion {
-    fn read(path: &Path) -> Self {
+    pub fn read(path: &Path) -> Self {
         let Ok(metadata) = std::fs::metadata(path) else {
             return FileVersion::default();
         };
@@ -600,11 +600,39 @@ fn decode(path: &Path, box_px: (u32, u32), tint: Option<Rgba>, thumbnails: Optio
 }
 
 /// Canvas-dependent half of a load: one texture from one decode.
+/// Uploads premultiplied, whatever the decoder produced (ADR-0184). `image` hands back straight
+/// alpha and `resvg` hands back premultiplied, and passing that difference on as a femtovg flag was
+/// enough while femtovg was the only thing sampling these textures. A config shader samples them
+/// directly, and cannot be handed two conventions: it would have to know which decoder produced its
+/// endpoint, which is an engine detail with no business in a config's `main()`.
+///
+/// Multiplying after the sample would not do instead. A texture lookup filters between texels
+/// first, so a straight-alpha edge interpolates colour the alpha was meant to hide, and no later
+/// multiply recovers it. Premultiplying the buffer is one pass over pixels that are about to be
+/// copied to the GPU anyway.
 fn upload(canvas: &mut Canvas<OpenGl>, decoded: Decoded) -> Result<ImageId, String> {
-    let Decoded { pixels, width, height, premultiplied } = decoded;
+    let Decoded { mut pixels, width, height, premultiplied } = decoded;
+    if !premultiplied {
+        premultiply(&mut pixels);
+    }
     let source = ImageSource::from(femtovg::imgref::Img::new(pixels.as_rgba(), width as usize, height as usize));
-    let flags = if premultiplied { ImageFlags::PREMULTIPLIED } else { ImageFlags::empty() };
-    canvas.create_image(source, flags).map_err(femtovg_error)
+    canvas.create_image(source, ImageFlags::PREMULTIPLIED).map_err(femtovg_error)
+}
+
+/// Scales each RGBA8 pixel's colour by its own alpha, rounding the way a straight-to-premultiplied
+/// conversion has to: `(c * a + 127) / 255`, not `c * a / 255`, or every translucent pixel darkens
+/// by up to half a level and a large flat region bands visibly.
+fn premultiply(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let scaled = u16::from(*channel) * alpha + 127;
+            *channel = ((scaled + scaled / 255) / 256) as u8;
+        }
+    }
 }
 
 /// Every one of femtovg's sixteen `ErrorKind` variants formats as `"canvas error"`; `Debug` names

@@ -29,6 +29,47 @@ wallpaper.FITS = {
     { value = "stretch", label = "Stretch" },
 }
 wallpaper.DEFAULT_FIT = "cover"
+-- `WallpaperService.availableTransitions`, as the config's own shader files (ADR-0184). The engine
+-- ships the cross-dissolve and the ability to run a fragment shader; which effects exist is this
+-- config's to say, exactly as the mirror keeps its own `Shaders/frag` directory.
+wallpaper.TRANSITIONS = { "fade", "wipe", "disc", "portal", "stripes", "pixelate" }
+-- `WallpaperService.qml`'s duration and curve.
+wallpaper.TRANSITION_MS = 1500
+wallpaper.TRANSITION_EASING = "InOutCubic"
+
+---`AnimatedWallpaper.qml`'s `transitionParams.randomize`: a wipe picks a side, a disc and a portal
+---pick a centre, stripes pick a count and an angle. Called per change, so no two are identical.
+---@param effect string One of `TRANSITIONS`.
+---@return table|nil params, string|nil shader
+local function shader_for(effect)
+    if effect == "wipe" then
+        return { direction = math.floor(math.random() * 4), softness = 0.1 }, "wipe"
+    elseif effect == "disc" or effect == "portal" then
+        return { center_x = math.random(), center_y = math.random(), softness = 0.1 }, effect
+    elseif effect == "stripes" then
+        return { count = math.random(4, 24), angle = math.random() * 360, softness = 0.1 }, "stripes"
+    elseif effect == "pixelate" then
+        return { softness = 0.35 }, "pixelate"
+    end
+    -- `fade`, and anything unrecognised: the engine's built-in cross-dissolve, which needs neither.
+    return nil, nil
+end
+
+---The `transition` table for one wallpaper `image`, or `nil` for no transition at all.
+---@param effect string|nil
+function wallpaper.transition_for(effect)
+    if effect == "none" then
+        return nil
+    end
+    local params, shader = shader_for(effect or "fade")
+    return {
+        duration = wallpaper.TRANSITION_MS,
+        easing = wallpaper.TRANSITION_EASING,
+        shader = shader and (oblisk.config_dir .. "/shaders/" .. shader .. ".frag") or nil,
+        params = params,
+    }
+end
+
 -- `Settings.defaultWallpaper`: file shipped beside `shell.lua` (ADR-0055 decision 5).
 wallpaper.DEFAULT = oblisk.config_dir .. "/wallpaper.svg"
 

@@ -8,6 +8,7 @@
 //! what a tick relays out are `layout::scene`'s.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -701,23 +702,30 @@ fn parse_spec(property: &str, entry: &Value) -> Result<AnimationSpec, LayoutErro
 /// the one that has just landed. Duration and easing, and nothing else yet -- a cross-dissolve is
 /// the whole of it until the masks arrive with a shader stage, and `effect` is the key that will
 /// name them.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TransitionSpec {
     pub duration: Duration,
     pub easing: Easing,
+    /// A fragment shader to cross with, instead of the built-in dissolve (ADR-0184). The config's
+    /// own file: `layout::image_shader` compiles it and owns nothing about what it draws.
+    pub shader: Option<PathBuf>,
+    /// `params` as `(uniform name, value)`, sorted, so two runs of one shader compare equal when
+    /// they are the same. A name the compiled shader has no uniform for is ignored, because a
+    /// shader may declare one and never use it.
+    pub params: Vec<(String, f32)>,
 }
 
 /// `transition = { duration = 700, easing = "InOutCubic" }` on an `image`. The `duration` is
 /// required: a dissolve with no length is a snap, and `retain` on its own is already that.
 ///
-/// Unknown keys are refused rather than ignored, so a config reaching for an `effect` this build
-/// does not have is told so instead of quietly getting a cross-dissolve.
+/// Unknown keys are refused rather than ignored, so a typo in a field name is an error the config
+/// sees rather than a setting that silently does nothing.
 pub fn parse_transition(properties: &HashMap<String, Value>) -> Result<Option<TransitionSpec>, LayoutError> {
     let Some(value) = properties.get("transition") else { return Ok(None) };
     let Value::Table(table) = value else {
         return Err(invalid(
             "transition",
-            format!("expected a table of `duration` and `easing`, got {}", preview_for_error(value)),
+            format!("expected a table of transition fields, got {}", preview_for_error(value)),
         ));
     };
     for pair in table.pairs::<Value, Value>() {
@@ -726,10 +734,10 @@ pub fn parse_transition(properties: &HashMap<String, Value>) -> Result<Option<Tr
             return Err(invalid("transition", format!("keys are field names, got {}", preview_for_error(&key))));
         };
         let key = key.to_str().map_err(|e| invalid("transition", e.to_string()))?;
-        if !matches!(&*key, "duration" | "easing") {
+        if !matches!(&*key, "duration" | "easing" | "shader" | "params") {
             return Err(invalid(
                 "transition",
-                format!("`{key}` is not a field of a transition; it takes `duration` and `easing`"),
+                format!("`{key}` is not a field of a transition; it takes `duration`, `easing`, `shader` and `params`"),
             ));
         }
     }
@@ -737,7 +745,66 @@ pub fn parse_transition(properties: &HashMap<String, Value>) -> Result<Option<Tr
     let duration = parse_millis("transition.duration", "duration", &duration, 1)?
         .ok_or_else(|| invalid("transition", "a transition needs a `duration` in ms"))?;
     let easing: Value = table.get("easing").map_err(|e| invalid("transition.easing", e.to_string()))?;
-    Ok(Some(TransitionSpec { duration, easing: parse_easing("transition.easing", &easing)? }))
+    let easing = parse_easing("transition.easing", &easing)?;
+    let shader: Value = table.get("shader").map_err(|e| invalid("transition.shader", e.to_string()))?;
+    let shader = match shader {
+        Value::Nil => None,
+        Value::String(path) => {
+            let path = path.to_str().map_err(|e| invalid("transition.shader", e.to_string()))?;
+            // Absolute, the way `image.source` is: a config names its own files through
+            // `oblisk.config_dir`, and a relative path would resolve against whatever directory
+            // the Renderer happens to have been started in.
+            if !path.starts_with('/') {
+                return Err(invalid("transition.shader", format!("expected an absolute path, got `{path}`")));
+            }
+            Some(PathBuf::from(&*path))
+        }
+        other => {
+            return Err(invalid(
+                "transition.shader",
+                format!("expected a path to a fragment shader, got {}", preview_for_error(&other)),
+            ));
+        }
+    };
+    let params: Value = table.get("params").map_err(|e| invalid("transition.params", e.to_string()))?;
+    let params = parse_shader_params(&params)?;
+    if shader.is_none() && !params.is_empty() {
+        return Err(invalid("transition.params", "there is no `shader` for these to reach"));
+    }
+    Ok(Some(TransitionSpec { duration, easing, shader, params }))
+}
+
+/// `params = { softness = 0.1 }`: uniform names to numbers, which is every type a config can hand a
+/// shader (ADR-0184). Sorted, so the list is a value two runs can compare.
+fn parse_shader_params(value: &Value) -> Result<Vec<(String, f32)>, LayoutError> {
+    let table = match value {
+        Value::Nil => return Ok(Vec::new()),
+        Value::Table(table) => table,
+        other => {
+            return Err(invalid(
+                "transition.params",
+                format!("expected a table of uniform names to numbers, got {}", preview_for_error(other)),
+            ));
+        }
+    };
+    let mut out = Vec::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|e| invalid("transition.params", e.to_string()))?;
+        let Value::String(key) = key else {
+            return Err(invalid(
+                "transition.params",
+                format!("keys are uniform names, got {}", preview_for_error(&key)),
+            ));
+        };
+        let name = key.to_str().map_err(|e| invalid("transition.params", e.to_string()))?.to_string();
+        let field = format!("transition.params.{name}");
+        let number = value_as_f32(&field, &value)?
+            .filter(|number| number.is_finite())
+            .ok_or_else(|| invalid(&field, format!("expected a finite number, got {}", preview_for_error(&value))))?;
+        out.push((name, number));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 /// One cross-dissolve in flight on an `image` (ADR-0181), started by the frame the incoming texture
@@ -2358,9 +2425,14 @@ mod tests {
     /// it reports its own end rather than resting at 1.0 the way a played-out sequence does.
     #[test]
     fn a_dissolve_eases_across_its_duration_and_reports_when_it_is_over() {
-        let spec = TransitionSpec { duration: Duration::from_millis(400), easing: Easing::Linear };
+        let spec = TransitionSpec {
+            duration: Duration::from_millis(400),
+            easing: Easing::Linear,
+            shader: None,
+            params: Vec::new(),
+        };
         let started = Instant::now();
-        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec, started);
+        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec.clone(), started);
         assert_eq!(dissolve.progress, 0.0, "it opens on the outgoing picture");
 
         assert!(dissolve.advance(started + Duration::from_millis(100)));
@@ -2372,7 +2444,12 @@ mod tests {
 
         // An overshooting curve is clamped before it is stored: this number is drawn as an alpha,
         // and `Easing::apply` clamps its input, not its output (ADR-0183).
-        let overshoot = TransitionSpec { duration: Duration::from_millis(400), easing: Easing::OutBack };
+        let overshoot = TransitionSpec {
+            duration: Duration::from_millis(400),
+            easing: Easing::OutBack,
+            shader: None,
+            params: Vec::new(),
+        };
         let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), overshoot, started);
         for millis in [40, 120, 200, 280, 360] {
             assert!(dissolve.advance(started + Duration::from_millis(millis)));
@@ -2381,7 +2458,7 @@ mod tests {
         assert!(!dissolve.advance(started + Duration::from_secs(9)));
 
         // A clock that has gone backwards saturates rather than wrapping into a huge progress.
-        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec, started);
+        let mut dissolve = Dissolve::start("/tmp/a.png".into(), "/tmp/b.png".into(), spec.clone(), started);
         assert!(dissolve.advance(started - Duration::from_millis(50)));
         assert_eq!(dissolve.progress, 0.0);
     }

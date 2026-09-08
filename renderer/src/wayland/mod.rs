@@ -90,6 +90,9 @@ pub struct App {
     /// (ADR-0071).
     egl: Option<egl::EglState>,
     gl: Option<glow::Context>,
+    /// Config shaders compiled against `gl`, kept for the context's lifetime rather than a
+    /// generation's: a swap replaces the scene, not the GL objects (ADR-0184).
+    shader_stage: crate::layout::image_shader::ShaderStage,
     /// Owns the `wl_display` pointer [`App::ensure_egl`] passes to EGL. Keeping the whole
     /// `Connection` refcounted guarantees `egl::init`'s SAFETY precondition: the display outlives
     /// every EGL object built from it.
@@ -251,6 +254,7 @@ pub fn run(
     let mut app = App {
         registry_state,
         output_state,
+        shader_stage: crate::layout::image_shader::ShaderStage::new(),
         compositor_state,
         seat_state,
         layer_shell,
@@ -594,6 +598,13 @@ pub fn run(
         }
     }
 
+    // While a context is still current, and only here: a config shader's program outlives every
+    // generation, so nothing earlier owns its end (ADR-0184). A context already gone took its
+    // objects with it, which is why this is an orderly teardown and not a recovery.
+    if let Some(gl) = app.gl.as_ref() {
+        // SAFETY: this is the context every paint bound, on the one thread that ever bound it.
+        unsafe { app.shader_stage.destroy(gl) };
+    }
     Ok(())
 }
 

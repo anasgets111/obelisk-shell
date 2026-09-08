@@ -389,7 +389,7 @@ impl Scene {
                 if let (Some(spec), Some(previous)) = (transition, previous)
                     && node.dissolve.is_none()
                 {
-                    node.dissolve = Some(Dissolve::start(previous, shown.source.clone(), *spec, now));
+                    node.dissolve = Some(Dissolve::start(previous, shown.source.clone(), spec.clone(), now));
                 }
             }
             node.children.iter_mut().for_each(|child| walk(child, drawn, now));

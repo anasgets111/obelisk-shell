@@ -4265,3 +4265,64 @@ Not fixed, and stated rather than left to be discovered:
 Every one of these came from a review of code that passed its own tests, on a shell that looked
 right. The tests were written against the mechanism as built rather than against the promise the
 ADR made, which is how a decision entry can state a failure guarantee the code never had.
+
+## 0184. A transition's effect is a config's fragment shader, because the reference's six were never Quickshell's
+
+ADR-0181 shipped a cross-dissolve and left the other five effects to a GL stage that would ship
+them as engine-owned names: `effect = "Wipe"` matched in Rust. The user rejected that. If the engine
+is going to compile and run fragment shaders anyway, expose it, and the framework's users get to
+write effects the framework never imagined.
+
+Checking the reference settles it. Those six `wp_*.frag` files live in `~/.config/quickshell/`, the
+*user's* directory. Quickshell ships `ShaderEffect`; the shaders are the user's. So engine-owned
+named effects were the deviation from the prior art, not the faithful port -- and ADR-0055 already
+ruled the same case one layer up: "there is no `wallpaper` capability and no wallpaper-specific Rust
+code of any kind". A `Wipe` arm is that mistake with a smaller blast radius.
+
+1. `transition = { duration, easing, shader, params }`. `shader` is an absolute path, named through
+   `oblisk.config_dir` the way the default wallpaper already is. Omit it for the built-in
+   cross-dissolve. The engine ships no effects; `dev-config` ships five as sample usage.
+2. The engine owns the vertex stage, a prelude and an epilogue. The prelude declares the contract
+   and two sampling helpers, then `#line 1` so a compile error names a line the config can find.
+   The epilogue is what makes the node's `opacity` a guarantee: the prelude `#define`s the config's
+   `main` to `oblisk_effect`, and the engine's own `main` calls it and multiplies the result.
+   Documenting that rule and trusting a config to obey it is the promise-without-mechanism this
+   branch has made twice already.
+3. Each endpoint is fitted on the CPU and handed over as a rect, not rendered into a normalised
+   plane. A shader never repeats the fit arithmetic and never disagrees with how the same image
+   draws ordinarily, and nothing is rendered twice. The ported files are about twenty lines each
+   because the reference's whole `sampleWithFillMode` prelude is unnecessary.
+4. `params` are named floats, every one set on every draw. Uniforms live in the program, so two
+   nodes sharing a shader would otherwise inherit each other's values; an omitted one is zero.
+5. Programs are keyed by path *and* file version. Editing an effect recompiles it and un-refuses one
+   that would not build, which is a reload rather than a restart.
+6. Every texture is premultiplied at upload. `image` decodes straight alpha and `resvg` decodes
+   premultiplied, and passing that difference on as a femtovg flag was fine while femtovg was the
+   only sampler. A config shader cannot be handed two conventions, and multiplying after the sample
+   does not work: the lookup filters between texels first, so a straight-alpha edge interpolates
+   colour the alpha was meant to hide.
+7. Failure is the cross-dissolve. A shader that will not compile, will not link, declares a
+   non-float parameter, or cannot get a quad is logged once and that node falls back. This is why
+   the dissolve was built before the stage rather than as its placeholder (ADR-0181).
+
+The stage flushes femtovg, captures the GL state it changes, draws one quad, and restores. It never
+binds framebuffer zero. It does scissor: femtovg clips its own paths through a uniform its shader
+reads, so a quad drawn here is clipped by nothing unless GL clips it. The quad's corners carry the
+node's affine and the target's origin, computed on the CPU, because femtovg never sees this draw.
+
+Not claimed: containment. A shader that compiles and loops forever hangs the GPU and with it the
+session. This is the config's own code at the trust level of the `process.run` it can already call,
+with a worse failure mode, and saying so is the whole of the mitigation.
+
+Not fixed: the fallback dissolve is still two source-over draws, exact for opaque endpoints at full
+opacity and approximate otherwise (ADR-0183). Routing it through an engine-owned shader would make
+it exact and is the obvious next step, but it puts a stage written this hour on the path of every
+transition; the limit is documented instead.
+
+Rejected: `effect` as a string meaning either a built-in name or a path. One field with two kinds of
+meaning reads as a menu with an escape hatch, and it would have to keep answering "which names
+exist" forever.
+
+Rejected: a general shader node over an arbitrary subtree. Two endpoints and a progress number is a
+contract that can be held stable; an arbitrary subtree brings offscreen targets, clip interaction
+and a question about what the inputs even are. `docs/roadmap.md` keeps that parked.

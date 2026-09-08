@@ -88,6 +88,8 @@ Current project vocabulary. Implementation contracts live in [docs](docs/oblisk-
 
 **Cross-dissolve**: An `image` crossing over a duration from the picture it was holding to the one whose decode has just landed, rather than swapping between them in one frame. _Avoid_: fade, transition, crossfade
 
+**Transition shader**: A config-supplied fragment shader that draws one `image`'s cross from its outgoing picture to its incoming one. The engine compiles and binds it and owns no effect of its own. _Avoid_: effect, filter, ShaderEffect
+
 **Spring**: A tween whose motion comes from stiffness and damping rather than a duration and a curve, and which hands its running speed to the run that replaces it when the target moves. _Avoid_: physics animation, damped tween, inertia
 
 ## Ownership

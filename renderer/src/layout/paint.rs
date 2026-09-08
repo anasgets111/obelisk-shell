@@ -18,6 +18,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, Color, ImageFlags, ImageId, Paint, Path, PixelFormat, RenderTarget, Solidity};
 
 use crate::image::{self, Fit, ImageCache, Load};
+use crate::layout::image_shader;
 use crate::layout::node::{self, BorderColor, ClipShape, EdgeInsets, PaintStyle, Rgba, StyleRun, TextAlign};
 use crate::layout::scene::{NodeId, ResolvedNode};
 use crate::text::atlas::{TextDraw, TextPainter};
@@ -71,6 +72,9 @@ pub enum Draw {
         /// when the node is showing one picture, which is when `retained` is a gap cover rather
         /// than the source being crossed away from.
         dissolve: Option<f32>,
+        /// The config shader this cross is drawn with and the `params` it is given (ADR-0184).
+        /// `None` is the built-in dissolve, and so is a shader that would not build.
+        shader: Option<(std::path::PathBuf, Vec<(String, f32)>)>,
     },
     /// A subtree masked by the declaring node's rounded arc. Rectangular clips flatten into each
     /// command; rounded clips stay grouped for [`execute`].
@@ -296,7 +300,8 @@ fn split_fill_and_border(draw: Option<Draw>) -> (Option<Draw>, Option<Draw>) {
 /// deleted the fixed Rust-owned role enum that had kept the two id spaces from overlapping.
 #[cfg(test)]
 pub fn paint_tree(painter: &mut TextPainter, images: &mut ImageCache, root: &ResolvedNode, scale: f32) {
-    execute(painter, images, &build(root, scale, None), scale);
+    // No GL context reaches this harness, so a config shader falls back to the dissolve.
+    execute(painter, images, &build(root, scale, None), scale, (0.0, 0.0), None);
 }
 
 /// Executes an already-built list; keeping canvas work separate makes the list comparable and
@@ -314,35 +319,67 @@ pub struct DrawnImage {
     pub source: String,
 }
 
-pub fn execute(painter: &mut TextPainter, images: &mut ImageCache, list: &DisplayList, scale: f32) -> Vec<DrawnImage> {
+/// The GL context and the compiled config shaders, for the runs that need them (ADR-0184). Absent
+/// wherever there is no context to draw with -- a test harness, a paint before a surface has bound
+/// one -- and every cross then falls back to the built-in dissolve.
+pub struct Shaders<'a> {
+    pub gl: &'a glow::Context,
+    pub stage: &'a mut image_shader::ShaderStage,
+}
+
+/// Everything a paint walk carries besides the commands and the target it is drawing into: the
+/// cache it asks for textures, what it has produced so far, and the shaders it may use. Bundled
+/// because these are one context threaded whole through a recursion, and passing them apart made
+/// `run` and `draw_clipped` a wall of positional arguments.
+struct Walk<'a, 'g> {
+    images: &'a mut ImageCache,
+    scale: f32,
+    /// Offscreen targets held until [`execute`] flushes.
+    scratch: Vec<ImageId>,
+    drawn: Vec<DrawnImage>,
+    shaders: Option<Shaders<'g>>,
+}
+
+/// The framebuffer a walk is drawing into and the transform in force there. Both are the screen's
+/// until `draw_clipped` opens an offscreen or `Draw::Transformed` sets a matrix, and both are
+/// things a shader quad needs that femtovg's own draws get from the canvas (ADR-0184).
+#[derive(Clone, Copy)]
+struct Frame {
+    /// Size of the target, and where its top-left sits in surface coordinates.
+    size: (f32, f32),
+    origin: (f32, f32),
+    transform: Option<node::Affine>,
+}
+
+pub fn execute(
+    painter: &mut TextPainter,
+    images: &mut ImageCache,
+    list: &DisplayList,
+    scale: f32,
+    target_size: (f32, f32),
+    shaders: Option<Shaders<'_>>,
+) -> Vec<DrawnImage> {
     // Before recording draws, after the previous flush: evicted textures cannot be queued draws.
     images.release_evicted(painter.canvas_mut());
     // Upload before any draw names the texture.
     images.upload_landed(painter.canvas_mut());
-    let mut scratch = Vec::new();
-    let mut drawn = Vec::new();
-    run(painter, images, &list.commands, scale, RenderTarget::Screen, &mut scratch, &mut drawn);
+    let mut walk = Walk { images, scale, scratch: Vec::new(), drawn: Vec::new(), shaders };
+    let frame = Frame { size: target_size, origin: (0.0, 0.0), transform: None };
+    run(painter, &mut walk, &list.commands, RenderTarget::Screen, frame);
     painter.canvas_mut().reset_scissor();
     painter.canvas_mut().flush();
     // Delete scratch targets only after flush; femtovg still executes queued calls at flush, as
     // `release_shadow_images` does for drop-shadow targets.
-    for id in scratch {
+    for id in std::mem::take(&mut walk.scratch) {
         painter.canvas_mut().delete_image(id);
     }
-    drawn
+    walk.drawn
 }
 
 /// Runs commands against `target`, recursively restoring parent images for nested clips. `scratch`
 /// holds offscreen images until [`execute`] flushes.
-fn run(
-    painter: &mut TextPainter,
-    images: &mut ImageCache,
-    commands: &[DrawCmd],
-    scale: f32,
-    target: RenderTarget,
-    scratch: &mut Vec<ImageId>,
-    drawn: &mut Vec<DrawnImage>,
-) {
+fn run(painter: &mut TextPainter, walk: &mut Walk<'_, '_>, commands: &[DrawCmd], target: RenderTarget, frame: Frame) {
+    let scale = walk.scale;
     for command in commands {
         // `command.clip` already contains every ancestor intersection, so set the final scissor.
         let clip = command.clip;
@@ -390,27 +427,59 @@ fn run(
                         tint: *color,
                         load: Load::Inline,
                     };
-                    let _ = draw_file(painter.canvas_mut(), images, &path, draw);
+                    let _ = draw_file(painter.canvas_mut(), walk.images, &path, draw);
                 }
             }
-            Draw::Image { node, source, fit, box_px, alpha, load, retained, dissolve } => {
+            Draw::Image { node, source, fit, box_px, alpha, load, retained, dissolve, shader } => {
                 let draw = FileDraw { fit: *fit, rect, box_px: *box_px, alpha: *alpha, tint: None, load: *load };
                 let under = retained.as_deref().map(std::path::Path::new);
                 match dissolve {
-                    // The outgoing at its own full alpha with the incoming fading in over it, not
-                    // both easing past each other: two source-over draws that each sit at half
-                    // alpha mid-cross compose to three quarters, and the last quarter is the
-                    // surface's ground showing through the middle of the dissolve (ADR-0181).
                     Some(progress) => {
-                        if let Some(under) = under {
-                            draw_file(painter.canvas_mut(), images, under, draw);
+                        // Asked for whether or not a pixel of it is visible yet: the answer is
+                        // about the texture, and it is what starts the run (ADR-0183).
+                        let to = file_texture(painter.canvas_mut(), walk.images, std::path::Path::new(source), draw);
+                        if to.is_some() {
+                            walk.drawn.push(DrawnImage { node: *node, source: source.clone() });
                         }
-                        // Asked for at the alpha it is drawn at, which at progress zero is
-                        // invisible but is still a real request with the real key: the answer is
-                        // about the texture, not about whether a pixel changed.
-                        let over = FileDraw { alpha: *alpha * *progress, ..draw };
-                        if draw_file(painter.canvas_mut(), images, std::path::Path::new(source), over) {
-                            drawn.push(DrawnImage { node: *node, source: source.clone() });
+                        let from = under.and_then(|under| file_texture(painter.canvas_mut(), walk.images, under, draw));
+
+                        // A config shader takes the whole cross, both endpoints at once, which is
+                        // the only way an effect can be anything but a fade (ADR-0184). It needs
+                        // both textures and a context; without any of those the dissolve below
+                        // takes the frame, which is why that was built first.
+                        let crossed = match (shader, walk.shaders.as_mut(), from, to) {
+                            (Some((path, params)), Some(shaders), Some((from, from_rect)), Some((to, to_rect))) => {
+                                let run = image_shader::Run {
+                                    from,
+                                    to,
+                                    from_rect,
+                                    to_rect,
+                                    rect,
+                                    transform: frame.transform,
+                                    clip,
+                                    target_size: frame.size,
+                                    target_origin: frame.origin,
+                                    opacity: *alpha,
+                                    progress: *progress,
+                                    params,
+                                };
+                                // SAFETY: `paint_surface` made this context current before calling
+                                // `execute`, and it is the one every GL object here belongs to.
+                                unsafe { shaders.stage.draw(shaders.gl, painter.canvas_mut(), path, &run) }
+                            }
+                            _ => false,
+                        };
+                        // The outgoing at its own full alpha with the incoming fading in over it,
+                        // not both easing past each other: two source-over draws that each sit at
+                        // half alpha mid-cross compose to three quarters, and the last quarter is
+                        // the surface's ground showing through the middle (ADR-0181).
+                        if !crossed {
+                            if let Some((id, fitted)) = from {
+                                fill_image(painter.canvas_mut(), id, fitted, *alpha);
+                            }
+                            if let Some((id, fitted)) = to {
+                                fill_image(painter.canvas_mut(), id, fitted, *alpha * *progress);
+                            }
                         }
                     }
                     // The named source has no texture: still decoding, or a failure the cache has
@@ -419,22 +488,22 @@ fn run(
                     // evicted despite the pin, or deleted from disk -- draws nothing, which is the
                     // old behaviour.
                     None => {
-                        if draw_file(painter.canvas_mut(), images, std::path::Path::new(source), draw) {
-                            drawn.push(DrawnImage { node: *node, source: source.clone() });
+                        if draw_file(painter.canvas_mut(), walk.images, std::path::Path::new(source), draw) {
+                            walk.drawn.push(DrawnImage { node: *node, source: source.clone() });
                         } else if let Some(under) = under {
-                            draw_file(painter.canvas_mut(), images, under, draw);
+                            draw_file(painter.canvas_mut(), walk.images, under, draw);
                         }
                     }
                 }
             }
             Draw::Clipped { radius, commands } => {
-                draw_clipped(painter, images, rect, clip, *radius, commands, scale, target, scratch, drawn)
+                draw_clipped(painter, walk, rect, clip, *radius, commands, target, frame)
             }
             Draw::Transformed { matrix, commands } => {
                 let canvas = painter.canvas_mut();
                 canvas.save();
                 canvas.set_transform(&femtovg::Transform2D(*matrix));
-                run(painter, images, commands, scale, target, scratch, drawn);
+                run(painter, walk, commands, target, Frame { transform: Some(*matrix), ..frame });
                 painter.canvas_mut().restore();
             }
         }
@@ -454,15 +523,13 @@ fn run(
 #[allow(clippy::too_many_arguments)]
 fn draw_clipped(
     painter: &mut TextPainter,
-    images: &mut ImageCache,
+    walk: &mut Walk<'_, '_>,
     rect: LogicalRect,
     clip: PhysicalRect,
     radius: f32,
     commands: &[DrawCmd],
-    scale: f32,
     target: RenderTarget,
-    scratch: &mut Vec<ImageId>,
-    drawn: &mut Vec<DrawnImage>,
+    frame: Frame,
 ) {
     let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
     // A box with no area shows nothing, and asking for a 0xN render target leaves GL with an
@@ -477,10 +544,12 @@ fn draw_clipped(
     let flags = ImageFlags::PREMULTIPLIED | ImageFlags::FLIP_Y;
     let Ok(image) = painter.canvas_mut().create_image_empty(width, height, PixelFormat::Rgba8, flags) else {
         // Out of texture memory: preserve the subtree unmasked rather than drop it.
-        run(painter, images, commands, scale, target, scratch, drawn);
+        // Into the parent's target, so it keeps the parent's frame: the clip this could not
+        // allocate is not where these commands are going.
+        run(painter, walk, commands, target, frame);
         return;
     };
-    scratch.push(image);
+    walk.scratch.push(image);
 
     let canvas = painter.canvas_mut();
     canvas.save();
@@ -490,7 +559,13 @@ fn draw_clipped(
     // scissors transform with it, so absolute command coordinates need no extra math.
     canvas.reset_transform();
     canvas.translate(-clip.x0 as f32, -clip.y0 as f32);
-    run(painter, images, commands, scale, RenderTarget::Image(image), scratch, drawn);
+    // The offscreen's own dimensions: a shader quad inside a rounded clip places itself in that
+    // target, not on the screen (ADR-0184).
+    // The offscreen's own size, its origin at the clip's corner, and no transform: `draw_clipped`
+    // reset the canvas transform above, and composites the result under the outer one afterwards.
+    let inner =
+        Frame { size: (width as f32, height as f32), origin: (clip.x0 as f32, clip.y0 as f32), transform: None };
+    run(painter, walk, commands, RenderTarget::Image(image), inner);
 
     let canvas = painter.canvas_mut();
     canvas.restore();
@@ -601,6 +676,10 @@ fn draw_for(
                 alpha: opacity,
                 load: *load,
                 retained: cover.clone(),
+                shader: dissolve.and_then(|dissolve| {
+                    let path = dissolve.spec.shader.clone()?;
+                    Some((path, dissolve.spec.params.clone()))
+                }),
                 dissolve: match dissolve {
                     Some(dissolve) => Some(dissolve.progress),
                     // A declared transition still covering a gap opens its cross *here*, at zero,
@@ -682,18 +761,31 @@ struct FileDraw {
 /// Answers whether it drew, which is how an `image` learns its source has no texture yet and its
 /// `retain` cover should take the frame (ADR-0180).
 fn draw_file(canvas: &mut Canvas<OpenGl>, images: &mut ImageCache, file: &std::path::Path, draw: FileDraw) -> bool {
-    let FileDraw { fit, rect, box_px, alpha, tint, load } = draw;
-    let Some(id) = images.image(canvas, file, box_px, tint, load) else {
+    let Some((id, fitted)) = file_texture(canvas, images, file, draw) else {
         return false;
     };
-    let Ok((width, height)) = canvas.image_size(id) else {
-        return false;
-    };
-    let fitted = image::fitted_rect(rect, width as f32, height as f32, fit);
+    fill_image(canvas, id, fitted, draw.alpha);
+    true
+}
+
+/// The texture for `file` and the rect its `fit` puts it in, without drawing it. Split out because
+/// a shader cross needs both endpoints' textures and rects and draws neither itself (ADR-0184).
+fn file_texture(
+    canvas: &mut Canvas<OpenGl>,
+    images: &mut ImageCache,
+    file: &std::path::Path,
+    draw: FileDraw,
+) -> Option<(ImageId, LogicalRect)> {
+    let FileDraw { fit, rect, box_px, alpha: _, tint, load } = draw;
+    let id = images.image(canvas, file, box_px, tint, load)?;
+    let (width, height) = canvas.image_size(id).ok()?;
+    Some((id, image::fitted_rect(rect, width as f32, height as f32, fit)))
+}
+
+fn fill_image(canvas: &mut Canvas<OpenGl>, id: ImageId, fitted: LogicalRect, alpha: f32) {
     let mut path = Path::new();
     path.rect(fitted.x, fitted.y, fitted.width, fitted.height);
     canvas.fill_path(&path, &Paint::image(id, fitted.x, fitted.y, fitted.width, fitted.height, 0.0, alpha));
-    true
 }
 
 /// One logical edge in physical pixels, rounded and floored at 1. `ImageCache` keys on this
@@ -1124,7 +1216,12 @@ mod tests {
             from: "/tmp/old.png".to_string(),
             to: "/tmp/new.png".to_string(),
             started: std::time::Instant::now(),
-            spec: node::TransitionSpec { duration: std::time::Duration::from_millis(400), easing: Default::default() },
+            spec: node::TransitionSpec {
+                duration: std::time::Duration::from_millis(400),
+                easing: Default::default(),
+                shader: None,
+                params: Vec::new(),
+            },
             progress: 0.25,
         });
         assert_eq!(image_draw(&tree), Some((Some("/tmp/old.png".to_string()), Some(0.25))));

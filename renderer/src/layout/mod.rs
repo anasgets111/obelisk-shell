@@ -9,6 +9,7 @@
 
 pub mod hit;
 pub mod hover;
+pub mod image_shader;
 pub mod instance;
 pub mod node;
 pub mod paint;

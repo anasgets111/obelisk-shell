@@ -732,7 +732,17 @@ impl App {
             if generation != painter.font_generation() {
                 painter.sync(&self.shaping.font_chain_data(), generation);
             }
-            let drawn = layout::paint::execute(painter, &mut self.image_cache, &list, 1.0);
+            // The context is current from `make_current` above, so a config shader can take a
+            // cross this frame; without one every cross falls back to the dissolve (ADR-0184).
+            let shaders = self.gl.as_ref().map(|gl| layout::paint::Shaders { gl, stage: &mut self.shader_stage });
+            let drawn = layout::paint::execute(
+                painter,
+                &mut self.image_cache,
+                &list,
+                1.0,
+                (width as f32, height as f32),
+                shaders,
+            );
             // After the draws that answered it, before the swap: the tree this reads is the one
             // the next build walks, so a `retain` cover ends and a `transition` starts on the
             // frame paint proved the texture exists (ADR-0183).
