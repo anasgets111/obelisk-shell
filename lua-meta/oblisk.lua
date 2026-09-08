@@ -197,7 +197,7 @@
 ---@field identity string `MediaPlayer2.Identity`, e.g. `"Spotify"`; empty if unanswered.
 ---@field length integer `-1` when `mpris:length` is absent or malformed, as for a live stream; unavailable is not fabricated as zero (ADR-0036).
 ---@field play_state string `"Playing"`, `"Paused"`, or `"Stopped"`; retains the previous value if the player fails.
----@field position integer Playback offset in microseconds, valid at [`PlayerState::position_updated_at`]. Nothing polls it while playing; progress bars add elapsed time.
+---@field position integer Playback offset in microseconds, valid at [`PlayerState::position_updated_at`]. Nothing polls it while playing; progress bars add elapsed time. `-1` when the player has never answered `Position`, which is not the same as a track sitting at zero (ADR-0036).
 ---@field position_updated_at integer `CLOCK_MONOTONIC` microseconds when [`PlayerState::position`] was read; subtract from a monotonic `now` for elapsed time and survive wall-clock adjustments.
 ---@field title string `xesam:title`; empty when metadata is absent, normal between tracks.
 ---@field url string `xesam:url`, such as a local `file://` path or browser `https://` page; empty when absent, normal for a stream. Carried for ADR-0137: configs cannot reliably classify video versus song from site lists or extensions, which are taste-dependent.

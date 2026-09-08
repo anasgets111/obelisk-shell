@@ -1,7 +1,8 @@
 //! Pure `Metadata` (`a{sv}`) parsing, album-art trust checks, and track identity comparison
 //! (ADR-0036). Split from `dbus::mpris`; see `dbus/mpris/mod.rs`.
 
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -88,10 +89,44 @@ impl ParsedMetadata {
 /// `~/.config/zen/...` cache; the player already runs with the user's privileges. Other schemes,
 /// remote `http(s)://`, and missing/dangling paths become empty; no HTTP-fetch dependency exists.
 pub(super) fn resolve_album_art_path(art_url: Option<&str>) -> String {
-    let Some(art_url) = art_url else { return String::new() };
-    let Some(path) = art_url.strip_prefix("file://") else { return String::new() };
-    let Ok(canonical) = Path::new(path).canonicalize() else { return String::new() };
+    let Some(path) = art_url.and_then(file_url_to_path) else { return String::new() };
+    let Ok(canonical) = path.canonicalize() else { return String::new() };
     if canonical.is_file() { canonical.to_string_lossy().into_owned() } else { String::new() }
+}
+
+/// A `file://` URL as a filesystem path: percent-decoded, with RFC 8089's optional `localhost`
+/// authority dropped.
+///
+/// `strip_prefix("file://")` alone treated the URL as if it were already a path, so artwork named
+/// `cover art.png` arrived as `cover%20art.png` and was never found, and `file://localhost/tmp/a`
+/// became the relative path `localhost/tmp/a`. Decoding is byte-wise because a path is bytes on
+/// Unix, not UTF-8: a filename the shell can open is not necessarily one `String` accepts.
+fn file_url_to_path(art_url: &str) -> Option<PathBuf> {
+    let rest = art_url.strip_prefix("file://")?;
+    let encoded = rest.strip_prefix("localhost").filter(|tail| tail.starts_with('/')).unwrap_or(rest);
+    let raw = encoded.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let escape = (raw[index] == b'%' && index + 2 < raw.len())
+            .then(|| Some(hex_digit(raw[index + 1])? * 16 + hex_digit(raw[index + 2])?))
+            .flatten();
+        match escape {
+            Some(byte) => {
+                bytes.push(byte);
+                index += 3;
+            }
+            None => {
+                bytes.push(raw[index]);
+                index += 1;
+            }
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
 }
 
 /// Absolute target for `mpris:seek`/`seek_relative`, clamped to `[0, length]` before
@@ -99,6 +134,39 @@ pub(super) fn resolve_album_art_path(art_url: Option<&str>) -> String {
 pub(super) fn clamp_seek_target(target_us: i64, length_us: i64) -> i64 {
     let lower = target_us.max(0);
     if length_us >= 0 { lower.min(length_us) } else { lower }
+}
+
+#[cfg(test)]
+mod file_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_percent_escape_becomes_the_byte_it_encodes() {
+        // A cover named "cover art.png" arrives as `cover%20art.png` and was looked up literally.
+        assert_eq!(file_url_to_path("file:///tmp/cover%20art.png"), Some(PathBuf::from("/tmp/cover art.png")));
+    }
+
+    #[test]
+    fn a_localhost_authority_is_not_part_of_the_path() {
+        assert_eq!(file_url_to_path("file://localhost/tmp/a.png"), Some(PathBuf::from("/tmp/a.png")));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_unchanged() {
+        let zen = "file:///home/anas/.config/zen/firefox-mpris/3909426_4.png";
+        assert_eq!(file_url_to_path(zen), Some(PathBuf::from("/home/anas/.config/zen/firefox-mpris/3909426_4.png")));
+    }
+
+    #[test]
+    fn a_stray_percent_is_kept_rather_than_swallowing_the_rest() {
+        // `100%` in a filename is not an escape; dropping it would rename the file.
+        assert_eq!(file_url_to_path("file:///tmp/100%.png"), Some(PathBuf::from("/tmp/100%.png")));
+    }
+
+    #[test]
+    fn a_non_file_scheme_has_no_path() {
+        assert_eq!(file_url_to_path("https://example.com/a.png"), None);
+    }
 }
 
 #[cfg(test)]

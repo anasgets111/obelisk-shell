@@ -25,20 +25,10 @@ pub enum MprisSignal {
     Changed,
 }
 
-#[derive(Debug)]
-enum MprisActionError {
-    UnknownPlayer,
-}
-
-impl std::fmt::Display for MprisActionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownPlayer => write!(f, "no MPRIS player with that id is currently tracked"),
-        }
-    }
-}
-
-impl std::error::Error for MprisActionError {}
+/// Every command here fails the same one way, and only into an `eprintln!`. An enum with `Display`
+/// and `Error` impls bought nothing a constant does not: nothing matches on it and nothing returns
+/// it.
+const UNKNOWN_PLAYER: &str = "no MPRIS player with that id is currently tracked";
 
 const VALID_COMMANDS: [&str; 5] = ["play", "pause", "play_pause", "next", "previous"];
 
@@ -50,20 +40,14 @@ pub fn parse_control_args(arguments: &[serde_json::Value]) -> Option<(String, St
     VALID_COMMANDS.contains(&cmd.as_str()).then_some((id, cmd))
 }
 
-/// `mpris:seek(id, pos_us)`'s `arguments: [id, pos_us]`. Absolute microseconds; clamp once in
-/// [`MprisController::seek`], not here.
+/// `arguments: [id, microseconds]`, shared by `mpris:seek` and `mpris:seek_relative`. The two
+/// commands mean different things by the number -- an absolute position and a signed offset -- but
+/// parse it identically, and a second copy of four lines only invited them to drift. Unclamped by
+/// design (ADR-0036); each command clamps, or declines to, where it is executed.
 pub fn parse_seek_args(arguments: &[serde_json::Value]) -> Option<(String, i64)> {
     let id = arguments.first()?.as_str()?.to_string();
-    let pos_us = arguments.get(1)?.as_i64()?;
-    Some((id, pos_us))
-}
-
-/// `mpris:seek_relative(id, off)`'s `arguments: [id, off]`, kept separate from
-/// [`parse_seek_args`] so its parser matches its command.
-pub fn parse_seek_relative_args(arguments: &[serde_json::Value]) -> Option<(String, i64)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let off = arguments.get(1)?.as_i64()?;
-    Some((id, off))
+    let microseconds = arguments.get(1)?.as_i64()?;
+    Some((id, microseconds))
 }
 
 /// No `events` field, unlike `TrayController` (ADR-0031): `control`/`seek`/`seek_relative` issue
@@ -98,7 +82,7 @@ impl MprisController {
     /// `mpris:send_command(id, cmd)` after [`parse_control_args`] validates the IDL's five values.
     pub async fn control(&self, id: &str, cmd: &str) {
         let Some(player) = self.find_player(id) else {
-            eprintln!("mpris: send_command({id:?}, {cmd:?}) failed: {}", MprisActionError::UnknownPlayer);
+            eprintln!("mpris: send_command({id:?}, {cmd:?}) failed: {}", UNKNOWN_PLAYER);
             return;
         };
         let result = match cmd {
@@ -121,18 +105,50 @@ impl MprisController {
         self.seek_to(id, pos_us).await;
     }
 
-    /// `mpris:seek_relative(id, off)`: same clamp/dispatch as [`Self::seek`], based on a live
-    /// `Position` read. `Position` is excluded from `PropertiesChanged`, so cached time can be
-    /// arbitrarily stale; the extra round trip makes `-10s` mean ten seconds before now.
+    /// `mpris:seek_relative(id, off)`: MPRIS `Seek`, which is relative already.
+    ///
+    /// This used to read a live `Position` and convert the offset into an absolute `SetPosition`.
+    /// That read is the one place `resolve_position`'s protection does not reach, and Firefox
+    /// answers `Position` with `0` for seconds after any seek, so "forward five seconds" from
+    /// 5:40 became `SetPosition(5s)` -- a jump to the start of the track rather than a step.
+    /// Handing the offset to the player removes both the round trip and the invented origin, and
+    /// is what `MediaService.qml`'s `seekBy` does.
+    ///
+    /// No clamping: the player owns its own endpoints, and MPRIS lets a `Seek` past the end move
+    /// to the next track. Clamping here would need a length we may not have (ADR-0036) and would
+    /// silently differ from what every other MPRIS client does.
     pub async fn seek_relative(&self, id: &str, off: i64) {
-        let Some(position) = self.live_position(id).await else {
-            eprintln!("mpris: seek_relative({id:?}, {off}) failed: {}", MprisActionError::UnknownPlayer);
+        let Some(player) = self.find_player(id) else {
+            eprintln!("mpris: seek_relative({id:?}, {off}) failed: {}", UNKNOWN_PLAYER);
             return;
         };
-        self.seek_to(id, position.saturating_add(off)).await;
+        if let Err(err) = player.seek(off).await {
+            eprintln!("mpris: seek_relative({id:?}, {off}) failed: {err}");
+        }
     }
 
-    /// A live `Position` read, not the cached snapshot; see [`Self::seek_relative`].
+    /// Converts an absolute `target` into the relative `Seek` a player without a usable trackid
+    /// needs. Refuses rather than inventing an origin: `unwrap_or(0)` here turned an unknown
+    /// position into "seek to `target` from the start", and `-1` from a never-read position made
+    /// the subtraction overflow for a large target.
+    async fn seek_by_difference(
+        &self,
+        id: &str,
+        player: &super::proxies::MprisPlayerProxy<'static>,
+        target: i64,
+    ) -> zbus::Result<()> {
+        let Some(position) = self.live_position(id).await.filter(|position| *position >= 0) else {
+            eprintln!("mpris: seek to {target} for {id:?} needs a position to convert against and has none");
+            return Ok(());
+        };
+        let Some(offset) = target.checked_sub(position) else {
+            eprintln!("mpris: seek to {target} for {id:?} does not fit an i64 offset from {position}");
+            return Ok(());
+        };
+        player.seek(offset).await
+    }
+
+    /// A live `Position` read, not the cached snapshot.
     async fn live_position(&self, id: &str) -> Option<i64> {
         let player = self.find_player(id)?;
         match player.position().await {
@@ -146,7 +162,7 @@ impl MprisController {
 
     async fn seek_to(&self, id: &str, target_us: i64) {
         let Some(context) = self.find_seek_context(id) else {
-            eprintln!("mpris: seek to {target_us} for {id:?} failed: {}", MprisActionError::UnknownPlayer);
+            eprintln!("mpris: seek to {target_us} for {id:?} failed: {}", UNKNOWN_PLAYER);
             return;
         };
         let target = clamp_seek_target(target_us, context.length);
@@ -158,12 +174,12 @@ impl MprisController {
                         "mpris: cached trackid {trackid:?} for {} isn't a valid object path, falling back to relative Seek: {err}",
                         context.bus_name
                     );
-                    context.player.seek(target - self.live_position(id).await.unwrap_or(0)).await
+                    self.seek_by_difference(id, &context.player, target).await
                 }
             },
             // Some players never report `mpris:trackid`; `Player.Seek` takes a relative offset, so
-            // convert the absolute target against a live position as in seek_relative.
-            None => context.player.seek(target - self.live_position(id).await.unwrap_or(0)).await,
+            // the absolute target has to be converted against a live position.
+            None => self.seek_by_difference(id, &context.player, target).await,
         };
         if let Err(err) = result {
             eprintln!("mpris: seek to {target} for {id:?} failed: {err}");
@@ -241,8 +257,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_seek_relative_args_reads_id_and_a_signed_offset() {
+    fn parse_seek_args_reads_a_signed_offset_for_the_relative_command() {
         let args = vec![serde_json::json!("firefox.instance_1"), serde_json::json!(-10_000_000)];
-        assert_eq!(parse_seek_relative_args(&args), Some(("firefox.instance_1".to_string(), -10_000_000)));
+        assert_eq!(parse_seek_args(&args), Some(("firefox.instance_1".to_string(), -10_000_000)));
     }
 }

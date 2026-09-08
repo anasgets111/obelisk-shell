@@ -20,7 +20,7 @@ pub mod player;
 pub mod proxies;
 pub mod watcher;
 
-pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args, parse_seek_relative_args};
+pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args};
 
 /// Actions accepted by `oblisk.mpris:invoke(...)`; exhaustive dispatch keeps variants and arms in
 /// sync.
@@ -56,7 +56,7 @@ pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope
             }
             None => crate::log_malformed_command(params),
         },
-        MprisAction::SeekRelative => match parse_seek_relative_args(&params.arguments) {
+        MprisAction::SeekRelative => match parse_seek_args(&params.arguments) {
             Some((id, off)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {

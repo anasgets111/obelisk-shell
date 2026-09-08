@@ -3349,3 +3349,101 @@ the smallest thing that does not leak the text.
 Rejected: reusing `message` as the prompt. It is the sentence explaining why authorization is
 needed, drawn above; polkitd sends both, and collapsing them loses the one the field is labelled
 with.
+
+## 0164. `PlayerState` describes the track but not what the player will accept
+
+`MediaPanel.qml` greys each transport control from a capability flag and offers a stop button.
+`oblisk.mpris` answers neither, so `modules/bar/panels/media_panel.lua` draws every control live and
+omits stop. Recording the list rather than faking the flags, which would mean guessing from
+`play_state` what only the player knows.
+
+`PlayerState` carries `album_art_path`, `artist`, `desktop_entry`, `id`, `identity`, `length`,
+`play_state`, `position`, `position_updated_at`, `title` and `url`; `invoke` accepts
+`control(id, command)` for `play`, `pause`, `play_pause`, `next` and `previous`, plus `seek` and
+`seek_relative`.
+
+1. **`can_go_next`, `can_go_previous`, `can_seek`, `can_control`.** MPRIS publishes all four. The
+   mirror disables the matching control; the config cannot, so a radio stream shows a next button
+   that does nothing. `can_seek` is the one that misleads most, because the seek bar is draggable
+   and the drag is silently discarded.
+2. **`stop`.** `controller.rs`'s `VALID_COMMANDS` has five entries and stop is not among them,
+   though its own test uses `"stop"` as the invalid case. MPRIS `Stop` differs from `Pause`: it
+   releases the track rather than holding a position.
+3. **`album`.** The mirror's second line falls back title → artist → album → identity. Without
+   album, a classical track whose artist tag is empty drops straight to the player's name.
+4. **A monotonic clock, or a pushed position while playing.** `position` is valid only at
+   `position_updated_at`, which is `CLOCK_MONOTONIC`, and no Lua global reads that clock. The panel
+   anchors each push against `os.time()` in an `on_change` handler and adds elapsed seconds, so a
+   clock adjustment during playback skews the bar until the next push. Either a monotonic reading
+   beside `oblisk.system.time` or a position pushed on a cadence while `Playing` removes the
+   workaround; the clock is the smaller and serves anything else timing a duration.
+
+1 is the one worth doing first: it is four booleans already on the bus, and without them three of
+the six controls are decorative on some players. 4 is next because it is a general capability, not
+an mpris one.
+
+Rejected: inferring 1 from `play_state`. Whether a player can seek is independent of whether it is
+playing; a paused local file seeks and a playing stream does not.
+
+Rejected: computing elapsed time from `os.clock()`. It returns CPU seconds for this process, which
+stops advancing whenever the shell is idle -- precisely when a track is playing and nothing is being
+drawn.
+
+## 0165. `Position` is read twice around a state change, and never fabricated
+
+Two changes to `capabilities/mpris/player.rs`, both from watching a browser drive the media panel.
+
+**A failed read keeps the last reading, with its timestamp.** `resync` did
+`player.position().await.unwrap_or(0)`, turning "the player did not answer" into "the track is at
+the start" -- the thing ADR-0036 forbids, and which the `PlaybackStatus` and `Metadata` arms beside
+it already avoid by keeping their previous values. The timestamp travels with the value now: a
+stale position under a fresh `position_updated_at` tells a client extrapolating from the pair that
+the track jumped backwards, which is worse than either half alone. `-1` when nothing has ever been
+read, matching `length`.
+
+**A `PlaybackStatus` change schedules a second read 100ms later.** Several players update `Position`
+at an indeterminate time *after* they publish the new state, so the read taken while handling that
+signal returns whatever they held mid-transition -- for Firefox, sometimes zero. Quickshell hit the
+same players and answers it the same way (`MprisPlayer::onPlaybackStatusUpdated` requests the
+property, then requests it again on a 100ms `singleShot`, commented for YouTube). One late re-read
+in the forwarder's `select!` is the same remedy without a polling loop.
+
+Rejected: polling `Position` while playing. It is a D-Bus round trip per tick for a number clients
+can extrapolate, and ADR-0036's whole point is that the pair of value and timestamp is enough. The
+recheck fires on a transition, not on a cadence.
+
+Rejected: filtering the zero in config. `dev-config` did carry that workaround while this was being
+diagnosed, and it needed a track identity to tell a bogus zero from a track legitimately starting at
+zero -- reconstructing in Lua what the Supervisor already knows. What the player said belongs where
+the player is read.
+
+## 0166. What the player says about its own position is not evidence
+
+Extends ADR-0165, which was written before the player was measured. Driving Firefox directly over
+D-Bus: seek to 340s, then read `Position` back as 340s, `0`, `0`, and finally the true 363s, with
+`PlaybackStatus` `Playing` throughout. `Rate` reads `0`. Some tracks publish no `mpris:length` at
+all. The zero is transient and recovers after seconds, not after the 100ms ADR-0165 waits.
+
+**A `Position` of zero on a track we were already inside is discarded** (`resolve_position`). It is
+the player not having recomputed, and publishing it restarts every progress bar at the beginning
+while the video plays on. A zero on a *new* track is published, because that is where one begins.
+
+**A failed read keeps the previous reading only for the same track.** ADR-0165 kept it
+unconditionally, so a 30-second track could inherit the previous track's 5:40 and draw past its own
+end.
+
+**`seek_relative` sends the offset to the player** (MPRIS `Seek`) instead of reading a position and
+converting to `SetPosition`. That read is the one path `resolve_position` does not cover, so "forward
+five seconds" from 5:40 became `SetPosition(5s)` -- a jump to the start. Where an absolute target
+must still be converted, for a player with no usable trackid, an unavailable position now refuses
+the command rather than standing in as zero, and the subtraction is checked.
+
+**The 100ms recheck is disarmed only by its own timer.** Clearing it on any event let a `Metadata`
+change 20ms later cancel the correction, which is the case it exists for.
+
+Rejected: filtering the zero in config. It needs a track identity to tell a bogus zero from a track
+legitimately starting at zero, which reconstructs in Lua what the Supervisor already knows. What the
+player said belongs where the player is read.
+
+Rejected: polling `Position`. A round trip per tick for a number clients extrapolate. The recheck
+fires on a transition, not a cadence.
