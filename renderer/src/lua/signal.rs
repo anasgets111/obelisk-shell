@@ -97,6 +97,7 @@ enum SignalKind {
     #[allow(dead_code)]
     Direct(Value),
     Computed {
+        id: MemoKey,
         deps: Rc<Vec<Signal>>,
         func: Function,
     },
@@ -412,7 +413,7 @@ impl Signal {
     /// Lua and Rust so `lua::capability::Capability` makes `oblisk.lock` read like bare
     /// capabilities.
     pub(crate) fn mapped(&self, func: Function) -> Signal {
-        Signal(SignalKind::Computed { deps: Rc::new(vec![self.clone()]), func })
+        Signal(SignalKind::Computed { id: next_computed_id(), deps: Rc::new(vec![self.clone()]), func })
     }
 
     /// Reads current value (ADR-0044 decision 1). `layout::node` uses it to resolve signal
@@ -435,13 +436,12 @@ impl Signal {
                 let fresh = source.get_value(lua)?;
                 Ok(Value::Boolean(cell.borrow_mut().fire(fresh, *hold, Instant::now(), |due| arm_wake(lua, due))))
             }
-            SignalKind::Computed { deps, func } => {
+            SignalKind::Computed { id, deps, func } => {
                 // A repeat within this evaluation costs one hash lookup and no Lua. Checked before
                 // `CpuBudget::enter` on purpose: a hit does no work, so it must not spend a nesting
                 // level either, or a wide diamond would hit `MAX_SIGNAL_NESTING_DEPTH` on cache
                 // hits alone.
-                let key = EvaluationMemo::key(deps);
-                if let Some(hit) = EvaluationMemo::get(lua, key) {
+                if let Some(hit) = EvaluationMemo::get(lua, *id) {
                     return Ok(hit);
                 }
 
@@ -460,7 +460,7 @@ impl Signal {
                 }
                 let value = func.call::<Value>(MultiValue::from_vec(args))?;
                 budget.check_not_exceeded()?;
-                EvaluationMemo::insert(lua, key, &value);
+                EvaluationMemo::insert(lua, *id, &value);
                 Ok(value)
             }
         }
@@ -710,12 +710,28 @@ pub fn take_geometry_moved(lua: &Lua) -> bool {
     lua.app_data_mut::<GeometryMoved>().is_some_and(|mut moved| std::mem::take(&mut moved.0))
 }
 
-/// One `Computed`'s identity for [`EvaluationMemo`]. `computed()` and [`Signal::mapped`] each
-/// allocate a fresh `Rc<Vec<Signal>>`, so the address separates every distinct computed; only
-/// `Signal::clone` shares one, and a clone is the same computed with the same `func`. Two computeds
-/// therefore cannot collide unless one is dropped and another allocated at that address *inside a
-/// single evaluation*, which needs a closure that builds and discards a computed mid-pass.
-type MemoKey = *const Vec<Signal>;
+/// One `Computed`'s identity for [`EvaluationMemo`], counted rather than derived from where its
+/// dependencies happen to sit in memory.
+///
+/// The address of the `Rc<Vec<Signal>>` was the first key, on the reasoning that a fresh `Rc` per
+/// `computed()` and per [`Signal::mapped`] separates every distinct computed. It does, until one is
+/// dropped: the allocator hands the next same-sized `Rc` the address just freed, and the memo --
+/// which holds a raw pointer and so keeps nothing alive -- serves the dead computed's value to the
+/// live one. The memo's scope is a whole layout pass, and a pass builds and discards computeds
+/// constantly: every `:map` in a `list`'s `itemfn`, every one in a surface that rebuilds its tree.
+/// On 2026-09-08 that is what put `Integer(0)` into the lock screen's keyboard label and its
+/// wallpaper path, from two Lua functions that cannot return an integer at all (ADR-0170).
+///
+/// A counter cannot be recycled. `Signal::clone` copies the id because a clone is the same computed
+/// with the same `func`, which is the one case that must share a memo entry.
+type MemoKey = u64;
+
+/// Next unused [`MemoKey`]. `Relaxed` is enough: ids need only differ, and the Loader is one thread
+/// (ADR-0039).
+fn next_computed_id() -> MemoKey {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Values already produced during the current outermost [`Signal::get_value`].
 #[derive(Default)]
@@ -751,10 +767,6 @@ struct EvaluationMemo<'lua> {
 }
 
 impl<'lua> EvaluationMemo<'lua> {
-    fn key(deps: &Rc<Vec<Signal>>) -> MemoKey {
-        Rc::as_ptr(deps)
-    }
-
     fn enter(lua: &'lua Lua) -> Self {
         let owner = lua.app_data_ref::<MemoTable>().is_none();
         if owner {
@@ -998,7 +1010,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 })?;
                 collected.push(signal);
             }
-            Ok(Signal(SignalKind::Computed { deps: Rc::new(collected), func }))
+            Ok(Signal(SignalKind::Computed { id: next_computed_id(), deps: Rc::new(collected), func }))
         })?,
     )?;
     lua.globals().set(
@@ -1304,6 +1316,32 @@ mod tests {
 
         assert_eq!(during, 0.0, "the reader that came first sets the pass's answer, wherever it sits in the tree");
         assert_eq!(next, 120.0, "and the clamp lands on the next pass, which is what `set_quiet` promises");
+    }
+
+    /// The memo was keyed on the address of a computed's dependency vector, and a computed dropped
+    /// mid-pass hands that address straight back to the allocator. This is the shape that broke the
+    /// lock screen on 2026-09-08: the second computed cannot return an integer, and with the
+    /// address as the key it returned the first one's `0`.
+    #[test]
+    fn a_computed_built_where_a_dead_one_stood_gets_its_own_value() {
+        let (lua, _dirty) = lua_with_state();
+        let _pass = LayoutPassBudget::enter(&lua).expect("a pass budget");
+        let answer: String = lua
+            .load(
+                r#"
+                local leaf = state("leaf", 1)
+                local doomed = computed({ leaf }, function() return 0 end)
+                doomed:get()
+                doomed = nil
+                collectgarbage("collect")
+                collectgarbage("collect")
+                local fresh = computed({ leaf }, function() return "mine" end)
+                return fresh:get()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(answer, "mine", "a recycled address must not carry a memo entry with it");
     }
 
     /// A wide diamond must not spend nesting levels on cache hits: the memo is checked before
