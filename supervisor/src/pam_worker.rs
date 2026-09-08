@@ -318,7 +318,9 @@ async fn spawn_worker_and_exchange(username: &str, secret: &[u8]) -> std::io::Re
 /// including after failed/timed-out I/O, so a hung worker is not untracked. `timeout` covers only
 /// write/read; `reap_process_group` has its own grace. Without it, `read_json_frame` could hang
 /// forever and the inline polkit path would stall `main.rs`'s `select!`. Parameterize it so tests
-/// avoid the real 30-second [`PAM_EXCHANGE_TIMEOUT`].
+/// avoid the real 30-second [`PAM_EXCHANGE_TIMEOUT`]. A failed exchange carries [`post_mortem`]'s
+/// account of how the worker died, because the reap already knows and the lock screen otherwise
+/// reports an I/O error with no subject.
 async fn exchange_over(
     mut child: tokio::process::Child,
     secret: &[u8],
@@ -331,11 +333,42 @@ async fn exchange_over(
         }
     };
 
-    if let Err(err) = crate::process::reap_process_group(&mut child, crate::process::DEFAULT_REAP_GRACE).await {
+    let reaped = crate::process::reap_process_group(&mut child, crate::process::DEFAULT_REAP_GRACE).await;
+    if let Err(err) = &reaped {
         eprintln!("failed to reap pam worker: {err}");
     }
 
-    outcome_result
+    // A worker that answered needs no post-mortem. One that did not leaves the lock screen saying
+    // only "early eof", and on 2026-09-08 that was the whole of the evidence: nothing on the
+    // worker's inherited stderr, no coredump, nothing in the journal, and a session that could not
+    // be unlocked until the next attempt happened to work. How it died is already in hand here and
+    // was being dropped on the floor.
+    outcome_result.map_err(|err| std::io::Error::new(err.kind(), format!("{err}; the worker {}", post_mortem(&reaped))))
+}
+
+/// How the worker died, for an [`exchange_over`] that never got a frame.
+///
+/// `reap_process_group` sends `SIGTERM` before waiting, so a live worker dies by our hand and
+/// reports signal 15. That is not the ambiguity it looks like: this runs only when the pipe already
+/// closed, which a live process does not do, so in practice the status is the worker's own.
+fn post_mortem(reaped: &std::io::Result<crate::process::ReapOutcome>) -> String {
+    use std::os::unix::process::ExitStatusExt;
+
+    let status = match reaped {
+        Ok(crate::process::ReapOutcome::ExitedCleanly(status) | crate::process::ReapOutcome::Escalated(status)) => {
+            status
+        }
+        Err(err) => return format!("could not be reaped, so how it died is unknown: {err}"),
+    };
+    if let Some(signal) = status.signal() {
+        return format!("was killed by signal {signal}");
+    }
+    match status.code() {
+        // The worker prints its own reason to the inherited stderr before returning non-zero, so a
+        // code here is a pointer to that line rather than the whole story.
+        Some(code) => format!("exited with status {code}"),
+        None => format!("ended in a way no exit status describes: {status}"),
+    }
 }
 
 /// Write/read half wrapped by [`exchange_over`] in `tokio::time::timeout`. It borrows `child`, so
@@ -573,6 +606,23 @@ mod tests {
             gone.is_ok(),
             "the worker (pid {pid}) should be reaped even though exchange_over returned an error, not left sleeping"
         );
+    }
+
+    /// The 2026-09-08 lockout: the worker vanished and "early eof" was the entire diagnosis.
+    #[tokio::test]
+    async fn a_worker_that_dies_without_answering_reports_how_it_died() {
+        for (script, expected) in [("exit 3", "exited with status 3"), ("kill -SEGV $$", "was killed by signal 11")] {
+            let child =
+                crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
+                    .expect("failed to spawn the fake worker");
+
+            let err = exchange_over(child, b"the-password", TEST_TIMEOUT)
+                .await
+                .expect_err("a worker that writes no frame must fail the exchange");
+
+            let message = err.to_string();
+            assert!(message.contains(expected), "`{script}` should report `{expected}`, got: {message}");
+        }
     }
 
     #[tokio::test]
