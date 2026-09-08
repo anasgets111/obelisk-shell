@@ -4405,3 +4405,54 @@ fault in it surfaces immediately instead of only under a config that names an ef
 Not tested by construction: the composite itself. The stage needs a GL context and the paint
 harness has none, so this is verified live -- a translucent image mid-cross over a known ground,
 measured against the value the arithmetic predicts, with the old code as the control.
+
+## 0187. What fits is a property of the decode pool, not of one worker's share of it
+
+`MAX_DECODE_ALLOC_BYTES` was 64 MiB passed to `image::Limits::max_alloc`, and its own doc said the
+real ceiling was itself times `MAX_DECODE_WORKERS`: 256 MiB. A per-decoder proxy for a pool figure
+gets the pool right and each decode wrong. A 6024x3401 wallpaper in the folder this was written
+against decodes to 78 MiB -- comfortably inside 256 MiB, past a 64 MiB quarter of it -- so a
+legitimate file was refused unread, permanently, while three quarters of the budget sat idle. The
+file is 380 KB on disk, which is why nothing about it looked large.
+
+The ceiling is unchanged. Where it is enforced moves: `Budget` is a byte count shared by the pool,
+a worker waits until its decode fits, and the permit is RAII because `decode_raster` has a dozen
+`?` exits and every one has to give the bytes back.
+
+Details that are the whole difficulty:
+
+1. **The size comes from the decoder, not from the dimensions.** `total_bytes()` is exactly the
+   number `max_alloc` checks. `w * h * 4` is wrong in both directions: a 16-bit source needs
+   `w * h * 8` and would be admitted at half its cost, and the RGB8 JPEG next to that wallpaper
+   needs `w * h * 3` and would be charged a third more than it takes.
+2. **One decoder answers the question and does the work.** `into_dimensions` is not the free header
+   read it looks like: for a JPEG it reads the whole compressed file, 8.7 ms against a PNG's 27 µs
+   here. Probing with a second reader would pay that twice.
+3. **The probe sits after source selection.** A covering cached thumbnail returns before the source
+   is opened at all, and an SVG rasterizes to `box_px` rather than to anything it declares. Charging
+   before that dispatch would make a 256-pixel thumbnail queue behind a wallpaper for room it does
+   not need.
+4. **An empty budget admits any decode.** Nothing is too big to run, and no set of waiters can be
+   waiting only on each other. A single decode is still refused above `DECODE_POOL_BYTES`, so this
+   admits one decode *at* the ceiling and not one above it -- without that refusal an 8192x8192
+   16-bit source would be admitted alone at 512 MiB, twice what four workers could reach before.
+5. **An inline decode charges but never waits.** It runs on the Wayland dispatch thread; blocking
+   there stalls dispatch, Supervisor reads and input. A frozen shell is a bad price for an
+   accounting nicety, so it is counted for the workers' benefit and let through.
+6. **A worker re-asks whether its decode is still wanted after the wait.** Waiting is what this
+   added, and an entry can be evicted while a worker sits in `acquire`.
+
+What this bound is, stated honestly, because the figure it replaced was not: it counts the decoder's
+own output while the decoder produces it. `decode_raster` scales and converts alongside the buffer
+it charged for; a finished decode holds its pixels in the result channel until `poll` and in
+`landed` until a paint uploads them; an inline decode charges without waiting. So the high-water
+mark is above `DECODE_POOL_BYTES` by the largest of those, not equal to it. That is still the first
+figure here that is enforced where it is claimed. The upgrade path is to hold the permit until
+`upload_landed` consumes the pixels, which needs the permit to travel with the result.
+
+Tested by construction: the admission rule, extracted pure so the deadlock case can be checked
+without threads; the permit returning its bytes and waking a waiter however the decode ends; a
+decode abandoned because its entry was evicted during the wait; and the 78 MiB case end to end. That
+last one looked untestable and is not -- the fixture is a solid colour at the real dimensions, 400
+KB on disk and 19 ms to encode, because what the decoder charges for is the dimensions and not the
+entropy. Assuming a large decode needs a large file is the same mistake this ADR is about.

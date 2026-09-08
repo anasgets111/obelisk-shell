@@ -98,7 +98,9 @@ impl Slot {
         // Under the same ceiling as any other decode. These files are ours, but they live in a
         // shared `$XDG_CACHE_HOME` any process of this user can write, so their headers are not
         // evidence of their size (`image::MAX_DECODE_EDGE`).
-        let decoded = super::decode_within_limits(&self.path).ok()?.into_rgba8();
+        // Free: a thumbnail is bounded by the slot size the caller asked for, not by the source,
+        // so it never approaches the pool budget (ADR-0187).
+        let decoded = super::decode_within_limits(&self.path, super::Charge::Free, &|| true).ok()?.into_rgba8();
         let (width, height) = decoded.dimensions();
         Ok::<_, ()>((decoded.into_raw(), width, height)).ok()
     }

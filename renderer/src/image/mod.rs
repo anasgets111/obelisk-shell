@@ -25,7 +25,7 @@ use crate::layout::node::Rgba;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use femtovg::renderer::OpenGl;
 use femtovg::rgb::FromSlice;
@@ -76,13 +76,15 @@ const MAX_INFLIGHT_DECODES: usize = 64;
 /// width, which is past anything this shell has to show.
 const MAX_DECODE_EDGE: u32 = 8_192;
 
-/// Bytes one decode may allocate.
+/// Decoded pixels the background pool holds at once, and the most one decode may produce.
 ///
-/// Sized so the *pool* stays within reach of ADR-0043's budget rather than one decoder: this times
-/// [`MAX_DECODE_WORKERS`] is the real ceiling, and at 64 MiB that is 256 MiB of transient decode
-/// against a 50 MiB steady state. A per-decoder figure that ignored the multiplier is how the
-/// crate's own 512 MiB default reads, and it is a courtesy rather than a budget.
-const MAX_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+/// This replaced a 64 MiB *per-decode* cap whose own doc said the real ceiling was itself times
+/// [`MAX_DECODE_WORKERS`]. A per-decoder proxy for a pool figure gets the pool right and each
+/// decode wrong: a 6024x3401 wallpaper decodes to 78 MiB, well inside a 256 MiB pool and refused
+/// unread by a 64 MiB slice of it, so a legitimate file was permanently unloadable while three
+/// quarters of the budget sat idle. The ceiling is unchanged; where it is enforced is not
+/// (ADR-0187).
+const DECODE_POOL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bytes an SVG source may occupy before it is refused unparsed. `usvg` parses the whole document
 /// into a tree with no ceiling of its own, and an icon that is not a few hundred kilobytes is not
@@ -192,6 +194,118 @@ struct Job {
     tint: Option<Rgba>,
 }
 
+/// The pool's shared ceiling on decoded pixels in flight, in bytes (ADR-0187).
+///
+/// A worker waits here until its decode fits, so four wallpapers arriving together decode in turn
+/// rather than all at once, and one large file decodes alone rather than not at all.
+///
+/// ponytail: this counts the decoder's own output and nothing else. `decode_raster` scales and
+/// converts alongside the buffer it charged for, a finished decode keeps its pixels in the result
+/// channel until `poll` and then in `landed` until the next paint uploads them, and an inline
+/// decode charges without waiting. So the real high-water mark is above `DECODE_POOL_BYTES` by the
+/// largest of those, not equal to it -- which is still the first honest figure this has had, the
+/// per-decode cap it replaced having claimed a pool bound it never enforced. Upgrade path: charge
+/// the permit until `upload_landed` consumes the pixels, which makes the permit outlive the worker
+/// and needs it to travel with the result.
+#[derive(Default)]
+pub(super) struct Budget {
+    in_flight: Mutex<u64>,
+    room: Condvar,
+}
+
+impl Budget {
+    /// Waits until `bytes` fit, then charges them.
+    ///
+    /// A decode is admitted when nothing else is in flight, whatever its size, so nothing is ever
+    /// too big to run and no set of waiters can deadlock each other. `decode_within_limits` has
+    /// already refused anything larger than the whole budget, so that case admits one decode at the
+    /// ceiling rather than one above it.
+    ///
+    /// A poisoned lock hands back an uncharged permit and lets the decode through: a decode pool
+    /// that has stopped accounting is worth less than a shell that has stopped drawing.
+    fn acquire(&self, bytes: u64) -> Permit<'_> {
+        let Ok(mut in_flight) = self.in_flight.lock() else { return Permit { budget: self, bytes: 0 } };
+        loop {
+            if admits(*in_flight, bytes) {
+                *in_flight += bytes;
+                return Permit { budget: self, bytes };
+            }
+            let Ok(waited) = self.room.wait(in_flight) else { return Permit { budget: self, bytes: 0 } };
+            in_flight = waited;
+        }
+    }
+
+    /// Charges `bytes` without waiting for room, for a decode that cannot afford to block: an
+    /// inline load runs on the Wayland dispatch thread, and stalling that to wait on a background
+    /// worker is a frozen shell. It still counts, so the workers see it.
+    fn charge(&self, bytes: u64) -> Permit<'_> {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            *in_flight += bytes;
+            return Permit { budget: self, bytes };
+        }
+        Permit { budget: self, bytes: 0 }
+    }
+}
+
+/// Where a decode's pixels are charged, and whether it may wait for room (ADR-0187).
+#[derive(Clone, Copy)]
+pub(super) enum Charge<'a> {
+    /// Not counted. A cached thumbnail is bounded by the slot size the caller asked for rather than
+    /// by the source, so it never approaches the budget and waiting for one would be nothing but
+    /// latency.
+    Free,
+    /// A background worker: waits until its pixels fit, which is what serializes four wallpapers
+    /// arriving together.
+    Waiting(&'a Budget),
+    /// The Wayland dispatch thread: counted, so the workers see it, but never waiting. Blocking
+    /// here stalls Wayland dispatch, Supervisor reads and input -- a frozen shell in exchange for
+    /// an accounting nicety.
+    Immediate(&'a Budget),
+}
+
+impl<'a> Charge<'a> {
+    /// Takes the charge, blocking only where that is safe.
+    fn take(self, bytes: u64) -> Option<Permit<'a>> {
+        match self {
+            Charge::Free => None,
+            Charge::Waiting(budget) => Some(budget.acquire(bytes)),
+            Charge::Immediate(budget) => Some(budget.charge(bytes)),
+        }
+    }
+}
+
+/// Whether `bytes` may start decoding with `in_flight` already charged.
+///
+/// Pure so the rule is testable without threads, which is where the deadlock would be. An empty
+/// budget admits any size: `decode_within_limits` has already refused anything past
+/// [`DECODE_POOL_BYTES`], so this admits at most one decode at the ceiling, and never leaves a
+/// decode that nothing can satisfy waiting on waiters that are all waiting on it.
+fn admits(in_flight: u64, bytes: u64) -> bool {
+    in_flight == 0 || in_flight + bytes <= DECODE_POOL_BYTES
+}
+
+/// Holds a [`Budget`] charge for as long as the pixels it paid for are being produced. RAII because
+/// `decode_raster` has a dozen `?` exits and every one of them has to give the bytes back.
+struct Permit<'a> {
+    budget: &'a Budget,
+    bytes: u64,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if let Ok(mut in_flight) = self.budget.in_flight.lock() {
+            *in_flight = in_flight.saturating_sub(self.bytes);
+        }
+        // Outside the lock's scope above only by `notify_all`'s own rules; waking every waiter
+        // rather than one because they want different amounts, and the one this would wake might
+        // be the one that still does not fit.
+        self.budget.room.notify_all();
+    }
+}
+
 /// Shared decode queue and result channel, at most `MAX_DECODE_WORKERS` threads. Spawned with the
 /// cache before Lua reads anything, so a failed spawn is a startup failure, not a later blank tile.
 struct Pool {
@@ -201,6 +315,9 @@ struct Pool {
     /// so closing the picker stops the queued tiles rather than decoding all of them into slots
     /// that were evicted while they waited.
     wanted: Arc<Mutex<HashSet<CacheKey>>>,
+    /// Decoded bytes in flight (ADR-0187). Shared with `ImageCache` so an inline decode on the
+    /// dispatch thread is counted against the same ceiling the workers wait on.
+    budget: Arc<Budget>,
 }
 
 impl Pool {
@@ -209,6 +326,7 @@ impl Pool {
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, results) = std::sync::mpsc::channel();
         let wanted: Arc<Mutex<HashSet<CacheKey>>> = Arc::new(Mutex::new(HashSet::new()));
+        let budget: Arc<Budget> = Arc::new(Budget::default());
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_DECODE_WORKERS);
         let cache_root = thumbnails::cache_dir();
         for index in 0..workers {
@@ -217,6 +335,7 @@ impl Pool {
             let cache_root = cache_root.clone();
             let waker = waker.clone();
             let wanted = Arc::clone(&wanted);
+            let budget = Arc::clone(&budget);
             std::thread::Builder::new()
                 .name(format!("oblisk-image-decode-{index}"))
                 .spawn(move || {
@@ -233,7 +352,18 @@ impl Pool {
                         if !wanted.lock().is_ok_and(|wanted| wanted.contains(&job.key)) {
                             continue;
                         }
-                        let result = decode(&job.key.path, job.key.box_px, job.tint, cache_root.as_deref());
+                        // The permit is taken inside, where the source has been chosen and its
+                        // size is known; `still_wanted` is re-asked there because a worker can now
+                        // wait for room, and an entry can be evicted while it does (ADR-0187).
+                        let still_wanted = || wanted.lock().is_ok_and(|wanted| wanted.contains(&job.key));
+                        let result = decode(
+                            &job.key.path,
+                            job.key.box_px,
+                            job.tint,
+                            cache_root.as_deref(),
+                            Charge::Waiting(&budget),
+                            &still_wanted,
+                        );
                         if result_tx.send((job.key, result)).is_err() {
                             return;
                         }
@@ -245,7 +375,7 @@ impl Pool {
                 })
                 .expect("failed to spawn an oblisk-image-decode thread");
         }
-        Pool { jobs, results, wanted }
+        Pool { jobs, results, wanted, budget }
     }
 }
 
@@ -453,7 +583,11 @@ impl ImageCache {
         }
         match load {
             Load::Inline => {
-                let slot = upload_or_log(canvas, &key.path, decode(&key.path, key.box_px, tint, None));
+                // Counted against the same ceiling the workers wait on, but never waiting for it:
+                // this is the dispatch thread (ADR-0187). Nothing is queued, so nothing can be
+                // evicted mid-decode and the request is still wanted by definition.
+                let decoded = decode(&key.path, key.box_px, tint, None, Charge::Immediate(&self.pool.budget), &|| true);
+                let slot = upload_or_log(canvas, &key.path, decoded);
                 let id = match slot {
                     Slot::Ready(id, _) => Some(id),
                     _ => None,
@@ -641,12 +775,21 @@ fn is_vector(path: &Path) -> bool {
 
 /// Canvas-free load half for pool threads: raster decode/downscale through `thumbnails` when
 /// available, or SVG rasterization at `box_px`'s longest edge.
-fn decode(path: &Path, box_px: (u32, u32), tint: Option<Rgba>, thumbnails: Option<&Path>) -> Result<Decoded, String> {
+fn decode(
+    path: &Path,
+    box_px: (u32, u32),
+    tint: Option<Rgba>,
+    thumbnails: Option<&Path>,
+    charge: Charge<'_>,
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<Decoded, String> {
+    // An SVG rasterizes to `box_px`, not to whatever the file declares, so it is bounded by the
+    // request and never approaches the pool budget. `MAX_SVG_BYTES` is what bounds the parse.
     if is_vector(path) {
         let (pixels, width, height) = rasterize_svg(path, box_px.0.max(box_px.1), tint)?;
         return Ok(Decoded { pixels, width, height, premultiplied: true });
     }
-    let (pixels, width, height) = decode_raster(path, box_px, thumbnails)?;
+    let (pixels, width, height) = decode_raster(path, box_px, thumbnails, charge, still_wanted)?;
     Ok(Decoded { pixels, width, height, premultiplied: false })
 }
 
@@ -716,7 +859,13 @@ fn stored_size(width: u32, height: u32, box_px: (u32, u32)) -> (u32, u32) {
 /// If `thumbnails` has a covering size, decode a current thumbnail instead of the file. A full
 /// decode larger than that size leaves one behind; a 32px tray icon is never thumbnailed. Write
 /// failure logs once and still produces the texture.
-fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> Result<(Vec<u8>, u32, u32), String> {
+fn decode_raster(
+    path: &Path,
+    box_px: (u32, u32),
+    thumbnails: Option<&Path>,
+    charge: Charge<'_>,
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, u32, u32), String> {
     let slot = thumbnails.and_then(|root| thumbnails::Slot::for_file(root, path, box_px));
     if let Some(slot) = &slot
         && let Some((pixels, width, height)) = slot.read_valid()
@@ -730,7 +879,9 @@ fn decode_raster(path: &Path, box_px: (u32, u32), thumbnails: Option<&Path>) -> 
         let (width, height) = scaled.dimensions();
         return Ok((scaled.into_raw(), width, height));
     }
-    let decoded = decode_within_limits(path)?;
+    // Past the thumbnail branch, so the budget is charged for the source actually decoded and a
+    // covering thumbnail is never made to wait for room it does not need (ADR-0187).
+    let decoded = decode_within_limits(path, charge, still_wanted)?;
     let (width, height) = (decoded.width(), decoded.height());
     if let Some(slot) = &slot
         && width.max(height) > slot.px
@@ -788,13 +939,28 @@ fn refuse_irregular(path: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"))
 }
 
-/// Decodes one raster file under [`MAX_DECODE_EDGE`] and [`MAX_DECODE_ALLOC_BYTES`].
+/// Decodes one raster file under [`MAX_DECODE_EDGE`], charging its pixels to `budget`.
 ///
 /// `image::open` reads the header and then the whole surface, so the size the caller wanted never
 /// entered into it: a thumbnail request for a 8000x6000 photo still allocated ~192 MB, and
-/// [`MAX_DECODE_WORKERS`] of those at once is most of a gigabyte. `ImageReader` applies the limits
-/// during decoding, so an oversized source is refused rather than allocated for.
-pub(super) fn decode_within_limits(path: &Path) -> Result<::image::DynamicImage, String> {
+/// [`MAX_DECODE_WORKERS`] of those at once is most of a gigabyte. `ImageReader` applies the edge
+/// limits during decoding, so an oversized source is refused rather than allocated for.
+///
+/// The size comes from the decoder rather than from `w * h * 4`, and one decoder serves both the
+/// question and the answer. Guessing the output from the dimensions is wrong in both directions:
+/// a 16-bit source needs `w * h * 8` and would be admitted on half its true cost, while the RGB8
+/// JPEG in the folder this was written for needs `w * h * 3` and would be charged a third more
+/// than it takes. `total_bytes` is the number the crate's own `max_alloc` checks, exactly.
+///
+/// Reusing the decoder also avoids opening the file twice: `into_dimensions` is not the free header
+/// read it looks like, reading the whole compressed file for a JPEG (8.7 ms against a PNG's 27 µs
+/// here). Paid once by the decode that follows, it costs nothing; paid by a separate probe first,
+/// it doubles.
+pub(super) fn decode_within_limits(
+    path: &Path,
+    charge: Charge<'_>,
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<::image::DynamicImage, String> {
     refuse_irregular(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut reader = ::image::ImageReader::open(path)
         .map_err(|err| err.to_string())?
@@ -803,9 +969,23 @@ pub(super) fn decode_within_limits(path: &Path) -> Result<::image::DynamicImage,
     let mut limits = ::image::Limits::no_limits();
     limits.max_image_width = Some(MAX_DECODE_EDGE);
     limits.max_image_height = Some(MAX_DECODE_EDGE);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
     reader.limits(limits);
-    reader.decode().map_err(|err| err.to_string())
+    let decoder = reader.into_decoder().map_err(|err| err.to_string())?;
+    let need = ::image::ImageDecoder::total_bytes(&decoder);
+    // One decode may have the whole pool but not more than it, which is what keeps the ceiling a
+    // ceiling now that it is no longer divided by [`MAX_DECODE_WORKERS`]. Without this an
+    // 8192x8192 16-bit source would be admitted alone at 512 MiB, twice what the four workers
+    // could reach before.
+    if need > DECODE_POOL_BYTES {
+        return Err(format!("decodes to {need} bytes, past the {DECODE_POOL_BYTES}-byte pool budget"));
+    }
+    let _permit = charge.take(need);
+    // Re-asked after the wait, not only before it: waiting is what this added, and an entry can be
+    // evicted while a worker sits in `acquire`. Cheap to ask, a whole decode to get wrong.
+    if !still_wanted() {
+        return Err("evicted while waiting for decode budget".to_string());
+    }
+    ::image::DynamicImage::from_decoder(decoder).map_err(|err| err.to_string())
 }
 
 fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8>, u32, u32), String> {
@@ -1094,7 +1274,8 @@ mod tests {
         let png = dir.path().join("fixture.png");
         std::fs::write(&png, PIL_2X2_RGBA_PNG).unwrap();
 
-        let (pixels, width, height) = decode_raster(&png, (2, 2), None).expect("a PNG decoder must be compiled in");
+        let (pixels, width, height) =
+            decode_raster(&png, (2, 2), None, Charge::Free, &|| true).expect("a PNG decoder must be compiled in");
         assert_eq!((width, height), (2, 2));
         // Straight alpha in Pillow's order: half-transparent green stays 0x00ff00, not
         // premultiplied 0x008000.
@@ -1106,7 +1287,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("not-really.png");
         std::fs::write(&fake, b"<svg/>").unwrap();
-        assert!(decode_raster(&fake, (8, 8), None).is_err());
+        assert!(decode_raster(&fake, (8, 8), None, Charge::Free, &|| true).is_err());
     }
 
     /// ADR-0183. The capacity bound never sees the pin list, so it evicts by what has been asked
@@ -1212,6 +1393,91 @@ mod tests {
         assert_eq!(stored_size(0, 0, (100, 100)), (0, 0));
     }
 
+    /// ADR-0187. The rule the old per-decode cap got wrong: what fits is a property of the pool,
+    /// not of one worker's quarter of it.
+    #[test]
+    fn the_decode_budget_admits_by_what_is_in_flight_and_never_by_a_fixed_share() {
+        // A 6024x3401 wallpaper decodes to 78 MiB. Alone it fits and always did; under the old
+        // 64 MiB per-decode cap it was refused unread while three quarters of the pool sat idle.
+        let wallpaper = 6024 * 3401 * 4;
+        assert!(admits(0, wallpaper), "a lone wallpaper decode fits the pool it is charged against");
+        assert!(admits(wallpaper, wallpaper), "and so does a second, at 156 MiB of 256");
+        assert!(!admits(wallpaper * 3, wallpaper), "a fourth does not, and waits for one to finish");
+
+        // Nothing in flight admits anything, so no decode is too big to ever run and no set of
+        // waiters can be waiting only on each other.
+        assert!(admits(0, DECODE_POOL_BYTES), "an empty budget admits a decode at the ceiling");
+        assert!(!admits(1, DECODE_POOL_BYTES), "and one byte of company is enough to make it wait");
+    }
+
+    /// ADR-0187. The permit is RAII because `decode_raster` has a dozen `?` exits; a decode that
+    /// fails after charging must still give the bytes back, or the pool shrinks by that much for
+    /// the life of the process.
+    #[test]
+    fn a_permit_returns_its_bytes_and_wakes_a_waiter_however_the_decode_ends() {
+        let budget = std::sync::Arc::new(Budget::default());
+        {
+            let _whole = budget.acquire(DECODE_POOL_BYTES);
+            assert_eq!(*budget.in_flight.lock().unwrap(), DECODE_POOL_BYTES);
+        }
+        assert_eq!(*budget.in_flight.lock().unwrap(), 0, "a dropped permit gives its bytes back");
+
+        // A waiter blocked behind a full budget is released when the permit drops, rather than
+        // waiting for a timeout it does not have.
+        let held = budget.acquire(DECODE_POOL_BYTES);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = std::sync::Arc::clone(&budget);
+        let joined = std::thread::spawn(move || {
+            let _permit = waiting.acquire(DECODE_POOL_BYTES);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a decode that does not fit must wait rather than run"
+        );
+        drop(held);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "and must be woken by the permit that made room, not by a poll"
+        );
+        joined.join().unwrap();
+        assert_eq!(*budget.in_flight.lock().unwrap(), 0);
+    }
+
+    /// ADR-0187, the case that started it: a real wallpaper of 6024x3401 decodes to 78 MiB of RGBA
+    /// from 400 KB on disk. That is comfortably inside the 256 MiB pool and past a 64 MiB quarter
+    /// of it, so the per-decode cap refused it unread, permanently, while the pool sat idle.
+    ///
+    /// Solid colour keeps the fixture a few hundred KB and the encode near instant; the dimensions
+    /// are what matter, because they are what the decoder charges for.
+    #[test]
+    fn a_source_past_one_workers_old_share_of_the_budget_decodes_and_gives_its_bytes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("wallpaper.png");
+        ::image::RgbaImage::from_pixel(6024, 3401, ::image::Rgba([7, 9, 11, 255])).save(&big).unwrap();
+
+        let pixels = 6024_u64 * 3401 * 4;
+        assert!(pixels > 64 * 1024 * 1024, "the fixture must be past the per-decode cap this replaced");
+        assert!(pixels < DECODE_POOL_BYTES, "and inside the pool budget that replaced it");
+
+        let budget = Budget::default();
+        let decoded = decode_within_limits(&big, Charge::Waiting(&budget), &|| true);
+        assert!(decoded.is_ok(), "a source inside the pool budget must decode: {:?}", decoded.err());
+        assert_eq!(decoded.map(|image| (image.width(), image.height())).ok(), Some((6024, 3401)));
+        assert_eq!(
+            *budget.in_flight.lock().unwrap(),
+            0,
+            "the permit is dropped with the decoder, so nothing stays charged after it returns"
+        );
+
+        // And the wait's own hazard: an entry evicted while its worker sat in `acquire` must not
+        // then be decoded into a slot that has gone away.
+        assert!(
+            decode_within_limits(&big, Charge::Free, &|| false).is_err(),
+            "a decode nobody wants any more must be abandoned rather than paid for"
+        );
+    }
+
     #[test]
     fn a_source_wider_than_the_decode_limit_is_refused_rather_than_allocated_for() {
         // The point of the limit: a thumbnail-sized request used to pay for the whole surface
@@ -1220,11 +1486,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wide = dir.path().join("wide.png");
         ::image::RgbaImage::from_pixel(MAX_DECODE_EDGE + 1, 1, ::image::Rgba([1, 2, 3, 255])).save(&wide).unwrap();
-        assert!(decode_within_limits(&wide).is_err(), "a source past MAX_DECODE_EDGE must not be decoded");
+        assert!(
+            decode_within_limits(&wide, Charge::Free, &|| true).is_err(),
+            "a source past MAX_DECODE_EDGE must not be decoded"
+        );
 
         let ordinary = dir.path().join("ordinary.png");
         ::image::RgbaImage::from_pixel(4, 4, ::image::Rgba([1, 2, 3, 255])).save(&ordinary).unwrap();
-        assert!(decode_within_limits(&ordinary).is_ok(), "an ordinary file must still decode");
+        assert!(decode_within_limits(&ordinary, Charge::Free, &|| true).is_ok(), "an ordinary file must still decode");
     }
 
     #[test]
@@ -1335,9 +1604,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.png");
         ::image::RgbaImage::from_pixel(400, 200, ::image::Rgba([10, 20, 30, 255])).save(&big).unwrap();
-        let (_, width, height) = decode_raster(&big, (100, 100), None).unwrap();
+        let (_, width, height) = decode_raster(&big, (100, 100), None, Charge::Free, &|| true).unwrap();
         assert_eq!((width, height), (200, 100));
-        let (_, width, height) = decode_raster(&big, (1000, 1000), None).unwrap();
+        let (_, width, height) = decode_raster(&big, (1000, 1000), None, Charge::Free, &|| true).unwrap();
         assert_eq!((width, height), (400, 200));
     }
 
@@ -1348,7 +1617,7 @@ mod tests {
         ::image::RgbaImage::from_pixel(400, 200, ::image::Rgba([10, 20, 30, 255])).save(&big).unwrap();
         let cache = dir.path().join("cache");
 
-        let (_, width, height) = decode_raster(&big, (100, 100), Some(&cache)).unwrap();
+        let (_, width, height) = decode_raster(&big, (100, 100), Some(&cache), Charge::Free, &|| true).unwrap();
         assert_eq!((width, height), (200, 100), "the texture is the box's, whatever the thumbnail is");
         let slot = thumbnails::Slot::for_file(&cache, &big, (100, 100)).unwrap();
         let (_, thumb_width, thumb_height) = slot.read_valid().expect("a `normal` thumbnail was written");
@@ -1356,7 +1625,10 @@ mod tests {
 
         // Source gone: only the thumbnail can answer, and it does.
         std::fs::remove_file(&big).unwrap();
-        assert!(decode_raster(&big, (100, 100), Some(&cache)).is_err(), "no source, no mtime, no slot");
+        assert!(
+            decode_raster(&big, (100, 100), Some(&cache), Charge::Free, &|| true).is_err(),
+            "no source, no mtime, no slot"
+        );
     }
 
     #[test]
@@ -1365,7 +1637,7 @@ mod tests {
         let small = dir.path().join("icon.png");
         ::image::RgbaImage::from_pixel(32, 32, ::image::Rgba([10, 20, 30, 255])).save(&small).unwrap();
         let cache = dir.path().join("cache");
-        decode_raster(&small, (24, 24), Some(&cache)).unwrap();
+        decode_raster(&small, (24, 24), Some(&cache), Charge::Free, &|| true).unwrap();
         assert!(!cache.exists(), "a 32px file has nothing to gain from a 128px thumbnail");
     }
 
@@ -1444,7 +1716,7 @@ mod tests {
 
         // Both open paths must refuse it. Neither call may block, which is what this asserts by
         // returning at all.
-        assert!(decode_within_limits(&fifo).is_err(), "a FIFO must not reach the decoder");
+        assert!(decode_within_limits(&fifo, Charge::Free, &|| true).is_err(), "a FIFO must not reach the decoder");
         assert!(read_capped(&fifo, 1024).is_err(), "nor the SVG reader");
 
         // A regular file at the same name still works, so the guard refuses the type, not the path.
