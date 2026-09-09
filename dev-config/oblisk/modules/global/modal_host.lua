@@ -51,6 +51,16 @@ return panel {
                 width = "Fill",
                 height = "Fill",
                 background = theme.SCRIM,
+                -- Dims, and does not blur. Blurring the whole screen here was tried and is the
+                -- louder reading: the desktop stops being legible at all, and a modal that only
+                -- wants attention does not need the rest of the screen destroyed. The cards ask
+                -- for themselves instead (ADR-0195), so what is blurred is the glass, and the
+                -- scrim behind it stays a dim over a sharp desktop.
+                --
+                -- Blur cannot fade either way. `set_blur_region` carries a region and nothing
+                -- else, so the step is a step; keeping it inside the card's own box is what makes
+                -- that unnoticeable, where the full-screen version had to be timed against the dim
+                -- to hide it.
                 opacity = any_modal:map(function(open)
                     return open and 1 or 0
                 end),

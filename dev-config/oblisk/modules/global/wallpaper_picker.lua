@@ -608,6 +608,9 @@ return modal({
         padding = { top = card_padding, right = card_padding, bottom = card_padding, left = card_padding },
         radius = theme.radius.lg,
         background = theme.GLASS,
+        -- The card alone, not the scrim behind it: the scrim is drawn under this in the same
+        -- surface, so what reaches the eye here is the blurred desktop seen through both.
+        blur = true,
         border_width = theme.border_width,
         border_color = theme.BORDER,
     }),
