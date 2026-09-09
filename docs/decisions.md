@@ -4371,6 +4371,10 @@ and a stale surface surviving a repaint narrowed to a tick that named something 
 loop's outer gate -- that a stale surface makes the turn reach a repaint at all -- is verified by
 reading `wayland/mod.rs`, because the loop needs a compositor.
 
+Amendment, ADR-0192: reading it was not enough. The gate was right and the branch under it was not,
+and the decision is extracted and tabulated there for the same reason `narrowed_repaint_targets` was
+extracted here.
+
 ## 0186. The engine's cross-dissolve is a shader like any other, because two source-over draws are not a cross-dissolve
 
 ADR-0181 built the dissolve out of two femtovg draws: the outgoing at the node's `alpha`, the
@@ -4626,4 +4630,51 @@ reached by scrolling rather than by search -- the wallpaper picker over a real f
 that exists. Until then the table above is the evidence, and it is reproducible rather than
 remembered, which is the difference between this entry and the two before it that deferred the same
 work.
+
+## 0192. A pass and a tick owe the screen different things, and one flag cannot say which ran
+
+ADR-0178 narrowed a tween frame's repaint to the instances `Scene::tick` named, and ADR-0185 added
+`stale` to that set because a decode refused for pool capacity owes a repaint no tree can ask for.
+The main loop then chose between the two repaints with a flag that had already been rebound:
+`re_resolved` starts as "a pass ran" and is immediately widened to "a pass ran or a tick advanced
+something", because everything downstream wants the wider meaning. The narrowing branch read the
+widened one.
+
+A turn that re-resolved does not tick, by the guard directly above it, so on any pass turn with a
+`stale` surface anywhere the branch took the narrowed arm with an empty tick list. The repaint
+covered the stale surface and nothing else, and whatever the pass had just changed -- a panel, a
+window, the surface the config had rewritten -- did not reach the screen. It would reach it on the
+next turn that had some other reason to repaint, which is why this reads as an intermittently
+dropped frame rather than a dead shell.
+
+The two meanings are two names now, and the choice is `repaint_for_turn`, pure and tabulated:
+`passed`, `typed` and `landed` are scene-wide and repaint everything; `ticked` and `stale` are the
+narrow set; nothing owed paints nothing. It sits beside `narrowed_repaint_targets` for the reason
+that function was extracted -- this decision is small, it is expressible without a `TrackedSurface`,
+and it has now been wrong twice.
+
+The same flag was also deciding how much protocol state to push. `apply_resolved_surface_state` runs
+`apply_resolved_state` over every tracked surface, and that is a role spec parse plus a `wl_region`
+create/add/set/destroy per surface. `apply_input_region` refuses to diff against the last region on
+purpose, and says why: the GPU repaint that follows costs more than the round trip. True for a pass.
+Not true for a tick, which repaints only what it advanced -- so one panel fading at 60 Hz was
+walking eighteen trees and issuing seventeen region round trips a frame for surfaces that would not
+be painted. A tick names its instances; the narrowed apply takes that list. Safe for everything the
+scene owns: `Scene::tick` mutates only the trees it returns, so every surface it did not name has
+exactly the tree its last push was derived from.
+
+One piece of that push does not come from the scene, and narrowing found it. ADR-0051's popup latch
+is read from `pointer_input_count`, and the serial that permits the reopen is armed by a press or a
+release and cleared at the end of that same turn (ADR-0049 amendment). A click whose handler writes
+no signal -- `on_click` setting an already-true `visible` -- re-resolves nothing, so the turn that
+carries the serial had no reason to visit the popup. It was visited anyway, on any turn where some
+unrelated surface happened to be mid-tween, because the widened flag ran the apply over everything;
+on a turn with no tween it was not visited at all and the popup stayed shut. Narrowing would have
+removed the accident and left the gap, so the latch is now its own small pass over popups, run
+whenever a serial is armed and the full apply did not already cover it.
+
+Both halves of the turn are pure functions now, `repaint_for_turn` and `surface_state_for_turn`,
+tested over their inputs rather than read. ADR-0185 closed by saying the main loop's gate was
+"verified by reading `wayland/mod.rs`, because the loop needs a compositor". The loop does. The
+decisions inside it do not, and neither of the two bugs above needed a compositor to show itself.
 

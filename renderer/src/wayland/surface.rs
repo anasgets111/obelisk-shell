@@ -177,6 +177,93 @@ fn narrowed_repaint_targets(ticked: &[String], stale: &[String]) -> Vec<String> 
     targets
 }
 
+/// What changed on one turn of the main loop, as the repaint decision reads it.
+pub(super) struct TurnChanges {
+    /// A re-resolve ran, so any tree in the scene may differ.
+    pub(super) passed: bool,
+    /// A tween tick advanced at least one instance. Never true on the same turn as `passed`.
+    pub(super) ticked: bool,
+    /// Some mapped surface owes a repaint its tree cannot ask for (ADR-0185).
+    pub(super) stale: bool,
+    /// A keystroke reached a field, moving a caret `field_focus_for` draws.
+    pub(super) typed: bool,
+    /// A decode landed, invalidating by file across every list that draws it.
+    pub(super) landed: bool,
+}
+
+/// How wide this turn's repaint has to be.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Repaint {
+    Nothing,
+    /// The ticked instances plus whatever is `stale`; see [`narrowed_repaint_targets`].
+    Narrowed,
+    Everything,
+}
+
+/// A turn that only ticked owes the screen exactly the surfaces it advanced, and `tick` just
+/// named them. Every other reason to repaint is scene-wide: a pass can change any tree, a
+/// keystroke moves a caret through `field_focus_for`, and a landed decode invalidates by file
+/// across every list that draws it.
+///
+/// So `passed` rules the narrowing out on its own, and it has to be the pass flag rather than the
+/// "did anything change" one the main loop also derives from the tick. Reading the derived flag
+/// let a pass that changed a panel be narrowed down to an unrelated `stale` wallpaper, and the
+/// panel's own repaint was simply dropped: the tick list it narrowed by was empty, because a turn
+/// that re-resolves does not tick.
+///
+/// A surface left `stale` by a decode turned away for capacity owes a repaint that no tree and no
+/// landing can ask for, so it is its own reason to reach one (ADR-0185).
+pub(super) fn repaint_for_turn(changes: TurnChanges) -> Repaint {
+    if changes.passed || changes.typed || changes.landed {
+        Repaint::Everything
+    } else if changes.ticked || changes.stale {
+        Repaint::Narrowed
+    } else {
+        Repaint::Nothing
+    }
+}
+
+/// Which surfaces owe a protocol-state push this turn.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StateScope {
+    /// Every tracked surface, because a pass can change any tree.
+    Everything,
+    /// The instances a tick named, and no others.
+    Ticked,
+    Nothing,
+}
+
+/// The protocol-state half of a turn: what [`App::apply_resolved_state`] is run over, and whether
+/// ADR-0051's popup latch still has to be looked at for the popups that misses.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SurfaceStateWork {
+    pub(super) scope: StateScope,
+    pub(super) popup_latch: bool,
+}
+
+/// `apply_resolved_state` is a role spec parse and an undiffed `wl_region` round trip per surface.
+/// A pass earns that for all of them. A tick earns it for the instances it named and no others:
+/// `Scene::tick` mutates only the trees it returns, so every other surface still has the tree its
+/// last push came from. Eighteen mapped surfaces at 60 Hz is otherwise seventeen region round
+/// trips a frame for surfaces the narrowed repaint will not even paint.
+///
+/// The latch is the exception, and it is an exception because it does not come from the scene at
+/// all. A press or release arms `input_serial` and bumps `pointer_input_count`, and the loop
+/// clears the serial at the end of that same turn (ADR-0049 amendment). A click whose handler
+/// writes no signal -- `on_click` setting an already-true `visible` -- re-resolves nothing, so
+/// nothing would look at whether the compositor has dismissed a popup the config still calls
+/// visible. That reopen used to depend on some unrelated surface happening to be mid-tween.
+pub(super) fn surface_state_for_turn(passed: bool, ticked: bool, armed_input: bool) -> SurfaceStateWork {
+    let scope = match (passed, ticked) {
+        (true, _) => StateScope::Everything,
+        (false, true) => StateScope::Ticked,
+        (false, false) => StateScope::Nothing,
+    };
+    // `Everything` has already visited every popup with this turn's serial in hand.
+    let popup_latch = armed_input && scope != StateScope::Everything;
+    SurfaceStateWork { scope, popup_latch }
+}
+
 /// Initial § 5.1 `visible`, with a role-aware fallback when startup apply has no tree
 /// (`Scene::apply` rolled back): panels default visible to keep the shell up, painting nothing
 /// until the next re-resolve; windows/popups default hidden (ADR-0049 decision 1), and locks have
@@ -393,6 +480,41 @@ impl App {
         }
     }
 
+    /// The same, for the instances a tween tick advanced.
+    ///
+    /// A tick moves the trees it names and no others, so the rest hold the fields, region and
+    /// visibility they were last pushed. Re-deriving those costs a role spec parse and a
+    /// `wl_region` create/add/set/destroy per surface, and `apply_input_region` deliberately does
+    /// not diff -- a reasonable trade when a GPU repaint follows, which for a narrowed tick is
+    /// exactly what does not. Eighteen mapped surfaces at 60 Hz make that seventeen round trips a
+    /// frame for surfaces nothing is going to paint.
+    pub(super) fn apply_resolved_surface_state_for(&mut self, instance_ids: &[String]) {
+        for index in 0..self.surfaces.len() {
+            if instance_ids.iter().any(|id| *id == self.surfaces[index].surface_id) {
+                self.apply_resolved_state(index);
+            }
+        }
+    }
+
+    /// The ADR-0051 latch, for the popups this turn's [`StateScope`] did not reach; see
+    /// [`surface_state_for_turn`] for why a click owes this and the scene does not.
+    ///
+    /// Popups only, and visibility only. The role fields and the input region are what a tick has
+    /// no business re-deriving; whether the compositor dismissed a popup the config still calls
+    /// visible is not something the scene can say.
+    pub(super) fn apply_popup_visibility_for_armed_input(&mut self) {
+        for index in 0..self.surfaces.len() {
+            if !matches!(self.surfaces[index].role, TrackedRole::Popup { .. }) {
+                continue;
+            }
+            let surface_id = self.surfaces[index].surface_id.clone();
+            let Some(visible) = self.client.scene().surface(&surface_id).map(|tree| tree.visible) else {
+                continue;
+            };
+            self.apply_popup_visibility(index, visible);
+        }
+    }
+
     /// Push a resolved root's live protocol fields, input region, and visibility
     /// (ADR-0038 decision 2, ADR-0049 decisions 1-2). Window fields must come from the resolved
     /// `WindowSpec`: raw evaluation values would freeze signal-bound `title`s. The socket parser
@@ -461,8 +583,10 @@ impl App {
     /// visible children means pass-through, a full child covers the surface, and intermediate
     /// content gets its visible geometry. Scale is `1.0` because no buffer scale is set. Do not
     /// diff against the last region: the following GPU repaint costs more than one `wl_region`
-    /// round trip. Skip a hidden window with no `wl_surface`; its first post-show re-resolve sets
-    /// the region.
+    /// round trip. That holds because every caller is a surface about to paint -- see
+    /// [`App::apply_resolved_surface_state_for`], which is what keeps a tick's frame from paying
+    /// this for the surfaces it did not move. Skip a hidden window with no `wl_surface`; its first
+    /// post-show re-resolve sets the region.
     fn apply_input_region(&mut self, index: usize, regions: Vec<crate::text::snap::PhysicalRect>) {
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
@@ -983,6 +1107,57 @@ mod tests {
 
         // Nothing owed, nothing painted: the idle turn stays idle (ADR-0124).
         assert!(narrowed_repaint_targets(&[], &[]).is_empty());
+    }
+
+    /// The narrowing above is only ever right for a turn that did not re-resolve. A pass can
+    /// change any tree, and it does not tick, so its `ticked` list is empty: narrowing by it
+    /// repaints the stale surface and drops the surface the pass actually changed.
+    #[test]
+    fn a_pass_repaints_everything_even_when_something_else_is_stale() {
+        let turn = |passed, ticked, stale, typed, landed| {
+            repaint_for_turn(TurnChanges { passed, ticked, stale, typed, landed })
+        };
+
+        // The bug: a pass changed a panel while a wallpaper waited on a refused decode. The
+        // narrowed repaint covers the wallpaper and the panel never reaches the screen.
+        assert_eq!(turn(true, false, true, false, false), Repaint::Everything);
+        assert_eq!(turn(true, false, false, false, false), Repaint::Everything);
+
+        // A tween frame is what narrowing exists for, stale surface or not (ADR-0178, ADR-0185).
+        assert_eq!(turn(false, true, false, false, false), Repaint::Narrowed);
+        assert_eq!(turn(false, false, true, false, false), Repaint::Narrowed);
+
+        // A caret and a landed decode are both scene-wide, and outrank a tick on the same turn.
+        assert_eq!(turn(false, true, false, true, false), Repaint::Everything);
+        assert_eq!(turn(false, true, false, false, true), Repaint::Everything);
+
+        // An idle turn paints nothing and stays timeout-free (ADR-0124).
+        assert_eq!(turn(false, false, false, false, false), Repaint::Nothing);
+    }
+
+    /// The protocol-state half of the same turn. Narrowing it to the ticked instances is the
+    /// point, and ADR-0051's latch is what that narrowing must not take with it: a click whose
+    /// handler writes no signal re-resolves nothing, so a popup the compositor dismissed while
+    /// `visible` stayed true would be reopened only when some unrelated surface was mid-tween.
+    #[test]
+    fn a_click_gets_the_popup_latch_looked_at_whatever_else_the_turn_did() {
+        let turn = surface_state_for_turn;
+
+        // A pass visits every popup with this turn's serial in hand, so the latch is not owed
+        // twice.
+        assert_eq!(turn(true, false, true), SurfaceStateWork { scope: StateScope::Everything, popup_latch: false });
+        assert_eq!(turn(true, false, false), SurfaceStateWork { scope: StateScope::Everything, popup_latch: false });
+
+        // A tween frame re-derives state for what it advanced. The click on top of it is still
+        // owed the latch, because the surfaces the tick named are not the popup's.
+        assert_eq!(turn(false, true, false), SurfaceStateWork { scope: StateScope::Ticked, popup_latch: false });
+        assert_eq!(turn(false, true, true), SurfaceStateWork { scope: StateScope::Ticked, popup_latch: true });
+
+        // The case that was never handled at all: a click, no signal written, nothing animating.
+        assert_eq!(turn(false, false, true), SurfaceStateWork { scope: StateScope::Nothing, popup_latch: true });
+
+        // An idle turn pushes nothing (ADR-0124).
+        assert_eq!(turn(false, false, false), SurfaceStateWork { scope: StateScope::Nothing, popup_latch: false });
     }
 
     #[test]

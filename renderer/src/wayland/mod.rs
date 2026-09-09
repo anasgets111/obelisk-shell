@@ -448,17 +448,21 @@ pub fn run(
         // Profiling adds three `clock_gettime` calls per turn for the resolve/repaint split.
         let mut phases = idle_profile::Phases::start(profile.is_some());
         app.client.wake_due_signals();
-        let re_resolved = app.client.re_resolve_if_dirty();
+        // Kept as its own name, not folded into `re_resolved` below: "a pass ran" and "something
+        // changed" answer different questions. Only a pass can change any tree, so only a pass
+        // rules out the narrowed repaint, and only a pass makes every surface's protocol state
+        // worth re-deriving.
+        let passed = app.client.re_resolve_if_dirty();
         // A frame callback is the tween clock (ADR-0145). Taken every turn so a callback that
         // arrives with a push is answered by this repaint, not repeated next turn. A turn that
         // re-resolved skips the tick: the pass's `retarget` already advanced every visible tween
         // to its own instant, and the repaint asks for the next callback either way.
-        let ticked = if std::mem::take(&mut app.animation_frame_due) && !re_resolved {
+        let ticked = if std::mem::take(&mut app.animation_frame_due) && !passed {
             app.client.tick_animations(std::time::Instant::now())
         } else {
             Vec::new()
         };
-        let re_resolved = re_resolved || !ticked.is_empty();
+        let re_resolved = passed || !ticked.is_empty();
         phases.mark_resolve();
         // Take unconditionally so a keystroke arriving with a push is covered by this repaint, not
         // repeated next turn.
@@ -472,23 +476,32 @@ pub fn run(
             // (ADR-0183).
             app.forget_painted_lists_drawing(&landed);
         }
+        // What protocol state this turn owes; `surface_state_for_turn` carries the reasoning.
+        let state = surface::surface_state_for_turn(passed, !ticked.is_empty(), app.input_serial.is_some());
+        match state.scope {
+            surface::StateScope::Everything => app.apply_resolved_surface_state(),
+            surface::StateScope::Ticked => app.apply_resolved_surface_state_for(&ticked),
+            surface::StateScope::Nothing => {}
+        }
+        if state.popup_latch {
+            app.apply_popup_visibility_for_armed_input();
+        }
         if re_resolved {
-            app.apply_resolved_surface_state();
             // Hover signals follow layout; `on_hover` follows the pointer (ADR-0112 amendment).
             app.refresh_hover_after_layout();
         }
         phases.mark_surface_state();
-        // A turn that only ticked owes the screen exactly the surfaces it advanced, and `tick`
-        // just named them. Every other reason to repaint is scene-wide: a pass can change any
-        // tree, a keystroke moves a caret through `field_focus_for`, and a landed decode
-        // invalidates by file across every list that draws it.
-        // A surface left `stale` by a decode turned away for capacity owes a repaint that no tree
-        // and no landing can ask for, so it has to be its own reason to reach one (ADR-0185).
-        let stale = app.has_stale_surfaces();
-        if (!ticked.is_empty() || stale) && !typed && landed.is_empty() {
-            app.repaint_surfaces_with_instance_ids(&ticked);
-        } else if re_resolved || typed || !landed.is_empty() {
-            app.repaint_mapped_surfaces();
+        // Which surfaces this turn owes the screen; `repaint_for_turn` carries the reasoning.
+        match surface::repaint_for_turn(surface::TurnChanges {
+            passed,
+            ticked: !ticked.is_empty(),
+            stale: app.has_stale_surfaces(),
+            typed,
+            landed: !landed.is_empty(),
+        }) {
+            surface::Repaint::Narrowed => app.repaint_surfaces_with_instance_ids(&ticked),
+            surface::Repaint::Everything => app.repaint_mapped_surfaces(),
+            surface::Repaint::Nothing => {}
         }
         phases.mark_repaint();
         // Skip focus maintenance on a truly idle turn (ADR-0124). It clones the focused tree to
