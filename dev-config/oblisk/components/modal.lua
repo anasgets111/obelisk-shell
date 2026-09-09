@@ -38,9 +38,11 @@ return function(opts)
         keyboard = opts.keyboard or false,
         -- Screen-sized, so the card keeps its own placement (a computed `margin`, or centre
         -- aligns) inside it, and the scale pivots on the screen's centre, where the card sits.
+        -- Stacking, not a column: a column governs its children's vertical placement itself, so a
+        -- card's own `align_v` would be dropped and every card would hang from the top.
         -- Hidden once the exit has run: a hidden subtree is frozen and its fields are out of the
         -- keyboard's reach.
-        node = column {
+        node = rect {
             width = "Fill",
             height = "Fill",
             visible = util.linger(showing, theme.animation_ms),
