@@ -15,9 +15,10 @@
 -- `textfield` (ADR-0092), `timestamp` (ADR-0093), and `hold_expiry`/`on_hover` so reading or
 -- replying does not remove the card (ADR-0094, ADR-0095).
 -- Body spans preserve bold, italic, underline, and accent links (ADR-0104); each link also gets an
--- opener button (ADR-0103). A card slides and fades in (ADR-0146) and out (ADR-0150); a message
--- box eases its hover ground (ADR-0145). Expansion, and the gap the cards below a dismissed one
--- close, still snap.
+-- opener button (ADR-0103). A card slides and fades in (ADR-0146) and out (ADR-0150), and so does
+-- each message inside one; a message box eases its hover ground (ADR-0145). The gap the cards
+-- below a dismissed one close still snaps: a leaving node takes no room, so what travels out of a
+-- card is clipped by the card closing over it.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -143,6 +144,11 @@ local function message(notification, ui, opts)
     -- (ADR-0092 decision 7).
     if notification.has_reply then
         lines[#lines + 1] = row {
+            -- `lines` is built conditionally and id-less siblings zip in order (ADR-0023), so a
+            -- body arriving shifts every row after it. Two `row`s pass the kind guard, and the
+            -- reply row inherits the images row's node, taking the `NodeId` the Renderer holds
+            -- keyboard focus by.
+            id = "notification-reply-" .. tostring(id),
             width = "Fill",
             align_v = "Center",
             spacing = theme.spacing.sm,
@@ -253,19 +259,60 @@ local function message(notification, ui, opts)
             return is_hovered and theme.ACCENT_MEDIUM or theme.BORDER_SUBTLE
         end)
     end
+    local animate = {
+        translate = {
+            duration = theme.notification_slide_ms,
+            easing = "OutCubic",
+            from = { x = theme.notification_width },
+        },
+        opacity = { duration = theme.notification_slide_ms, from = 0 },
+        exit = {
+            duration = theme.notification_slide_ms,
+            easing = "OutCubic",
+            translate = { x = theme.notification_width },
+            opacity = 0,
+        },
+    }
+    if ground then
+        animate.background = theme.animation_ms
+        animate.border_color = theme.animation_ms
+    end
     return button {
+        -- Named for the notification it draws, not for where it sits. A collapsed group renders
+        -- its newest message only, so a new notification from the same application takes the
+        -- previous one's slot. Both are `button`s, so the kind guard passes and the newcomer
+        -- inherits the old subtree, the reply field's `NodeId` with it: one card's draft under
+        -- another's summary, submitting through the first's callbacks.
+        id = "notification-message-" .. tostring(id),
         width = "Fill",
         hover = hovered,
         radius = theme.radius.sm,
         background = ground,
         border_width = ring and theme.border_width or nil,
         border_color = ring,
-        -- `Theme.ColorTransition on border.color` / `on color`, the two the mirror puts on this
-        -- box. Only a message inside a group has either; a standalone one has no ground to ease.
-        animate = ground and {
-            background = theme.animation_ms,
-            border_color = theme.animation_ms,
-        } or nil,
+        -- Resting pose: an exit eases from what the node holds, and an unset property has
+        -- nothing to leave from.
+        translate = { x = 0 },
+        opacity = 1,
+        -- `Behavior on x` on `messageContent`: a message rendered inside a group slides in from
+        -- beyond the right edge and a dismissed one slides out. Expanding a group is where it
+        -- shows. Both scopes, unlike the card's own entry: the mirror gates the card on
+        -- `_animReady`, but each message delegate carries its own flag (`root._shownMessageIds`)
+        -- with no scope test.
+        --
+        -- It also runs where the mirror hard-swaps, and that is kept. A collapsed group draws its
+        -- newest message alone, so a newer one arriving replaces the message in that slot; the
+        -- names above make that a node leaving and another entering rather than one node's text
+        -- changing under it, and both tweens run. The mirror destroys the old delegate outright,
+        -- because its exit is gated on `isDismissing` and a message rotating out of the slot is
+        -- not being dismissed. Ours reads as the group moving on rather than as text swapping
+        -- under a fixed heading, and the leaver takes no room, so the card does not grow to hold
+        -- both while they cross. Travel is the card's width, a little past this row's own, which only
+        -- clears the edge sooner. The exit's travel is theoretical for now, because a leaving node
+        -- takes no room (ADR-0150): the card closes over the message and clips it, and the opacity
+        -- is what carries it out. `Theme.ColorTransition` on colour joins them where there is a
+        -- ground to ease.
+        animate = animate,
         on_click = function(_, mouse_button)
             if mouse_button ~= "left" then
                 return
@@ -285,11 +332,13 @@ local function message(notification, ui, opts)
     }
 end
 
--- How long one card waits behind the one above it before entering. Notifications usually arrive
--- alone and this is then zero, but the whole stack returns at once whenever a panel closes or the
--- session unlocks (`modules/notification/popup.lua`), and four cards landing on the same frame read
--- as one block appearing rather than as a stack filling. This is the first consumer of a spec
--- `delay` (ADR-0153), which shipped without one.
+-- How long one card waits behind the one above it before entering. Four cards landing on the same
+-- frame read as one block appearing rather than as a stack filling. This is the first consumer of
+-- a spec `delay` (ADR-0153), which shipped without one.
+--
+-- Only notifications arriving together reach it. A panel closing does not bring the stack back
+-- through here: a hidden node's subtree is frozen rather than rebuilt (ADR-0124,
+-- `layout::scene::prepare_node`), so those cards keep their identities and enter nothing.
 local STAGGER_MS = 60
 
 -- The entry and exit of a whole card, which is the one thing the two scopes disagree about.
@@ -298,19 +347,23 @@ local STAGGER_MS = 60
 -- takes it out the same way. It is `translate`, not `margin`: a `Fill`-width card is stretched to
 -- its parent *minus* its margin, so easing `margin.left` from a card width unfurled the card out of
 -- zero width and re-wrapped every line of text on the way in. `translate` is paint-only
--- (ADR-0149), so the card is laid out once at its full width and only its pixels travel. The exit
--- was already written this way (ADR-0150) and the entry was not, so the two edges did not match.
+-- (ADR-0149), so the card is laid out once at its full width and only its pixels travel.
 --
--- The entry is `animation_slow_ms` against the exit's `animation_ms`: arriving is the frame the
--- user has to read and decelerates over a card's width, leaving is bookkeeping about something
--- already dealt with. The mirror runs both at `animationDuration`, and 380px in 147ms is a flick.
+-- Both edges run at `notification_slide_ms` on `OutCubic`, matching the mirror:
+-- `NotificationCard.qml` takes `slideAnimDuration` from `NotificationService.animationDuration`,
+-- which is `Math.round(Theme.animationDuration * 1.4)`. The bare 147 is the colour transitions
+-- only, so a card was never given a card's width to cross in it.
 --
--- Either way the cards below close the gap on one frame while a leaver slides; easing that too is
--- a move transition the engine does not have (`docs/roadmap.md`).
+-- The opacity is ours. The mirror slides inside a full-screen popup window; our surface is one
+-- card wide (`modules/notification/popup.lua` sizes it to its content), so travel is clipped by
+-- the surface almost at once and the fade is what makes the exit legible.
+--
+-- The cards below still close the gap on one frame while a leaver slides; easing that is a move
+-- transition the engine does not have (`docs/roadmap.md`).
 local function entry_animation(scope, rank)
     local exit = {
-        duration = theme.animation_ms,
-        easing = "InCubic",
+        duration = theme.notification_slide_ms,
+        easing = "OutCubic",
         translate = { x = theme.notification_width },
         opacity = 0,
     }
@@ -328,14 +381,14 @@ local function entry_animation(scope, rank)
     local delay = math.max(0, ((rank or 1) - 1)) * STAGGER_MS
     return {
         translate = {
-            duration = theme.animation_slow_ms,
+            duration = theme.notification_slide_ms,
             easing = "OutCubic",
             delay = delay,
             from = { x = theme.notification_width },
         },
         -- The same hold, so a waiting card is invisible where it waits instead of fading in off
         -- the edge of the surface and then travelling.
-        opacity = { duration = theme.animation_slow_ms, delay = delay, from = 0 },
+        opacity = { duration = theme.notification_slide_ms, delay = delay, from = 0 },
         exit = exit,
     }
 end

@@ -339,6 +339,11 @@ theme.animation_ms              = 147
 theme.animation_fast_ms         = 100
 -- `animationSlow`, the pace of a pulse rather than a transition: slow enough to read as breathing.
 theme.animation_slow_ms         = 250
+-- `NotificationService.qml`'s own `animationDuration`, not `Theme.animationDuration`:
+-- `Math.round(Theme.animationDuration * 1.4)`. Only the notification card uses it, for a card's
+-- travel and a message's; the colour transitions there stay at `animation_ms`. Derived rather
+-- than written as 206, so it follows the base.
+theme.notification_slide_ms     = math.floor(theme.animation_ms * 1.4 + 0.5)
 -- For a fill the user is scrubbing: a volume key on repeat, a brightness button held down. An
 -- eased tween cannot do this. A target that moves mid-flight restarts the curve from a standstill
 -- (ADR-0145's retarget), so under key repeat the fill re-launches every few frames and crawls
