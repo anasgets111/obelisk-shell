@@ -333,6 +333,17 @@ theme.animation_ms              = 147
 theme.animation_fast_ms         = 100
 -- `animationSlow`, the pace of a pulse rather than a transition: slow enough to read as breathing.
 theme.animation_slow_ms         = 250
+-- For a fill the user is scrubbing: a volume key on repeat, a brightness button held down. An
+-- eased tween cannot do this. A target that moves mid-flight restarts the curve from a standstill
+-- (ADR-0145's retarget), so under key repeat the fill re-launches every few frames and crawls
+-- along behind the number beside it, never finishing a curve. A spring carries its velocity
+-- across the retarget instead (ADR-0154), which is the one thing no easing can do.
+--
+-- Critically damped, so a volume bar never overshoots and shows a level nobody set: `damping` is
+-- just above the `2 * math.sqrt(stiffness)` that stops overshoot. Stiff enough that a single
+-- press still lands in about a tenth of a second, which is what keeps it feeling like a keypress
+-- rather than a wobble.
+theme.spring_tracking           = { spring = { stiffness = 400, damping = 42 } }
 -- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`: bar
 -- panels share one card in `modules/shell/panel_host.lua`; ADR-0110 makes it as tall as the panel.
 -- Each list is capped at `Math.min(contentHeight, Theme.itemHeight * 7)`, then scrolls.
@@ -388,7 +399,14 @@ theme.notification_app_icon     = s(40, 32)
 theme.notification_stack_height = s(560, 420)
 -- `OSDCard.qml`'s `osdSliderWidth`, `osdCardHeight`, `osdToggleIconContainerSize` and
 -- `osdSliderTrackHeight`.
+-- `osdSliderWidth`. The track layout is a fixed width: its content is a glyph, a bar and a
+-- percentage, none of which changes length, so a card that resized under a volume key would be
+-- the only thing on screen moving while the user holds it still.
 theme.osd_width                 = s(300, 240)
+-- `osdToggleMinWidth`. The toggle layout has no bar to fill the middle, and its text is whatever
+-- the system had to say -- a sink name, a keyboard layout. So that card is sized to its content
+-- and this is only its floor, keeping "num lock on" from drawing a card as narrow as the words.
+theme.osd_toggle_min            = s(220, 176)
 theme.osd_height                = s(80, 60)
 theme.osd_tile                  = s(48, 36)
 theme.osd_track                 = s(12, 8)

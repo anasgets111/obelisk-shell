@@ -311,9 +311,11 @@ local body = {
             icon_button(icons.minus, function()
                 step_brightness(-BRIGHTNESS_STEP)
             end, { size = theme.control.xs, icon_size = theme.icon.xs }),
+            -- Springs rather than eases: the two buttons either side of this repeat while held,
+            -- so the fill's target moves while the fill is still moving.
             meter(oblisk.brightness, function(b)
                 return b.percent
-            end, theme.YELLOW, "Fill"),
+            end, theme.YELLOW, "Fill", nil, { motion = theme.spring_tracking }),
             icon_button(icons.plus, function()
                 step_brightness(BRIGHTNESS_STEP)
             end, { size = theme.control.xs, icon_size = theme.icon.xs }),
