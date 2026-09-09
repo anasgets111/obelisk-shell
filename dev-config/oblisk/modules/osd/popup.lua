@@ -26,32 +26,19 @@ local SLIDE = theme.s(12, 8)
 local RISE_MS = theme.animation_ms
 local FALL_MS = theme.animation_fast_ms
 
--- Both layouts inset their content by the same amount, and the toggle width below counts it twice.
+-- Both layouts inset their content by the same amount.
 local PADDING = theme.spacing.xl
 
 -- `OSDCard.qml` sizes itself `isSlider ? osdSliderWidth : Math.max(osdToggleMinWidth,
--- _toggleWidth)`, where the second is measured off `labelText.implicitWidth`. Ours was the slider
--- width in both layouts, so a card carrying whatever the system had to say -- a sink named
--- "SteelSeries Arctis Nova Pro Wireless", `layout: English (US)` -- ran its words off the card and
--- the surface clipped them. `text` does not wrap or elide unless asked, so nothing gave way.
+-- _toggleWidth)`, where the second is measured off `labelText.implicitWidth`. Ours read that box
+-- back through `geometry` and redid the arithmetic in Lua, because a `panel` could not be sized
+-- from what it held. It can now, so the toggle row is content-sized and the card, the surface and
+-- `set_size` follow it, with nothing settling a pass behind the words.
 --
--- `geometry` is how Lua reads a width the pass measured (ADR-0147). The label is content-sized, so
--- what it reports is the natural width of the words and not the room they were given, which is
--- what keeps this from feeding itself: the measurement does not move when the card does. The card
--- is an ancestor of what it measures, so it settles one pass behind a change of text -- a single
--- frame at the card's own minimum, spent while it is still fading in.
-local LABEL = geometry("osd_label")
-
--- The mirror's `_toggleWidth`, kept term for term, including a `spacingLg` the one gap between
--- tile and label does not account for. It reads as slack rather than as arithmetic, and a card cut
--- to its text with none of it looks like a mistake.
-local card_width = computed({ osd.entry, LABEL }, function(entry, label)
-    if entry.level ~= nil then
-        return theme.osd_width
-    end
-    local words = (label and label.width) or 0
-    return math.max(theme.osd_toggle_min, math.floor(theme.osd_tile + theme.spacing.lg * 2 + words + PADDING * 2))
-end)
+-- The mirror counts `spacingLg` twice where this layout has one gap. It reads as slack rather than
+-- arithmetic, and a card cut exactly to its text looks tight, so the second one is asked for here
+-- instead of falling out of a sum: half each side, where it does not move the contents off centre.
+local SLACK = theme.spacing.lg / 2
 
 local function read(field)
     return osd.entry:map(function(e)
@@ -67,7 +54,10 @@ end
 
 -- Slider layout: accent glyph, filling track, bold readout.
 local level_row = row {
-    width = "Fill",
+    -- `osdSliderWidth`. A track has no width of its own to measure, so this layout states one and
+    -- the card takes it; the toggle layout beside it measures instead. Only one of the two is ever
+    -- visible, and an invisible child takes no space, so the card is whichever is showing.
+    width = theme.osd_width,
     height = "Fill",
     align_v = "Center",
     spacing = theme.spacing.lg,
@@ -99,14 +89,16 @@ local level_row = row {
 
 -- Toggle layout: glyph in an accent-tinted tile and bold text beside it, centered.
 local fact_row = row {
-    width = "Fill",
+    -- No `width`: the card is these words. `osdToggleMinWidth` is the floor under them, and
+    -- `align_h` is what centres the pair on a card the floor decided rather than the text.
+    min_width = theme.osd_toggle_min,
     height = "Fill",
     align_h = "Center",
     align_v = "Center",
     spacing = theme.spacing.lg,
     -- The mirror counts this inset in `_toggleWidth` and this row never had it, so the words ran
     -- to the card's edge on the way to running past it.
-    padding = { left = PADDING, right = PADDING },
+    padding = { left = PADDING + SLACK, right = PADDING + SLACK },
     visible = osd.entry:map(function(e)
         return e.level == nil
     end),
@@ -128,14 +120,12 @@ local fact_row = row {
                 children = { glyph(read("glyph"), theme.ACCENT, theme.font.xl, { align_v = "Center" }) },
             } },
         },
-        -- `labelText`, and the node `card_width` measures. No `width`, so it sizes to its own
-        -- words and reports what they need.
+        -- `labelText`. No `width`, so it sizes to its own words and everything above measures it.
         text {
             content = bold("text"),
             foreground = theme.FG,
             font_size = theme.font.lg,
             align_v = "Center",
-            geometry = LABEL,
         },
     },
 }
@@ -145,20 +135,19 @@ return panel {
     layer = "Overlay",
     -- No `left`/`right`: § 6's anchors map directly to `zwlr_layer_surface_v1`
     -- (`renderer/src/wayland/layer.rs`'s `anchor_for` is a bare bitflag map), and the protocol
-    -- centers an axis with neither edge anchored. Explicit `width`/`height` are required because
-    -- `bottom` alone anchors neither full axis.
+    -- centers an axis with neither edge anchored. That is also what leaves the width worth
+    -- measuring: an axis with both its edges anchored is spanned whatever it asks for.
     anchor = { bottom = true },
     -- The surface is `SLIDE` taller than the card, and sits that much lower, so the card can rise
     -- into place from below its resting spot without leaving the surface. `translate` is painted,
     -- not laid out, but the surface still clips it, so the room is still needed.
     margin = { bottom = theme.s(132, 90) - SLIDE },
-    width = card_width,
+    -- No `width`: the surface is the card, and the card is its content.
     height = theme.osd_height + SLIDE,
     -- Mapped until the exit has played, and no longer: the card leaves at `FALL_MS`, so holding
     -- the surface for the entry's beat left an overlay on the compositor doing nothing.
     visible = util.linger(osd.visible, FALL_MS),
     child = column {
-        width = "Fill",
         height = theme.osd_height,
         -- `translate`, matching `components/modal.lua` and the notification cards: the travel is
         -- paint-only (ADR-0149), so the card is solved once and the rise costs no layout. Easing

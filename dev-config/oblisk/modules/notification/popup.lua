@@ -69,10 +69,9 @@ return panel {
     anchor = { top = true, right = true },
     margin = { top = theme.bar_height + theme.spacing.md, right = theme.spacing.md },
     width = theme.notification_width,
-    -- Fit the whole stack, but no taller. Fixed `notification_height` suited one card; four
-    -- expandable
-    -- cards now need content height.
-    height = theme.notification_stack_height,
+    -- No `height`: the surface is the stack. The cap that used to stand here was wrong in both
+    -- directions -- one card sat in 560px of surface, four expanded ones had nowhere to grow -- and
+    -- is now the list's `max_height`, which is what its "but no taller" always meant.
     visible = visible_groups:map(function(shown)
         return #shown > 0
     end),
@@ -91,7 +90,8 @@ return panel {
     end),
     child = column {
         width = "Fill",
-        height = "Fill",
+        -- No `height` here or on the list: content all the way down, or the surface would ask a
+        -- child how tall to be while the child asked back.
         -- A pointer on any card stops countdowns; leaving releases the hold (ADR-0094, ADR-0095).
         -- The region follows drawn input (ADR-0109), so empty space below sends no events. One
         -- region
@@ -104,7 +104,9 @@ return panel {
         children = {
             list {
                 width = "Fill",
-                height = "Fill",
+                -- The one bounded box in that chain: below the cap the stack is exactly its
+                -- cards, at it the rest becomes the remainder `SCROLL` scrolls.
+                max_height = theme.notification_stack_height,
                 scroll = SCROLL,
                 spacing = theme.spacing.sm,
                 source = visible_groups,
