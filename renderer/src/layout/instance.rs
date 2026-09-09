@@ -40,8 +40,11 @@ pub struct SurfaceInstance {
     /// again -- it wraps taller inside the width it happened to open at. `TrackedRole::Panel`'s
     /// `output_size` field exists for the same reason on the other side of the same conflation.
     ///
-    /// Only a `popup` sets these today. A `window` or `lock` root resolves a `Content` axis to
-    /// `available` outright (`scene::forced_root_size`), so its configure *is* its allocation.
+    /// A `window` or `lock` root resolves a `Content` axis to `available` outright
+    /// (`scene::forced_root_size`), so its configure *is* its allocation and neither axis is ever
+    /// measured. A `popup` seeds these here; a `panel` has them pushed by
+    /// `RendererClient::set_measured_axes` instead, because only the *resolved* spec can tell an
+    /// omitted extent from a signal-bound one (see `wayland::layer::measured_axes`).
     pub measured_axes: (bool, bool),
 }
 
@@ -90,9 +93,9 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                         declared_id: panel.topology.id.clone(),
                         output: output.name.clone(),
                         available: output.size,
-                        // A `Content` panel axis is still layer-shell's `set_size(0)`, "you decide"
-                        // (`wayland::layer::layer_extent_for`), so its configure is an allocation
-                        // like any other. Measuring one is its own change.
+                        // The output is the ceiling either way, so this seeds allocated and
+                        // measured axes alike; `wayland::layer::create_panel` pushes the real
+                        // reading from the resolved spec before the first configure can arrive.
                         measured_axes: (false, false),
                     });
                 }

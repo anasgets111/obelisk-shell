@@ -336,9 +336,16 @@ Monitor is a connector name or `"All"`. Exclusive is false, true, or `"Ignore"` 
 others' reserved space. Keyboard interactivity is None/OnDemand/Exclusive.
 `child = function(output)` on panels/locks builds per-output content; nil yields an empty instance.
 
+A panel's `width`/`height` are its layer-shell `set_size` request, and omitting one measures it
+from the content, so a stack that grows reserves the room it grew into. The exception is an axis
+anchored to both its edges, where an omitted extent stays the compositor's, as `"Fill"` always is:
+the protocol allows a size there, but smithay spans the axis and drops it while wlroots centres it,
+and asking for nothing is what makes the two agree. `max_width`/`max_height` cap a measurement. `"Fill"` on an axis anchored to one
+edge or neither is a protocol error, and that surface is refused rather than created.
+
 Windows/popups use `visible` to open/close. A window's `on_close` is a request the config handles;
-min/max sizes are compositor hints. Popup parent is a panel or window ID; anchor rect and
-width/height must be nonzero. Anchors/gravity accept edges, corners or Center.
+min/max sizes are compositor hints. Popup parent is a panel or window ID; its anchor rect must be
+nonzero, and its `width`/`height` are omitted to measure the content the same way. Anchors/gravity accept edges, corners or Center.
 Constraint adjustments accept SlideX/Y, FlipX/Y, ResizeX/Y; default is FlipY and SlideX.
 `grab` defaults true and needs an input serial; use false for hover-opened tooltips.
 

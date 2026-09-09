@@ -58,6 +58,18 @@ pub(super) enum TrackedRole {
         /// `set_instance_size` replaces it with the compositor size, which would shrink a panel on
         /// every push. Panel-only; a window has no `width`/`height` (§ 6).
         output_size: layout::LogicalSize,
+        /// The box the last layout pass solved for this surface's root, which is what a `Content`
+        /// axis asks `set_size` for (`layer::layer_size_for`). Written by
+        /// [`App::apply_resolved_state`] on every pass, whether or not a `LayerSurface` exists, so
+        /// that [`App::show_panel`] rebuilds a hidden panel at the size the pass showing it
+        /// measured. Zero until a pass has one: an invisible root resolves to no geometry at all.
+        measured: layout::LogicalSize,
+        /// The last pair actually sent to `zwlr_layer_surface_v1::set_size`, and
+        /// `layer::spec_update`'s size baseline. Re-deriving it from the applied spec would
+        /// compare two specs against one measurement and miss the case the measurement exists for:
+        /// content that grew under a spec that did not change at all. `(0, 0)` while no layer
+        /// object has been built.
+        requested: (u32, u32),
     },
     Window {
         /// `None` when hidden: no `xdg_toplevel`, `xdg_surface`, or `wl_surface` exists
@@ -403,9 +415,10 @@ fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)
 }
 /// PBA § 14.2 staging gate. It takes `(null_buffered, exists)`: a hidden window has no
 /// `xdg_toplevel`, so `null_buffered` stays false forever and a plain `all(null_buffered)` would
-/// hang `ready_timeout`. A `panel` always gets a configure, created at startup even when `visible`
-/// is false. A no-object surface is complete by construction; a shown window also attaches a
-/// null buffer on its first configure. Popup visibility is frozen during the handshake.
+/// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also attaches a
+/// null buffer on its first configure. A `panel` gets a configure once it has a layer object, which
+/// it is created with unless it measures an axis and starts hidden -- and that one has no object,
+/// so it is complete by construction too. Popup visibility is frozen during the handshake.
 /// [`presenting_surface_ids`] uses the matching `Unmapped` filter.
 fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
     surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
@@ -462,8 +475,16 @@ impl App {
                 None => roster.clone(),
             };
 
+            // The solved root box, for a panel measuring an axis from its content. Zero without a
+            // tree, and zero while hidden -- an invisible root resolves to no geometry at all --
+            // which `create_panel` reads as "not measured yet".
+            let measured = tree.as_ref().map_or(layout::LogicalSize::default(), |tree| layout::LogicalSize {
+                width: tree.rect.width,
+                height: tree.rect.height,
+            });
+
             match &spec {
-                SurfaceSpec::Panel(panel) => self.create_panel(qh, panel, instance, &outputs, visible),
+                SurfaceSpec::Panel(panel) => self.create_panel(qh, panel, instance, &outputs, visible, measured),
                 SurfaceSpec::Window(window) => self.create_window(qh, window, instance, visible),
                 SurfaceSpec::Popup(popup) => self.create_popup(qh, popup, instance, visible),
                 SurfaceSpec::Lock(_) => self.create_lock(instance, &outputs),
@@ -657,7 +678,24 @@ impl App {
         };
 
         match panel {
-            Some(Ok(fresh)) => self.apply_spec_change(index, fresh),
+            // Store the measurement first and unconditionally. `apply_spec_change` returns early
+            // on a hidden panel, whose `LayerSurface` is gone (ADR-0088), and that is exactly the
+            // panel `show_panel` is about to rebuild from this number.
+            Some(Ok(fresh)) => {
+                if let TrackedRole::Panel { measured, .. } = &mut self.surfaces[index].role {
+                    *measured = layout::LogicalSize { width: tree_rect.width, height: tree_rect.height };
+                }
+                // Re-derived every pass rather than fixed at creation: `width` and `height` are
+                // live layer-shell fields (ADR-0038 decision 2), so a signal can move an axis
+                // between a number and its content between one pass and the next.
+                let output_size = match &self.surfaces[index].role {
+                    TrackedRole::Panel { output_size, .. } => *output_size,
+                    _ => layout::LogicalSize::default(),
+                };
+                let (axes, ceiling) = layer::measurement(&fresh, output_size);
+                self.client.set_measured_axes(&surface_id, axes, ceiling);
+                self.apply_spec_change(index, fresh);
+            }
             Some(Err(err)) => eprintln!(
                 "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
             ),

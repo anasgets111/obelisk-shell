@@ -34,15 +34,92 @@ pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> K
         node::KeyboardInteractivity::Exclusive => KeyboardInteractivity::Exclusive,
     }
 }
-/// One `set_size` axis resolved against the output. `0` means anchors decide it, covering `Fill`
-/// and `Content` because omitted dimensions have no content size at creation; only `Percent` uses
-/// the output extent.
-pub(super) fn layer_extent_for(mode: SizeMode, output_extent: f32) -> u32 {
+/// What a `Content` axis asks for before the layout pass has measured one. An invisible root
+/// resolves to no geometry at all, so a panel created hidden has nothing to measure; one pixel
+/// rather than zero because zero on an axis this surface does not span is the protocol error
+/// [`ambiguous_zero_axis`] names. Nothing is ever shown at this extent: [`App::create_panel`]
+/// leaves a measured panel's layer object unbuilt until the pass that gives it a tree.
+const UNMEASURED_EXTENT: u32 = 1;
+
+/// One `set_size` axis. `0` is "you decide", which is `Fill`, and also what a `Content` axis whose
+/// opposite edges are both anchored asks for. The protocol does not require that -- it demands
+/// opposite anchors only for an omitted *zero* -- but smithay, and so niri, spans such an axis and
+/// drops the size outright (`LayerMap::arrange`: `if anchor.anchored_horizontally() { size.w =
+/// source.size.w }`), while wlroots keeps and centres it. Asking for `0` is what makes the two
+/// agree, and it keeps `available` honest: on a spanned axis the configure is a real allocation,
+/// and a measured request the compositor ignored would leave the tree solved to a width the
+/// surface does not have. `Percent` is the only mode that reads the output.
+///
+/// `spanned` is that both-edges test for this axis, not the whole anchor: a bar anchored left and
+/// right spans its width and still measures its height.
+fn layer_extent_for(mode: SizeMode, output_extent: f32, measured_extent: f32, spanned: bool) -> u32 {
     match mode {
-        SizeMode::Fill | SizeMode::Content => 0,
+        SizeMode::Fill => 0,
+        SizeMode::Content if spanned => 0,
+        // `ceil`, and the same reasoning as `wayland::surface::popup_requested_size`: a card
+        // measuring 252.48 given 252 loses the half pixel to the surface's own edge, which is the
+        // clipping content sizing exists to end.
+        SizeMode::Content => (measured_extent.max(0.0).ceil() as u32).max(UNMEASURED_EXTENT),
         SizeMode::Pixels(px) => px.max(0.0) as u32,
         SizeMode::Percent(fraction) => (output_extent * fraction).max(0.0) as u32,
     }
+}
+/// Both `set_size` axes for a spec: `output` resolves its percentages, `measured` is the box the
+/// layout pass solved for its root.
+fn layer_size_for(spec: &PanelSpec, output: layout::LogicalSize, measured: layout::LogicalSize) -> (u32, u32) {
+    let anchor = spec.topology.anchor;
+    (
+        layer_extent_for(spec.width, output.width, measured.width, anchor.left && anchor.right),
+        layer_extent_for(spec.height, output.height, measured.height, anchor.top && anchor.bottom),
+    )
+}
+/// Which axes this panel measures from its own tree rather than receives from the compositor, in
+/// `SurfaceInstance::measured_axes`' sense: `available` stays the ceiling there and
+/// `RendererClient::set_instance_size` leaves it alone, or the size the surface asked for would
+/// become the cap on what it may ask for next.
+///
+/// A spanned `Content` axis is not measured. Its `set_size` is `0` and the compositor's answer is
+/// an allocation like `Fill`'s, which is exactly what `available` wants.
+///
+/// The resolved spec, never `crate::socket::surface_specs`': a signal-bound `width` reads as
+/// `Content` on the evaluation pass by design (`parse_size_mode` defers it for
+/// [`App::apply_spec_change`] to re-derive), and pinning `available` for one of those would strand
+/// a panel sized by a signal at its output's width.
+/// The most room a measured axis can actually take, and so what `available` is on one: the output,
+/// less the margins on the edges this surface is anchored to. That is the same subtraction the
+/// compositor makes before it clamps -- smithay's `LayerMap::arrange` does `source.size.w -=
+/// data.margin.left` under `Anchor::LEFT` and then `size.w = size.w.min(source.size.w)`.
+///
+/// Deliberately not derived from the configure. On a measured axis the granted size is either the
+/// size this surface asked for, and feeding that back caps the content at whatever it opened at,
+/// or the compositor's clamp of that size, and a ceiling built from clamps only ever ratchets
+/// down: it would never recover when the room grew back. Computing it instead means it is right
+/// again the moment a margin or an anchor changes.
+///
+/// What it leaves out is the exclusive zones other clients reserved, which this surface is never
+/// told. Content that wants more room than those leave is cut by the compositor's clamp rather
+/// than wrapped into what is left.
+fn measured_ceiling(spec: &PanelSpec, output: layout::LogicalSize) -> layout::LogicalSize {
+    let (anchor, margin) = (spec.topology.anchor, spec.margin);
+    let axis = |extent: f32, near: bool, near_margin: f32, far: bool, far_margin: f32| {
+        (extent - if near { near_margin } else { 0.0 } - if far { far_margin } else { 0.0 }).max(0.0)
+    };
+    layout::LogicalSize {
+        width: axis(output.width, anchor.left, margin.left, anchor.right, margin.right),
+        height: axis(output.height, anchor.top, margin.top, anchor.bottom, margin.bottom),
+    }
+}
+/// What `RendererClient::set_measured_axes` is given for this panel: which axes it measures, and
+/// the ceiling those axes are solved against.
+pub(super) fn measurement(spec: &PanelSpec, output: layout::LogicalSize) -> ((bool, bool), layout::LogicalSize) {
+    (measured_axes(spec), measured_ceiling(spec, output))
+}
+fn measured_axes(spec: &PanelSpec) -> (bool, bool) {
+    let anchor = spec.topology.anchor;
+    (
+        spec.width == SizeMode::Content && !(anchor.left && anchor.right),
+        spec.height == SizeMode::Content && !(anchor.top && anchor.bottom),
+    )
 }
 /// The axis on which `set_size(0, ...)` would be a protocol error. Layer-shell requires both
 /// opposite edges for an omitted axis; the error kills the connection, so name and refuse it
@@ -104,15 +181,23 @@ impl SpecUpdate {
             || self.exclusive.is_some()
     }
 }
-fn spec_update(applied: &PanelSpec, fresh: &PanelSpec, output: layout::LogicalSize) -> SpecUpdate {
-    // Compare the wire pixel pair: equivalent percent/pixel sizes and `Fill`/`Content` (`0`) match.
-    let extent =
-        |spec: &PanelSpec| (layer_extent_for(spec.width, output.width), layer_extent_for(spec.height, output.height));
+fn spec_update(
+    applied: &PanelSpec,
+    fresh: &PanelSpec,
+    requested: (u32, u32),
+    output: layout::LogicalSize,
+    measured: layout::LogicalSize,
+) -> SpecUpdate {
+    // Against the pair last put on the wire, not against a re-derivation of `applied`: equivalent
+    // percent and pixel sizes still match, and so do a spanned `Content` and a `Fill`, but content
+    // that grew under a spec that did not change is a size change too -- the one this whole
+    // measurement exists for -- and comparing two specs to one measurement cannot see it.
+    let wanted = layer_size_for(fresh, output, measured);
     SpecUpdate {
         margin: (fresh.margin != applied.margin).then_some(fresh.margin),
         keyboard_interactivity: (fresh.keyboard_interactivity != applied.keyboard_interactivity)
             .then_some(fresh.keyboard_interactivity),
-        size: (extent(fresh) != extent(applied)).then(|| extent(fresh)),
+        size: (wanted != requested).then_some(wanted),
         exclusive: (fresh.exclusive != applied.exclusive).then_some(fresh.exclusive),
     }
 }
@@ -154,6 +239,8 @@ impl App {
     }
 
     /// [`App::create_surfaces`]'s `panel` arm: create, commit, and track one layer surface.
+    /// `measured` is the box the layout pass solved for this instance's root, for the axes the
+    /// spec measures; zero when there is no tree yet, or when the panel starts hidden.
     pub(super) fn create_panel(
         &mut self,
         qh: &QueueHandle<App>,
@@ -161,6 +248,7 @@ impl App {
         instance: &SurfaceInstance,
         outputs: &HashMap<String, wl_output::WlOutput>,
         visible: bool,
+        measured: layout::LogicalSize,
     ) {
         let Some(output) = outputs.get(&instance.output) else {
             eprintln!(
@@ -169,11 +257,22 @@ impl App {
             );
             return;
         };
-        let size = (
-            layer_extent_for(spec.width, instance.available.width),
-            layer_extent_for(spec.height, instance.available.height),
-        );
-        if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
+        // Before the first configure, and before `set_instance_size` has replaced it, `available`
+        // is still the output's own size, which is what `Percent` wants.
+        let size = layer_size_for(spec, instance.available, measured);
+        // Tell the scene which axes this panel measures before its first configure can arrive:
+        // that configure is the size this surface asked for, and writing it back into `available`
+        // would make the measurement its own ceiling.
+        let (axes, ceiling) = measurement(spec, instance.available);
+        self.client.set_measured_axes(&instance.instance_id, axes, ceiling);
+        // A hidden panel has no tree to measure -- an invisible root resolves to no geometry at all
+        // -- so a measured one would be created at `UNMEASURED_EXTENT` and take its first buffer
+        // there, a frame wide of what the pass that shows it will have solved. Leave the layer
+        // object to [`App::show_panel`], which runs on that pass and is already the path a panel
+        // hidden after being shown takes (ADR-0088). PBA staging loses nothing: an `Unmapped`
+        // surface presents no frame either way (`MapState::presents`).
+        let deferred = !visible && measured_axes(spec) != (false, false);
+        if !deferred && let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
                 "[oblisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
                  which layer-shell rejects as a protocol error; no surface created. Give it an explicit {axis}, or anchor both edges.",
@@ -181,29 +280,36 @@ impl App {
             );
             return;
         }
-        let layer = self.spawn_layer(
-            qh,
-            LayerSpec {
-                layer_type: layer_for(spec.topology.layer),
-                namespace: &spec.topology.namespace,
-                output,
-                anchor: anchor_for(spec.topology.anchor),
-                size,
-                margin: spec.margin,
-                keyboard_interactivity: keyboard_interactivity_for(spec.keyboard_interactivity),
-            },
-        );
-        layer.commit();
+        let layer = (!deferred).then(|| {
+            let layer = self.spawn_layer(
+                qh,
+                LayerSpec {
+                    layer_type: layer_for(spec.topology.layer),
+                    namespace: &spec.topology.namespace,
+                    output,
+                    anchor: anchor_for(spec.topology.anchor),
+                    size,
+                    margin: spec.margin,
+                    keyboard_interactivity: keyboard_interactivity_for(spec.keyboard_interactivity),
+                },
+            );
+            layer.commit();
+            layer
+        });
 
-        // A declared `visible = false` panel still needs `get_layer_surface`'s initial commit, but
-        // no buffer is attached. Unlike an already-shown hidden panel (ADR-0088), the object has
-        // never mapped and can safely remain for PBA staging to see every declared surface.
+        // A declared `visible = false` panel that is not deferred still needs `get_layer_surface`'s
+        // initial commit, but no buffer is attached. Unlike an already-shown hidden panel
+        // (ADR-0088), the object has never mapped and can safely remain for PBA staging to see
+        // every declared surface. A deferred one has no object at all, which PBA already treats as
+        // complete by construction (`surface::candidate_has_staged`).
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Panel {
-                layer: Some(layer),
+                layer,
                 output: output.clone(),
                 spec: spec.clone(),
                 output_size: instance.available,
+                measured,
+                requested: if deferred { (0, 0) } else { size },
             },
             bound: None,
             surface_id: instance.instance_id.clone(),
@@ -229,7 +335,7 @@ impl App {
     /// Repeat [`App::create_panel`]'s guard because signal-bound `width`/`height` can turn a fixed
     /// axis into `Fill` after creation; `set_size(_, 0)` would kill the connection.
     pub(super) fn show_panel(&mut self, qh: &QueueHandle<App>, index: usize) {
-        let TrackedRole::Panel { layer, spec, output, output_size } = &self.surfaces[index].role else {
+        let TrackedRole::Panel { layer, spec, output, output_size, measured, .. } = &self.surfaces[index].role else {
             return;
         };
         if layer.is_some() {
@@ -237,7 +343,10 @@ impl App {
             eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
             return;
         }
-        let size = (layer_extent_for(spec.width, output_size.width), layer_extent_for(spec.height, output_size.height));
+        // `measured` is this pass's: [`App::apply_resolved_state`] writes it from the solved root
+        // before it gets here, so a panel measured from its content is created at the size the
+        // tree that is about to be painted actually takes.
+        let size = layer_size_for(spec, *output_size, *measured);
         if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
                 "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
@@ -269,8 +378,9 @@ impl App {
             },
         );
         fresh.commit();
-        if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
+        if let TrackedRole::Panel { layer, requested, .. } = &mut self.surfaces[index].role {
             *layer = Some(fresh);
+            *requested = size;
         }
         self.surfaces[index].map_state = MapState::AwaitingConfigure;
         eprintln!("[oblisk-renderer] {} created: visible = true", self.surfaces[index].surface_id);
@@ -307,11 +417,20 @@ impl App {
     /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
     /// procedure, and Supervisor services § 14.2 keeps Candidates invisible until `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
-        let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, .. } = &self.surfaces[index].role
+        let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, measured, requested, .. } =
+            &self.surfaces[index].role
         else {
+            // No layer object: hidden after being shown (ADR-0088), or deferred at creation because
+            // it measures an axis and had no tree to measure. Nothing can be sent, but the spec must
+            // still be kept -- [`App::show_panel`] rebuilds from it, and a spec dropped here is one
+            // the panel never gets back. Dropping it stranded a panel whose creation-time `width`
+            // was refused: every later pass carried a good one and every show retried the bad one.
+            if let TrackedRole::Panel { spec, .. } = &mut self.surfaces[index].role {
+                *spec = fresh;
+            }
             return;
         };
-        let update = spec_update(applied, &fresh, *output_size);
+        let update = spec_update(applied, &fresh, *requested, *output_size, *measured);
 
         if let Some(margin) = update.margin {
             layer.set_margin(margin.top as i32, margin.right as i32, margin.bottom as i32, margin.left as i32);
@@ -323,6 +442,7 @@ impl App {
             eprintln!("[oblisk-renderer] {}: keyboard_interactivity -> {mode:?}", self.surfaces[index].surface_id);
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
+        let mut sent = None;
         if let Some(size) = update.size {
             // Signals can turn a fixed height into `Fill`; `set_size(_, 0)` on a singly anchored
             // axis kills the connection, so repeat [`ambiguous_zero_axis`].
@@ -337,12 +457,16 @@ impl App {
                 fresh.height = applied.height;
             } else {
                 layer.set_size(size.0, size.1);
+                sent = Some(size);
             }
         }
 
         // End the role borrow before `apply_exclusive_zone` reads the updated spec.
-        if let TrackedRole::Panel { spec, .. } = &mut self.surfaces[index].role {
+        if let TrackedRole::Panel { spec, requested, .. } = &mut self.surfaces[index].role {
             *spec = fresh;
+            if let Some(size) = sent {
+                *requested = size;
+            }
         }
         if update.exclusive.is_some() || update.size.is_some() {
             self.apply_exclusive_zone(index);
@@ -440,19 +564,72 @@ mod tests {
     }
 
     #[test]
-    fn layer_extent_maps_fill_and_content_to_the_protocols_zero_and_resolves_a_percent() {
+    fn layer_extent_maps_fill_to_the_protocols_zero_and_resolves_a_percent() {
         assert_eq!(
-            layer_extent_for(SizeMode::Fill, 1920.0),
+            layer_extent_for(SizeMode::Fill, 1920.0, 300.0, false),
             0,
-            "`Fill` means the anchors decide, which the protocol spells 0"
+            "`Fill` means the anchors decide, which the protocol spells 0, whatever the tree measured"
+        );
+        assert_eq!(layer_extent_for(SizeMode::Pixels(32.0), 1920.0, 300.0, false), 32);
+        assert_eq!(layer_extent_for(SizeMode::Percent(0.5), 1920.0, 300.0, false), 960);
+    }
+
+    #[test]
+    fn a_content_axis_asks_for_what_the_tree_measured_unless_the_surface_spans_it() {
+        assert_eq!(
+            layer_extent_for(SizeMode::Content, 1920.0, 252.48, false),
+            253,
+            "`ceil`: 252 would leave the half pixel it asked for to be cut by the surface's own edge"
         );
         assert_eq!(
-            layer_extent_for(SizeMode::Content, 1920.0),
+            layer_extent_for(SizeMode::Content, 1920.0, 252.48, true),
             0,
-            "an omitted width has no measured content at creation time either"
+            "both edges anchored, so layer-shell spans the axis and drops any size given; asking is noise"
         );
-        assert_eq!(layer_extent_for(SizeMode::Pixels(32.0), 1920.0), 32);
-        assert_eq!(layer_extent_for(SizeMode::Percent(0.5), 1920.0), 960);
+        assert_eq!(
+            layer_extent_for(SizeMode::Content, 1920.0, 0.0, false),
+            UNMEASURED_EXTENT,
+            "nothing measured yet -- a hidden root has no geometry -- and 0 here is the protocol error"
+        );
+    }
+
+    #[test]
+    fn a_measured_axiss_ceiling_drops_the_margins_on_the_edges_it_is_anchored_to() {
+        // The same subtraction the compositor makes before it clamps. A margin on an edge this
+        // surface is not anchored to costs it nothing, because the compositor never applies it.
+        let mut stack = panel("stack");
+        stack.topology.anchor = node::Anchor { top: true, right: true, bottom: false, left: false };
+        stack.margin = node::EdgeInsets { top: 60.0, right: 20.0, bottom: 500.0, left: 500.0 };
+
+        assert_eq!(
+            measured_ceiling(&stack, output_1080p()),
+            layout::LogicalSize { width: 1900.0, height: 1020.0 },
+            "the anchored top and right margins come off; the unanchored bottom and left do not"
+        );
+
+        // Never negative: a margin wider than the output leaves no room, not room owed.
+        let mut absurd = stack.clone();
+        absurd.margin = node::EdgeInsets { top: 4000.0, right: 4000.0, bottom: 0.0, left: 0.0 };
+        assert_eq!(measured_ceiling(&absurd, output_1080p()), layout::LogicalSize::default());
+    }
+
+    #[test]
+    fn only_an_unspanned_content_axis_is_measured_rather_than_allocated() {
+        // What `set_instance_size` reads. A spanned `Content` axis gets a real allocation from the
+        // compositor, exactly like `Fill`, and `available` should take it.
+        let mut bar = panel("bar");
+        bar.height = SizeMode::Content;
+        assert_eq!(
+            measured_axes(&bar),
+            (false, true),
+            "anchored left and right, so the width is the compositor's; the height is the bar's own"
+        );
+
+        let mut covering = bar.clone();
+        covering.topology.anchor.bottom = true;
+        assert_eq!(measured_axes(&covering), (false, false), "anchoring the fourth edge hands the height back");
+
+        assert_eq!(measured_axes(&panel("bar")), (false, false), "`Fill` and a number are never measured");
     }
 
     #[test]
@@ -525,10 +702,30 @@ mod tests {
         layout::LogicalSize { width: 1920.0, height: 1080.0 }
     }
 
+    /// For the specs that measure nothing: every axis of `panel` is a `Fill` or a number.
+    fn nothing_measured() -> layout::LogicalSize {
+        layout::LogicalSize::default()
+    }
+
+    /// `spec_update`'s baseline for a surface already carrying `applied`: the pair its last
+    /// `set_size` put on the wire.
+    fn on_the_wire(applied: &PanelSpec, measured: layout::LogicalSize) -> (u32, u32) {
+        layer_size_for(applied, output_1080p(), measured)
+    }
+
     #[test]
     fn a_re_resolve_that_changed_nothing_sends_no_requests_at_all() {
         let applied = panel("bar");
-        assert_eq!(spec_update(&applied, &applied.clone(), output_1080p()), SpecUpdate::default());
+        assert_eq!(
+            spec_update(
+                &applied,
+                &applied.clone(),
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
+            SpecUpdate::default()
+        );
     }
 
     #[test]
@@ -538,14 +735,26 @@ mod tests {
         let mut moved_margin = applied.clone();
         moved_margin.margin = node::EdgeInsets { top: 12.0, right: 12.0, bottom: 0.0, left: 0.0 };
         assert_eq!(
-            spec_update(&applied, &moved_margin, output_1080p()),
+            spec_update(
+                &applied,
+                &moved_margin,
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
             SpecUpdate { margin: Some(moved_margin.margin), ..SpecUpdate::default() }
         );
 
         let mut takes_typing = applied.clone();
         takes_typing.keyboard_interactivity = node::KeyboardInteractivity::Exclusive;
         assert_eq!(
-            spec_update(&applied, &takes_typing, output_1080p()),
+            spec_update(
+                &applied,
+                &takes_typing,
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
             SpecUpdate {
                 keyboard_interactivity: Some(node::KeyboardInteractivity::Exclusive),
                 ..SpecUpdate::default()
@@ -555,7 +764,13 @@ mod tests {
         let mut stops_reserving = applied.clone();
         stops_reserving.exclusive = node::Exclusive::Respect;
         assert_eq!(
-            spec_update(&applied, &stops_reserving, output_1080p()),
+            spec_update(
+                &applied,
+                &stops_reserving,
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
             SpecUpdate { exclusive: Some(node::Exclusive::Respect), ..SpecUpdate::default() }
         );
 
@@ -565,8 +780,41 @@ mod tests {
         let mut covers_everything = applied.clone();
         covers_everything.exclusive = node::Exclusive::Ignore;
         assert_eq!(
-            spec_update(&applied, &covers_everything, output_1080p()),
+            spec_update(
+                &applied,
+                &covers_everything,
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
             SpecUpdate { exclusive: Some(node::Exclusive::Ignore), ..SpecUpdate::default() }
+        );
+    }
+
+    #[test]
+    fn content_that_grew_under_an_unchanged_spec_is_still_a_size_change() {
+        // The whole point of measuring, and the one case a spec-against-spec diff cannot see: the
+        // declaration is identical pass to pass and only the tree under it moved. Caught live --
+        // an open panel measured from its content sat at the height it was first shown at while
+        // rows were added to it, one `set_size` short of following them.
+        let mut applied = panel("stack");
+        applied.height = SizeMode::Content;
+        applied.topology.anchor = node::Anchor { top: true, right: true, bottom: false, left: false };
+
+        let one_row = layout::LogicalSize { width: 300.0, height: 36.8 };
+        let four_rows = layout::LogicalSize { width: 300.0, height: 104.8 };
+        let opened = on_the_wire(&applied, one_row);
+        assert_eq!(opened, (0, 37), "width unanchored on both sides is still `Fill`'s 0; the height is measured");
+
+        assert_eq!(
+            spec_update(&applied, &applied.clone(), opened, output_1080p(), four_rows),
+            SpecUpdate { size: Some((0, 105)), ..SpecUpdate::default() },
+            "same spec, taller tree: the surface must ask for the room the rows now need"
+        );
+        assert_eq!(
+            spec_update(&applied, &applied.clone(), opened, output_1080p(), one_row),
+            SpecUpdate::default(),
+            "and a pass that measured the same thing again sends nothing"
         );
     }
 
@@ -577,7 +825,13 @@ mod tests {
         let mut taller = applied.clone();
         taller.height = SizeMode::Pixels(48.0);
         assert_eq!(
-            spec_update(&applied, &taller, output_1080p()),
+            spec_update(
+                &applied,
+                &taller,
+                on_the_wire(&applied, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
             SpecUpdate { size: Some((0, 48)), ..SpecUpdate::default() },
             "`Fill` stays the protocol's 0 on the width axis; only the height moved"
         );
@@ -588,7 +842,16 @@ mod tests {
         half_by_percent.height = SizeMode::Percent(0.5);
         let mut half_by_pixels = applied.clone();
         half_by_pixels.height = SizeMode::Pixels(540.0);
-        assert_eq!(spec_update(&half_by_percent, &half_by_pixels, output_1080p()), SpecUpdate::default());
+        assert_eq!(
+            spec_update(
+                &half_by_percent,
+                &half_by_pixels,
+                on_the_wire(&half_by_percent, nothing_measured()),
+                output_1080p(),
+                nothing_measured()
+            ),
+            SpecUpdate::default()
+        );
     }
 
     #[test]
@@ -600,7 +863,15 @@ mod tests {
         let mut filled = applied.clone();
         filled.height = SizeMode::Fill;
 
-        let size = spec_update(&applied, &filled, output_1080p()).size.expect("the height moved from 32 to 0");
+        let size = spec_update(
+            &applied,
+            &filled,
+            on_the_wire(&applied, nothing_measured()),
+            output_1080p(),
+            nothing_measured(),
+        )
+        .size
+        .expect("the height moved from 32 to 0");
         assert_eq!(ambiguous_zero_axis(size, filled.topology.anchor), Some("height"));
     }
 }

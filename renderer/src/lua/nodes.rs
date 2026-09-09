@@ -552,7 +552,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 762, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 766, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when

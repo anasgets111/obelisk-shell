@@ -388,6 +388,37 @@ impl RendererClient {
         }
     }
 
+    /// Records which of an instance's axes are measured from its own tree rather than allocated to
+    /// it, for [`Self::set_instance_size`] to honour, and puts `ceiling` on those axes.
+    /// `crate::wayland::layer` pushes both from the *resolved* panel spec, on creation and on every
+    /// later pass: the socket parser cannot tell a genuinely omitted extent from a signal-bound
+    /// one, since `parse_size_mode` defers both to `SizeMode::Content`, and pinning `available` for
+    /// a signal-bound extent would strand the surface at its output's size.
+    ///
+    /// The ceiling is written, not merely permitted, because on a measured axis `available` *is*
+    /// the ceiling and nothing else may set it -- `set_instance_size` declines that axis outright.
+    /// An axis that becomes measured therefore has to be given one here, or it would keep whatever
+    /// the last configure left: a panel reloaded from `width = 200` to a measured width would solve
+    /// its content against 200 for the rest of the generation, and no later configure could widen
+    /// it. Idempotent, and it dirties only when the ceiling actually moved.
+    ///
+    /// Unknown ids are ignored, like `set_instance_size`'s.
+    pub fn set_measured_axes(&mut self, instance_id: &str, axes: (bool, bool), ceiling: layout::LogicalSize) {
+        let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) else {
+            return;
+        };
+        instance.measured_axes = axes;
+        let bounded = layout::LogicalSize {
+            width: if axes.0 { ceiling.width } else { instance.available.width },
+            height: if axes.1 { ceiling.height } else { instance.available.height },
+        };
+        if instance.available == bounded {
+            return;
+        }
+        instance.available = bounded;
+        self.dirty.mark();
+    }
+
     /// Replaces one instance's compositor-configured `available` size and dirties the scene through
     /// ADR-0044 decision 2's [`DirtyFlag`] (ADR-0023). Ignore unknown ids instead of dirtying a
     /// nonexistent surface.
@@ -2604,9 +2635,7 @@ mod tests {
         assert!(run_startup(&mut client), "startup must have applied");
 
         let ceiling = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap().available;
-        if let Some(instance) = client.instances.iter_mut().find(|i| i.instance_id == "bar@TEST") {
-            instance.measured_axes = (true, false);
-        }
+        client.set_measured_axes("bar@TEST", (true, false), ceiling);
         client.dirty.take();
 
         client.set_instance_size("bar@TEST", layout::LogicalSize { width: 342.0, height: 32.0 });
@@ -2614,6 +2643,53 @@ mod tests {
         let after = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap().available;
         assert_eq!(after.width, ceiling.width, "the measured axis keeps the ceiling it was seeded with");
         assert_eq!(after.height, 32.0, "the allocated axis takes the configured size, as before");
+    }
+
+    #[test]
+    fn an_axis_that_becomes_measured_is_given_a_ceiling_instead_of_keeping_its_last_allocation() {
+        // A reload may drop `width = 200` and leave the axis measured. Nothing else can set
+        // `available` there afterwards -- `set_instance_size` declines a measured axis outright --
+        // so without this the content would be solved against 200 for the rest of the generation
+        // and no configure could ever widen it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "startup must have applied");
+        client.set_instance_size("bar@TEST", layout::LogicalSize { width: 200.0, height: 39.0 });
+        client.dirty.take();
+
+        let ceiling = layout::LogicalSize { width: 1920.0, height: 1080.0 };
+        client.set_measured_axes("bar@TEST", (true, false), ceiling);
+
+        let instance = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap();
+        assert_eq!(instance.measured_axes, (true, false));
+        assert_eq!(instance.available.width, 1920.0, "the newly measured axis takes the ceiling it may grow into");
+        assert_eq!(instance.available.height, 39.0, "the allocated axis keeps what the compositor configured");
+        assert!(client.dirty.take(), "the tree must be solved again against the room it actually has");
+    }
+
+    #[test]
+    fn recording_the_same_measurement_again_changes_nothing_and_names_no_instance_it_lacks() {
+        // It runs on every resolved pass, so a pass that re-derived the same panel spec must not
+        // cost a re-resolve of every surface in the scene.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "startup must have applied");
+        assert!(!client.dirty.take(), "a clean startup leaves the flag clear");
+        let ceiling = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap().available;
+
+        client.set_measured_axes("bar@TEST", (false, true), ceiling);
+        assert!(!client.dirty.take(), "the ceiling it already had is not a change to any tree");
+
+        client.set_measured_axes("no-such-surface@TEST", (true, true), ceiling);
+        assert!(!client.dirty.take(), "an unknown id is ignored, the way an unknown configure is");
     }
 
     #[test]
