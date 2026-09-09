@@ -42,8 +42,6 @@ end), nil, {
 local idle_tooltip = tooltip({
     id = "idle_tooltip",
     slot = SLOT,
-    width = 240,
-    height = 60,
     children = {
         cell(idle.reasons:map(function(reasons)
             if #reasons == 0 then

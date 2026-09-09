@@ -133,8 +133,6 @@ local battery_module = rect {
 local battery_tooltip = tooltip({
     id = "battery_tooltip",
     slot = SLOT,
-    width = 180,
-    height = 64,
     children = {
         cell(util.label(oblisk.battery, function(b)
             if not b.present then

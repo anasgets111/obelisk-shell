@@ -30,9 +30,12 @@ end), theme.text_contrast(theme.GLASS_CONTROL), theme.font.sm, { align_v = "Cent
 -- belongs: the clock's click opens the notifications panel, and a calendar nobody asked for should
 -- not be what a click on the bar's one always-visible readout produces.
 --
--- A `popup` is sized explicitly (§ 6), so the height is the calendar's own plus the two lines above
--- it and `panel_card`'s spacing and padding, rather than something the surface measures. It
--- follows the calendar's signal because a month is four to six weeks tall.
+-- The one tooltip that still declares its size. Every other one omits `width`/`height` and is
+-- measured (`components/tooltip.lua`); this one's rows fill the card instead of sizing it -- the
+-- two lines are `width = "Fill"` and the grid is a fixed cell -- so there is nothing for a
+-- content-sized measurement to read. The height is the calendar's own plus the two lines above it
+-- and `panel_card`'s spacing and padding, following the calendar's signal because a month is four
+-- to six weeks tall.
 local DATE_LINE = math.ceil(theme.font.sm * 1.2)
 local TIME_LINE = math.ceil(theme.font.xs * 1.2)
 

@@ -25,8 +25,6 @@ local wallpaper_button = icon_button(icons.wallpaper, nil, {
 local wallpaper_tooltip = tooltip({
     id = "wallpaper_tooltip",
     slot = SLOT,
-    width = 250,
-    height = 44,
     children = {
         cell("open the wallpaper picker", theme.FG, theme.font.sm),
         cell("right-click for a random one everywhere", theme.DIM, theme.font.xs),

@@ -38,8 +38,6 @@ end, {
 local bluetooth_tooltip = tooltip({
     id = "bluetooth_tooltip",
     slot = SLOT,
-    width = 220,
-    height = 60,
     children = {
         cell(oblisk.bluetooth:map(function(b)
             if b == nil or not b.enabled then

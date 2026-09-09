@@ -20,8 +20,6 @@ end, { slot = SLOT, selected = ui_state.launcher_open })
 local launcher_tooltip = tooltip({
     id = "launcher_tooltip",
     slot = SLOT,
-    width = 190,
-    height = 44,
     children = {
         cell("open the app launcher", theme.FG, theme.font.sm),
         cell(oblisk.applications:map(function(applications)

@@ -67,8 +67,6 @@ end), nil, {
 local screen_recorder_tooltip = tooltip({
     id = "screen_recorder_tooltip",
     slot = SLOT,
-    width = 260,
-    height = 60,
     children = {
         cell(computed({ state_of, recorder.elapsed_text }, function(current, elapsed)
             if current == "idle" then

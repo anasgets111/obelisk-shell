@@ -31,8 +31,6 @@ end, {
 local network_tooltip = tooltip({
     id = "network_tooltip",
     slot = SLOT,
-    width = 220,
-    height = 60,
     children = {
         cell(oblisk.network:map(function(n)
             if n == nil then
