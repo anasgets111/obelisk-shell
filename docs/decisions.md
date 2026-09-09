@@ -4568,3 +4568,62 @@ and a fade run during that handshake would be over before the screen it introduc
 Every way a lock can end shuts the window, including a relock during one: an idle timer can fire
 while the last unlock is still playing, and the new lock screen must not come up already playing
 its own exit.
+
+## 0191. A list's frame time is set by the length of its source, and the viewport that would fix it is invisible to the stage that builds the items
+
+Measured on a cached re-apply, six nodes to a row, one of them text
+(`layout::scene::tests::list_pass_cost`, release):
+
+| rows | p50 |
+|---|---|
+| 12 | 0.53 ms |
+| 50 | 1.70 ms |
+| 125 | 3.98 ms |
+| 500 | 15.1 ms |
+
+Linear, about 32 us a row. Twelve rows is one viewport of the wallpaper picker; 125 is that folder
+holding 500 wallpapers, four to a row; 500 rows is 2000 wallpapers and a frame already over budget
+before anything is painted. This is the one place in the tree where the size of a config's *data*,
+rather than the shape of its tree, sets the frame time, and ADR-0044 decision 2 makes the pass a
+per-capability-push event: the clock ticking is enough to pay it. ADR-0124's hidden-subtree freeze
+is what keeps a *closed* picker at zero, so this is the cost of an open one and nothing else.
+
+Two cheaper answers are already closed. ADR-0132 measured delegate memoization at 19% of the pass
+and said the rest is resolution, layout and measurement; the split above agrees, with the text
+nodes accounting for 30% of the 125-row figure -- their resolution and layout as well as their
+measurement, and every measurement of them a shaping-cache hit. And a
+config cannot window its own `source`, because ADR-0069 decision 2 deliberately does not expose the
+measured extents to Lua -- a config that fed the engine only the visible rows would watch the scroll
+clamp collapse to the height it just supplied.
+
+So the window has to be the engine's, and the difficulty is where the engine would decide it. The
+items are built in `children_of`, which is handed the property map and nothing else, and the
+viewport it would window against is the list's own solved box, which taffy has not computed yet this
+pass. The previous pass knew both: `prepare` already holds the retained node, its children carry
+their solved rects, and `scroll` is in the property map. A window read off last pass's rects, with
+overscan, is the design -- one pass stale, which is what overscan is for.
+
+What makes it a change rather than a filter, and why it is not in the same commit as the four bugs
+this measurement came out of:
+
+1. **Skipping items breaks positional pairing.** `pair_children_by_id_then_position` falls back to
+   position, and a windowed list has no stable position. Virtualization would require `key`, which
+   is a rule a config can be told but cannot be defaulted into.
+2. **A scrolled-out item is not a removed one.** Unclaimed retained children become `leaving` and
+   play their exit animation (ADR-0150). Scrolling would fire every exit in the list. The out-of-
+   window children have to be retained without being laid out, which is close to what `frozen`
+   already does for a hidden subtree and is not the same thing.
+3. **The content extent has to survive the window.** Twelve children in place of 125 collapses the
+   scroll bound ADR-0069 decision 4 clamps against. Leading and trailing extent has to be
+   reintroduced, and whatever reintroduces it has to be invisible to hit testing, to the duplicate-
+   key check, and to `spacing`.
+4. **A `geometry` signal on an unbuilt item goes stale.** ADR-0147 publishes the solved rect into a
+   config's handle. A windowed list publishes for the window only, which is defensible and has to be
+   written down rather than discovered.
+
+Not built here. The trigger is a config whose list is long enough to matter and whose rows are
+reached by scrolling rather than by search -- the wallpaper picker over a real folder is the one
+that exists. Until then the table above is the evidence, and it is reproducible rather than
+remembered, which is the difference between this entry and the two before it that deferred the same
+work.
+

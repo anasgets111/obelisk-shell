@@ -128,7 +128,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 /// ponytail: `key` speeds reconciliation, not evaluation. A 30-item tray still runs `itemfn` 30
 /// times and discards 29 fresh nodes on ADR-0044 decision 2's per-poll-turn capability-push
 /// cadence. § 5.2 calls `list` a "fast-reconciling virtual repeater"; skipping unchanged items
-/// needs retained-side data, which `children_of` does not provide.
+/// needs retained-side data, which `children_of` does not provide. That is worth about 19% of the
+/// pass (ADR-0132); the whole of it is a viewport, measured at 32us a row by
+/// `layout::scene::tests::list_pass_cost` and designed in ADR-0191.
 pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     let source_value = properties.get("source").ok_or_else(|| invalid("source", "required for `list`, got nothing"))?;
     let Value::Table(source) = source_value else {

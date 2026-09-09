@@ -224,6 +224,12 @@ pub struct Scene {
 /// Adds `node` and its descendants to the running node and property totals. Shared by
 /// [`Scene::census`] and [`Scene::census_by_surface`] so the per-surface figures always sum to the
 /// total the same report prints beside them.
+/// Nodes in one retained tree. [`Scene::census_by_surface`] wants only this half of
+/// [`census_walk`], and asking that one for it meant passing a counter in to throw away.
+fn count_nodes(node: &ResolvedNode) -> usize {
+    1 + node.children.iter().map(count_nodes).sum::<usize>()
+}
+
 fn census_walk(node: &ResolvedNode, nodes: &mut usize, properties: &mut usize) {
     *nodes += 1;
     *properties += node.properties.len();
@@ -486,16 +492,8 @@ impl Scene {
     /// total from [`Self::census`] says the scene is growing; only this says which of eighteen
     /// trees is doing it, which is the difference between a finding and a number.
     pub fn census_by_surface(&self) -> Vec<(String, usize)> {
-        let mut per_surface: Vec<(String, usize)> = self
-            .surfaces
-            .iter()
-            .map(|(key, tree)| {
-                let mut nodes = 0;
-                let mut properties = 0;
-                census_walk(tree, &mut nodes, &mut properties);
-                (key.clone(), nodes)
-            })
-            .collect();
+        let mut per_surface: Vec<(String, usize)> =
+            self.surfaces.iter().map(|(key, tree)| (key.clone(), count_nodes(tree))).collect();
         // Biggest first: a growing tree is the one worth naming, and the report prints only the
         // head of this list.
         per_surface.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -4446,6 +4444,69 @@ pub(super) mod tests {
             .eval()
             .unwrap();
         deserialize_lua_table(&table).unwrap()
+    }
+
+    /// What one `list` pass costs at the sizes a wallpaper folder reaches:
+    /// `cargo test -p renderer --release list_pass_cost -- --ignored --nocapture`. Ignored for the
+    /// same reasons as [`read_seam_cost`]: it reports numbers, and only a release build's mean
+    /// anything.
+    ///
+    /// Six nodes per row, one of them text, over a cached re-apply -- the per-capability-push
+    /// shape of ADR-0044 decision 2, not a cold start. On this machine:
+    ///
+    /// | rows | p50 | note |
+    /// |---|---|---|
+    /// | 12 | 0.53 ms | one viewport of a virtualized list |
+    /// | 50 | 1.70 ms | ADR-0132's fifty tiles |
+    /// | 125 | 3.98 ms | 500 wallpapers, four to a row |
+    /// | 500 | 15.1 ms | 2000 wallpapers |
+    /// | 125, no text | 2.77 ms | the text nodes are 30% of the 125-row figure |
+    ///
+    /// Linear in source length at roughly 32us a row, which is what makes this the one place in
+    /// the tree where a config's data size, not its structure, sets the frame time. ADR-0191 is
+    /// the design that would cut it to the first row of this table, and why it is not built yet.
+    #[test]
+    #[ignore]
+    fn list_pass_cost() {
+        let src = |rows: usize, text: bool| {
+            let label =
+                if text { r###"text { content = e.label, font_size = 14, foreground = "#ffffff" },"### } else { "" };
+            format!(
+                r##"local entries = {{}}
+                for i = 1, {rows} do entries[i] = {{ id = "e" .. i, label = "wallpaper " .. i }} end
+                return panel {{
+                    id = "picker",
+                    child = list {{
+                        width = "Fill", height = "Fill", spacing = 6,
+                        source = entries,
+                        key = function(e) return e.id end,
+                        itemfn = function(e)
+                            return row {{ width = "Fill", height = 96, spacing = 6, children = {{
+                                rect {{ width = 96, height = 96, background = "#202020", radius = 8 }},
+                                rect {{ width = 96, height = 96, background = "#202020", radius = 8 }},
+                                rect {{ width = 96, height = 96, background = "#202020", radius = 8 }},
+                                rect {{ width = 96, height = 96, background = "#202020", radius = 8 }},
+                                {label}
+                            }} }}
+                        end,
+                    }},
+                }}"##
+            )
+        };
+        let shaping = ShapingHandle::spawn();
+        for (rows, text) in [(12usize, true), (50, true), (125, true), (500, true), (125, false)] {
+            let (lua, surface) = surface_from(&src(rows, text));
+            let mut scene = Scene::new();
+            apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+            let mut samples = Vec::new();
+            for _ in 0..40 {
+                let started = std::time::Instant::now();
+                apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("{rows:4} rows text={text}: p50 {:.3} ms  p95 {:.3} ms", samples[20], samples[38]);
+        }
     }
 
     /// What one production read of a retained tree costs:
