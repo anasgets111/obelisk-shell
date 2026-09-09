@@ -670,8 +670,18 @@ impl wayland_client::Dispatch<ExtBackgroundEffectManagerV1, ()> for App {
             return;
         };
         let blur = flags.into_result().map(|caps| caps.contains(manager::Capability::Blur)).unwrap_or(false);
-        if let Some((_, supported)) = state.background_effect.as_mut() {
-            *supported = blur;
+        let Some((_, supported)) = state.background_effect.as_mut() else {
+            return;
+        };
+        if *supported == blur {
+            return;
+        }
+        *supported = blur;
+        // Every surface's last pushed region is now a lie in both directions: while support was
+        // off nothing was sent, and when it goes off the compositor drops what it holds. Clearing
+        // the record makes the next resolve push again rather than compare equal and skip.
+        for surface in &mut state.surfaces {
+            surface.last_blur_region.clear();
         }
     }
 }

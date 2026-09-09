@@ -160,10 +160,17 @@ pub(super) struct TrackedSurface {
     /// kept landing in that window, evicting a whole picker's thumbnails, which then re-decoded,
     /// landed, and unpinned everything again.
     pub(super) stale: bool,
-    /// This surface's `ext_background_effect_surface_v1`, created the first time the tree asks for
-    /// blur and destroyed with the `wl_surface` it names (ADR-0195). `None` on a compositor
-    /// without the protocol, and on every surface whose tree never sets `blur`.
-    pub(super) blur_effect: Option<ExtBackgroundEffectSurfaceV1>,
+    /// This surface's `ext_background_effect_surface_v1` and the id of the `wl_surface` it names
+    /// (ADR-0195). `None` on a compositor without the protocol, and on every surface whose tree
+    /// never sets `blur`.
+    ///
+    /// The id is carried because the object goes inert when its `wl_surface` is destroyed, and
+    /// calling `set_blur_region` on an inert one is a protocol error that takes the whole client
+    /// down. A `TrackedSurface` outlives its `wl_surface`: a tooltip is destroyed and recreated on
+    /// every hover, keeping its index and getting a fresh surface, and `unmap` -- which does drop
+    /// this -- returns early for anything that is not a panel. Comparing ids at the push is what
+    /// makes every teardown path safe rather than the ones that were remembered.
+    pub(super) blur_effect: Option<(ExtBackgroundEffectSurfaceV1, wayland_client::backend::ObjectId)>,
     /// The region last sent, so an unchanged one is not resent. `apply_input_region` deliberately
     /// does not diff, and says why: one `wl_region` round trip is cheaper than the repaint that
     /// follows it. That reasoning was about a handful of rectangles. A rounded card is a couple of
@@ -414,6 +421,12 @@ impl App {
         // Drop children before `remove` invalidates indices and before the parent dies.
         self.drop_child_popups(index);
         self.release_bound(index);
+        // Send the effect's `destroy` while its `wl_surface` is still alive. Dropping the proxy
+        // does not send it, so an unplugged output would otherwise leave one inert object per
+        // surface on the connection for the rest of the session.
+        if let Some((effect, _)) = self.surfaces[index].blur_effect.take() {
+            effect.destroy();
+        }
         let TrackedSurface { role, surface_id, .. } = self.surfaces.remove(index);
         drop(role);
         // `App::surfaces` and `Scene::surfaces` are different maps; dropping the tracked surface
@@ -640,20 +653,36 @@ impl App {
         if !supported {
             return;
         }
-        if regions == self.surfaces[index].last_blur_region {
-            return;
-        }
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
         };
         let manager = manager.clone();
         let qh = self.queue_handle.clone();
+        // Identity first, and before the region compare below. An object whose `wl_surface` is
+        // gone is inert, and a tooltip reopens at the same size constantly -- so the compare would
+        // match, return, and leave the reopened surface holding a dead object and no blur. The
+        // crash this replaces was the same fact read from the other side.
+        let surface_id = surface.id();
+        if let Some((stale, named)) = self.surfaces[index].blur_effect.take() {
+            if named == surface_id {
+                self.surfaces[index].blur_effect = Some((stale, named));
+            } else {
+                // The `wl_surface` is already gone, so `destroy` is the only request still legal
+                // on it; the region it held died with the surface, so the compare below has
+                // nothing to match against.
+                stale.destroy();
+                self.surfaces[index].last_blur_region.clear();
+            }
+        }
+        if regions == self.surfaces[index].last_blur_region {
+            return;
+        }
         if self.surfaces[index].blur_effect.is_none() {
             // Nothing to ask for and nothing asked for before: do not create the object at all.
             if regions.is_empty() {
                 return;
             }
-            self.surfaces[index].blur_effect = Some(manager.get_background_effect(&surface, &qh, ()));
+            self.surfaces[index].blur_effect = Some((manager.get_background_effect(&surface, &qh, ()), surface_id));
         }
         let region = match Region::new(&self.compositor_state) {
             Ok(region) => region,
@@ -665,10 +694,17 @@ impl App {
         for rect in &regions {
             region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
         }
-        if let Some(effect) = self.surfaces[index].blur_effect.as_ref() {
+        if let Some((effect, _)) = self.surfaces[index].blur_effect.as_ref() {
             // A null region would remove the effect; an empty one keeps the object and blurs
             // nothing, which is what a surface whose glass is currently hidden wants.
             effect.set_blur_region(Some(region.wl_region()));
+            // The region is double-buffered and lands on the next `wl_surface.commit`, and
+            // `paint_surface` skips both the draw and the commit when the display list is
+            // unchanged. A `blur` that flips with nothing else moving produces exactly that list,
+            // so without this the region would sit pending until some unrelated repaint. `stale`
+            // is the existing word for "the committed state is behind what this surface should be
+            // showing", and it costs one repaint of a surface whose glass just changed.
+            self.surfaces[index].stale = true;
         }
         self.surfaces[index].last_blur_region = regions;
     }
@@ -725,7 +761,9 @@ impl App {
         }
         // The effect object names the `wl_surface` that just went away; a stale one would be inert
         // at best. The next map creates a fresh pair, and the cleared region forces the push.
-        drop(self.surfaces[index].blur_effect.take());
+        if let Some((effect, _)) = self.surfaces[index].blur_effect.take() {
+            effect.destroy();
+        }
         self.surfaces[index].last_blur_region.clear();
         self.surfaces[index].map_state = MapState::Unmapped;
         self.surfaces[index].null_buffered = false;

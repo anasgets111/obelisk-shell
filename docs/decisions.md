@@ -4790,6 +4790,35 @@ else here.
    an object plus a destroy for each of them buys nothing. `unmap` drops it and clears the last
    region, so the next map builds a fresh pair and pushes again.
 
+A review of the first implementation found five real faults, all of them in the seams rather than
+in the idea, and they are worth recording because each is a way this shape goes wrong:
+
+- **The object outlived its `wl_surface`.** A tooltip is destroyed and recreated on every hover;
+  `drop_popup_object` keeps the `TrackedSurface` and swaps the surface under it, while `unmap`,
+  which does drop the effect, returns early for anything that is not a panel. `set_blur_region` on
+  the inert object is a protocol error, so the compositor killed the client, the renderer panicked
+  on the way down, and three generations died inside 60s. The fix is not to enumerate teardown
+  paths but to carry the `wl_surface`'s `ObjectId` beside the effect and rebuild the pair whenever
+  it does not match -- and to do that *before* the region compare, since a tooltip reopens at the
+  same size and the compare would otherwise return early and keep the dead object.
+- **The clip was intersected in the wrong space.** `layout::paint::build_node` intersects ancestor
+  boxes untransformed and hands the group to the canvas under one matrix, so a node's painted area
+  is its ancestors' clip *and then* the composed transform. Intersecting transformed boxes drops a
+  child that its parent's translate carries back into view, asking for no blur where paint draws
+  pixels.
+- **Rounding was applied after clipping.** A card scrolled halfway out of a list is cut by a
+  straight edge; rounding the cut rectangle rounds that edge too and pulls blur off the straight
+  sides still on screen. Round the node's own box, then cut.
+- **A box as small as its own rounding lost everything.** The middle strip was pushed
+  unconditionally, so a box exactly twice its radius tall emitted an empty rectangle, and the
+  corner inset was sampled at each row's outer edge -- where the arc is furthest in -- so a 2x2 at
+  radius 1 produced that empty rectangle and nothing else. Sampling at the row's centre fixes it.
+- **A changed region needs a commit.** The region is double-buffered and lands on the next
+  `wl_surface.commit`, while `paint_surface` skips both draw and commit for an unchanged display
+  list. A `blur` that flips with nothing else moving produces exactly that list, so the region
+  would sit pending until an unrelated repaint; marking the surface `stale` is the existing word
+  for that and costs one repaint.
+
 Not built: a per-node opt-out. It cannot be a plain negation -- suppressing a child's contribution
 cannot remove blur its parent already asked for, which is hole-punching and a different feature --
 and nothing in `dev-config` wants a translucent box without blur. The roadmap's rule applies:
@@ -4797,6 +4826,14 @@ decide against a real consumer first. Also not built: any blur *parameter*. Stre
 xray live in the compositor's configuration and the protocol carries none of them, so `blur` is a
 boolean that cannot grow, and that is the protocol's shape rather than a simplification.
 
+Also not built, and both are edge cases with no consumer: a descendant of a `clip = "Rounded"`
+parent inherits only the rectangular clip, so a square blurring child inside a pill would blur the
+corners paint masks out; and nothing re-derives regions when the blur capability returns, beyond
+clearing the record so the next resolve pushes again.
+
 Verified on the wire against niri rather than by reading: `capabilities(1)`, one
 `get_background_effect`, one `set_blur_region`, and the 27 `wl_region.add` calls with the middle
 band first (`add(200, 280, 620, 220)`) and the corner strips insetting symmetrically after it.
+The lifetime fault above was found by the running shell dying, not by any of that -- everything
+verified before it was startup-time, and nothing had exercised a hover. It is pinned now by 27
+tooltip cycles with no protocol error, where 14 had been enough to kill the previous build.

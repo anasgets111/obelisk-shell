@@ -1945,7 +1945,9 @@ pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<Phy
 /// and a rounded parent that does not clip can have children painting outside its corners.
 pub fn blur_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
     let mut regions = Vec::new();
-    let everything = PhysicalRect { x0: i32::MIN / 2, y0: i32::MIN / 2, x1: i32::MAX / 2, y1: i32::MAX / 2 };
+    // The root intersects itself on the first step, so this only has to not be the limit.
+    let everything =
+        LogicalRect { x: f32::MIN / 4.0, y: f32::MIN / 4.0, width: f32::MAX / 2.0, height: f32::MAX / 2.0 };
     collect_blur_regions(surface_root, 0.0, 0.0, scale, IDENTITY_AFFINE, everything, 1.0, &mut regions);
     regions
 }
@@ -1991,7 +1993,7 @@ fn collect_blur_regions(
     origin_y: f32,
     scale: f32,
     matrix: node::Affine,
-    clip: PhysicalRect,
+    clip: LogicalRect,
     opacity: f32,
     out: &mut Vec<PhysicalRect>,
 ) {
@@ -2003,14 +2005,15 @@ fn collect_blur_regions(
     let rect = LogicalRect { x: origin_x + node.rect.x, y: origin_y + node.rect.y, ..node.rect };
     let matrix =
         if node.transform.is_identity() { matrix } else { compose_affine(matrix, node.transform.matrix(rect)) };
-    // Mirrors `layout::paint::build_node`: a node clips its children to its own box before drawing
-    // them, so the running clip is the intersection of every ancestor box.
-    let clip = intersect_physical(clip, snap_to_physical(transformed_bounds(matrix, rect), scale));
-    if clip.x1 <= clip.x0 || clip.y1 <= clip.y0 {
+    // Untransformed, exactly as `layout::paint::build_node` accumulates it: that walk intersects
+    // boxes before any transform and hands the whole group to the canvas under one matrix, so a
+    // node's painted area is its ancestors' clip *and then* the composed transform. Intersecting
+    // transformed boxes instead loses a child that its parent's translate carries back into view.
+    let clip = intersect_logical(clip, rect);
+    if clip.width <= 0.0 || clip.height <= 0.0 {
         return;
     }
     if node.blur {
-        let painted = snap_to_physical(transformed_bounds(matrix, rect), scale);
         let radius = match &node.paint {
             Some(PaintStyle::Box { radius, .. }) => *radius,
             _ => 0.0,
@@ -2020,11 +2023,35 @@ fn collect_blur_regions(
         // approximated by the larger of the two.
         let grow = ((matrix[0] * matrix[0] + matrix[1] * matrix[1]).sqrt())
             .max((matrix[2] * matrix[2] + matrix[3] * matrix[3]).sqrt());
-        push_rounded_rect(intersect_physical(painted, clip), radius * scale * grow, out);
+        // Round the node's own box and *then* cut it to the clip, never the other way round: a
+        // card scrolled halfway out of a list is cut by a straight edge, and rounding the cut
+        // rectangle would round that edge too, pulling blur off the straight sides still on screen.
+        let mut rounded = Vec::new();
+        push_rounded_rect(
+            snap_to_physical(transformed_bounds(matrix, rect), scale),
+            radius * scale * grow,
+            &mut rounded,
+        );
+        let visible = snap_to_physical(transformed_bounds(matrix, clip), scale);
+        for strip in rounded {
+            let cut = intersect_physical(strip, visible);
+            if cut.x1 > cut.x0 && cut.y1 > cut.y0 {
+                out.push(cut);
+            }
+        }
     }
     for child in &node.children {
         collect_blur_regions(child, rect.x, rect.y, scale, matrix, clip, opacity * node.opacity, out);
     }
+}
+
+/// The overlap of two untransformed absolute boxes, zero-sized when they miss.
+fn intersect_logical(a: LogicalRect, b: LogicalRect) -> LogicalRect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    LogicalRect { x, y, width: right - x, height: bottom - y }
 }
 
 /// A rounded rectangle as the axis-aligned rectangles a `wl_region` is made of, since the protocol
@@ -2046,8 +2073,11 @@ fn push_rounded_rect(rect: PhysicalRect, radius: f32, out: &mut Vec<PhysicalRect
         out.push(rect);
         return;
     }
-    // The straight middle, full width, between the two corner bands.
-    out.push(PhysicalRect { x0: rect.x0, y0: rect.y0 + r, x1: rect.x1, y1: rect.y1 - r });
+    // The straight middle, full width, between the two corner bands. A box exactly twice its own
+    // radius tall has no middle, and an empty rectangle is a request for nothing.
+    if rect.y1 - r > rect.y0 + r {
+        out.push(PhysicalRect { x0: rect.x0, y0: rect.y0 + r, x1: rect.x1, y1: rect.y1 - r });
+    }
     // One band walked once, mirrored top and bottom: row `dy` from the band's outer edge sits
     // `r - sqrt(r^2 - (r - dy)^2)` in from each side.
     let mut row = 0;
@@ -2066,8 +2096,13 @@ fn push_rounded_rect(rect: PhysicalRect, radius: f32, out: &mut Vec<PhysicalRect
 }
 
 /// How far row `row` of a corner band is inset from the side, for a corner of radius `r`.
+///
+/// Sampled at the row's centre rather than its outer edge. The edge is where the arc is furthest
+/// in, so sampling there insets the outermost row by the whole radius and a box only as tall as
+/// its rounding loses every rectangle it had -- a 2x2 at radius 1 produced one empty rect and
+/// nothing else.
 fn inset_at(r: i32, row: i32) -> i32 {
-    let dy = (r - row) as f32;
+    let dy = (r - row) as f32 - 0.5;
     let r = r as f32;
     (r - (r * r - dy * dy).max(0.0).sqrt()).round() as i32
 }
@@ -5388,6 +5423,21 @@ pub(super) mod tests {
         }
     }
 
+    /// A box no bigger than its own rounding still has pixels, and every rectangle handed to
+    /// `wl_region` must be a real one: a degenerate middle strip is a request for nothing.
+    #[test]
+    fn a_box_as_small_as_its_radius_still_produces_a_region_and_never_an_empty_rect() {
+        for (w, h, r) in [(2, 2, 1.0), (4, 4, 2.0), (10, 4, 2.0), (3, 9, 1.0)] {
+            let mut strips = Vec::new();
+            push_rounded_rect(PhysicalRect { x0: 0, y0: 0, x1: w, y1: h }, r, &mut strips);
+            for s in &strips {
+                assert!(s.x1 > s.x0 && s.y1 > s.y0, "{w}x{h} r{r} emitted the empty rect {s:?}");
+            }
+            let covered: i32 = strips.iter().map(|s| (s.x1 - s.x0) * (s.y1 - s.y0)).sum();
+            assert!(covered > 0, "{w}x{h} r{r} asked for no blur at all");
+        }
+    }
+
     /// The catcher case the whole design exists for: a full-screen surface whose only glass is one
     /// card must hand the compositor the card, not the screen. Proven empirically first -- a niri
     /// `layer-rule` blurring the surface rect flattened a striped backdrop across the whole output.
@@ -5434,13 +5484,15 @@ pub(super) mod tests {
             "the card blurs where its parent's translate paints it, not where the solver left it"
         );
 
-        // The surface is an ancestor box like any other, so a card sliding past its edge is cut
-        // there. The compositor clips to the surface too; agreeing with it costs nothing.
+        // A narrower surface does not cut it, and neither does paint: the clip is intersected
+        // before any transform (`layout::paint::build_node`), so a card whose ancestor translate
+        // carries it past the surface edge is still drawn there, and the compositor clips the
+        // region to the surface itself. Cutting here would disagree with the pixels.
         let narrow = region_node(7, "panel", (0.0, 0.0, 400.0, 100.0), None, vec![build_slider(8, card)]);
         assert_eq!(
             blur_regions(&narrow, 1.0),
-            [PhysicalRect { x0: 310, y0: 10, x1: 400, y1: 50 }],
-            "cut at the surface edge on the way in"
+            [PhysicalRect { x0: 310, y0: 10, x1: 410, y1: 50 }],
+            "the untransformed clip is what paint uses, so the translate is not cut by the surface box"
         );
 
         // The same card scrolled halfway out of a shorter list: paint clips it to the parent box
@@ -5454,6 +5506,55 @@ pub(super) mod tests {
             [PhysicalRect { x0: 0, y0: 0, x1: 100, y1: 20 }],
             "clipped to the list, not the card's own height"
         );
+    }
+
+    /// `layout::paint::build_node` intersects ancestor boxes *before* any transform and hands the
+    /// whole group to the canvas under one matrix, so an ancestor's translate carries the clip
+    /// with it. A walk that intersected transformed boxes instead would drop a child its parent
+    /// moves back into view, and ask for no blur where paint draws pixels.
+    #[test]
+    fn a_child_its_parents_translate_carries_into_view_still_asks_for_blur() {
+        let mut card = region_node(1, "rect", (80.0, 0.0, 40.0, 20.0), solid_paint(), Vec::new());
+        card.blur = true;
+        let mut parent = region_node(2, "column", (0.0, 0.0, 100.0, 20.0), None, vec![card]);
+        parent.transform = node::Transform { translate: (50.0, 0.0), ..node::Transform::default() };
+        let root = region_node(3, "panel", (0.0, 0.0, 300.0, 100.0), None, vec![parent]);
+
+        // The card is clipped to its parent's box untransformed (80..100), then the whole group
+        // moves +50, so paint draws 130..150 and the blur must follow it there.
+        assert_eq!(
+            blur_regions(&root, 1.0),
+            [PhysicalRect { x0: 130, y0: 0, x1: 150, y1: 20 }],
+            "the clip is applied before the transform, as paint applies it"
+        );
+    }
+
+    /// A card scrolled halfway out of a list is cut by a straight edge, so rounding must happen on
+    /// the node's own box and the cut applied after. Rounding the already-cut rectangle would put
+    /// corners on the cut edge and pull blur off the straight sides still on screen.
+    #[test]
+    fn a_clipped_rounded_card_keeps_square_corners_where_it_was_cut() {
+        let mut card = region_node(1, "rect", (0.0, 0.0, 100.0, 100.0), solid_paint(), Vec::new());
+        card.blur = true;
+        card.paint = Some(PaintStyle::Box {
+            background: Some(node::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.8 }),
+            radius: 20.0,
+            colors: node::BorderColor::default(),
+            widths: crate::layout::node::EdgeInsets::default(),
+            clip: node::ClipShape::Box,
+        });
+        // Only the top half is inside the list.
+        let list = region_node(2, "list", (0.0, 0.0, 100.0, 50.0), None, vec![card]);
+        let root = region_node(3, "panel", (0.0, 0.0, 300.0, 300.0), None, vec![list]);
+        let regions = blur_regions(&root, 1.0);
+
+        assert!(!regions.is_empty(), "a half-visible card still blurs");
+        let bottom = regions.iter().map(|r| r.y1).max().unwrap();
+        assert_eq!(bottom, 50, "nothing reaches past the list");
+        // The cut edge is straight: the row just above it spans the card's full width, which a
+        // second rounding would have pulled in.
+        let widest_at_cut = regions.iter().filter(|r| r.y1 == 50).map(|r| r.x1 - r.x0).max().unwrap();
+        assert_eq!(widest_at_cut, 100, "the cut edge is square, not rounded a second time");
     }
 
     /// Opt-in and nothing else: translucency is not a request, and a faded-out subtree asks for
