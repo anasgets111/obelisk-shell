@@ -309,8 +309,10 @@ function idle.own_reasons(privacy, mpris, settings, manual)
             reasons[#reasons + 1] = "screen capture"
         end
     end
-    -- TODO: `fullscreenInhibitorActive`; niri's `oblisk.workspaces.active_client` has no fullscreen
-    -- flag, so a fullscreen film is caught by `video` or not at all.
+    -- No `fullscreenInhibitorActive`. `active_client.is_fullscreen` exists but is nil under niri,
+    -- which reports no such field and does not fabricate `false` (ADR-0056 decision 5); Hyprland
+    -- reports it (ADR-0119). So here a fullscreen film is caught by `video` or not at all, and the
+    -- reason would only ever appear on the compositor this config is not developed against.
     return reasons
 end
 
