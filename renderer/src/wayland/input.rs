@@ -723,7 +723,12 @@ impl App {
             // nowhere, `finish_secure_submit` is never reached, and every refusal log lives below
             // this return. Only the submit key says so, or an unfocused keyboard would log per
             // keystroke.
-            if matches!(action, KeyAction::Submit) {
+            //
+            // A plain field taking keys is not that shape: both focuses see every key, so Enter in
+            // a notification reply or a search box arrives here with an `on_submit` waiting for it.
+            if matches!(action, KeyAction::Submit)
+                && !self.focused_text_field.as_ref().is_some_and(|field| self.text_field_takes_keys(field))
+            {
                 eprintln!(
                     "[oblisk-renderer] submit pressed while no secure field holds focus; nothing was typed into one and nothing was sent"
                 );
