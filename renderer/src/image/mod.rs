@@ -881,8 +881,15 @@ fn decode_raster(
     }
     // Past the thumbnail branch, so the budget is charged for the source actually decoded and a
     // covering thumbnail is never made to wait for room it does not need (ADR-0187).
-    let decoded = decode_within_limits(path, charge, still_wanted)?;
+    let decoded = decode_within_limits(path, MAX_DECODE_EDGE, charge, still_wanted)?;
     let (width, height) = (decoded.width(), decoded.height());
+    let (stored_width, stored_height) = stored_size(width, height, box_px);
+    // The thumbnail this pass writes is also the best source for the texture it is about to make,
+    // whenever it still covers the stored size: scaling 128x128 down beats scaling 4096x4096 down
+    // to the same place, and the second one measured 27 ms on a 4096 source here. It is also what
+    // every *later* open of this file already does, one branch up, so a first open producing
+    // pixels from the full source was the odd one out rather than the careful one.
+    let mut covering_thumbnail = None;
     if let Some(slot) = &slot
         && width.max(height) > slot.px
     {
@@ -891,14 +898,20 @@ fn decode_raster(
         if let Err(err) = slot.write(thumb.as_raw(), thumb_width, thumb_height) {
             eprintln!("[oblisk-renderer] image: {}: thumbnail not written: {err}", path.display());
         }
+        // Both axes, because `stored_size` fills the box while `thumbnail` fits inside it: a wide
+        // source thumbnails to 128x72 and stores at 228x128, and rescaling from that would be an
+        // upscale of a thumbnail rather than a downscale of a photograph.
+        if thumb_width >= stored_width && thumb_height >= stored_height {
+            covering_thumbnail = Some(::image::DynamicImage::ImageRgba8(thumb));
+        }
     }
-    let (stored_width, stored_height) = stored_size(width, height, box_px);
-    let decoded = if (stored_width, stored_height) == (width, height) {
+    let decoded = covering_thumbnail.unwrap_or(decoded);
+    let scaled = if (stored_width, stored_height) == (decoded.width(), decoded.height()) {
         decoded
     } else {
         decoded.thumbnail(stored_width, stored_height)
     };
-    let rgba = decoded.into_rgba8();
+    let rgba = scaled.into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok((rgba.into_raw(), width, height))
 }
@@ -939,7 +952,13 @@ fn refuse_irregular(path: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"))
 }
 
-/// Decodes one raster file under [`MAX_DECODE_EDGE`], charging its pixels to `budget`.
+/// Decodes one raster file under `max_edge`, charging its pixels to `budget`.
+///
+/// `max_edge` is [`MAX_DECODE_EDGE`] for a source file, whose size nothing here gets to choose.
+/// A caller that already knows what the file is allowed to be passes that instead, and the limit
+/// then binds the decoder that produces the pixels rather than a header read of an earlier open:
+/// see [`thumbnails::Slot::read_valid`], which validates one open and decodes another, in a
+/// directory any process of this user can write between the two.
 ///
 /// `image::open` reads the header and then the whole surface, so the size the caller wanted never
 /// entered into it: a thumbnail request for a 8000x6000 photo still allocated ~192 MB, and
@@ -958,6 +977,7 @@ fn refuse_irregular(path: &Path) -> std::io::Result<()> {
 /// it doubles.
 pub(super) fn decode_within_limits(
     path: &Path,
+    max_edge: u32,
     charge: Charge<'_>,
     still_wanted: &dyn Fn() -> bool,
 ) -> Result<::image::DynamicImage, String> {
@@ -967,8 +987,8 @@ pub(super) fn decode_within_limits(
         .with_guessed_format()
         .map_err(|err| err.to_string())?;
     let mut limits = ::image::Limits::no_limits();
-    limits.max_image_width = Some(MAX_DECODE_EDGE);
-    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_image_width = Some(max_edge);
+    limits.max_image_height = Some(max_edge);
     reader.limits(limits);
     let decoder = reader.into_decoder().map_err(|err| err.to_string())?;
     let need = ::image::ImageDecoder::total_bytes(&decoder);
@@ -1461,7 +1481,7 @@ mod tests {
         assert!(pixels < DECODE_POOL_BYTES, "and inside the pool budget that replaced it");
 
         let budget = Budget::default();
-        let decoded = decode_within_limits(&big, Charge::Waiting(&budget), &|| true);
+        let decoded = decode_within_limits(&big, MAX_DECODE_EDGE, Charge::Waiting(&budget), &|| true);
         assert!(decoded.is_ok(), "a source inside the pool budget must decode: {:?}", decoded.err());
         assert_eq!(decoded.map(|image| (image.width(), image.height())).ok(), Some((6024, 3401)));
         assert_eq!(
@@ -1473,7 +1493,7 @@ mod tests {
         // And the wait's own hazard: an entry evicted while its worker sat in `acquire` must not
         // then be decoded into a slot that has gone away.
         assert!(
-            decode_within_limits(&big, Charge::Free, &|| false).is_err(),
+            decode_within_limits(&big, MAX_DECODE_EDGE, Charge::Free, &|| false).is_err(),
             "a decode nobody wants any more must be abandoned rather than paid for"
         );
     }
@@ -1487,13 +1507,27 @@ mod tests {
         let wide = dir.path().join("wide.png");
         ::image::RgbaImage::from_pixel(MAX_DECODE_EDGE + 1, 1, ::image::Rgba([1, 2, 3, 255])).save(&wide).unwrap();
         assert!(
-            decode_within_limits(&wide, Charge::Free, &|| true).is_err(),
+            decode_within_limits(&wide, MAX_DECODE_EDGE, Charge::Free, &|| true).is_err(),
             "a source past MAX_DECODE_EDGE must not be decoded"
         );
 
+        // The limit a caller supplies binds the same way, and this is the one that matters:
+        // `thumbnails::Slot::read_valid` validates one open of a shared cache file and decodes
+        // another, so the header it checked is not evidence about the pixels it gets.
+        let swapped = dir.path().join("swapped.png");
+        ::image::RgbaImage::from_pixel(200, 200, ::image::Rgba([1, 2, 3, 255])).save(&swapped).unwrap();
+        assert!(
+            decode_within_limits(&swapped, 128, Charge::Free, &|| true).is_err(),
+            "a 128px slot must not decode a 200px file, however valid it looked a moment ago"
+        );
+        assert!(decode_within_limits(&swapped, 256, Charge::Free, &|| true).is_ok());
+
         let ordinary = dir.path().join("ordinary.png");
         ::image::RgbaImage::from_pixel(4, 4, ::image::Rgba([1, 2, 3, 255])).save(&ordinary).unwrap();
-        assert!(decode_within_limits(&ordinary, Charge::Free, &|| true).is_ok(), "an ordinary file must still decode");
+        assert!(
+            decode_within_limits(&ordinary, MAX_DECODE_EDGE, Charge::Free, &|| true).is_ok(),
+            "an ordinary file must still decode"
+        );
     }
 
     #[test]
@@ -1716,7 +1750,10 @@ mod tests {
 
         // Both open paths must refuse it. Neither call may block, which is what this asserts by
         // returning at all.
-        assert!(decode_within_limits(&fifo, Charge::Free, &|| true).is_err(), "a FIFO must not reach the decoder");
+        assert!(
+            decode_within_limits(&fifo, MAX_DECODE_EDGE, Charge::Free, &|| true).is_err(),
+            "a FIFO must not reach the decoder"
+        );
         assert!(read_capped(&fifo, 1024).is_err(), "nor the SVG reader");
 
         // A regular file at the same name still works, so the guard refuses the type, not the path.

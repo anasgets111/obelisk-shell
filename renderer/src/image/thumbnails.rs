@@ -58,6 +58,43 @@ pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
     cache_root.join("thumbnails").join(dir).join(name)
 }
 
+/// A temp name no other writer can pick: unique within this process by the counter, and across
+/// processes by the pid.
+///
+/// The pid alone was not enough. Four decode workers share it, so a name of pid and source mtime
+/// collided whenever two sources carried the same mtime second -- ordinary for a folder copied or
+/// unpacked in one go. `create_new` then failed for the loser, whose cleanup unlinked the temp the
+/// winner was still writing, and the winner's rename failed too: two thumbnails asked for, neither
+/// written, both re-decoded from full size on the next look at that folder.
+///
+/// The final name cannot serve here: it is an md5 of the source URI, so two writers racing on the
+/// same source would share it. Uniqueness has to come from the writer, not the target.
+fn temp_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(".oblisk-{}-{}.png.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A `0600` temp file in `dir` that this call owns, so the caller's cleanup can only ever unlink
+/// its own partial write.
+///
+/// More than one name is tried because the pid half of [`temp_name`] is only unique among *live*
+/// processes: a temp orphaned by a process killed mid-write, whose pid this one was later handed,
+/// would otherwise refuse this write for as long as the file sat there, and nothing above retries.
+fn create_temp(dir: &Path) -> io::Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut taken = None;
+    for _ in 0..4 {
+        let temp = dir.join(temp_name());
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => taken = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(taken.unwrap_or_else(|| io::Error::other("no temp name was free")))
+}
+
 /// One source file's slot: path, freshness metadata, and longest edge.
 pub struct Slot {
     path: PathBuf,
@@ -84,7 +121,9 @@ impl Slot {
     pub fn read_valid(&self) -> Option<(Vec<u8>, u32, u32)> {
         let file = std::fs::File::open(&self.path).ok()?;
         let reader = png::Decoder::new(BufReader::new(file)).read_info().ok()?;
-        let text = &reader.info().uncompressed_latin1_text;
+        let info = reader.info();
+        let (width, height) = (info.width, info.height);
+        let text = &info.uncompressed_latin1_text;
         let mtime = text.iter().find(|chunk| chunk.keyword == "Thumb::MTime")?;
         if mtime.text.trim().parse::<i64>().ok()? != self.mtime_secs {
             return None;
@@ -94,13 +133,22 @@ impl Slot {
         if text.iter().any(|chunk| chunk.keyword == "Thumb::URI" && chunk.text != self.uri) {
             return None;
         }
+        // A thumbnail at this path is at most `px` on its longest edge, because that is what the
+        // directory it sits in means. This one is not, so it is not a thumbnail: something else
+        // wrote a full-size PNG into a shared `$XDG_CACHE_HOME` any process of this user can
+        // write to. Refuse it here, where the header is already open and free to read.
+        if width.max(height) > self.px {
+            return None;
+        }
         drop(reader);
-        // Under the same ceiling as any other decode. These files are ours, but they live in a
-        // shared `$XDG_CACHE_HOME` any process of this user can write, so their headers are not
-        // evidence of their size (`image::MAX_DECODE_EDGE`).
-        // Free: a thumbnail is bounded by the slot size the caller asked for, not by the source,
-        // so it never approaches the pool budget (ADR-0187).
-        let decoded = super::decode_within_limits(&self.path, super::Charge::Free, &|| true).ok()?.into_rgba8();
+        // `px` again, and this is the limit that actually holds: the check above validated the
+        // file this open read, and the decode below opens the path a second time. Anything can
+        // land there in between, and the decode takes no pool permit, so the ceiling has to bind
+        // the decoder that produces the pixels rather than a header this call has already closed.
+        // Free stays right underneath it: a thumbnail bounded by the slot size the caller asked
+        // for never approaches the pool budget (ADR-0187).
+        let decoded =
+            super::decode_within_limits(&self.path, self.px, super::Charge::Free, &|| true).ok()?.into_rgba8();
         let (width, height) = decoded.dimensions();
         Ok::<_, ()>((decoded.into_raw(), width, height)).ok()
     }
@@ -108,12 +156,11 @@ impl Slot {
     /// Writes straight-alpha `rgba` as the spec requires: `0700` dir, `0600` temp beside the final
     /// file, then rename, so readers never see a partial PNG.
     pub fn write(&self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::fs::DirBuilderExt;
         let dir = self.path.parent().ok_or_else(|| io::Error::other("thumbnail path has no parent"))?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let temp = dir.join(format!(".oblisk-{}-{}.png.tmp", std::process::id(), self.mtime_secs));
+        let (temp, file) = create_temp(dir)?;
         let result = (|| -> io::Result<()> {
-            let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
             let mut encoder = png::Encoder::new(io::BufWriter::new(file), width, height);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
@@ -191,6 +238,62 @@ mod tests {
         ::image::RgbaImage::from_pixel(4, 2, ::image::Rgba([1, 2, 3, 255])).save(&source).unwrap();
         let later = Slot::for_file(&cache, &source, (100, 100)).unwrap();
         assert!(later.read_valid().is_none());
+    }
+
+    #[test]
+    fn a_full_size_png_sitting_in_the_thumbnail_directory_is_refused_before_it_is_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("wall.png");
+        ::image::RgbaImage::from_pixel(4, 2, ::image::Rgba([1, 2, 3, 255])).save(&source).unwrap();
+        let cache = dir.path().join("cache");
+        let slot = Slot::for_file(&cache, &source, (100, 100)).unwrap();
+        assert_eq!(slot.px, 128);
+
+        // Valid metadata, oversize pixels: what any other process of this user can drop into the
+        // shared cache. The decode it would otherwise reach takes no pool permit.
+        let big = vec![0u8; (200 * 200 * 4) as usize];
+        slot.write(&big, 200, 200).unwrap();
+        assert!(slot.read_valid().is_none(), "200px is not a 128px thumbnail");
+
+        // At the size the directory promises it reads back, so the check is a ceiling and not a
+        // refusal of everything.
+        slot.write(&vec![7u8; (128 * 64 * 4) as usize], 128, 64).unwrap();
+        assert!(slot.read_valid().is_some());
+    }
+
+    /// Four decode workers share a pid, so a temp named after the process and the source mtime
+    /// collided across sources written in the same second, and the loser's cleanup unlinked the
+    /// winner's file.
+    #[test]
+    fn concurrent_writers_of_same_second_sources_all_land_their_thumbnails() {
+        assert_ne!(temp_name(), temp_name(), "two writers must never pick the same temp");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let pixels = vec![9u8, 8, 7, 255];
+        // Written back to back, so they share an mtime second the way an unpacked folder does.
+        let sources: Vec<PathBuf> = (0..8)
+            .map(|index| {
+                let source = dir.path().join(format!("wall{index}.png"));
+                ::image::RgbaImage::from_pixel(4, 2, ::image::Rgba([1, 2, 3, 255])).save(&source).unwrap();
+                source
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for source in &sources {
+                let cache = cache.clone();
+                let pixels = pixels.clone();
+                scope.spawn(move || {
+                    Slot::for_file(&cache, source, (100, 100)).unwrap().write(&pixels, 1, 1).unwrap();
+                });
+            }
+        });
+
+        for source in &sources {
+            let slot = Slot::for_file(&cache, source, (100, 100)).unwrap();
+            assert_eq!(slot.read_valid(), Some((pixels.clone(), 1, 1)), "{} lost its thumbnail", source.display());
+        }
     }
 
     #[test]

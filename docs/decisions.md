@@ -4461,6 +4461,8 @@ last one looked untestable and is not -- the fixture is a solid colour at the re
 KB on disk and 19 ms to encode, because what the decoder charges for is the dimensions and not the
 entropy. Assuming a large decode needs a large file is the same mistake this ADR is about.
 
+Amendment, ADR-0193: the thumbnail reader's `Charge::Free` claimed a bound this pool never checked.
+
 ## 0188. A program handed to the user is let go of, not merely put in its own process group
 
 `applications.launch` and `open_url` spawned through `spawn_group_leader` and dropped the handle,
@@ -4678,3 +4680,59 @@ tested over their inputs rather than read. ADR-0185 closed by saying the main lo
 "verified by reading `wayland/mod.rs`, because the loop needs a compositor". The loop does. The
 decisions inside it do not, and neither of the two bugs above needed a compositor to show itself.
 
+## 0193. A thumbnail is only a thumbnail because of the directory it is in, so the reader has to check
+
+`$XDG_CACHE_HOME/thumbnails/normal/` is shared with every other process of this user, and its
+contract is entirely in the path: a file there is at most 128 pixels on its longest edge. `read_valid`
+checked the freedesktop metadata -- `Thumb::MTime` against the source, `Thumb::URI` against a hash
+collision -- and then decoded whatever pixels the file held. That decode is `Charge::Free`, taking
+no permit from the pool ADR-0187 built, on the stated grounds that a thumbnail is bounded by the
+slot size the caller asked for. Nothing enforced the bound. A full-size PNG written into that
+directory by anything else, with a matching mtime, decoded uncounted up to `MAX_DECODE_EDGE` beside
+four workers each holding a charged share. The `png` reader's header is already open two lines
+above, so that check is free.
+
+Free, and on its own not enough, which is the more interesting half. `read_valid` validates one
+open of the file and then decodes a second one, by pathname, and this is a directory any process of
+this user can write between the two. A header check is evidence about the bytes that were there,
+not about the bytes the decoder will get. So the slot size is passed to `decode_within_limits` as
+the decode's own edge limit -- the same mechanism `MAX_DECODE_EDGE` already used, given the number
+the caller actually knows -- and it binds the decoder that produces the pixels. The header check
+stays, because refusing before the second open is cheaper than refusing during it, but the limit
+underneath it is what makes `Charge::Free` honest.
+
+The writer had a second version of the same mistake: trusting a name to be unique because one
+process picked it. `.oblisk-{pid}-{mtime_secs}.png.tmp` is unique per process and per mtime second,
+and the four decode workers share the process. Two sources with the same mtime second -- a folder
+copied or unpacked in one go, which is most folders -- picked the same temp. `create_new` failed for
+the loser, and the loser's error cleanup unlinked the file the winner was still writing, so the
+winner's rename failed too: two thumbnails asked for, neither written, both re-decoded from full
+size on the next look at that folder. The name comes from a process-wide counter now, and the create
+moved out of the closure that cleans up after it, so the cleanup cannot reach a file this call did
+not make. The final name cannot serve as the temp name for the same reason: it is an md5 of the
+source URI, shared by definition between two writers racing on one source.
+
+A pid is unique among live processes and not among all of them. A temp orphaned by a process killed
+mid-write, whose pid this one is later handed, would refuse this write for as long as the file sat
+there, and nothing above `write` retries. So a taken name is tried again a few times rather than
+returned as an error, which costs four `open` calls in a case that should never happen and avoids a
+thumbnail that can never be written until someone clears the cache by hand.
+
+## 0194. The thumbnail a decode just wrote is the right source for the texture it is about to make
+
+`decode_raster` scaled the full source twice on a first open: once to `slot.px` for the freedesktop
+cache, once to `stored_size` for the texture. Two independent downscales of the same 4096x4096
+image, measured at 54.4 ms against 26.8 ms for one, and the second of them starting from pixels the
+first had already reduced to a hundred and twenty-eight on a side.
+
+Every *later* open of that file already goes through the thumbnail: the branch above this one reads
+the cached PNG and scales it to `stored_size`. So the first open was the odd one out, not the
+careful one -- it produced slightly different pixels for the same image than every open after it.
+Scaling from the thumbnail makes the two agree, and the agreement is worth as much as the
+milliseconds.
+
+The condition is that the thumbnail covers the stored size in both axes, and both is the word that
+matters. `stored_size` fills the box while `thumbnail` fits inside it, so a 16:9 wallpaper into a
+128 box thumbnails to 128x72 and stores at 228x128: reusing there would upscale a thumbnail instead
+of downscaling a photograph. Square-ish sources take the shortcut, wide ones keep the full-source
+scale they need.
