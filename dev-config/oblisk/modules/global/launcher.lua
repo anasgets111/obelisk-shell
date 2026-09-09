@@ -462,6 +462,7 @@ return modal({
         },
         radius = theme.radius.lg,
         background = theme.GLASS,
+        blur = true,
         border_width = theme.border_width,
         border_color = theme.BORDER,
     }),

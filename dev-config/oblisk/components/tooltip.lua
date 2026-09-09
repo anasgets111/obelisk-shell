@@ -41,6 +41,7 @@ return function(opts)
         offset = { x = 0, y = theme.panel_gap },
         child = panel_card(opts.children, {
             background = theme.GLASS,
+            blur = true,
             border_width = theme.border_width,
             border_color = theme.BORDER,
             -- `padding_v` is per-tip because the surface is a fixed size: the one- and two-line

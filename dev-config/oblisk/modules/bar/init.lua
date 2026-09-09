@@ -64,6 +64,8 @@ return panel {
         width = "Fill",
         height = "Fill",
         background = theme.GLASS_SURFACE,
+        -- The bar is the one sheet that is always up, so it is the one blur anybody notices.
+        blur = true,
         padding = { left = theme.spacing.md, right = theme.spacing.md },
         children = { left, center, right },
     },

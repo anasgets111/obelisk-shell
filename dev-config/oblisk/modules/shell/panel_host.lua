@@ -241,6 +241,10 @@ return panel {
                         margin = card_margin,
                         animate = card_animate,
                         background = theme.GLASS,
+                        -- The card, not the surface: `panel_host` is screen-sized and its catcher
+                        -- draws nothing, so the region is the card alone (ADR-0195). History cards
+                        -- sit on this glass and do not ask again.
+                        blur = true,
                         border_width = theme.border_width,
                         border_color = theme.BORDER,
                         padding = {

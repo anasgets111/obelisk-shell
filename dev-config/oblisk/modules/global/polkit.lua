@@ -118,6 +118,7 @@ return panel {
                 padding = { top = pad, right = pad, bottom = pad, left = pad },
                 radius = theme.radius.lg,
                 background = theme.GLASS,
+                blur = true,
                 border_width = theme.border_width,
                 border_color = theme.BORDER,
             }),

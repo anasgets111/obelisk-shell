@@ -193,9 +193,15 @@ theme.ELEVATED_HOVER            = lighten(theme.BG, 0.18)
 theme.TEXT_OFF                  = theme.with_opacity(theme.DIM, theme.opacity.medium)
 theme.BORDER                    = theme.with_opacity(theme.SURFACE, 0.75)
 theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
--- Shared translucent card ground formerly hand-written as `"#181825ee"`; naming it avoids a twelfth
--- swatch.
-theme.GLASS                     = "#181825ee"
+-- Shared translucent card ground for every panel, menu, popup and card. Mantle rather than `BG`,
+-- so a card reads as a sheet above the bar rather than the same tone as it.
+--
+-- The alpha is a number rather than the `ee` this was written as, because it is the one value in
+-- the palette anybody tunes. It came down from 0.933 once the compositor started blurring behind
+-- these surfaces (ADR-0195): the old value existed to keep text legible over whatever window
+-- happened to be underneath, and a blurred backdrop carries no detail to fight. Glass that cannot
+-- be seen through is just a dark rectangle.
+theme.GLASS                     = theme.with_opacity("#181825", 0.88)
 theme.GLASS_CONTENT             = theme.with_opacity(theme.ELEVATED, 0.46)
 theme.GLASS_HOVER               = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
 theme.ACCENT_SUBTLE             = theme.with_opacity(theme.ACCENT, theme.opacity.subtle)

@@ -439,6 +439,10 @@ return function(group, ui, opts)
         opacity = 1,
         animate = entry_animation(scope, group.rank),
         background = in_history and theme.GLASS_CONTENT or theme.GLASS,
+        -- A popup card is its own sheet over the desktop and blurs what is behind it (ADR-0195).
+        -- A history card is not: it sits on `panel_host`'s card, which has already asked, and a
+        -- second request inside that region would be work for pixels nobody sees.
+        blur = not in_history,
         radius = theme.radius.md,
         border_width = theme.border_width_medium,
         border_color = BORDER_BY_URGENCY[group.urgency] or theme.BORDER,

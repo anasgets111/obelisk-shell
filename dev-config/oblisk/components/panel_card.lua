@@ -31,6 +31,9 @@ return function(children, opts)
         animate = opts.animate,
         spacing = opts.spacing or theme.spacing.xs,
         background = opts.background or theme.BG,
+        -- Passed through rather than defaulted: a card on an already-blurred sheet asking again
+        -- would union into a region that covers it, which is work for no pixels (ADR-0195).
+        blur = opts.blur,
         radius = opts.radius or theme.radius.md,
         border_width = opts.border_width,
         border_color = opts.border_color,

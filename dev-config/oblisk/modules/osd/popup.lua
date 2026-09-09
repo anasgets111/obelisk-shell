@@ -182,6 +182,7 @@ return panel {
             }
         end),
         background = theme.GLASS,
+        blur = true,
         radius = theme.radius.md,
         border_width = theme.border_width,
         border_color = theme.BORDER,
