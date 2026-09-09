@@ -2289,6 +2289,7 @@ pub(super) mod tests {
             declared_id,
             output: "TEST".to_string(),
             available,
+            measured_axes: (false, false),
         }
     }
 
@@ -2307,6 +2308,7 @@ pub(super) mod tests {
                 declared_id: declared_id.clone(),
                 output: output.to_string(),
                 available: full(),
+                measured_axes: (false, false),
             })
             .collect();
         scene.apply(std::slice::from_ref(surface), &instances, shaping, lua)
@@ -2507,6 +2509,7 @@ pub(super) mod tests {
             declared_id: "bar".to_string(),
             output: "TEST".to_string(),
             available: full(),
+            measured_axes: (false, false),
         }];
         let ticked = scene.tick(&instances, &shaping, &lua, started + std::time::Duration::from_millis(100));
         assert_eq!(ticked, ["bar@TEST"], "the surface it advanced is what the frame is owed to");
@@ -4315,12 +4318,14 @@ pub(super) mod tests {
                 declared_id: "bar".to_string(),
                 output: "eDP-1".to_string(),
                 available: LogicalSize { width: 1920.0, height: 1080.0 },
+                measured_axes: (false, false),
             },
             SurfaceInstance {
                 instance_id: "bar@DP-1".to_string(),
                 declared_id: "bar".to_string(),
                 output: "DP-1".to_string(),
                 available: LogicalSize { width: 3840.0, height: 2160.0 },
+                measured_axes: (false, false),
             },
         ];
 
@@ -4355,6 +4360,7 @@ pub(super) mod tests {
             declared_id: "ghost".to_string(),
             output: "TEST".to_string(),
             available: full(),
+            measured_axes: (false, false),
         }];
 
         let err = scene.apply(&[surface], &instances, &shaping, &_lua).unwrap_err();
@@ -4377,6 +4383,7 @@ pub(super) mod tests {
             declared_id: "bar".to_string(),
             output: "TEST".to_string(),
             available: full(),
+            measured_axes: (false, false),
         }];
         let err = scene
             .apply_admitting(&[v2], &instances, &shaping, &_lua2, |_| {
@@ -4523,6 +4530,7 @@ pub(super) mod tests {
             declared_id: "bar".to_string(),
             output: "TEST".to_string(),
             available: full(),
+            measured_axes: (false, false),
         }];
         let parse = |source: &str| {
             let table: mlua::Table = lua.load(source).eval().unwrap();

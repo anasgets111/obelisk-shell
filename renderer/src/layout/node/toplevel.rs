@@ -299,18 +299,30 @@ pub fn parse_anchor_rect(properties: &HashMap<String, Value>) -> Result<LogicalR
     Ok(LogicalRect { x: origin("x")?, y: origin("y")?, width: extent("width")?, height: extent("height")? })
 }
 
-/// Popup `width`/`height`, distinct from [`parse_size_mode`]: no `"Fill"`, percent, zero, or
-/// omission can reach `xdg_positioner::set_size`; valid values are `(0, 8192]`. Stored as logical
-/// `f32` for layout and quantized once at the scale-aware request site.
-fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Result<f32, LayoutError> {
+/// Popup `width`/`height`, narrower than [`parse_size_mode`]: no `"Fill"` and no percent, because
+/// there is no parent box for either to mean anything against -- `xdg_positioner::set_size` takes a
+/// number, and the compositor places the popup rather than fitting it into something.
+///
+/// Omitted is [`SizeMode::Content`], on the same terms as every other node: `parse_size_mode`'s own
+/// error says content sizing has no literal and the property is left off instead. That axis is then
+/// whatever the resolved tree measures, and `wayland::surface::App::apply_resolved_state` reads it
+/// off the root's box on the pass that opens the popup. A number is still a number, and still has
+/// to be in `(0, 8192]`: `set_size` raises `invalid_input` on a zero or negative size.
+fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
     if is_deferred_signal(properties, property) {
-        return Ok(DEFERRED_POPUP_EXTENT);
+        return Ok(SizeMode::Pixels(DEFERRED_POPUP_EXTENT));
     }
-    let value = properties.get(property).ok_or_else(|| {
-        invalid(property, "required for `popup`, got nothing -- a popup has no \"Fill\", and set_size raises invalid_input on a zero size")
-    })?;
+    let Some(value) = properties.get(property) else {
+        return Ok(SizeMode::Content);
+    };
     let n = value_as_f32(property, value)?.ok_or_else(|| {
-        invalid(property, format!("expected a number, got {} -- a popup has no \"Fill\"", preview_for_error(value)))
+        invalid(
+            property,
+            format!(
+                "expected a number, got {} -- a popup has no \"Fill\" and no percent; omit the property to size it to its content",
+                preview_for_error(value)
+            ),
+        )
     })?;
     if !(n > 0.0 && n <= 8192.0) {
         return Err(invalid(
@@ -318,7 +330,7 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
             format!("must be within (0, 8192], got {n} -- set_size raises invalid_input on a zero or negative size"),
         ));
     }
-    Ok(n)
+    Ok(SizeMode::Pixels(n))
 }
 
 /// § 6's `grab`, defaulting to `true` so outside clicks dismiss a dropdown (ADR-0040 decision 2).
@@ -350,8 +362,12 @@ pub struct PopupSpec {
     /// conversion [`parse_surface_id`] uses on the other side of the match, so the two agree.
     pub parent: String,
     pub anchor_rect: LogicalRect,
-    pub width: f32,
-    pub height: f32,
+    /// [`SizeMode::Pixels`] for a declared number, [`SizeMode::Content`] for an omitted axis. Only
+    /// those two: [`parse_popup_extent`] admits nothing else. A `Content` axis carries no number
+    /// here because there is none until the tree is solved; `wayland::surface` resolves it against
+    /// the root's measured box before the positioner is built.
+    pub width: SizeMode,
+    pub height: SizeMode,
     pub anchor: PopupAnchor,
     pub gravity: PopupAnchor,
     pub constraint_adjustment: ConstraintAdjustment,
@@ -596,8 +612,8 @@ mod tests {
                 id: "menu".to_string(),
                 parent: "bar".to_string(),
                 anchor_rect: LogicalRect { x: 10.0, y: 0.0, width: 24.0, height: 24.0 },
-                width: 200.0,
-                height: 300.0,
+                width: SizeMode::Pixels(200.0),
+                height: SizeMode::Pixels(300.0),
                 anchor: PopupAnchor::BottomLeft,
                 gravity: PopupAnchor::BottomRight,
                 constraint_adjustment: ConstraintAdjustment {
@@ -691,9 +707,14 @@ mod tests {
     }
 
     #[test]
-    fn a_popup_missing_its_width_or_height_is_a_layout_error_rather_than_invalid_positioner() {
+    fn an_omitted_popup_width_or_height_is_measured_from_the_tree_rather_than_refused() {
+        // This used to be the error "required for `popup`", which is why every tooltip in the
+        // shipped config carried a hand-guessed pair of numbers and cut off any text longer than
+        // the sentence the number was guessed against. An omitted axis is `Content` here as it is
+        // on every other node; `wayland::surface::popup_requested_size` turns it into the number
+        // the positioner needs, off the box the pass measured.
         let lua = lua();
-        for (present, missing) in [("width", "height"), ("height", "width")] {
+        for (present, omitted) in [("width", "height"), ("height", "width")] {
             let table: mlua::Table = lua
                 .load(format!(
                     r#"return {{ kind = "popup", id = "menu", parent = "bar",
@@ -701,11 +722,11 @@ mod tests {
                 ))
                 .eval()
                 .unwrap();
-            let err = popup_spec(&props_from_table(&table)).unwrap_err();
-            assert!(
-                matches!(&err, LayoutError::InvalidProperty { property, .. } if property == missing),
-                "an omitted `{missing}` must be a LayoutError naming it: {err:?}"
-            );
+            let spec = popup_spec(&props_from_table(&table)).expect("an omitted axis is not an error");
+            let (declared, measured) =
+                if omitted == "height" { (spec.width, spec.height) } else { (spec.height, spec.width) };
+            assert_eq!(declared, SizeMode::Pixels(200.0), "the declared axis keeps its number");
+            assert_eq!(measured, SizeMode::Content, "the omitted `{omitted}` is measured");
         }
     }
 
@@ -931,7 +952,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(spec.anchor_rect, LogicalRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
-        assert_eq!((spec.width, spec.height), (1.0, 1.0));
+        assert_eq!((spec.width, spec.height), (SizeMode::Pixels(1.0), SizeMode::Pixels(1.0)));
         assert_eq!((spec.anchor, spec.gravity), (PopupAnchor::Center, PopupAnchor::Center));
         assert_eq!(spec.constraint_adjustment, ConstraintAdjustment::default());
         assert_eq!(spec.offset, PopupOffset::default());

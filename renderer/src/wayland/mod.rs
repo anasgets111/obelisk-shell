@@ -171,6 +171,11 @@ pub struct App {
     /// dismissal relative to `popup_done`. It survives `input_serial`'s per-turn lifetime and
     /// tells whether the user asked again.
     pointer_input_count: u64,
+    /// Serial for `xdg_popup.reposition`, returned on the configure it causes
+    /// (`ConfigureKind::Reposition`). One counter for the process rather than one per popup: it
+    /// only has to tell two requests apart, and wrapping is harmless because nothing here waits on
+    /// a specific token.
+    reposition_token: u32,
     /// Focused `secure_submit` field and declaring surface, set by a textfield press or sole-field
     /// keyboard focus (ADR-0050 decision 4). `None` means no frame; writes go through
     /// [`App::focus_secure_submit`].
@@ -301,6 +306,7 @@ pub fn run(
         drag: None,
         input_serial: None,
         pointer_input_count: 0,
+        reposition_token: 0,
         focused_secure_submit: None,
         last_focus_key: (Vec::new(), false),
         focused_text_field: None,

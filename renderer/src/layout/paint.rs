@@ -1147,6 +1147,7 @@ mod tests {
             declared_id: "bar".to_string(),
             output: "TEST".to_string(),
             available: size,
+            measured_axes: (false, false),
         }];
         scene.apply(&[surface], &instances, &shaping, lua).unwrap();
         scene.surface("bar@TEST").unwrap().clone()

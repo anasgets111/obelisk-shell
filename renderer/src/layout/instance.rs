@@ -7,7 +7,7 @@
 //! monitor count); § 6 gives a `lock` no `monitor` for the opposite reason (always every
 //! monitor); only a `panel` expands per output.
 
-use crate::layout::node::SurfaceSpec;
+use crate::layout::node::{SizeMode, SurfaceSpec};
 use crate::layout::scene::LogicalSize;
 
 /// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the shared id
@@ -29,6 +29,20 @@ pub struct SurfaceInstance {
     /// startup, replaced per instance by `RendererClient::set_instance_size` once the compositor
     /// configures that surface: differs from the output for any surface smaller than it, every bar.
     pub available: LogicalSize,
+    /// Which axes are measured from the tree rather than allocated to it, per axis `(width,
+    /// height)`. On a measured axis `available` is a *ceiling* -- the most the content may take --
+    /// and `set_instance_size` leaves it alone, because the compositor's answer there is the size
+    /// this surface asked for and writing it back would make the measurement its own cap.
+    ///
+    /// That is not pedantry. A `Content` root over a `wrap = "Word"` child does take its bound into
+    /// account: measured against 1000 the same paragraph is 342 wide on one line, against 180 it is
+    /// 180 wide on two. Feed the granted 342 back as the ceiling and the text can never grow wider
+    /// again -- it wraps taller inside the width it happened to open at. `TrackedRole::Panel`'s
+    /// `output_size` field exists for the same reason on the other side of the same conflation.
+    ///
+    /// Only a `popup` sets these today. A `window` or `lock` root resolves a `Content` axis to
+    /// `available` outright (`scene::forced_root_size`), so its configure *is* its allocation.
+    pub measured_axes: (bool, bool),
 }
 
 /// One connected output, as far as instance expansion cares: a name to match `monitor` against and
@@ -76,6 +90,10 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                         declared_id: panel.topology.id.clone(),
                         output: output.name.clone(),
                         available: output.size,
+                        // A `Content` panel axis is still layer-shell's `set_size(0)`, "you decide"
+                        // (`wayland::layer::layer_extent_for`), so its configure is an allocation
+                        // like any other. Measuring one is its own change.
+                        measured_axes: (false, false),
                     });
                 }
             }
@@ -84,13 +102,28 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                 declared_id: window.id.clone(),
                 output: String::new(),
                 available: outputs.first().map_or(LogicalSize::default(), |output| output.size),
+                measured_axes: (false, false),
             }),
-            SurfaceSpec::Popup(popup) => instances.push(SurfaceInstance {
-                instance_id: popup.id.clone(),
-                declared_id: popup.id.clone(),
-                output: String::new(),
-                available: LogicalSize { width: popup.width, height: popup.height },
-            }),
+            SurfaceSpec::Popup(popup) => {
+                // A declared axis is its own bound. A `Content` one takes the output as its ceiling
+                // -- the room a popup could occupy at most -- rather than the parent's box: a
+                // 39px-tall bar is a poor height bound for the tooltip hanging off it, and the
+                // compositor's own flip/slide is what actually keeps the result on screen.
+                let ceiling = outputs.first().map_or(LogicalSize::default(), |output| output.size);
+                let axis = |mode: SizeMode, ceiling: f32| match mode {
+                    SizeMode::Pixels(px) => (px, false),
+                    _ => (ceiling, true),
+                };
+                let (width, measured_width) = axis(popup.width, ceiling.width);
+                let (height, measured_height) = axis(popup.height, ceiling.height);
+                instances.push(SurfaceInstance {
+                    instance_id: popup.id.clone(),
+                    declared_id: popup.id.clone(),
+                    output: String::new(),
+                    available: LogicalSize { width, height },
+                    measured_axes: (measured_width, measured_height),
+                })
+            }
             SurfaceSpec::Lock(lock) => {
                 for output in outputs {
                     instances.push(SurfaceInstance {
@@ -98,6 +131,7 @@ pub fn expand_instances(specs: &[SurfaceSpec], outputs: &[OutputGeometry]) -> Ve
                         declared_id: lock.id.clone(),
                         output: output.name.clone(),
                         available: output.size,
+                        measured_axes: (false, false),
                     });
                 }
             }
@@ -249,8 +283,8 @@ mod tests {
             id: id.to_string(),
             parent: parent.to_string(),
             anchor_rect: crate::text::snap::LogicalRect { x: 0.0, y: 0.0, width: 86.0, height: 24.0 },
-            width: 200.0,
-            height: 120.0,
+            width: crate::layout::node::SizeMode::Pixels(200.0),
+            height: crate::layout::node::SizeMode::Pixels(120.0),
             anchor: crate::layout::node::PopupAnchor::BottomLeft,
             gravity: crate::layout::node::PopupAnchor::BottomRight,
             constraint_adjustment: crate::layout::node::ConstraintAdjustment::default(),
@@ -352,6 +386,7 @@ mod tests {
             declared_id: declared_id.to_string(),
             output: output_name.to_string(),
             available: LogicalSize { width, height },
+            measured_axes: (false, false),
         }
     }
 

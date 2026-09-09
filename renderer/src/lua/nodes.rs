@@ -688,6 +688,7 @@ mod meta_stub_tests {
             declared_id: declared,
             output: "PROBE".to_string(),
             available: crate::layout::LogicalSize { width: 1000.0, height: 500.0 },
+            measured_axes: (false, false),
         }];
         scene.apply(std::slice::from_ref(&virtual_node), &instances, &shaping, &lua).map_err(|e| format!("{e:?}"))
     }

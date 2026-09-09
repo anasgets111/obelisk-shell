@@ -74,6 +74,29 @@ pub(super) enum TrackedRole {
         /// Whole spec for the next open; `xdg_positioner` fields are consumed at creation, so no
         /// live diff exists.
         spec: PopupSpec,
+        /// The size the next open asks the positioner for, in logical pixels: the spec's declared
+        /// numbers, with every `SizeMode::Content` axis replaced by what the resolved tree measured
+        /// on the pass this was written. The spec cannot hold it -- a `Content` axis has no number
+        /// until the tree is solved -- and the positioner cannot wait for it, since `get_popup`
+        /// consumes the whole positioner at creation.
+        ///
+        /// Zero on an axis means nothing has been measured yet, which is what a hidden popup's
+        /// frozen 0x0 tree reports (ADR-0124). [`App::show_popup`] declines to open on that rather
+        /// than substituting a stale number: the pass that reveals the popup is the pass that
+        /// measures it, so the size is there by the time it is needed, and if it somehow is not,
+        /// waiting one more pass is better than opening at the wrong size.
+        requested: (f32, f32),
+        /// What the *live* popup's positioner was given, or `None` while nothing is open. A pass
+        /// whose [`Placement`] differs from this is one the open popup is the wrong size or in the
+        /// wrong place for, and [`App::reposition_popup`] is what closes that gap: `get_popup`
+        /// consumed the positioner at creation, so the only way to change any of it afterwards is
+        /// `xdg_popup.reposition`.
+        ///
+        /// Without it a popup keeps whatever it opened at. That is invisible for a menu, whose
+        /// contents are fixed, and wrong for anything measured: a battery tooltip opened on
+        /// "69% charging" cannot grow when the estimate arrives and becomes
+        /// "69% charging, 1h 20m to full", so the hover that was already up cuts the words off.
+        positioned: Option<Placement>,
         /// ADR-0051 decision 2 latch: pointer count at compositor dismissal. It blocks replacement
         /// while unchanged, preventing a `popup_done`/`visible = true` click-outside livelock. A
         /// count, not a bool (first amendment), because the `visible = false` clear edge is not
@@ -126,7 +149,69 @@ pub(super) enum PopupRefusal {
     Seatless,
     /// § 6's `parent` names no shown surface, commonly a hidden parent window.
     HiddenParent,
+    /// A `Content` axis with nothing measured on it yet, so there is no size to ask the positioner
+    /// for. Ordinarily impossible -- the pass that makes a popup visible is the pass that measures
+    /// it -- and a standing one means the tree resolves to nothing on that axis.
+    Unmeasured,
+    /// The compositor bound `xdg_popup` below version 3, which is where `reposition` was added, so
+    /// an open popup cannot be resized or moved and keeps what it opened at until it closes.
+    Unrepositionable,
 }
+/// Everything an `xdg_positioner` is told, as one value: the size to ask for and the five fields
+/// that place it. It exists so that what is sent and what is remembered cannot drift apart -- a
+/// popup repositions when this differs from what its live positioner was given, and a field added
+/// here is compared by the same edit that starts sending it.
+///
+/// All `Copy`, so remembering one costs nothing. `PopupSpec`'s own `id` and `parent` are not here:
+/// they are structural (ADR-0051 decision 1), and changing either is a different popup rather than
+/// a repositioned one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Placement {
+    pub(super) size: (f32, f32),
+    pub(super) anchor_rect: crate::text::snap::LogicalRect,
+    pub(super) anchor: node::PopupAnchor,
+    pub(super) gravity: node::PopupAnchor,
+    pub(super) constraint_adjustment: node::ConstraintAdjustment,
+    pub(super) offset: node::PopupOffset,
+}
+
+impl Placement {
+    /// What `spec` asks for, with its `Content` axes resolved against `root` -- the box the layout
+    /// pass measured for this surface (see [`popup_requested_size`]).
+    pub(super) fn of(spec: &PopupSpec, root: crate::text::snap::LogicalRect) -> Self {
+        Self {
+            size: popup_requested_size(spec, root),
+            anchor_rect: spec.anchor_rect,
+            anchor: spec.anchor,
+            gravity: spec.gravity,
+            constraint_adjustment: spec.constraint_adjustment,
+            offset: spec.offset,
+        }
+    }
+
+    /// Whether both axes have a size to ask for. A `Content` axis reads zero until the tree is
+    /// measured, and `set_size` raises `invalid_input` on a zero.
+    pub(super) fn is_measured(&self) -> bool {
+        self.size.0 > 0.0 && self.size.1 > 0.0
+    }
+}
+
+/// What the next `xdg_positioner::set_size` should ask for: the spec's own numbers, with each
+/// `Content` axis taken from the box the layout pass measured for this surface's root.
+///
+/// `ceil`, not `round`: a card measuring 252.48 needs 253 or the half pixel it asked for is the
+/// half pixel the surface cuts off, which is the whole failure this sizing exists to end. Rounding
+/// is right for an anchor rect, which names a point, and wrong for an extent, which names room.
+///
+/// A `Content` axis the tree reports as zero stays zero, for [`App::show_popup`] to decline on.
+pub(super) fn popup_requested_size(spec: &PopupSpec, root: crate::text::snap::LogicalRect) -> (f32, f32) {
+    let axis = |mode: node::SizeMode, measured: f32| match mode {
+        node::SizeMode::Pixels(px) => px,
+        _ => measured.max(0.0).ceil(),
+    };
+    (axis(spec.width, root.width), axis(spec.height, root.height))
+}
+
 /// Popup roots: `Popup::from_surface` roots windows/nested popups at creation; a panel has no
 /// `xdg_surface`, so layer-shell's `get_popup` must root the raw popup before its initial commit.
 pub(super) enum PopupParent {
@@ -553,7 +638,7 @@ impl App {
         // `Scene::surface` lends its tree, so what the tree is read for is taken here and the
         // borrow ends with this block; the role updates below write through `&mut self`. Exactly
         // one spec is parsed -- the one this surface's role calls for.
-        let (panel, window, popup, regions, visible, blur) = {
+        let (panel, window, popup, tree_rect, regions, visible, blur) = {
             let Some(tree) = self.client.scene().surface(&surface_id) else {
                 // Startup/apply failure or rollback (`Scene::apply` restores its prior state): keep
                 // the last applied fields rather than pushing defaults over a working surface.
@@ -564,6 +649,7 @@ impl App {
                 matches!(role, TrackedRole::Panel { .. }).then(|| node::panel_spec(&tree.properties)),
                 matches!(role, TrackedRole::Window { .. }).then(|| node::window_spec(&tree.properties)),
                 matches!(role, TrackedRole::Popup { .. }).then(|| node::popup_spec(&tree.properties)),
+                tree.rect,
                 layout::overlay_input_regions(tree, 1.0),
                 tree.visible,
                 layout::blur_regions(tree, 1.0),
@@ -589,8 +675,10 @@ impl App {
             // `xdg_popup.reposition` exists. The next open uses this pass's `anchor_rect`
             // (ADR-0049 amendment), including a click-written state signal.
             Some(Ok(fresh)) => {
-                if let TrackedRole::Popup { spec, .. } = &mut self.surfaces[index].role {
+                let size = popup_requested_size(&fresh, tree_rect);
+                if let TrackedRole::Popup { spec, requested, .. } = &mut self.surfaces[index].role {
                     *spec = fresh;
+                    *requested = size;
                 }
             }
             Some(Err(err)) => eprintln!(
@@ -1342,13 +1430,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_omitted_popup_axis_takes_the_measured_box_and_a_declared_one_ignores_it() {
+        // The whole point of the `Content` axis: the number the positioner is given comes from
+        // what the tree measured, not from a guess in the config. A declared axis is untouched by
+        // the measurement, so one axis can be fixed and the other fitted.
+        let measured = LogicalRect { x: 0.0, y: 0.0, width: 252.48, height: 36.0 };
+        let mut spec = popup_spec_fixture();
+        assert_eq!(popup_requested_size(&spec, measured), (200.0, 120.0), "declared numbers win outright");
+
+        spec.width = node::SizeMode::Content;
+        assert_eq!(
+            popup_requested_size(&spec, measured),
+            (253.0, 120.0),
+            "252.48 rounds *up*: 252 would cut the half pixel the card asked for, which is the clipping this ends"
+        );
+
+        spec.height = node::SizeMode::Content;
+        assert_eq!(popup_requested_size(&spec, measured), (253.0, 36.0));
+    }
+
+    #[test]
+    fn a_content_axis_measuring_nothing_stays_zero_for_show_popup_to_decline_on() {
+        // A hidden popup's tree is frozen at 0x0 (ADR-0124). Reporting that honestly is what lets
+        // `show_popup` wait a pass instead of opening at a size nothing measured.
+        let mut spec = popup_spec_fixture();
+        spec.width = node::SizeMode::Content;
+        spec.height = node::SizeMode::Content;
+        let nothing = LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        assert_eq!(popup_requested_size(&spec, nothing), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_placement_moves_when_the_measurement_does_and_holds_when_nothing_does() {
+        // The comparison that decides whether an open popup is repositioned. It must be false for
+        // an unchanged pass: `apply_popup_visibility` runs for every surface on every capability
+        // push, so a placement that compared unequal to itself would send a `reposition` several
+        // times a second for the life of every open popup.
+        let card = LogicalRect { x: 0.0, y: 0.0, width: 169.0, height: 36.0 };
+        let mut spec = popup_spec_fixture();
+        spec.width = node::SizeMode::Content;
+        spec.height = node::SizeMode::Content;
+
+        let opened = Placement::of(&spec, card);
+        assert_eq!(opened, Placement::of(&spec, card), "an unchanged pass is not a reposition");
+
+        let grown = LogicalRect { width: 253.0, ..card };
+        assert_ne!(opened, Placement::of(&spec, grown), "the words grew, so the surface must follow");
+
+        // Placement, not just size: an indicator that moves takes its tooltip with it.
+        let mut slid = spec.clone();
+        slid.anchor_rect = LogicalRect { x: 400.0, ..spec.anchor_rect };
+        assert_ne!(opened, Placement::of(&slid, card));
+
+        // And a declared axis is deaf to the measurement, so a fixed popup never repositions for it.
+        let fixed = popup_spec_fixture();
+        assert_eq!(Placement::of(&fixed, card), Placement::of(&fixed, grown));
+    }
+
+    #[test]
+    fn an_unmeasured_placement_is_not_something_to_reposition_to() {
+        // A popup open on real content whose tree momentarily resolves to nothing must keep what it
+        // has: `set_size` raises `invalid_input` on a zero, and a popup that vanished mid-hover is
+        // worse than one a frame stale.
+        let mut spec = popup_spec_fixture();
+        spec.width = node::SizeMode::Content;
+        spec.height = node::SizeMode::Content;
+        let nothing = LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+        assert!(!Placement::of(&spec, nothing).is_measured());
+        assert!(Placement::of(&spec, LogicalRect { x: 0.0, y: 0.0, width: 169.0, height: 36.0 }).is_measured());
+
+        // One axis measured is not enough; `set_size` takes both.
+        let half = LogicalRect { x: 0.0, y: 0.0, width: 169.0, height: 0.0 };
+        assert!(!Placement::of(&spec, half).is_measured());
+    }
+
     fn popup_spec_fixture() -> PopupSpec {
         PopupSpec {
             id: "menu".to_string(),
             parent: "bar".to_string(),
             anchor_rect: LogicalRect { x: 997.0, y: 4.0, width: 86.0, height: 24.0 },
-            width: 200.0,
-            height: 120.0,
+            width: SizeMode::Pixels(200.0),
+            height: SizeMode::Pixels(120.0),
             anchor: PopupAnchor::BottomLeft,
             gravity: PopupAnchor::BottomRight,
             constraint_adjustment: ConstraintAdjustment::default(),

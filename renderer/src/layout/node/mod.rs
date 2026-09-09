@@ -46,10 +46,9 @@ pub use style::{
     parse_transform, parse_visible,
 };
 pub use surface::{Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
-pub use toplevel::{ConstraintAdjustment, PopupAnchor, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec};
-// `wayland::tests`' fixtures name it `node::PopupOffset`, same reason as `LockSpec` above.
-#[cfg(test)]
-pub use toplevel::PopupOffset;
+pub use toplevel::{
+    ConstraintAdjustment, PopupAnchor, PopupOffset, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec,
+};
 
 use std::collections::HashMap;
 

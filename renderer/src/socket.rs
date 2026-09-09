@@ -391,9 +391,18 @@ impl RendererClient {
     /// Replaces one instance's compositor-configured `available` size and dirties the scene through
     /// ADR-0044 decision 2's [`DirtyFlag`] (ADR-0023). Ignore unknown ids instead of dirtying a
     /// nonexistent surface.
+    ///
+    /// A measured axis is left alone (`SurfaceInstance::measured_axes`). The compositor's answer
+    /// there is the size this surface asked for after measuring its own content, so writing it back
+    /// would turn the measurement into its own ceiling and the content could never outgrow the size
+    /// it happened to open at.
     pub fn set_instance_size(&mut self, instance_id: &str, size: layout::LogicalSize) {
         let Some(instance) = self.instances.iter_mut().find(|i| i.instance_id == instance_id) else {
             return;
+        };
+        let size = layout::LogicalSize {
+            width: if instance.measured_axes.0 { instance.available.width } else { size.width },
+            height: if instance.measured_axes.1 { instance.available.height } else { size.height },
         };
         if instance.available == size {
             // Same no-op rule as `set_rescue_state`.
@@ -953,6 +962,7 @@ mod tests {
                 declared_id: (*id).to_string(),
                 output: "TEST".to_string(),
                 available: layout::LogicalSize { width: 1920.0, height: 1080.0 },
+                measured_axes: (false, false),
             })
             .collect()
     }
@@ -2573,6 +2583,37 @@ mod tests {
             RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence: 8 })
         );
         assert!(client.state.pending.is_none());
+    }
+
+    #[test]
+    fn a_measured_axis_keeps_its_ceiling_when_the_compositor_configures_the_size_it_asked_for() {
+        // The conflation this guards against: `available` is the box a tree is solved against, and
+        // on a measured axis that box is a *ceiling*, not an allocation. Writing the granted size
+        // back would make the measurement its own cap.
+        //
+        // It only bites where natural size depends on the bound, which is exactly what wrapping
+        // does. Measured against 1000 this paragraph is one line wide; against 180 it is 180 wide
+        // and two lines tall. Grant it the 342 it asked for, feed that back as the ceiling, and it
+        // can never grow wider again -- it wraps taller inside the width it happened to open at.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_shell_lua(
+            dir.path(),
+            r#"return panel { id = "bar", layer = "Top", width = "Fill", height = "Fill" }"#,
+        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        assert!(run_startup(&mut client), "startup must have applied");
+
+        let ceiling = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap().available;
+        if let Some(instance) = client.instances.iter_mut().find(|i| i.instance_id == "bar@TEST") {
+            instance.measured_axes = (true, false);
+        }
+        client.dirty.take();
+
+        client.set_instance_size("bar@TEST", layout::LogicalSize { width: 342.0, height: 32.0 });
+
+        let after = client.instances.iter().find(|i| i.instance_id == "bar@TEST").unwrap().available;
+        assert_eq!(after.width, ceiling.width, "the measured axis keeps the ceiling it was seeded with");
+        assert_eq!(after.height, 32.0, "the allocated axis takes the configured size, as before");
     }
 
     #[test]

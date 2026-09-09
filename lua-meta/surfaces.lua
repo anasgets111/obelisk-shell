@@ -40,8 +40,8 @@
 ---@field id string Unique across the surface set. Structural, on the same terms as a `window`'s.
 ---@field parent string|Bound The `id` of the `panel` or `window` this anchors to.
 ---@field anchor_rect Rect|Bound Required and must be non-zero. Normally the rect `on_click` hands back, so a dropdown lands on the button that opened it.
----@field width integer|Bound Required and non-zero. A popup has no `"Fill"`.
----@field height integer|Bound Required and non-zero.
+---@field width? integer|Bound Omit to size the popup to its content, which is what a `Content` axis means on every other node: the surface becomes the box the layout pass measured for `child`, so a card is never cut by the surface it sits in. A number is still a number and must be within `(0, 8192]` -- `xdg_positioner::set_size` raises `invalid_input` on zero or negative. No `"Fill"` and no percent: the compositor places a popup rather than fitting it into a parent, so there is no box for either to mean anything against. A measured axis is read on the pass that opens the popup; the popup does not resize afterwards, so a change of content lands on the next open.
+---@field height? integer|Bound Omit to measure, on the same terms as `width`. The two are independent: one axis may be a number while the other is measured.
 ---@field anchor? PopupAnchor Which edge or corner of `anchor_rect` the popup hangs from.
 ---@field gravity? PopupAnchor|Bound Which direction it extends from that point.
 ---@field constraint_adjustment? ("SlideX"|"SlideY"|"FlipX"|"FlipY"|"ResizeX"|"ResizeY")[] How the compositor may move it to keep it on screen. Defaults to `{ "FlipY", "SlideX" }`; the protocol's own default is none. Applied flip, then slide, then resize.

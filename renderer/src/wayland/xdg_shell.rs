@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::wayland::surface::MapState;
+use crate::wayland::surface::Placement;
 use crate::wayland::surface::PopupParent;
 use crate::wayland::surface::PopupRefusal;
 use crate::wayland::surface::TrackedRole;
@@ -56,14 +57,17 @@ fn parent_instance_index<'a>(
 /// flip, or resize for § 6 constraints. Non-positive axes use the requested size: SCTK's
 /// `PopupInner` starts pending dimensions at `-1`, which would crash `WlEglSurface::new`; clamp to
 /// at least 1.
-fn popup_size_for(configured: (i32, i32), spec: &PopupSpec) -> (u32, u32) {
+///
+/// `requested` is what the positioner was given, not what the spec says: a `Content` axis has no
+/// number in the spec at all (`surface::popup_requested_size`).
+fn popup_size_for(configured: (i32, i32), requested: (f32, f32)) -> (u32, u32) {
     let axis = |configured: i32, requested: f32| -> u32 {
         if configured > 0 {
             return configured as u32;
         }
         (requested.max(1.0)) as u32
     };
-    (axis(configured.0, spec.width), axis(configured.1, spec.height))
+    (axis(configured.0, requested.0), axis(configured.1, requested.1))
 }
 /// § 6 `anchor` to `xdg_positioner`; `Center` is protocol `none`, centered in the anchor rectangle.
 fn positioner_anchor(anchor: PopupAnchor) -> xdg_positioner::Anchor {
@@ -106,23 +110,34 @@ fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::Co
     bits.set(xdg_positioner::ConstraintAdjustment::ResizeY, adjustment.resize_y);
     bits
 }
-/// Sends all § 6 positioner fields in protocol order. Each open builds a fresh positioner, so no
-/// diff exists. Logical pixels round to `i32` (`x=996.6` becomes 997) because the anchor came from
-/// `on_click` (ADR-0050 decision 3); sizes clamp to 1 after parsers reject zero.
-fn configure_positioner(positioner: &XdgPositioner, spec: &PopupSpec) {
+/// Sends all § 6 positioner fields in protocol order, from the one value that is also what a live
+/// popup remembers being given ([`Placement`]), so a field cannot be sent without being compared.
+/// An open popup's positioner is replaced through `xdg_popup.reposition`; a fresh one gets its at
+/// `get_popup`, which consumes it.
+///
+/// Logical pixels round to `i32` (`x=996.6` becomes 997) because the anchor came from `on_click`
+/// (ADR-0050 decision 3). The size `ceil`s instead: an anchor rect names a point and a size names
+/// room, and a card measuring 252.48 given 252 loses the half pixel to the surface's own edge,
+/// which is the clipping content sizing exists to end. Both clamp to 1, since `set_size` raises
+/// `invalid_input` on a zero.
+fn configure_positioner(positioner: &XdgPositioner, placement: &Placement) {
     let round = |n: f32| n.round() as i32;
-    positioner.set_size(round(spec.width).max(1), round(spec.height).max(1));
+    positioner.set_size((placement.size.0.ceil() as i32).max(1), (placement.size.1.ceil() as i32).max(1));
     positioner.set_anchor_rect(
-        round(spec.anchor_rect.x),
-        round(spec.anchor_rect.y),
-        round(spec.anchor_rect.width).max(1),
-        round(spec.anchor_rect.height).max(1),
+        round(placement.anchor_rect.x),
+        round(placement.anchor_rect.y),
+        round(placement.anchor_rect.width).max(1),
+        round(placement.anchor_rect.height).max(1),
     );
-    positioner.set_anchor(positioner_anchor(spec.anchor));
-    positioner.set_gravity(positioner_gravity(spec.gravity));
-    positioner.set_constraint_adjustment(positioner_constraint(spec.constraint_adjustment));
-    positioner.set_offset(round(spec.offset.x), round(spec.offset.y));
+    positioner.set_anchor(positioner_anchor(placement.anchor));
+    positioner.set_gravity(positioner_gravity(placement.gravity));
+    positioner.set_constraint_adjustment(positioner_constraint(placement.constraint_adjustment));
+    positioner.set_offset(round(placement.offset.x), round(placement.offset.y));
 }
+
+/// `xdg_popup.reposition` arrived in xdg-shell version 3. SCTK's `Popup::reposition` silently does
+/// nothing below it, which would leave a popup quietly the wrong size, so ask first and say so.
+const REPOSITION_SINCE: u32 = 3;
 /// Fallback for a compositor-selected window axis without `min_size`. ponytail: fixed 640x480;
 /// with no min size, that is the opening size when the first configure leaves an axis zero.
 /// Upgrade: § 6 advisory initial size or solver-backed `Content` sizing (ADR-0077).
@@ -219,7 +234,18 @@ impl App {
         visible: bool,
     ) {
         self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Popup { popup: None, spec: spec.clone(), dismissed_at: None, refusal_logged: None },
+            role: TrackedRole::Popup {
+                popup: None,
+                // The declaration's own numbers, which for a `Content` axis is zero until the first
+                // resolve measures one. Nothing opens before then; `apply_resolved_state` writes
+                // the real pair on every pass.
+                requested: super::surface::popup_requested_size(spec, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }),
+                // Nothing is open, so no positioner has been given anything yet.
+                positioned: None,
+                spec: spec.clone(),
+                dismissed_at: None,
+                refusal_logged: None,
+            },
             bound: None,
             surface_id: instance.instance_id.clone(),
             map_state: MapState::Unmapped,
@@ -268,9 +294,16 @@ impl App {
     /// latch on every `visible = false`, even if the object is already gone: `on_dismiss` may write
     /// false in the same turn and must reopen without waiting for pointer input.
     pub(super) fn apply_popup_visibility(&mut self, index: usize, visible: bool) {
-        let TrackedRole::Popup { popup, dismissed_at, .. } = &self.surfaces[index].role else {
+        let TrackedRole::Popup { popup, dismissed_at, spec, requested, positioned, .. } = &self.surfaces[index].role
+        else {
             return;
         };
+        // An open popup whose placement has moved since its positioner was given one. `Nothing`
+        // used to be the whole of the already-open case, which is why a popup kept the size it
+        // opened at for as long as it stayed open.
+        let moved = (visible && popup.is_some())
+            .then(|| Placement { size: *requested, ..Placement::of(spec, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }) })
+            .filter(|placement| placement.is_measured() && Some(*placement) != *positioned);
         let action = popup_visibility_action(visible, popup.is_some(), *dismissed_at, self.pointer_input_count);
         if !visible && let TrackedRole::Popup { dismissed_at, refusal_logged, .. } = &mut self.surfaces[index].role {
             *dismissed_at = None;
@@ -282,7 +315,11 @@ impl App {
                 self.show_popup(&qh, index);
             }
             PopupAction::Destroy => self.hide_popup(index),
-            PopupAction::Nothing => {}
+            PopupAction::Nothing => {
+                if let Some(placement) = moved {
+                    self.reposition_popup(index, placement);
+                }
+            }
         }
     }
 
@@ -362,10 +399,28 @@ impl App {
             );
             return;
         };
-        let TrackedRole::Popup { spec, .. } = &self.surfaces[index].role else {
+        let TrackedRole::Popup { spec, requested, .. } = &self.surfaces[index].role else {
             return;
         };
         let spec = spec.clone();
+        let placement = Placement::of(&spec, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        // `requested` is what `apply_resolved_state` measured; `Placement::of` above cannot know it,
+        // so take the measured pair and keep the placement fields it did read.
+        let placement = Placement { size: *requested, ..placement };
+
+        // Nothing measured on a `Content` axis yet, so there is no size to ask for. Decline and
+        // let the next pass open it, rather than inventing one the surface would then cut.
+        if !placement.is_measured() {
+            if self.refusal_is_new(index, PopupRefusal::Unmeasured) {
+                eprintln!(
+                    "[oblisk-renderer] {surface_id}: sized {:?}, so it is not opened yet. An omitted `width`/`height` \
+                     is measured off the resolved tree, and this one has measured nothing on that axis. \
+                     Logged once until it opens or `visible` resolves false.",
+                    placement.size
+                );
+            }
+            return;
+        }
 
         // Refuse before creating protocol objects.
         let grab = if spec.grab {
@@ -418,7 +473,7 @@ impl App {
                 return;
             }
         };
-        configure_positioner(&positioner, &spec);
+        configure_positioner(&positioner, &placement);
 
         let surface = self.compositor_state.create_surface(qh);
         let rooted_at_creation = match &parent {
@@ -448,9 +503,70 @@ impl App {
             *refusal_logged = None;
         }
         self.surfaces[index].map_state = MapState::AwaitingConfigure;
+        // What this popup's positioner now holds. Every later pass compares against it.
+        if let TrackedRole::Popup { positioned, .. } = &mut self.surfaces[index].role {
+            *positioned = Some(placement);
+        }
         eprintln!(
             "[oblisk-renderer] {surface_id} creating: visible = true, anchored to {parent_id}, grab {}",
             if grab.is_some() { "taken" } else { "not requested" }
+        );
+    }
+
+    /// Give an open popup a new positioner (`xdg_popup.reposition`), which is the only way to
+    /// change a size or a placement that `get_popup` already consumed.
+    ///
+    /// The token is ours to choose and comes back on the resulting `PopupConfigure` as
+    /// `ConfigureKind::Reposition`; nothing here needs to correlate them, because the ordinary
+    /// configure path already takes whatever size arrives and resizes the EGL window to it. It is
+    /// sent anyway rather than left at zero so a compositor's own logs can pair request to answer.
+    ///
+    /// `positioned` moves forward on the request, not on the answer: it records what this popup's
+    /// positioner was told, and a second identical request would be no more true for waiting. The
+    /// configure that follows is what actually resizes anything.
+    fn reposition_popup(&mut self, index: usize, placement: Placement) {
+        let surface_id = self.surfaces[index].surface_id.clone();
+        // Read the version out before anything wants `&mut self`; a `Popup` borrow of the role
+        // would otherwise outlive the throttle check below.
+        let TrackedRole::Popup { popup: Some(popup), .. } = &self.surfaces[index].role else {
+            return;
+        };
+        let version = popup.xdg_popup().version();
+        if version < REPOSITION_SINCE {
+            if self.refusal_is_new(index, PopupRefusal::Unrepositionable) {
+                eprintln!(
+                    "[oblisk-renderer] {surface_id}: this compositor bound xdg_popup v{version}, and `reposition` needs \
+                     v{REPOSITION_SINCE}, so it keeps the size and place it opened at until it closes. \
+                     Logged once until it opens again or `visible` resolves false."
+                );
+            }
+            return;
+        }
+        let Some(xdg_shell) = self.xdg_shell.as_ref() else {
+            return;
+        };
+        let positioner = match XdgPositioner::new(xdg_shell) {
+            Ok(positioner) => positioner,
+            Err(err) => {
+                log_bind_failure(&surface_id, "xdg_wm_base::create_positioner", err);
+                return;
+            }
+        };
+        configure_positioner(&positioner, &placement);
+        self.reposition_token = self.reposition_token.wrapping_add(1);
+        let token = self.reposition_token;
+        let was = if let TrackedRole::Popup { popup: Some(popup), positioned, .. } = &mut self.surfaces[index].role {
+            popup.reposition(&positioner, token);
+            positioned.replace(placement)
+        } else {
+            None
+        };
+        // Rare enough to say every time: a popup only repositions when its content or its anchor
+        // actually moved, and if that starts happening on every pass this line is the evidence.
+        eprintln!(
+            "[oblisk-renderer] {surface_id} repositioned to {:?} from {:?} (token {token})",
+            placement.size,
+            was.map(|placement| placement.size)
         );
     }
 
@@ -484,8 +600,10 @@ impl App {
     /// `wl_egl_window`, then drop [`Popup`], whose `Drop` sends `xdg_popup.destroy`.
     fn drop_popup_object(&mut self, index: usize) {
         self.release_bound(index);
-        if let TrackedRole::Popup { popup, .. } = &mut self.surfaces[index].role {
+        if let TrackedRole::Popup { popup, positioned, .. } = &mut self.surfaces[index].role {
             drop(popup.take());
+            // No object, no positioner to have been given anything. The next open sends afresh.
+            *positioned = None;
         }
         self.surfaces[index].map_state = MapState::Unmapped;
         self.surfaces[index].null_buffered = false;
@@ -597,10 +715,10 @@ impl PopupHandler for App {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;
         };
-        let TrackedRole::Popup { spec, .. } = &self.surfaces[index].role else {
+        let TrackedRole::Popup { requested, .. } = &self.surfaces[index].role else {
             return;
         };
-        let (width, height) = popup_size_for((configure.width, configure.height), spec);
+        let (width, height) = popup_size_for((configure.width, configure.height), *requested);
         self.bind_and_clear(index, width, height);
     }
 
@@ -745,21 +863,6 @@ mod tests {
         assert_eq!(size_hint_pair(Some(SizeHint { width: 320.0, height: 240.0 })), Some((320, 240)));
     }
 
-    fn popup_spec_fixture() -> PopupSpec {
-        PopupSpec {
-            id: "menu".to_string(),
-            parent: "bar".to_string(),
-            anchor_rect: LogicalRect { x: 997.0, y: 4.0, width: 86.0, height: 24.0 },
-            width: 200.0,
-            height: 120.0,
-            anchor: PopupAnchor::BottomLeft,
-            gravity: PopupAnchor::BottomRight,
-            constraint_adjustment: ConstraintAdjustment::default(),
-            offset: node::PopupOffset { x: 0.0, y: 4.0 },
-            grab: true,
-        }
-    }
-
     #[test]
     fn a_visible_popup_with_no_object_is_created_unless_the_latch_is_set() {
         assert_eq!(popup_visibility_action(true, false, None, 4), PopupAction::Create);
@@ -849,7 +952,7 @@ mod tests {
     fn a_popup_configure_is_taken_as_given_because_the_compositor_may_have_constrained_it() {
         // § 6's `constraint_adjustment` lets the compositor slide, flip or resize the popup to
         // keep it on screen, and the size it lands on is the one that has to be painted.
-        assert_eq!(popup_size_for((180, 90), &popup_spec_fixture()), (180, 90));
+        assert_eq!(popup_size_for((180, 90), (200.0, 120.0)), (180, 90));
     }
 
     #[test]
@@ -857,16 +960,13 @@ mod tests {
         // `PopupInner` seeds its pending dimensions at `-1` and reports whatever they hold when
         // `xdg_surface.configure` arrives; a `-1` reaching `WlEglSurface::new` is a crash and the
         // requested size is right there.
-        assert_eq!(popup_size_for((-1, -1), &popup_spec_fixture()), (200, 120));
-        assert_eq!(popup_size_for((180, 0), &popup_spec_fixture()), (180, 120), "per axis, not all or nothing");
+        assert_eq!(popup_size_for((-1, -1), (200.0, 120.0)), (200, 120));
+        assert_eq!(popup_size_for((180, 0), (200.0, 120.0)), (180, 120), "per axis, not all or nothing");
     }
 
     #[test]
     fn a_popup_never_takes_a_zero_sized_buffer() {
-        let mut spec = popup_spec_fixture();
-        spec.width = 0.0;
-        spec.height = 0.0;
-        assert_eq!(popup_size_for((0, 0), &spec), (1, 1), "a wl_egl_window of 0 is invalid");
+        assert_eq!(popup_size_for((0, 0), (0.0, 0.0)), (1, 1), "a wl_egl_window of 0 is invalid");
     }
 
     #[test]

@@ -508,6 +508,7 @@ mod tests {
             declared_id: "bar".to_string(),
             output: "TEST".to_string(),
             available: crate::layout::LogicalSize { width: 1000.0, height: 500.0 },
+            measured_axes: (false, false),
         }];
         scene.apply(&[surface], &instances, &shaping, &lua).unwrap();
 
