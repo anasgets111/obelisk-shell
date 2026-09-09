@@ -54,6 +54,8 @@
 ---@field height? Length|Bound The same, on the cross axis. `"Fill"` on both is how a background covers its parent.
 ---@field max_width? integer|Bound A ceiling in pixels on a node whose `width` is omitted: it grows with its content up to here and stops. Past it the children overflow, which a `scroll` on the same node is what turns into scrolling. Ignored beside a fixed or `"Fill"` width, which already say how wide.
 ---@field max_height? integer|Bound The same, on the other axis.
+---@field min_width? integer|Bound A floor in pixels on a node whose `width` is omitted: it never measures narrower than this, however little it holds. What keeps a card sized by its own words looking like a card when the words are two of them. Ignored beside a fixed or `"Fill"` width; above `max_width` it wins, as in CSS, rather than being refused.
+---@field min_height? integer|Bound The same, on the other axis.
 ---@field margin? integer|Edges|Bound Outer spacing. A bare number is all four edges.
 ---@field padding? integer|Edges|Bound Inner spacing. A bare number is all four edges.
 ---@field align_h? Align|Bound On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.

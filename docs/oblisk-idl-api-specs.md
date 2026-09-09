@@ -175,7 +175,8 @@ tables do not resolve, so derive the whole table instead.
 | Property | Values / behavior |
 | :--- | :--- |
 | `width`, `height` | Number of logical pixels, `"Fill"`, or `"NN%"`; omit for content sizing. `"Content"` is not a literal |
-| `max_width`, `max_height` | Numeric size ceilings |
+| `max_width`, `max_height` | Numeric size ceilings on a content-sized axis; overflow past one is what `scroll` scrolls |
+| `min_width`, `min_height` | Numeric size floors on a content-sized axis. A floor above a ceiling wins, as in CSS |
 | `padding`, `margin` | Number or `{ top, right, bottom, left }`; unspecified edges are zero |
 | `align_h`, `align_v` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` |
 | `visible` | Boolean; false removes the node from layout and paint |

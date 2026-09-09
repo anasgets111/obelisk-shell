@@ -63,9 +63,10 @@ pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> R
     ))
 }
 
-/// `max_width`/`max_height` cap a `Content`-sized node in pixels, leaving overflow for `scroll`.
-/// Percent and `"Fill"` ceilings add no meaning beyond a fixed size.
-pub fn parse_max_size(properties: &HashMap<String, Value>, property: &str) -> Result<Option<f32>, LayoutError> {
+/// One pixel bound on a `Content`-sized node: `max_width`/`max_height` cap its growth, leaving the
+/// overflow for `scroll`; `min_width`/`min_height` floor it. Percent and `"Fill"` bounds add no
+/// meaning beyond a fixed size.
+pub fn parse_size_bound(properties: &HashMap<String, Value>, property: &str) -> Result<Option<f32>, LayoutError> {
     let Some(value) = properties.get(property) else {
         return Ok(None);
     };

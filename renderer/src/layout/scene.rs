@@ -65,6 +65,9 @@ struct LayoutStyle {
     /// Ceilings for `Content` growth; overflow goes to `scroll`.
     max_width: Option<f32>,
     max_height: Option<f32>,
+    /// Floors for `Content` growth; a declared one replaces taffy's disabled automatic minimum.
+    min_width: Option<f32>,
+    min_height: Option<f32>,
     align_h: Align,
     align_v: Align,
     spacing: f32,
@@ -86,8 +89,10 @@ impl LayoutStyle {
             padding: node::parse_edge_insets(properties, "padding")?,
             width_mode: node::parse_size_mode(properties, "width")?,
             height_mode: node::parse_size_mode(properties, "height")?,
-            max_width: node::parse_max_size(properties, "max_width")?,
-            max_height: node::parse_max_size(properties, "max_height")?,
+            max_width: node::parse_size_bound(properties, "max_width")?,
+            max_height: node::parse_size_bound(properties, "max_height")?,
+            min_width: node::parse_size_bound(properties, "min_width")?,
+            min_height: node::parse_size_bound(properties, "min_height")?,
             align_h: node::parse_align(properties, "align_h")?,
             align_v: node::parse_align(properties, "align_v")?,
             spacing: node::parse_spacing(properties)?,
@@ -1029,12 +1034,21 @@ fn taffy_style(
         // then drew it 378px wide/two lines, making every card a line short
         // (`a_containers_own_margin_does_not_widen_what_its_children_are_measured_at`).
         flex_shrink: 0.0,
-        min_size: match parent_axis {
-            Some(MainAxis::Horizontal) => {
-                taffy::Size { width: length(0.0), height: taffy::LengthPercentageAuto::auto() }
+        // A declared `min_width`/`min_height` takes that axis over; the other keeps the default.
+        min_size: {
+            let automatic = match parent_axis {
+                Some(MainAxis::Horizontal) => {
+                    taffy::Size { width: length(0.0), height: taffy::LengthPercentageAuto::auto() }
+                }
+                Some(MainAxis::Vertical) => {
+                    taffy::Size { width: taffy::LengthPercentageAuto::auto(), height: length(0.0) }
+                }
+                None => taffy::Size { width: length(0.0), height: length(0.0) },
+            };
+            taffy::Size {
+                width: style.min_width.map_or(automatic.width, taffy::LengthPercentageAuto::length),
+                height: style.min_height.map_or(automatic.height, taffy::LengthPercentageAuto::length),
             }
-            Some(MainAxis::Vertical) => taffy::Size { width: taffy::LengthPercentageAuto::auto(), height: length(0.0) },
-            None => taffy::Size { width: length(0.0), height: length(0.0) },
         },
         padding: taffy::Rect {
             left: length(style.padding.left),
@@ -3775,6 +3789,68 @@ pub(super) mod tests {
         );
         assert_eq!(used, 0.0, "no remainder, so the offset is clamped away rather than erroring");
         assert_eq!(ys, vec![0.0, 100.0]);
+    }
+
+    /// `min_width` shares a taffy field with the disabled automatic minimum above, so the two have
+    /// to be checked together: a declared floor, content that already clears it, and no floor.
+    #[test]
+    fn a_min_width_floors_a_content_sized_row_without_widening_what_already_clears_it() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+
+        let measure = |scene: &mut Scene, source: &str| {
+            let (lua, surface) = surface_from(source);
+            apply_at(scene, &[surface], full(), &shaping, &lua).unwrap();
+            let width = scene.surface("bar@TEST").unwrap().children[0].rect.width;
+            drop(lua);
+            width
+        };
+
+        assert_eq!(
+            measure(
+                &mut scene,
+                r#"panel { id = "bar", child = row { min_width = 220, children = {
+                rect { width = 40, height = 10 },
+            } } }"#
+            ),
+            220.0,
+            "40 of content in a box floored at 220 is 220 wide"
+        );
+        assert_eq!(
+            measure(
+                &mut scene,
+                r#"panel { id = "bar", child = row { min_width = 220, children = {
+                rect { width = 400, height = 10 },
+            } } }"#
+            ),
+            400.0,
+            "content that already clears the floor is untouched by it"
+        );
+        assert_eq!(
+            measure(
+                &mut scene,
+                r#"panel { id = "bar", child = row { children = {
+                rect { width = 40, height = 10 },
+            } } }"#
+            ),
+            40.0,
+            "and no floor leaves the automatic minimum exactly as it was"
+        );
+    }
+
+    /// A floor above a ceiling is the size, the way CSS resolves the pair, rather than a tree the
+    /// engine refuses: the two are separate properties and nothing stops a config carrying both.
+    #[test]
+    fn a_min_width_above_a_max_width_wins_instead_of_being_refused() {
+        let mut scene = Scene::new();
+        let shaping = ShapingHandle::spawn();
+        let (lua, surface) = surface_from(
+            r#"panel { id = "bar", child = row { min_width = 300, max_width = 120, children = {
+                rect { width = 40, height = 10 },
+            } } }"#,
+        );
+        apply_at(&mut scene, &[surface], full(), &shaping, &lua).unwrap();
+        assert_eq!(scene.surface("bar@TEST").unwrap().children[0].rect.width, 300.0);
     }
 
     /// `max_height` is what makes a content-sized container scrollable: below the cap it is exactly

@@ -43,6 +43,8 @@ const COMMON_PROPERTIES: &[&str] = &[
     "margin",
     "max_height",
     "max_width",
+    "min_height",
+    "min_width",
     "on_hover",
     "opacity",
     "origin",
@@ -552,7 +554,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 766, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 818, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when

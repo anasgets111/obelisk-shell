@@ -42,7 +42,7 @@ pub use spec::{
 pub use spec::LockSpec;
 pub use style::{
     Affine, BorderColor, ClipShape, Transform, apply_affine, invert_affine, parse_align, parse_blur, parse_cursor,
-    parse_edge_insets, parse_list_direction, parse_max_size, parse_opacity, parse_size_mode, parse_spacing,
+    parse_edge_insets, parse_list_direction, parse_opacity, parse_size_bound, parse_size_mode, parse_spacing,
     parse_transform, parse_visible,
 };
 pub use surface::{Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
