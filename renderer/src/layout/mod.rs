@@ -19,9 +19,9 @@ pub mod secure_submit;
 // ponytail: this is the tested public surface, but external callers still mostly need
 // `Scene`/`LogicalSize`. Upgrade path: expose the remaining re-exports when callers match
 // `LayoutError` or name `NodeId` directly; `wayland` already names `ResolvedNode` and
-// `overlay_input_regions` for input regions.
+// `overlay_input_regions` for input regions, `blur_regions` for the compositor's blur region.
 #[allow(unused_imports)]
 pub use node::{Align, EdgeInsets, LayoutError, SizeMode};
 #[allow(unused_imports)]
 pub use scene::NodeId;
-pub use scene::{LogicalSize, ResolvedNode, Scene, overlay_input_regions};
+pub use scene::{LogicalSize, ResolvedNode, Scene, blur_regions, overlay_input_regions};

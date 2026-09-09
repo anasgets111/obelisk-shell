@@ -197,6 +197,8 @@ impl App {
             configured_size: (0, 0),
             last_painted: None,
             stale: false,
+            blur_effect: None,
+            last_blur_region: Vec::new(),
         });
         if visible {
             let index = self.surfaces.len() - 1;
@@ -225,6 +227,8 @@ impl App {
             configured_size: (0, 0),
             last_painted: None,
             stale: false,
+            blur_effect: None,
+            last_blur_region: Vec::new(),
         });
         if visible {
             let index = self.surfaces.len() - 1;

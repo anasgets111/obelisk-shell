@@ -79,6 +79,7 @@
 ---@field radius? integer|Bound Corner rounding, default `0`.
 ---@field border_color? Color|BorderColors|Bound A bare string applies to all four edges. No default: an edge paints only where both a colour and a non-zero width say so.
 ---@field border_width? integer|Edges|Bound A bare number applies to all four edges. Default `0`.
+---@field blur? boolean|Bound Ask the compositor to blur the desktop behind this node's box (ADR-0195). Default `false`, and never inferred from a translucent `background`: an invisible `#00000000` control is not asking for glass, and border-only or image-backed glass has no background alpha to read. The engine unions every asking node in a surface, following the transforms and clips the node is painted under, so a card that slides, scrolls out of a list, or fades to nothing blurs where it is drawn and nowhere else. Nothing is sent on a compositor without `ext-background-effect-v1`, or one whose blur capability is off, so this is silently nothing rather than an error. Strength, passes and xray belong to the compositor's own configuration and cannot be set from here, which is why this is a boolean.
 ---@field clip? "Box"|"Rounded"|Bound What this node cuts its children down to. Default `"Box"`, its rectangle with square corners, which is what a node has always done. `"Rounded"` uses `radius` instead, so a child overflowing a pill is cut by the same arc the pill's fill draws. Costs an offscreen pass, which is why `radius` alone does not imply it.
 
 ---@class RectProps: NodeBase, BoxBase

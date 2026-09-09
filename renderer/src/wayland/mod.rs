@@ -36,6 +36,8 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
 use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_egl::WlEglSurface;
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 use wayland_protocols::xdg::shell::client::{xdg_positioner, xdg_surface};
 
@@ -72,6 +74,12 @@ pub struct App {
     compositor_state: CompositorState,
     seat_state: SeatState,
     layer_shell: LayerShell,
+    /// `ext_background_effect_manager_v1`, or `None` on a compositor without it (ADR-0195).
+    /// Optional by design: `blur = true` on a compositor that cannot blur is silently nothing, the
+    /// same answer every other unavailable compositor feature gets here. `blur` is the capability
+    /// bit the manager announces on bind; a compositor may advertise the global and still not
+    /// blur, and it may withdraw the bit later.
+    background_effect: Option<(ExtBackgroundEffectManagerV1, bool)>,
     /// `xdg_wm_base`, plus the `zxdg_decoration_manager_v1` that `XdgShell::bind` picks up beside
     /// it, or `None`; panels still work without xdg-shell,
     /// while a declared window logs the missing global once.
@@ -232,6 +240,10 @@ pub fn run(
     // left unbuilt.
     let xdg_shell =
         XdgShell::bind(&globals, &qh).inspect_err(|err| log_bind_failure("<xdg-shell>", "xdg_wm_base::bind", err)).ok();
+    // Optional, and quiet when absent: a compositor with no blur is not a broken session.
+    // Version 1 is the only version; `capabilities` arrives on the queue right after this.
+    let background_effect =
+        globals.bind::<ExtBackgroundEffectManagerV1, App, ()>(&qh, 1..=1, ()).ok().map(|manager| (manager, false));
     let output_state = OutputState::new(&globals, &qh);
     let seat_state = SeatState::new(&globals, &qh);
     // Mandatory: every compositor advertises `wl_shm`.
@@ -258,6 +270,7 @@ pub fn run(
         compositor_state,
         seat_state,
         layer_shell,
+        background_effect,
         xdg_shell,
         session_lock_state,
         session_lock: None,
@@ -639,6 +652,43 @@ impl ProvidesRegistryState for App {
 // `WindowHandler`, `PopupHandler` and `SessionLockHandler` are implemented above with no
 // `delegate_pointer!`/`delegate_keyboard!`/`delegate_xdg_shell!`/`delegate_xdg_popup!`/
 // `delegate_session_lock!` call to match: none of those macros exist in this SCTK.
+/// `ext_background_effect_manager_v1` (ADR-0195). The manager's one event is `capabilities`,
+/// a bitfield the compositor sends on bind and again whenever it changes; the `blur` bit going away
+/// means the compositor has stopped applying blur even for regions already set, so this tracks the
+/// current value rather than the one at startup.
+impl wayland_client::Dispatch<ExtBackgroundEffectManagerV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        _manager: &ExtBackgroundEffectManagerV1,
+        event: <ExtBackgroundEffectManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1 as manager;
+        let manager::Event::Capabilities { flags } = event else {
+            return;
+        };
+        let blur = flags.into_result().map(|caps| caps.contains(manager::Capability::Blur)).unwrap_or(false);
+        if let Some((_, supported)) = state.background_effect.as_mut() {
+            *supported = blur;
+        }
+    }
+}
+
+/// The per-surface half has no events; it exists to carry `set_blur_region`.
+impl wayland_client::Dispatch<ExtBackgroundEffectSurfaceV1, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _effect: &ExtBackgroundEffectSurfaceV1,
+        _event: <ExtBackgroundEffectSurfaceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
 

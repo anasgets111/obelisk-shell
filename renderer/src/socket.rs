@@ -884,6 +884,51 @@ mod tests {
         (client, outbound_rx)
     }
 
+    /// The whole `blur` path from Lua to the rects the compositor is handed (ADR-0195), on the
+    /// shape the design exists for: a full-screen surface whose click-catcher covers everything
+    /// and whose only glass is one card. A `layer-rule` blurring the surface rect flattens the
+    /// entire output; this must hand over the card alone.
+    #[test]
+    fn a_full_screen_surfaces_blur_region_is_the_card_that_asked_and_not_the_catcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_lua = write_shell_lua(
+            dir.path(),
+            r##"return {
+                panel {
+                    id = "host", layer = "Overlay",
+                    anchor = { top = true, bottom = true, left = true, right = true },
+                    exclusive = false, width = "Fill", height = "Fill",
+                    child = rect { width = "Fill", height = "Fill", children = {
+                        button { width = "Fill", height = "Fill", on_click = function() end },
+                        column { margin = { top = 260, left = 200 }, children = {
+                            rect {
+                                width = 620, height = 260, radius = 0,
+                                background = "#20222eb0", blur = true,
+                            },
+                        } },
+                    } },
+                },
+            }"##,
+        );
+        let (mut client, _rx) = test_client(&shell_lua);
+        assert!(run_startup(&mut client), "the config must resolve into a scene");
+        let tree = client.scene().surface("host@TEST").expect("the panel resolved");
+
+        assert_eq!(
+            layout::blur_regions(tree, 1.0),
+            [crate::text::snap::PhysicalRect { x0: 200, y0: 260, x1: 820, y1: 520 }],
+            "the card that asked, at its surface-local position"
+        );
+        assert_eq!(
+            layout::overlay_input_regions(tree, 1.0),
+            [
+                crate::text::snap::PhysicalRect { x0: 0, y0: 0, x1: 1920, y1: 1080 },
+                crate::text::snap::PhysicalRect { x0: 200, y0: 260, x1: 820, y1: 520 }
+            ],
+            "while the catcher still takes every click, which is the difference between the two walks"
+        );
+    }
+
     /// One 1920x1080 `"TEST"` output keeps fixture ids readable (`"bar@TEST"`).
     fn test_outputs() -> Vec<OutputGeometry> {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]

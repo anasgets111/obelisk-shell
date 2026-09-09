@@ -56,7 +56,7 @@ const COMMON_PROPERTIES: &[&str] = &[
 
 /// Box-paint properties beyond [`COMMON_PROPERTIES`]. `node::paint_style`'s first arm paints
 /// `row`, `column`, `button`, `rect`, and all four § 6 roles alike.
-const BOX_PROPERTIES: &[&str] = &["background", "border_color", "border_width", "clip", "radius"];
+const BOX_PROPERTIES: &[&str] = &["background", "blur", "border_color", "border_width", "clip", "radius"];
 
 /// Which kinds that arm covers.
 const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "window", "popup", "lock"];
@@ -552,7 +552,7 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 746, "the number of declared type members moved; confirm the change is intended");
+        assert_eq!(probed, 762, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when

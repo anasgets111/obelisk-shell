@@ -71,6 +71,7 @@ struct LayoutStyle {
     visible: bool,
     opacity: f32,
     transform: node::Transform,
+    blur: bool,
 }
 
 impl LayoutStyle {
@@ -93,6 +94,7 @@ impl LayoutStyle {
             visible: node::parse_visible(properties)?,
             opacity: node::parse_opacity(properties)?,
             transform: node::parse_transform(properties)?,
+            blur: node::parse_blur(properties)?,
         })
     }
 }
@@ -138,6 +140,10 @@ pub struct ResolvedNode {
     /// and everything the solver produced are untransformed. `layout::paint` composes it down
     /// the subtree, `layout::hit` maps the pointer back through its inverse.
     pub transform: node::Transform,
+    /// This node asked for the desktop behind it to be blurred (§ 5.1 `blur`, ADR-0195).
+    /// [`blur_regions`] turns every one of these in a surface into the one region the compositor
+    /// is given; nothing else reads it, and a compositor without the protocol ignores the lot.
+    pub blur: bool,
     pub properties: HashMap<String, Value>,
     /// This node's paint properties, parsed here rather than by `layout::paint` on every frame
     /// (`node::paint_style`'s module doc comment says why). `None` for a kind that draws nothing.
@@ -1371,6 +1377,7 @@ fn finish(
             visible: style.visible,
             opacity: style.opacity,
             transform: style.transform,
+            blur: style.blur,
             properties,
             paint,
             displayed_source,
@@ -1437,6 +1444,7 @@ fn finish(
         visible: style.visible,
         opacity: style.opacity,
         transform: style.transform,
+        blur: style.blur,
         properties,
         paint,
         displayed_source,
@@ -1910,6 +1918,158 @@ pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<Phy
         collect_input_regions(child, 0.0, 0.0, scale, &mut regions);
     }
     regions
+}
+
+/// Every `blur = true` node in one surface, as the physical rects the compositor is handed
+/// (ADR-0195). Pure; the `ext_background_effect_surface_v1::set_blur_region` push it feeds lives
+/// in `crate::wayland::App::apply_blur_region`.
+///
+/// Opt-in, never inferred. The sibling walk above answers "what can be clicked", which has one
+/// correct answer and so needs no config input; "what should be blurred" is an aesthetic with no
+/// correct answer, and inferring it from `background` alpha would have been a guess: `dev-config`
+/// writes `background = "#00000000"` on eight deliberately invisible controls, and border-only or
+/// image-backed glass carries no background alpha to read.
+///
+/// Three things this does that [`overlay_input_regions`] does not, each because blur is about
+/// where a node is *painted* rather than where it can be pressed:
+///
+/// 1. **Ancestor transforms compose.** `painted_bounds` reads one node's own transform and says so;
+///    a notification card slides in under `translate` while its own children are the glass, so a
+///    walk that missed the ancestor's shift would blur where the card is not. Exact for the
+///    translation every animation here uses; a rotated or scaled node contributes its bounding box.
+/// 2. **Ancestor clips intersect.** `layout::paint::build_node` clips every child to its parent's
+///    box, so a card scrolled out of a `max_height` list is not drawn and must not blur either.
+/// 3. **The surface root is included**, because a root may paint its own box.
+///
+/// A claiming node does not stop the walk: a marked child inside a marked parent unions into it,
+/// and a rounded parent that does not clip can have children painting outside its corners.
+pub fn blur_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
+    let mut regions = Vec::new();
+    let everything = PhysicalRect { x0: i32::MIN / 2, y0: i32::MIN / 2, x1: i32::MAX / 2, y1: i32::MAX / 2 };
+    collect_blur_regions(surface_root, 0.0, 0.0, scale, IDENTITY_AFFINE, everything, 1.0, &mut regions);
+    regions
+}
+
+const IDENTITY_AFFINE: node::Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `outer` applied after `inner`, which is the order `layout::paint` nests its `Draw::Transformed`
+/// groups in.
+fn compose_affine(outer: node::Affine, inner: node::Affine) -> node::Affine {
+    let [a1, b1, c1, d1, e1, f1] = outer;
+    let [a2, b2, c2, d2, e2, f2] = inner;
+    [
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    ]
+}
+
+/// The axis-aligned bounds of `rect`'s four corners under `matrix`.
+fn transformed_bounds(matrix: node::Affine, rect: LogicalRect) -> LogicalRect {
+    let corners = [
+        node::apply_affine(matrix, rect.x, rect.y),
+        node::apply_affine(matrix, rect.x + rect.width, rect.y),
+        node::apply_affine(matrix, rect.x, rect.y + rect.height),
+        node::apply_affine(matrix, rect.x + rect.width, rect.y + rect.height),
+    ];
+    let (x0, y0) = corners.iter().fold((f32::MAX, f32::MAX), |(x, y), &(cx, cy)| (x.min(cx), y.min(cy)));
+    let (x1, y1) = corners.iter().fold((f32::MIN, f32::MIN), |(x, y), &(cx, cy)| (x.max(cx), y.max(cy)));
+    LogicalRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+}
+
+fn intersect_physical(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
+    PhysicalRect { x0: a.x0.max(b.x0), y0: a.y0.max(b.y0), x1: a.x1.min(b.x1), y1: a.y1.min(b.y1) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_blur_regions(
+    node: &ResolvedNode,
+    origin_x: f32,
+    origin_y: f32,
+    scale: f32,
+    matrix: node::Affine,
+    clip: PhysicalRect,
+    opacity: f32,
+    out: &mut Vec<PhysicalRect>,
+) {
+    // `visible`, not `in_flow`: a leaving node is still painted (ADR-0150) and its glass is still
+    // on the glass. A fully faded subtree paints nothing, so it asks for nothing.
+    if !node.visible || opacity * node.opacity <= 0.0 {
+        return;
+    }
+    let rect = LogicalRect { x: origin_x + node.rect.x, y: origin_y + node.rect.y, ..node.rect };
+    let matrix =
+        if node.transform.is_identity() { matrix } else { compose_affine(matrix, node.transform.matrix(rect)) };
+    // Mirrors `layout::paint::build_node`: a node clips its children to its own box before drawing
+    // them, so the running clip is the intersection of every ancestor box.
+    let clip = intersect_physical(clip, snap_to_physical(transformed_bounds(matrix, rect), scale));
+    if clip.x1 <= clip.x0 || clip.y1 <= clip.y0 {
+        return;
+    }
+    if node.blur {
+        let painted = snap_to_physical(transformed_bounds(matrix, rect), scale);
+        let radius = match &node.paint {
+            Some(PaintStyle::Box { radius, .. }) => *radius,
+            _ => 0.0,
+        };
+        // The radius travels with the box, so scale it the way the box was scaled. An axis-aligned
+        // matrix scales x and y alike here; a rotation would not, and a rounded rotated box is
+        // approximated by the larger of the two.
+        let grow = ((matrix[0] * matrix[0] + matrix[1] * matrix[1]).sqrt())
+            .max((matrix[2] * matrix[2] + matrix[3] * matrix[3]).sqrt());
+        push_rounded_rect(intersect_physical(painted, clip), radius * scale * grow, out);
+    }
+    for child in &node.children {
+        collect_blur_regions(child, rect.x, rect.y, scale, matrix, clip, opacity * node.opacity, out);
+    }
+}
+
+/// A rounded rectangle as the axis-aligned rectangles a `wl_region` is made of, since the protocol
+/// carries no radius.
+///
+/// The middle is one rectangle and only the two corner bands are cut into strips, so an ordinary
+/// card costs about `radius` rectangles rather than its height in them: at `radius.md` that is a
+/// couple of dozen, against the ~600 a scanline-per-row rasterisation would have sent every frame.
+/// Rows sharing an inset merge into one strip, which is most of them near the middle of a band.
+fn push_rounded_rect(rect: PhysicalRect, radius: f32, out: &mut Vec<PhysicalRect>) {
+    if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 {
+        return;
+    }
+    let height = rect.y1 - rect.y0;
+    let width = rect.x1 - rect.x0;
+    // A radius cannot exceed half the box in either axis, the same clamp the painter's arcs use.
+    let r = (radius.round().max(0.0) as i32).min(width / 2).min(height / 2);
+    if r <= 0 {
+        out.push(rect);
+        return;
+    }
+    // The straight middle, full width, between the two corner bands.
+    out.push(PhysicalRect { x0: rect.x0, y0: rect.y0 + r, x1: rect.x1, y1: rect.y1 - r });
+    // One band walked once, mirrored top and bottom: row `dy` from the band's outer edge sits
+    // `r - sqrt(r^2 - (r - dy)^2)` in from each side.
+    let mut row = 0;
+    while row < r {
+        let inset = inset_at(r, row);
+        let mut last = row + 1;
+        while last < r && inset_at(r, last) == inset {
+            last += 1;
+        }
+        if rect.x0 + inset < rect.x1 - inset {
+            out.push(PhysicalRect { x0: rect.x0 + inset, y0: rect.y0 + row, x1: rect.x1 - inset, y1: rect.y0 + last });
+            out.push(PhysicalRect { x0: rect.x0 + inset, y0: rect.y1 - last, x1: rect.x1 - inset, y1: rect.y1 - row });
+        }
+        row = last;
+    }
+}
+
+/// How far row `row` of a corner band is inset from the side, for a corner of radius `r`.
+fn inset_at(r: i32, row: i32) -> i32 {
+    let dy = (r - row) as f32;
+    let r = r as f32;
+    (r - (r * r - dy * dy).max(0.0).sqrt()).round() as i32
 }
 
 fn collect_input_regions(node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32, out: &mut Vec<PhysicalRect>) {
@@ -5214,6 +5374,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(id),
@@ -5225,6 +5386,112 @@ pub(super) mod tests {
             paint,
             children,
         }
+    }
+
+    /// The catcher case the whole design exists for: a full-screen surface whose only glass is one
+    /// card must hand the compositor the card, not the screen. Proven empirically first -- a niri
+    /// `layer-rule` blurring the surface rect flattened a striped backdrop across the whole output.
+    #[test]
+    fn blur_regions_claim_only_the_marked_node_inside_a_full_screen_surface() {
+        let lua = mlua::Lua::new();
+        let mut card = region_node(1, "rect", (200.0, 260.0, 620.0, 260.0), solid_paint(), Vec::new());
+        card.blur = true;
+        let mut catcher = region_node(2, "button", (0.0, 0.0, 1920.0, 1161.0), None, Vec::new());
+        catcher
+            .properties
+            .insert("on_click".to_string(), Value::Function(lua.create_function(|_, ()| Ok(())).unwrap()));
+        let root = region_node(3, "panel", (0.0, 0.0, 1920.0, 1161.0), None, vec![catcher, card]);
+
+        assert_eq!(
+            blur_regions(&root, 1.0),
+            [PhysicalRect { x0: 200, y0: 260, x1: 820, y1: 520 }],
+            "the card only; the catcher takes the whole screen for input and none of it for blur"
+        );
+        assert_eq!(
+            overlay_input_regions(&root, 1.0),
+            [PhysicalRect { x0: 0, y0: 0, x1: 1920, y1: 1161 }, PhysicalRect { x0: 200, y0: 260, x1: 820, y1: 520 }],
+            "and the input region still takes the whole screen, which is the point of the catcher"
+        );
+    }
+
+    /// A notification card slides in under `translate` and its glass is the card itself, so the
+    /// blur has to travel with the paint. `painted_bounds` reads one node's own transform only
+    /// (its comment says so); this walk composes ancestors' too.
+    #[test]
+    fn blur_regions_follow_an_ancestors_transform_and_an_ancestors_clip() {
+        let mut card = region_node(1, "rect", (0.0, 0.0, 100.0, 40.0), solid_paint(), Vec::new());
+        card.blur = true;
+        let build_slider = |id: u64, card: ResolvedNode| {
+            let mut slider = region_node(id, "column", (10.0, 10.0, 100.0, 40.0), None, vec![card]);
+            slider.transform = node::Transform { translate: (300.0, 0.0), ..node::Transform::default() };
+            slider
+        };
+        let slider = build_slider(2, card.clone());
+        let root = region_node(3, "panel", (0.0, 0.0, 500.0, 100.0), None, vec![slider]);
+        assert_eq!(
+            blur_regions(&root, 1.0),
+            [PhysicalRect { x0: 310, y0: 10, x1: 410, y1: 50 }],
+            "the card blurs where its parent's translate paints it, not where the solver left it"
+        );
+
+        // The surface is an ancestor box like any other, so a card sliding past its edge is cut
+        // there. The compositor clips to the surface too; agreeing with it costs nothing.
+        let narrow = region_node(7, "panel", (0.0, 0.0, 400.0, 100.0), None, vec![build_slider(8, card)]);
+        assert_eq!(
+            blur_regions(&narrow, 1.0),
+            [PhysicalRect { x0: 310, y0: 10, x1: 400, y1: 50 }],
+            "cut at the surface edge on the way in"
+        );
+
+        // The same card scrolled halfway out of a shorter list: paint clips it to the parent box
+        // (`layout::paint::build_node`), so blur stops at the same edge.
+        let mut card = region_node(4, "rect", (0.0, 0.0, 100.0, 40.0), solid_paint(), Vec::new());
+        card.blur = true;
+        let list = region_node(5, "list", (0.0, 0.0, 100.0, 20.0), None, vec![card]);
+        let root = region_node(6, "panel", (0.0, 0.0, 400.0, 100.0), None, vec![list]);
+        assert_eq!(
+            blur_regions(&root, 1.0),
+            [PhysicalRect { x0: 0, y0: 0, x1: 100, y1: 20 }],
+            "clipped to the list, not the card's own height"
+        );
+    }
+
+    /// Opt-in and nothing else: translucency is not a request, and a faded-out subtree asks for
+    /// nothing because it paints nothing.
+    #[test]
+    fn blur_is_opt_in_and_a_faded_subtree_asks_for_nothing() {
+        let glass = region_node(1, "rect", (0.0, 0.0, 100.0, 40.0), solid_paint(), Vec::new());
+        let root = region_node(2, "panel", (0.0, 0.0, 400.0, 100.0), None, vec![glass]);
+        assert!(blur_regions(&root, 1.0).is_empty(), "a painted box that never asked does not blur");
+
+        let mut card = region_node(3, "rect", (0.0, 0.0, 100.0, 40.0), solid_paint(), Vec::new());
+        card.blur = true;
+        let mut faded = region_node(4, "column", (0.0, 0.0, 100.0, 40.0), None, vec![card]);
+        faded.opacity = 0.0;
+        let root = region_node(5, "panel", (0.0, 0.0, 400.0, 100.0), None, vec![faded]);
+        assert!(blur_regions(&root, 1.0).is_empty(), "nothing is painted at zero opacity, so nothing is blurred");
+    }
+
+    /// `wl_region` carries no radius, so a rounded card is sent as strips. The cost matters: this
+    /// is pushed every time the region changes, so a card must not cost its height in rectangles.
+    #[test]
+    fn a_rounded_box_becomes_a_middle_and_two_corner_bands_costing_about_its_radius() {
+        let mut strips = Vec::new();
+        push_rounded_rect(PhysicalRect { x0: 0, y0: 0, x1: 600, y1: 300 }, 12.0, &mut strips);
+
+        assert_eq!(strips[0], PhysicalRect { x0: 0, y0: 12, x1: 600, y1: 288 }, "the straight middle is one rect");
+        assert!(strips.len() < 30, "about the radius in strips, not the height: {}", strips.len());
+        // Every strip is inside the box, and none of them reaches a corner pixel.
+        for s in &strips {
+            assert!(s.x0 >= 0 && s.y0 >= 0 && s.x1 <= 600 && s.y1 <= 300, "{s:?} escapes the box");
+            assert!(s.x1 > s.x0 && s.y1 > s.y0, "{s:?} is empty");
+        }
+        let corner = strips.iter().any(|s| s.x0 == 0 && s.y0 == 0);
+        assert!(!corner, "the top-left pixel belongs to the rounding, not to the region");
+
+        let mut square = Vec::new();
+        push_rounded_rect(PhysicalRect { x0: 0, y0: 0, x1: 10, y1: 10 }, 0.0, &mut square);
+        assert_eq!(square, [PhysicalRect { x0: 0, y0: 0, x1: 10, y1: 10 }], "no radius is one rectangle");
     }
 
     /// ADR-0109: a transparent container is walked into; a solid child claims its box; a `button`
@@ -5275,6 +5542,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(102),
@@ -5291,6 +5559,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(103),
@@ -5307,6 +5576,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(104),
@@ -5331,6 +5601,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(105),
@@ -5347,6 +5618,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(106),
@@ -5371,6 +5643,7 @@ pub(super) mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: NodeId::test(107),
@@ -5385,6 +5658,7 @@ pub(super) mod tests {
                 dissolve: None,
                 tweens: Vec::new(),
                 leaving: false,
+                blur: false,
                 transform: node::Transform::default(),
                 margin: crate::layout::node::EdgeInsets::default(),
                 id: NodeId::test(120),

@@ -41,7 +41,7 @@ pub use spec::{
 #[cfg(test)]
 pub use spec::LockSpec;
 pub use style::{
-    Affine, BorderColor, ClipShape, Transform, apply_affine, invert_affine, parse_align, parse_cursor,
+    Affine, BorderColor, ClipShape, Transform, apply_affine, invert_affine, parse_align, parse_blur, parse_cursor,
     parse_edge_insets, parse_list_direction, parse_max_size, parse_opacity, parse_size_mode, parse_spacing,
     parse_transform, parse_visible,
 };

@@ -4736,3 +4736,67 @@ matters. `stored_size` fills the box while `thumbnail` fits inside it, so a 16:9
 128 box thumbnails to 128x72 and stores at 228x128: reusing there would upscale a thumbnail instead
 of downscaling a photograph. Square-ish sources take the shortcut, wide ones keep the full-source
 scale they need.
+
+## 0195. `blur` is opt-in per node and the region is derived from where that node is painted, because "what can be clicked" has one right answer and "what should be blurred" does not
+
+`ext-background-effect-v1` is three requests -- `get_background_effect(wl_surface)`,
+`set_blur_region(wl_region)`, `destroy` -- and niri implements it. The alternative needs no client
+code at all: a niri `layer-rule` matching a layer namespace blurs the surface behind it, and our
+namespaces are already `oblisk-{id}`.
+
+That alternative was measured before it was rejected. A full-screen surface holding a click-catcher
+and one 620x260 card, with a striped backdrop behind it: the stripe luma spread at a point far from
+the card went from 224 with the rule off to 5 with it on. The rule blurs the surface rectangle, and
+`panel_host`, `modal_host` and the wallpaper are all screen-sized, so the routine case would be
+opening a panel and blurring the whole desktop. The rule is right for a bar and wrong for everything
+else here.
+
+1. **Per node, opt-in, and never inferred.** The first design was per *surface*, with the engine
+   picking the rects inside it by `background` alpha under 1. Two facts in this repo killed it:
+   `dev-config` writes `background = "#00000000"` on eight deliberately invisible controls, so
+   translucency does not mean "blur behind me"; and border-only or image-backed glass carries no
+   background alpha to read at all. Inference would have been a guess dressed as a rule. A node that
+   wants blur says so.
+2. **`blur` is a `BOX_PROPERTIES` name, so the four surface roles accept it too.** A root that paints
+   its own box can ask, which the earlier surface-level design would have made a second mechanism.
+3. **The region is where the node is *painted*, which is not where `overlay_input_regions` says it
+   is.** That walk answers a different question and takes two documented shortcuts this one cannot:
+   it composes no ancestor transforms (`painted_bounds` says so), and it carries no ancestor clip.
+   Both matter here and neither matters for input. A notification card enters under `translate`
+   while its glass is the card itself, so an uncomposed walk would blur where the card is not; a
+   history card scrolled out of a `max_height` list is not drawn and must not blur. So this walk
+   composes the matrix and intersects the clip, mirroring `layout::paint::build_node`, which clips
+   every child to its parent's box. Exact for the translation every animation here uses; a rotated
+   or scaled node contributes its bounding box.
+4. **A claiming node does not stop the walk.** The input walk returns at the box it claims, which is
+   right when the question is "does this point hit something". A marked child inside a marked parent
+   simply unions, and a rounded parent that does not clip can have children painting outside its
+   corners, so stopping would lose them.
+5. **`wl_region` has no radius, so a rounded box is sent as strips.** The middle is one rectangle and
+   only the two corner bands are cut up, with equal-inset rows merged: about `radius` rectangles
+   rather than the box's height in them. A 620x260 card at `radius.md` measured 27 rects on the
+   wire, against roughly 600 for a scanline-per-row rasterisation.
+6. **This one diffs, and `apply_input_region` still does not.** That refusal is deliberate and says
+   why: one `wl_region` round trip is cheaper than the GPU repaint that follows it. The reasoning
+   assumed a handful of rectangles. Twenty-seven per card, several cards, and an identical region on
+   every frame of a fade is a different trade, so an unchanged region is not resent -- one
+   `set_blur_region` against four `set_input_region` calls over the same startup.
+7. **Absent support is silence, not an error.** No manager, or a `blur` capability the compositor
+   never sets or later withdraws, means nothing is pushed and the config hears nothing. A compositor
+   feature that is missing is not a config mistake, which is the answer every other optional global
+   here already gets. The capability is tracked live rather than read once, because the protocol says
+   the bit can go away and take existing regions with it.
+8. **The effect object is lazy and dies with its `wl_surface`.** Most surfaces never set `blur`, and
+   an object plus a destroy for each of them buys nothing. `unmap` drops it and clears the last
+   region, so the next map builds a fresh pair and pushes again.
+
+Not built: a per-node opt-out. It cannot be a plain negation -- suppressing a child's contribution
+cannot remove blur its parent already asked for, which is hole-punching and a different feature --
+and nothing in `dev-config` wants a translucent box without blur. The roadmap's rule applies:
+decide against a real consumer first. Also not built: any blur *parameter*. Strength, passes and
+xray live in the compositor's configuration and the protocol carries none of them, so `blur` is a
+boolean that cannot grow, and that is the protocol's shape rather than a simplification.
+
+Verified on the wire against niri rather than by reading: `capabilities(1)`, one
+`get_background_effect`, one `set_blur_region`, and the 27 `wl_region.add` calls with the middle
+band first (`add(200, 280, 620, 220)`) and the corner strips insetting symmetrically after it.

@@ -121,6 +121,7 @@ mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: crate::layout::node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             id: crate::layout::scene::NodeId::test(0),

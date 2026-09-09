@@ -1636,6 +1636,7 @@ mod tests {
             dissolve: None,
             tweens: Vec::new(),
             leaving: false,
+            blur: false,
             transform: crate::layout::node::Transform::default(),
             margin: crate::layout::node::EdgeInsets::default(),
             // Distinct per node, since `focused_field` now reads an identity off one of these and

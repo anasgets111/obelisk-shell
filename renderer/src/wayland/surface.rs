@@ -7,6 +7,8 @@ use super::*;
 /// A surface bound to shared EGL after its first configure. Field order is load-bearing:
 /// wayland-egl requires `WlEglSurface` to outlive the EGL surface, and Rust drops top to bottom;
 /// `khronos_egl::Surface` has no `Drop`, so [`App::destroy_surface_by_id`] destroys it explicitly.
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+
 pub(super) struct BoundSurface {
     egl_surface: EglSurface,
     #[allow(dead_code)]
@@ -158,6 +160,16 @@ pub(super) struct TrackedSurface {
     /// kept landing in that window, evicting a whole picker's thumbnails, which then re-decoded,
     /// landed, and unpinned everything again.
     pub(super) stale: bool,
+    /// This surface's `ext_background_effect_surface_v1`, created the first time the tree asks for
+    /// blur and destroyed with the `wl_surface` it names (ADR-0195). `None` on a compositor
+    /// without the protocol, and on every surface whose tree never sets `blur`.
+    pub(super) blur_effect: Option<ExtBackgroundEffectSurfaceV1>,
+    /// The region last sent, so an unchanged one is not resent. `apply_input_region` deliberately
+    /// does not diff, and says why: one `wl_region` round trip is cheaper than the repaint that
+    /// follows it. That reasoning was about a handful of rectangles. A rounded card is a couple of
+    /// dozen, several cards more, and a card that only fades has the same region on every frame of
+    /// the fade -- so this one compares.
+    pub(super) last_blur_region: Vec<crate::text::snap::PhysicalRect>,
 }
 /// Which surfaces a narrowed repaint must cover: the ones a tick advanced, plus every surface
 /// already marked `stale`.
@@ -528,7 +540,7 @@ impl App {
         // `Scene::surface` lends its tree, so what the tree is read for is taken here and the
         // borrow ends with this block; the role updates below write through `&mut self`. Exactly
         // one spec is parsed -- the one this surface's role calls for.
-        let (panel, window, popup, regions, visible) = {
+        let (panel, window, popup, regions, visible, blur) = {
             let Some(tree) = self.client.scene().surface(&surface_id) else {
                 // Startup/apply failure or rollback (`Scene::apply` restores its prior state): keep
                 // the last applied fields rather than pushing defaults over a working surface.
@@ -541,6 +553,7 @@ impl App {
                 matches!(role, TrackedRole::Popup { .. }).then(|| node::popup_spec(&tree.properties)),
                 layout::overlay_input_regions(tree, 1.0),
                 tree.visible,
+                layout::blur_regions(tree, 1.0),
             )
         };
 
@@ -576,6 +589,7 @@ impl App {
         // arrives in configure. The create path parses a spec only for the role match; input region
         // handling still runs.
         self.apply_input_region(index, regions);
+        self.apply_blur_region(index, blur);
         self.apply_visibility(index, visible);
     }
 
@@ -605,6 +619,58 @@ impl App {
         }
         surface.set_input_region(Some(region.wl_region()));
         // `set_input_region` copies the contents, so dropping the region here is sufficient.
+    }
+
+    /// Hand the compositor the region behind this surface it should blur (§ 5.1 `blur`,
+    /// ADR-0195). The rects come from `layout::blur_regions`, which is where the policy lives; this
+    /// is only the push.
+    ///
+    /// Lazily created and never created at all for the common surface, because most surfaces never
+    /// set `blur` and an `ext_background_effect_surface_v1` per surface would be an object and a
+    /// destroy for nothing. The object names a `wl_surface`, so it is dropped with one: `unmap`
+    /// takes the layer object down and the next `create` makes a fresh pair.
+    ///
+    /// A compositor with no manager, or one whose `blur` capability is absent or withdrawn, gets
+    /// nothing pushed and the config sees no error -- an unavailable compositor feature is not a
+    /// config mistake.
+    fn apply_blur_region(&mut self, index: usize, regions: Vec<crate::text::snap::PhysicalRect>) {
+        let Some((manager, supported)) = self.background_effect.as_ref() else {
+            return;
+        };
+        if !supported {
+            return;
+        }
+        if regions == self.surfaces[index].last_blur_region {
+            return;
+        }
+        let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
+            return;
+        };
+        let manager = manager.clone();
+        let qh = self.queue_handle.clone();
+        if self.surfaces[index].blur_effect.is_none() {
+            // Nothing to ask for and nothing asked for before: do not create the object at all.
+            if regions.is_empty() {
+                return;
+            }
+            self.surfaces[index].blur_effect = Some(manager.get_background_effect(&surface, &qh, ()));
+        }
+        let region = match Region::new(&self.compositor_state) {
+            Ok(region) => region,
+            Err(e) => {
+                log_bind_failure(&self.surfaces[index].surface_id.clone(), "wl_compositor::create_region", e);
+                return;
+            }
+        };
+        for rect in &regions {
+            region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+        }
+        if let Some(effect) = self.surfaces[index].blur_effect.as_ref() {
+            // A null region would remove the effect; an empty one keeps the object and blurs
+            // nothing, which is what a surface whose glass is currently hidden wants.
+            effect.set_blur_region(Some(region.wl_region()));
+        }
+        self.surfaces[index].last_blur_region = regions;
     }
 
     /// Apply § 5.1 `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
@@ -657,6 +723,10 @@ impl App {
         if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
             drop(layer.take());
         }
+        // The effect object names the `wl_surface` that just went away; a stale one would be inert
+        // at best. The next map creates a fresh pair, and the cleared region forces the push.
+        drop(self.surfaces[index].blur_effect.take());
+        self.surfaces[index].last_blur_region.clear();
         self.surfaces[index].map_state = MapState::Unmapped;
         self.surfaces[index].null_buffered = false;
         // The old object and its pixels are gone; force the next object to paint.
