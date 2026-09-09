@@ -41,12 +41,12 @@ local SCRIM         = theme.with_opacity(theme.BG, 0.6)
 --
 -- The lock comes down when the *engine* says so, not when the tween ends: the user has already
 -- authenticated, and a config is not allowed to keep them looking at a lock screen (ADR-0190).
--- So this number has to cover the exit rather than describe it, and it is derived from the two
--- animations below instead of written twice.
+-- So this number has to cover the exit rather than describe it, and it is read off the card's
+-- animation below instead of written twice.
 --
--- The card fades over `animation_slow_ms`; the ground waits `animation_ms` and then fades over
--- `animation_ms`, so the pair ends at whichever of those runs longer.
-local EXIT_MS       = math.max(theme.animation_slow_ms, theme.animation_ms * 2)
+-- The card is the only thing that moves on the way out; the ground under it holds until the
+-- compositor takes the surface away. See the ground's own note for why it cannot fade.
+local EXIT_MS       = theme.animation_slow_ms
 -- Slack, because the window opens when the Supervisor schedules the release and not when this
 -- config hears about it: a state push has to reach the Renderer and a first frame be scheduled
 -- before anything moves. Without it the exit is cut off by exactly that round trip, which is the
@@ -54,11 +54,6 @@ local EXIT_MS       = math.max(theme.animation_slow_ms, theme.animation_ms * 2)
 local LEAVE_SLACK   = 60
 local LEAVE_MS      = EXIT_MS + LEAVE_SLACK
 oblisk.lock:invoke("set_unlock_animation", LEAVE_MS)
-
--- True from the moment PAM says yes until the lock is off the glass.
-local leaving      = oblisk.lock:map(function(l)
-    return l ~= nil and l.unlocking
-end)
 
 -- True exactly while the card should be up: the compositor has granted the lock and PAM has not yet
 -- answered. Both edges of the card's motion are this one flag changing value.
@@ -352,15 +347,16 @@ local function content(output)
     return rect {
         width = "Fill",
         height = "Fill",
-        -- The ground leaves a stage after the card, which is the mirror's `phase` 1 -> 0 following
-        -- its 2 -> 1: the screen behind the card is the last thing to go, so the session does not
-        -- appear through a card that is still on its way out.
-        opacity = leaving:map(function(out)
-            return out and 0 or 1
-        end),
-        animate = {
-            opacity = { duration = theme.animation_ms, easing = "InCubic", delay = theme.animation_ms },
-        },
+        -- Opaque for the whole of the lock's life, including its exit. The mirror fades this
+        -- ground out after the card (`phase` 1 -> 0), because a QML lock screen is a window with
+        -- the session behind it. Here it is an `ext_session_lock_v1` surface, and behind one of
+        -- those there is no session to reveal: every other client is hidden and the compositor
+        -- paints its own not-yet-locked colour, which on niri is solid red. Fading this to zero
+        -- shows that colour rather than the desktop, and the frame after the tween lands -- the
+        -- `LEAVE_SLACK` before the release -- is a full screen of it.
+        --
+        -- So the wallpaper is the last thing on screen and the compositor's unlock is what takes
+        -- it away. There is no cross-fade to the session available under this protocol.
         -- Under the image, as `modules/global/wallpaper.lua` is: a failed decode leaves the lock
         -- dark rather than transparent, which on a lock screen is the difference between a mistake
         -- and a hole through to the session.
@@ -386,9 +382,8 @@ local function content(output)
                 -- tween to reach and the entry is skipped (`Animatable::from_value` on an absent
                 -- property answers "nothing to animate").
                 --
-                -- On the way out both run backwards, which is `leaving` doing the same job the
-                -- `from` does on the way in: the card shrinks back to `CLOSED_SCALE` and fades,
-                -- and the ground below follows it a stage later.
+                -- On the way out both run backwards, and this is the whole exit: the card
+                -- shrinks back to `CLOSED_SCALE` and fades off a wallpaper that stays put.
                 opacity = up:map(function(on)
                     return on and 1 or 0
                 end),
