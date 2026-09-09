@@ -52,7 +52,12 @@ local visible_groups = computed(
         local all = util.group_notifications(unseen, applications)
         local shown = {}
         for index = 1, math.min(#all, MAX_CARDS) do
-            shown[index] = all[index]
+            local group = all[index]
+            -- Where this card sits in the stack, read by `components/notification_card.lua` to
+            -- stagger the entry. `all` is built fresh by `group_notifications` on every pass, so
+            -- this stamps a local table rather than anything the capability holds.
+            group.rank = index
+            shown[index] = group
         end
         return shown
     end

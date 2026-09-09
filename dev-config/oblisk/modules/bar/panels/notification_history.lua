@@ -188,9 +188,11 @@ local body = {
                     if item.kind == "header" then
                         return section_header(item.label)
                     end
-                    -- Lighter ground inside the glass panel; the popup's heavier ground would read
-                    -- as a second sheet. History also shows the time.
-                    return notification_card(item, ui, { background = theme.GLASS_CONTENT, show_time = true })
+                    -- `groupScope: "history"`: lighter ground inside the glass panel, because the
+                    -- popup's heavier ground would read as a second sheet; a timestamp, because
+                    -- this list is about when; and no flight in from the right, because there is
+                    -- no screen edge here to fly in from.
+                    return notification_card(item, ui, { scope = "history" })
                 end,
                 key = function(item)
                     return item.key

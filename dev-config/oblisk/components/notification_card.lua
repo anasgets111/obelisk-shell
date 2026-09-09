@@ -1,8 +1,8 @@
 -- One application's notifications as one card, matching
 -- `Modules/Notification/NotificationCard.qml`.
 -- The popup stack (`modules/notification/popup.lua`) and history panel
--- (`modules/bar/panels/notification_history.lua`) share it; only ground colour and old-card dismiss
--- behavior differ.
+-- (`modules/bar/panels/notification_history.lua`) share it; `opts.scope` carries the three things
+-- they disagree about -- ground colour, timestamp, and how a card arrives.
 -- ## Why this is built in Lua rather than bound
 -- Structure, such as shown messages, a reply row, and action count, is built rather than bound
 -- because `children` takes an array, not a `Bound`. A `list`'s `itemfn` runs for every element on
@@ -15,8 +15,9 @@
 -- `textfield` (ADR-0092), `timestamp` (ADR-0093), and `hold_expiry`/`on_hover` so reading or
 -- replying does not remove the card (ADR-0094, ADR-0095).
 -- Body spans preserve bold, italic, underline, and accent links (ADR-0104); each link also gets an
--- opener button (ADR-0103). Removal slides and fades the card out (ADR-0150); expansion still
--- snaps.
+-- opener button (ADR-0103). A card slides and fades in (ADR-0146) and out (ADR-0150); a message
+-- box eases its hover ground (ADR-0145). Expansion, and the gap the cards below a dismissed one
+-- close, still snap.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -259,6 +260,12 @@ local function message(notification, ui, opts)
         background = ground,
         border_width = ring and theme.border_width or nil,
         border_color = ring,
+        -- `Theme.ColorTransition on border.color` / `on color`, the two the mirror puts on this
+        -- box. Only a message inside a group has either; a standalone one has no ground to ease.
+        animate = ground and {
+            background = theme.animation_ms,
+            border_color = theme.animation_ms,
+        } or nil,
         on_click = function(_, mouse_button)
             if mouse_button ~= "left" then
                 return
@@ -278,12 +285,70 @@ local function message(notification, ui, opts)
     }
 end
 
+-- How long one card waits behind the one above it before entering. Notifications usually arrive
+-- alone and this is then zero, but the whole stack returns at once whenever a panel closes or the
+-- session unlocks (`modules/notification/popup.lua`), and four cards landing on the same frame read
+-- as one block appearing rather than as a stack filling. This is the first consumer of a spec
+-- `delay` (ADR-0153), which shipped without one.
+local STAGGER_MS = 60
+
+-- The entry and exit of a whole card, which is the one thing the two scopes disagree about.
+--
+-- `NotificationCard.qml`'s `Behavior on x` flies a popup card in from beyond the right edge and
+-- takes it out the same way. It is `translate`, not `margin`: a `Fill`-width card is stretched to
+-- its parent *minus* its margin, so easing `margin.left` from a card width unfurled the card out of
+-- zero width and re-wrapped every line of text on the way in. `translate` is paint-only
+-- (ADR-0149), so the card is laid out once at its full width and only its pixels travel. The exit
+-- was already written this way (ADR-0150) and the entry was not, so the two edges did not match.
+--
+-- The entry is `animation_slow_ms` against the exit's `animation_ms`: arriving is the frame the
+-- user has to read and decelerates over a card's width, leaving is bookkeeping about something
+-- already dealt with. The mirror runs both at `animationDuration`, and 380px in 147ms is a flick.
+--
+-- Either way the cards below close the gap on one frame while a leaver slides; easing that too is
+-- a move transition the engine does not have (`docs/roadmap.md`).
+local function entry_animation(scope, rank)
+    local exit = {
+        duration = theme.animation_ms,
+        easing = "InCubic",
+        translate = { x = theme.notification_width },
+        opacity = 0,
+    }
+    if scope == "history" then
+        -- A fade, and no travel at all. The mirror gives a history card no entry either
+        -- (`_animReady` is true outside the popup scope), and a card crossing 380px of a 420px
+        -- panel is why. Nothing is arriving here: the panel is a record of things that already
+        -- happened, and a record that slides around is claiming to be news. Travel is how the
+        -- popup says "this came from outside", and that line stays the popup's alone.
+        return {
+            opacity = { duration = theme.animation_ms, from = 0 },
+            exit = exit,
+        }
+    end
+    local delay = math.max(0, ((rank or 1) - 1)) * STAGGER_MS
+    return {
+        translate = {
+            duration = theme.animation_slow_ms,
+            easing = "OutCubic",
+            delay = delay,
+            from = { x = theme.notification_width },
+        },
+        -- The same hold, so a waiting card is invisible where it waits instead of fading in off
+        -- the edge of the surface and then travelling.
+        opacity = { duration = theme.animation_slow_ms, delay = delay, from = 0 },
+        exit = exit,
+    }
+end
+
 -- `group` is one entry of `util.group_notifications`; `ui` is `lib/ui_state`.
--- The popup wants heavier glass and no clock because it is about now. A card in the glassy history
--- panel wants the lighter ground and "Wed 14:32" (`showTimestamp`). Those are the only call-site
--- differences.
+-- `opts.scope` is the mirror's `groupScope`, and picks the three things a popup and a history row
+-- disagree about: the popup wants heavier glass, no clock, and the flight in from the screen edge,
+-- because it is about now; a card in the glassy history panel wants the lighter ground,
+-- "Wed 14:32" (`showTimestamp`), and to stay where it was put.
 return function(group, ui, opts)
     opts = opts or {}
+    local scope = opts.scope or "popup"
+    local in_history = scope == "history"
     local items = group.items or {}
     local expanded = (ui.expanded_groups:get() or {})[group.key] or false
     local is_group = #items > 1
@@ -355,7 +420,7 @@ return function(group, ui, opts)
             -- renders
             -- one card-level message, not a list entry.
             standalone = #shown == 1,
-            age = opts.show_time and util.absolute_time(notification.timestamp) or nil,
+            age = in_history and util.absolute_time(notification.timestamp) or nil,
         })
     end
 
@@ -368,25 +433,12 @@ return function(group, ui, opts)
             bottom = theme.spacing.md,
             left = theme.spacing.md,
         },
-        -- `NotificationCard.qml`'s `Behavior on x`: a new card slides in from the right edge and
-        -- fades, its resting `margin` a table so the entry `from` has a shape to tween against
-        -- (ADR-0146). Dismissal leaves the same way (ADR-0150), through `translate` rather than
-        -- `margin`: a leaving card is out of the solver, so only the paint-only shift moves it.
-        -- The cards below close the gap at once while it slides; easing that too is a move
-        -- transition the engine does not have.
-        margin = { left = 0 },
+        -- Resting pose. `translate` is declared even in history, where nothing moves it on the
+        -- way in, because the exit still slides the card out from here.
+        translate = { x = 0, y = 0 },
         opacity = 1,
-        animate = {
-            margin = { duration = theme.animation_ms, easing = "OutCubic", from = { left = theme.notification_width } },
-            opacity = { duration = theme.animation_ms, from = 0 },
-            exit = {
-                duration = theme.animation_ms,
-                easing = "InCubic",
-                translate = { x = theme.notification_width },
-                opacity = 0,
-            },
-        },
-        background = opts.background or theme.GLASS,
+        animate = entry_animation(scope, group.rank),
+        background = in_history and theme.GLASS_CONTENT or theme.GLASS,
         radius = theme.radius.md,
         border_width = theme.border_width_medium,
         border_color = BORDER_BY_URGENCY[group.urgency] or theme.BORDER,
