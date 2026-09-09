@@ -17,14 +17,41 @@ fn unlocks_the_session(target: &SecureSubmitTarget) -> bool {
     (target.capability.as_str(), target.action.as_str()) == UNLOCK_TARGET
 }
 
-/// Every declared destination in document order. It walks the whole tree because callers ask what
-/// a surface offers before an event supplies a hit node. Malformed targets already fail
-/// `Scene::apply`; `None` means a `textfield` declared no destination. This is not admission:
-/// `tree_can_authenticate` uses [`sole_secure_submit`] so focus and lock admission cannot diverge.
+/// Every declared destination in document order, whether or not a key could reach it. It walks the
+/// whole tree because callers ask what a surface offers before an event supplies a hit node.
+/// Malformed targets already fail `Scene::apply`; `None` means a `textfield` declared no
+/// destination. This is not admission: `tree_can_authenticate` uses [`sole_secure_submit`] so focus
+/// and lock admission cannot diverge.
+///
+/// Only `socket`'s capability startup wants this reading. A prompt declared once and revealed by a
+/// pushed value must register its agent before it is shown, or the capability that would ask for the
+/// password is not running to ask (ADR-0070 decision 5). Everything that arms a keyboard wants
+/// [`typable_secure_submit_targets`] instead.
 pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarget> {
+    targets(tree, |_| true)
+}
+
+/// The destinations a key could actually arrive at: [`secure_submit_targets`] minus the subtrees no
+/// input reaches. A hidden subtree is skipped whole -- it is frozen (ADR-0124) and draws nothing --
+/// and so is a leaving one, which is out of reach by ADR-0150 while its exit tweens run.
+///
+/// The keyboard walk owes the pointer walk this. `wayland::input`'s `autofocus_field_in_scope` has
+/// always skipped both, and the gap between the two was load-bearing: one surface holding every
+/// panel body keeps eight of them hidden beside the shown one, so the hidden network password field
+/// counted as the scope's sole destination and took the keyboard from the panel that was open. An
+/// invisible field cannot be typed into on purpose, so every key went somewhere nobody could see.
+pub(crate) fn typable_secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarget> {
+    targets(tree, |node| node.visible && !node.leaving)
+}
+
+/// Document-order walk behind both readings; `descend` decides which subtrees count.
+fn targets(tree: &ResolvedNode, descend: impl Fn(&ResolvedNode) -> bool) -> Vec<SecureSubmitTarget> {
     let mut found = Vec::new();
     let mut stack = vec![tree];
     while let Some(node) = stack.pop() {
+        if !descend(node) {
+            continue;
+        }
         if let Some(node::PaintStyle::TextField { target: Some(target), .. }) = &node.paint {
             found.push(target.clone());
         }
@@ -40,12 +67,16 @@ pub(crate) fn secure_submit_targets(tree: &ResolvedNode) -> Vec<SecureSubmitTarg
 /// Scope it over the focused surface and its shown popups: niri gives a grabbing popup the keyboard
 /// only when its parent already held it. Surface-only scope made the network password prompt
 /// untypable while its popup was open, then typable after reopening the panel.
+///
+/// Sole among the *reachable* ones ([`typable_secure_submit_targets`]): a surface that declares one
+/// prompt per panel and shows one at a time offers exactly one destination at a time, and a hidden
+/// one neither counts as the sole field nor makes two.
 pub(crate) fn sole_secure_submit_in_scope<'a>(
     scope: &[(&'a str, &ResolvedNode)],
 ) -> Option<(&'a str, SecureSubmitTarget)> {
     let mut sole = None;
     for (surface_id, tree) in scope {
-        for target in secure_submit_targets(tree) {
+        for target in typable_secure_submit_targets(tree) {
             if sole.is_some() {
                 return None;
             }

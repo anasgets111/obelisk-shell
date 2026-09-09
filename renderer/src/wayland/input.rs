@@ -3,7 +3,7 @@
 //! keystrokes become a `SecureSubmit` frame without a Lua value holding plaintext (ADR-0005/0027).
 
 use super::*;
-use crate::layout::secure_submit::{secure_submit_targets, sole_secure_submit_in_scope};
+use crate::layout::secure_submit::{sole_secure_submit_in_scope, typable_secure_submit_targets};
 
 /// Mouse-wheel notch size in logical pixels (ADR-0069 decision 6): flat 39, approximating three
 /// lines of the shipped config's 13px text. A per-container step would need a font size; touchpads
@@ -329,12 +329,15 @@ fn retarget_secure_submit(
 /// Reconcile secure focus on keyboard enter from the scoped trees. Empty/untracked scopes and
 /// scopes without one `secure_submit` return `None` through [`App::focus_secure_submit`], so moving
 /// focus cannot leave keys addressed to the old field. Keep a current field only if still declared
-/// in scope. The compositor's `enter` commonly follows a press, so discarding current focus would
+/// in scope, and still reachable there: a prompt that hides while focused is as gone as one a
+/// reload deleted. The compositor's `enter` commonly follows a press, so discarding current focus would
 /// make a multi-field surface untypable by clicking. Otherwise, [`sole_secure_submit_in_scope`]
 /// refuses to guess among several fields; reloads cannot keep deleted targets.
 fn focus_on_enter(scope: &[(&str, &layout::ResolvedNode)], current: Option<&FocusedField>) -> Option<FocusedField> {
     let still_declared = |field: &&FocusedField| {
-        scope.iter().any(|(id, tree)| *id == field.surface_id && secure_submit_targets(tree).contains(&field.target))
+        scope
+            .iter()
+            .any(|(id, tree)| *id == field.surface_id && typable_secure_submit_targets(tree).contains(&field.target))
     };
     if let Some(current) = current.filter(still_declared) {
         return Some(current.clone());
@@ -349,6 +352,18 @@ fn focus_on_enter(scope: &[(&str, &layout::ResolvedNode)], current: Option<&Focu
 /// could arm a field the next key prunes.
 fn focus_is_still_armed(field: &FocusedField, scope: &[String], its_surface_is_live: bool) -> bool {
     scope.contains(&field.surface_id) && its_surface_is_live
+}
+/// Whether a plain field takes the keys arriving now. A masked field armed anywhere in scope takes
+/// them all: the two focuses are held independently, and `apply_key` offers a key to both, so a
+/// prompt revealed while a plain field was already typing would otherwise put every character of a
+/// password through that field's `on_change` -- into Lua, which is the one place a `secure_submit`
+/// secret must never reach (ADR-0005). "Masked focus wins" is the rule `arm_autofocus_if_nothing_is_typing`
+/// already states for arming; this is the same rule for the keys themselves.
+///
+/// The draft survives, exactly as it does when the surface loses the keyboard (ADR-0108): the field
+/// stops taking keys and stops drawing a caret, and is typable again when the prompt is answered.
+fn plain_field_takes_keys(typing: bool, its_surface_is_in_scope: bool, a_masked_field_is_armed: bool) -> bool {
+    typing && its_surface_is_in_scope && !a_masked_field_is_armed
 }
 /// One key event's action for a focused `secure_submit`; borrow the SCTK `KeyEvent` text, avoiding
 /// another allocation.
@@ -786,7 +801,11 @@ impl App {
     /// keyboard is on (ADR-0108). The same question decides the caret, so what is drawn as live is
     /// what a key would land in.
     fn text_field_takes_keys(&self, field: &FocusedTextField) -> bool {
-        field.typing && self.keyboard_focus_scope().contains(&field.surface_id)
+        plain_field_takes_keys(
+            field.typing,
+            self.keyboard_focus_scope().contains(&field.surface_id),
+            self.focused_secure_submit.is_some(),
+        )
     }
 
     /// Apply one plain `textfield` key (ADR-0092, § 5.2 item 8). Callbacks receive whole text, not
@@ -2147,6 +2166,43 @@ mod tests {
         // A field with no destination is not a candidate either -- it names nowhere to send to.
         let bare = tree_with(&lua, vec![textfield(&lua, None)]);
         assert_eq!(sole_secure_submit(&bare), None);
+    }
+
+    #[test]
+    fn an_armed_password_prompt_takes_the_keys_away_from_a_plain_field_that_was_typing() {
+        // The two focuses are independent and `apply_key` offers a key to both. The panel host
+        // reveals its network prompt while a notification reply may already be typing, so without
+        // this every character of that password would also arrive at the reply field's `on_change`.
+        assert!(plain_field_takes_keys(true, true, false));
+        assert!(!plain_field_takes_keys(true, true, true), "the password is not also typed into the reply box");
+        // Unchanged either way: a field no press chose, and one on a surface the keyboard left.
+        assert!(!plain_field_takes_keys(false, true, false));
+        assert!(!plain_field_takes_keys(true, false, false));
+    }
+
+    #[test]
+    fn a_hidden_secure_submit_field_neither_takes_the_keyboard_nor_hides_the_shown_one() {
+        // The single-tree panel host declares one prompt per panel body and shows one at a time.
+        // The walk used to ignore `visible`, so the network password field -- invisible, and only
+        // ever revealed by `password_ssid` -- was the scope's sole destination whenever that
+        // surface held the keyboard: it swallowed keys meant for the panel that was open, and an
+        // `autofocus` plain field beside it never armed at all.
+        let lua = Lua::new();
+        let mut hidden = textfield(&lua, Some(secure_submit_table(&lua, "network", "connect")));
+        hidden.visible = false;
+        let mut leaving = textfield(&lua, Some(secure_submit_table(&lua, "polkit", "authenticate")));
+        leaving.leaving = true;
+        let shown = textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")));
+        let tree = tree_with(&lua, vec![hidden, leaving, shown]);
+
+        assert_eq!(
+            sole_secure_submit(&tree),
+            Some(target("lock", "authenticate")),
+            "the one field a key can arrive at is the sole one, whatever the hidden siblings declare"
+        );
+        // The unfiltered reading still sees all three, because that is the one capability startup
+        // wants: a prompt has to register its agent before the capability can ask it for anything.
+        assert_eq!(crate::layout::secure_submit::secure_submit_targets(&tree).len(), 3);
     }
 
     #[test]
