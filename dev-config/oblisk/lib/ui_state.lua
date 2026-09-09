@@ -44,6 +44,79 @@ local function mark_popups_seen()
     popup_seen:set(seen)
 end
 
+-- ## Joining a network that broadcasts no name
+-- The Supervisor drops empty-SSID access points from `available_networks`, so a hidden network has
+-- no row to click: the join starts from a typed name instead. `NetworkPanel.qml` walks one sheet
+-- through three steps for it -- name, then a wait, then the password -- and these are the three
+-- signals that sheet is drawn from.
+--
+-- `hidden_prompt` is the mirror's `isHiddenTarget`: the flow is running. `hidden_draft` is what is
+-- in the name field this instant, kept because the Next button needs the text a `textfield` only
+-- ever hands to `on_change` (ADR-0092 decision 5). `hidden_ssid` is the mirror's `targetSsid`: the
+-- name once it has been submitted, which titles the rest of the sheet and is what a Retry
+-- reconnects to. None of them is a secret; the password half never passes through Lua at all.
+local hidden_prompt = state("network_hidden_prompt", false)
+local hidden_draft = state("network_hidden_draft", "")
+local hidden_ssid = state("network_hidden_ssid", "")
+
+-- Which step of the credential sheet is on screen, `""` for none: the mirror's
+-- `ssidMode`/`waitingMode`/`passwordMode` as one string, because they are points on one path and
+-- never two at once. `panel_host` reads it to decide whether to hold the keyboard, and the panel to
+-- decide what the sheet draws.
+--
+-- A password prompt outranks the hidden steps because it also answers a plain click on a secured
+-- row, where no name was ever typed. `password_ssid` names whichever network is being asked about
+-- (§ 2.5).
+--
+-- The end of a hidden join is *read*, not latched. A `computed` may not have side effects
+-- (ADR-0021) and nothing else in a config runs on a capability push, so there is no
+-- `onConnectSucceeded` to close the sheet the way the mirror does: the sheet is up while the join
+-- is unfinished, and `n.ssid` reaching the typed name is what finishes it.
+--
+-- `connect_error` is checked last. Every fresh attempt clears it -- `begin_connect` and
+-- `request_password` both do -- but only once the Supervisor has answered, so an error still
+-- standing from the previous try must not outvote the attempt now in flight.
+local credential_step = computed({ hidden_prompt, hidden_ssid, oblisk.network }, function(active, name, n)
+    if n and n.password_ssid ~= nil then
+        return "password"
+    end
+    if not active then
+        return ""
+    end
+    if name == "" then
+        return "name"
+    end
+    if n and n.ssid == name then
+        return ""
+    end
+    if n and n.connecting_ssid ~= name and n.connect_error ~= nil then
+        return "failed"
+    end
+    return "waiting"
+end)
+
+-- Whether the sheet on screen belongs to a hidden join, which is what stands in for the access
+-- point list while it runs (`visible: !root.isHiddenTarget` in the mirror). A password asked for a
+-- row that *is* listed leaves the list alone, since that row is the thing being asked about.
+local hidden_join = computed({ hidden_prompt, credential_step }, function(active, step)
+    return active and step ~= ""
+end)
+
+-- Every way out of the sheet, from Escape to closing the panel. `cancel_connect` clears a parked
+-- intent and is a no-op otherwise, so this is safe on every closing edge, including ones where
+-- nothing was pending.
+local function clear_network_prompts()
+    hidden_prompt:set(false)
+    hidden_draft:set("")
+    hidden_ssid:set("")
+    oblisk.network:invoke("cancel_connect")
+end
+
+local function open_hidden_prompt()
+    clear_network_prompts()
+    hidden_prompt:set(true)
+end
+
 -- The panel host's single close path, including prompts. `network:connect` on an unsaved secured
 -- network parks intent and raises `password_ssid` (ADR-0085); closing hides the field, while
 -- `cancel_connect` clears that intent and is a no-op otherwise, so generic close cannot clear
@@ -57,7 +130,7 @@ local function close_panel()
         mark_popups_seen()
     end
     panel_open:set(false)
-    oblisk.network:invoke("cancel_connect")
+    clear_network_prompts()
 end
 
 -- Clicking an indicator opens its panel; clicking it again closes it, matching the mirror after
@@ -78,6 +151,9 @@ local function toggle_panel(kind, rect)
     if kind == "notifications" then
         mark_popups_seen()
     end
+    -- Switching panels ends the network panel's prompts as surely as closing does. Left standing,
+    -- a pending password would keep this surface `Exclusive` over a panel that has no field in it.
+    clear_network_prompts()
     -- A panel and a modal never share the screen (`openPanel` clears `activeModal`).
     active_modal:set("")
     popup_anchor:set(rect)
@@ -228,6 +304,13 @@ return {
     panel_kind = panel_kind,
     toggle_panel = toggle_panel,
     close_panel = close_panel,
+    hidden_prompt = hidden_prompt,
+    hidden_draft = hidden_draft,
+    hidden_ssid = hidden_ssid,
+    credential_step = credential_step,
+    hidden_join = hidden_join,
+    open_hidden_prompt = open_hidden_prompt,
+    clear_network_prompts = clear_network_prompts,
     panel_showing = panel_showing,
     launcher_open = launcher_open,
     wallpaper_picker_open = wallpaper_picker_open,

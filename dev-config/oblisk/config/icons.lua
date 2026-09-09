@@ -61,6 +61,9 @@ icons.vol_high        = "\u{F057E}"
 icons.wifi            = { "\u{F091F}", "\u{F0922}", "\u{F0925}", "\u{F0928}" }
 icons.wifi_off        = "\u{F092E}"
 icons.wifi_none       = "\u{F092D}"
+-- The row that starts a hidden join, the same glyph `NetworkPanel.qml` puts on it. A network that
+-- broadcasts no SSID has no scanned row to click, so this stands for the one that is not listed.
+icons.wifi_hidden     = "\u{F05AA}"
 icons.ethernet        = "\u{F0200}"
 
 icons.bt_off          = "\u{F00B2}"

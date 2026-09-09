@@ -4,12 +4,14 @@
 -- lock -- connected". The mirror draws those facts as signal bars, a coloured "5G" band label, a
 -- lock badge, and an accent ring; the row keeps only the SSID.
 --
--- Dropped: "Hidden network..." (it needs a typed name, while this surface asks for the keyboard
--- only
--- for a pending password; see `modules/shell/panel_host.lua`), the IP address (`NetworkState` lacks
--- it), and Saved/Available sections (no `saved` flag). A connected network is saved by
--- construction,
--- so its forget action is offered there.
+-- "Hidden network..." is here now. It was dropped while this surface asked for the keyboard only for
+-- a pending password: the name field could not be typed into, because the engine armed the panel
+-- host's password field whether or not it was on screen and every key went into that invisible
+-- buffer. `layout::secure_submit` counts only the fields a key can reach now, so an `autofocus` name
+-- field beside it arms normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
+--
+-- Still dropped: the IP address (`NetworkState` lacks it) and Saved/Available sections (no `saved`
+-- flag). A connected network is saved by construction, so its forget action is offered there.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -22,6 +24,9 @@ local panel_toggle_card = require("components.panel_toggle_card")
 local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
 local panel_empty_state = require("components.panel_empty_state")
+local action_button = require("components.action_button")
+-- One-way, like every panel's: `lib/ui_state.lua` requires only `lib/util`, never a panel back.
+local ui = require("lib.ui_state")
 
 local KIND = "network"
 local SCROLL = scroll("network_aps")
@@ -132,6 +137,86 @@ local function access_point_row(entry)
     }
 end
 
+-- ## The credential sheet
+-- `NetworkPanel.qml`'s `CredentialSheet`, which is the part of the mirror this panel was missing:
+-- one block that walks a join from a typed name through the wait to the password, retitled at each
+-- step, rather than two prompts stacked in the card. `lib/ui_state.lua`'s `credential_step` says
+-- which step is on screen and `hidden_join` whether the list should stand aside for it.
+--
+-- It answers the plain row click too, whose `password_ssid` is `"password"` with no name step in
+-- front of it. The mirror puts that form inside the row it belongs to; one sheet is the shape this
+-- surface can hold, because a form per row would put a `secure_submit` field in every one of them.
+local step = ui.credential_step
+
+-- `visible` for a part of the sheet that belongs to some of the steps.
+local function during(...)
+    local wanted = {}
+    for _, name in ipairs({ ... }) do
+        wanted[name] = true
+    end
+    return step:map(function(current)
+        return wanted[current] == true
+    end)
+end
+
+-- The mirror's three titles, plus one it has no need for: a failure keeps the sheet up here, where
+-- the mirror hands the error back to the row it came from.
+local sheet_title = computed({ step, ui.hidden_ssid, oblisk.network }, function(current, name, n)
+    local target = (n and n.password_ssid) or name
+    if current == "name" then
+        return { { text = "hidden network", bold = true } }
+    elseif current == "waiting" then
+        return { { text = string.format("connecting to “%s”", target), bold = true } }
+    elseif current == "failed" then
+        return { { text = string.format("could not join “%s”", target), bold = true } }
+    end
+    return { { text = string.format("connect to “%s”", target), bold = true } }
+end)
+
+-- The mirror's `OInput`: a glass box with a ring, which `textfield` cannot draw itself. The ring is
+-- accent throughout because the sheet's field is the only thing on this surface that can hold the
+-- keyboard -- `hasError ? critical : activeFocus ? active : border` needs a focus a config cannot
+-- observe (ADR-0102), and the two states it would tell apart are the same state here.
+local function field_box(shown, field)
+    return rect {
+        visible = shown,
+        width = "Fill",
+        height = theme.control.md,
+        radius = theme.radius.md,
+        background = theme.GLASS_CONTROL,
+        border_width = theme.border_width,
+        border_color = theme.ACCENT,
+        padding = { left = theme.spacing.sm, right = theme.spacing.sm },
+        children = { field },
+    }
+end
+
+-- Enter, or Next. `hidden = true` is what makes the Supervisor write `802-11-wireless.hidden` and
+-- `scan-ssid`, so NetworkManager probes for the name instead of waiting to see it advertised
+-- (§ 3.2) -- and what makes it treat the target as secured even though no scanned row says so,
+-- since a network it cannot see is one it cannot ask about. So either a saved profile answers and
+-- the join goes through, or `password_ssid` comes back and this same sheet asks for the rest.
+--
+-- The name is kept because the sheet is titled with it and a Retry reconnects to it; the Supervisor
+-- has its own copy parked under the intent.
+--
+-- Submitting nothing is not an attempt to join "": leave the step where it is.
+local function submit_hidden_name()
+    local name = ui.hidden_draft:get():match("^%s*(.-)%s*$")
+    if name == "" then
+        return
+    end
+    ui.hidden_ssid:set(name)
+    oblisk.network:invoke("connect", name, true)
+end
+
+-- A failed attempt leaves nothing parked -- `finish_connect` clears the prompt and the intent both
+-- -- so Retry is a fresh `connect`, not a resubmission. It is what takes the sheet from "failed"
+-- back to "password" with the name it already knows.
+local function retry_hidden()
+    oblisk.network:invoke("connect", ui.hidden_ssid:get(), true)
+end
+
 local body = {
     panel_header {
         title = "network",
@@ -211,6 +296,9 @@ local body = {
     },
     -- Mirror error card, red on a red-tinted ground. `connect_error` is sticky until the next
     -- attempt (§ 2.5), with no clear command; the next row click dismisses it.
+    -- It yields to the sheet, as `visible: ... && !root.isHiddenTarget` does in the mirror: the
+    -- sheet carries the same error with the name it belongs to, and two copies of it read as two
+    -- failures.
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -218,8 +306,8 @@ local body = {
         padding = { top = theme.spacing.sm, right = theme.spacing.sm, bottom = theme.spacing.sm, left = theme.spacing.sm },
         radius = theme.radius.md,
         background = theme.ALERT_BG,
-        visible = util.shown_when(oblisk.network, function(n)
-            return n.connect_error ~= nil and n.connecting_ssid == nil
+        visible = computed({ oblisk.network, step }, function(n, current)
+            return current == "" and n ~= nil and n.connect_error ~= nil and n.connecting_ssid == nil
         end),
         children = {
             glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
@@ -228,68 +316,151 @@ local body = {
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
         },
     },
-    -- The Supervisor raises this when `network:connect` hits a secured network without a saved
-    -- profile; `password_ssid` says so (§ 2.5). NetworkManager, not this config, knows whether to
-    -- ask.
+    -- The sheet itself. Its parts leave layout as the step moves, and `panel_host` tweens the
+    -- card's height to whatever the section now measures, so each step slides into the last one's
+    -- room rather than snapping (ADR-0147).
     --
-    -- Typed characters never reach this VM. `mask_character` plus `secure_submit` stores keystrokes
+    -- Typed passwords never reach this VM. `mask_character` plus `secure_submit` stores keystrokes
     -- in a native buffer on the Renderer's Wayland thread and sends a `("network", "connect")`
-    -- envelope, as in `modules/global/lock.lua` (ADR-0005/ADR-0027). Hence no `on_change` or
-    -- `on_submit` callback can reopen that hole.
+    -- envelope, as in `modules/global/lock.lua` (ADR-0005/ADR-0027); no `on_change` or `on_submit`
+    -- callback can reopen that hole, which is also why the password half has no Next button that
+    -- reads the field. `submit = true` is a button's one way to a password (ADR-0114).
     --
-    -- It is the only `secure_submit` field across `panel_host`'s five panels. The engine focuses a
-    -- surface's *sole* such field on keyboard focus and refuses to guess between two; a second here
-    -- would require a click that `modules/bar/init.lua` cannot arrange, and would violate the lock
-    -- screen's own sole-field rule if placed there.
-    --
-    -- Always declared, usually hidden. Invisible nodes leave layout (`resolve_sizes` in scene.rs)
-    -- but stay in the tree, keeping "exactly one" structural.
+    -- The masked field is the only `secure_submit` field across `panel_host`'s nine panels. The
+    -- engine focuses a surface's *sole* such field on keyboard focus and refuses to guess between
+    -- two, so the name field beside it is a plain one -- an SSID is an ordinary `connect` argument,
+    -- which is the whole reason it can be typed at all. Only the shown ones are counted or armed
+    -- (`layout::secure_submit::typable_secure_submit_targets`), which is what lets each step take
+    -- the keyboard while the other step's field is down.
     column {
         width = "Fill",
-        spacing = theme.spacing.xs,
-        visible = util.shown_when(oblisk.network, function(n)
-            return n.password_ssid ~= nil
+        spacing = theme.spacing.sm,
+        visible = step:map(function(current)
+            return current ~= ""
         end),
         children = {
-            -- Mirror title `Connect to "%1"`, identifying the network before typing.
-            cell(util.label(oblisk.network, function(n)
-                return string.format("connect to “%s”", n.password_ssid or "")
-            end), theme.FG, theme.font.sm, { width = "Fill" }),
+            cell(sheet_title, theme.FG, theme.font.sm, { width = "Fill" }),
+            -- `autofocus` rather than a click into it: the row that raises this sheet is the last
+            -- thing the pointer touches, and `panel_host` turns the keyboard `Exclusive` on the
+            -- same edge. The draft is stored on every keystroke because Next has no other way to
+            -- read the field.
+            field_box(during("name"), textfield {
+                width = "Fill",
+                height = "Fill",
+                autofocus = true,
+                placeholder = "network name",
+                font_size = theme.font.sm,
+                foreground = theme.FG,
+                on_change = function(typed)
+                    ui.hidden_draft:set(typed or "")
+                end,
+                on_submit = submit_hidden_name,
+                -- Escape empties the field and releases the keyboard (ADR-0102); take the sheet
+                -- down with it rather than leaving an empty field holding focus.
+                on_cancel = ui.clear_network_prompts,
+            }),
+            field_box(during("password"), textfield {
+                width = "Fill",
+                height = "Fill",
+                placeholder = "password",
+                mask_character = "*",
+                secure_submit = { capability = "network", action = "connect" },
+                font_size = theme.font.sm,
+            }),
+            -- The mirror's `OSpinner` beside "Connecting…". There is no spinner node here, so the
+            -- word breathes instead, the same `loops = "Infinite"` pulse `power_menu.lua` puts on a
+            -- running countdown (ADR-0152). The entry's presence is the gate: no step, no sequence.
+            text {
+                content = "connecting…",
+                foreground = theme.DIM,
+                font_size = theme.font.xs,
+                visible = during("waiting"),
+                animate = {
+                    opacity = {
+                        duration = theme.animation_slow_ms,
+                        easing = "InOutQuad",
+                        loops = "Infinite",
+                        keyframes = { 1, 0.4, 1 },
+                    },
+                },
+            },
+            -- `⚠ errorMessage` under the field, where the mirror puts it, instead of the card at the
+            -- top of the panel: the error belongs to the network being asked about.
             row {
                 width = "Fill",
+                spacing = theme.spacing.xs,
                 align_v = "Center",
+                visible = during("failed"),
+                children = {
+                    glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
+                    cell(util.label(oblisk.network, function(n)
+                        return n.connect_error or ""
+                    end), theme.RED, theme.font.xs, { width = "Fill", wrap = "Word", max_lines = 2 }),
+                },
+            },
+            row {
+                width = "Fill",
+                align_h = "End",
                 spacing = theme.spacing.sm,
                 children = {
-                    textfield {
-                        width = "Fill",
-                        height = theme.control.md,
-                        placeholder = "password, then Enter",
-                        mask_character = "*",
-                        secure_submit = { capability = "network", action = "connect" },
-                        font_size = theme.font.sm,
-                    },
-                    -- The only way out: Escape clears a `secure_submit` field and stays in it, so
-                    -- this closes a prompt raised by a mis-click and releases the bar's focus.
-                    icon_button(icons.close, function()
-                        oblisk.network:invoke("cancel_connect")
-                    end, { slot = "network-password-cancel", size = theme.control.md, foreground = theme.RED }),
+                    action_button("cancel", ui.clear_network_prompts, "network-sheet-cancel", { tone = "quiet" }),
+                    -- Hidden rather than disabled while the name is empty: `action_button` has no
+                    -- disabled tone, and a button that cannot do anything is better absent than
+                    -- greyed. Enter does the same thing for anyone already typing.
+                    action_button("next", submit_hidden_name, "network-sheet-next", {
+                        tone = "solid",
+                        visible = computed({ step, ui.hidden_draft }, function(current, draft)
+                            return current == "name" and draft:match("^%s*(.-)%s*$") ~= ""
+                        end),
+                    }),
+                    -- No `on_activate`: its click *is* the field's Enter (ADR-0114), which is the
+                    -- only path a password has out of the Renderer.
+                    action_button("connect", nil, "network-sheet-connect", {
+                        tone = "solid",
+                        submit = true,
+                        visible = during("password"),
+                    }),
+                    action_button("retry", retry_hidden, "network-sheet-retry", {
+                        tone = "solid",
+                        glyph = icons.warning,
+                        visible = during("failed"),
+                    }),
                 },
             },
         },
     },
     -- Rows up to the cap, then a scrolling viewport (ADR-0110), matching
     -- `Math.min(networkList.contentHeight, Theme.itemHeight * 7)`.
+    -- The sheet replaces it during a hidden join rather than sitting above it, which is the mirror's
+    -- `visible: !root.isHiddenTarget`: nothing in the list is what is being joined, and the card
+    -- tweens down to the sheet's height instead of growing to hold both.
     list {
         width = "Fill",
         max_height = theme.panel_list_height,
         scroll = SCROLL,
         spacing = theme.spacing.xs,
-        visible = util.shown_when(oblisk.network, radio_on),
+        visible = computed({ oblisk.network, ui.hidden_join }, function(n, joining)
+            return radio_on(n) and not joining
+        end),
         source = rows,
         itemfn = access_point_row,
         key = function(entry)
             return tostring(entry.ap.ssid)
         end,
+    },
+    -- The one row nothing scanned put there, last as in the mirror. A network broadcasting no SSID
+    -- is dropped from `available_networks`, so this stands in for it and asks for the name instead.
+    -- It leaves with the list it sits under: while the sheet is asking, the offer to open it again
+    -- is nothing the reader needs.
+    panel_row {
+        slot = "network-hidden",
+        icon = icons.wifi_hidden,
+        title = "hidden network…",
+        visible = computed({ oblisk.network, ui.hidden_join }, function(n, joining)
+            return radio_on(n) and not joining
+        end),
+        trailing = glyph(icons.chevron_right, theme.DIM, theme.font.sm, { align_v = "Center" }),
+        on_activate = ui.open_hidden_prompt,
     },
     panel_empty_state(
         util.label(oblisk.network, function(n)
@@ -302,8 +473,11 @@ local body = {
             end
             return "no networks found"
         end),
-        util.shown_when(oblisk.network, function(n)
-            return not radio_on(n) or #access_points(n) == 0
+        computed({ oblisk.network, ui.hidden_join }, function(n, joining)
+            if n == nil then
+                return false
+            end
+            return not radio_on(n) or (not joining and #access_points(n) == 0)
         end),
         {
             icon = oblisk.network:map(function(n)

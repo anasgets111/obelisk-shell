@@ -178,27 +178,30 @@ return panel {
     width = "Fill",
     height = "Fill",
     visible = util.linger(ui_state.panel_open, theme.animation_ms),
-    -- `password_ssid` names the network whose `network:connect` awaits a password and is nil
-    -- otherwise (§ 2.5), so this holds the keyboard only while typing is needed.
+    -- The network panel's credential sheet is what asks for the keyboard outright, at every step it
+    -- has: a name to type, and a password to type after it. `ui_state.credential_step` is the whole
+    -- question, and `clear_network_prompts` ends the sheet on every closing edge, so it cannot leave
+    -- this surface holding the keyboard.
     --
-    -- `"Exclusive"`, not `"OnDemand"`: the field must be typable without a click. The engine arms a
-    -- focus scope's *sole* `secure_submit` field on compositor focus
-    -- (`layout::secure_submit::sole_secure_submit_in_scope`), and `network_panel.lua` has that
-    -- field.
-    -- This surface never maps while a password is pending; the Supervisor raises the prompt after a
-    -- click on an already-open panel.
+    -- Held across the wait between the two, not dropped and retaken. The steps are one flow to the
+    -- person typing, and `"None"` in the gap would hand the keyboard back to whatever is behind the
+    -- panel for as long as the Supervisor takes to answer.
     --
-    -- Nil-guarded like every bare capability `:map`; this resolves once before the first push.
+    -- `"Exclusive"`, not `"OnDemand"`: both fields must be typable without a click into them. The
+    -- engine arms a focus scope's *sole* `secure_submit` field, and its first `autofocus` plain
+    -- field, on compositor focus (`layout::secure_submit`, `wayland::input`), and the sheet shows
+    -- one of the two at a time. This surface never maps while either is pending; the sheet is raised
+    -- by a click on an already-open panel.
     --
     -- Notifications also need it: history draws the popup's always-present reply field (ADR-0109),
     -- and niri focuses an `OnDemand` layer on a click while already on demand, not on the flip.
     -- Ask on demand only while history is shown: clicks there take the keyboard, other windows give
     -- it back, and the catcher closes the panel. Network and calendar never ask without a field.
     keyboard_interactivity = computed(
-        { oblisk.network, ui_state.panel_showing("notifications") },
-        function(n, showing_notifications)
-            -- Password stays `Exclusive`: this panel's click raised it and the catcher ends it.
-            if n and n.password_ssid then
+        { ui_state.credential_step, ui_state.panel_showing("notifications") },
+        function(step, showing_notifications)
+            -- The sheet stays `Exclusive`: this panel's click raised it and the catcher ends it.
+            if step ~= "" then
                 return "Exclusive"
             end
             return showing_notifications and "OnDemand" or "None"
