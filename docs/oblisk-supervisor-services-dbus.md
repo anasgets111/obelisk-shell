@@ -36,7 +36,7 @@ and [markup validator](../supervisor/src/capabilities/notifications/markup.rs) d
 ### 1.2 Actions and replies
 
 `invoke_action(id, key)` accepts a declared action and removes the entry unless it is resident.
-`reply(id, text)` emits `ActionInvoked(id, "inline-reply::<text>")` and removes the entry.
+`reply(id, text)` emits `NotificationReplied(id, text)` and removes the entry unless it is resident.
 `dismiss(id)` removes it explicitly. Removal signals and expiry are owned by the Supervisor.
 
 `hold_expiry(seconds)` pauses pending expiry countdowns for up to 300 seconds; zero releases the

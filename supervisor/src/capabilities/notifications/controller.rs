@@ -33,11 +33,6 @@ use super::{
 use crate::capabilities::system::controller::epoch_seconds;
 use crate::capabilities::truncate_utf8_bytes;
 
-/// `ActionInvoked` key for a completed inline reply (ADR-0033).
-fn format_reply_action_key(text: &str) -> String {
-    format!("inline-reply::{text}")
-}
-
 /// Results of one pass over `Notify`'s flat action array, returned together rather than as three
 /// passes that each re-decide what a key means (ADR-0090).
 #[derive(Debug, Default, PartialEq)]
@@ -225,6 +220,20 @@ impl NotificationsController {
         }
     }
 
+    /// The reply half of [`NotificationsController::emit_action_invoked`]. The text stays out of
+    /// the log: it is the user's message to someone, and the id is enough to place a failure.
+    async fn emit_notification_replied(&self, id: u32, text: String) {
+        let Some(connection) = &self.connection else { return };
+        match zbus::object_server::SignalEmitter::new(connection, NOTIFICATIONS_OBJECT_PATH) {
+            Ok(emitter) => {
+                let _ = Self::notification_replied(&emitter, id, text).await;
+            }
+            Err(err) => {
+                eprintln!("notifications: failed to build a signal emitter for NotificationReplied({id}): {err}")
+            }
+        }
+    }
+
     /// Resolves `Notify`'s attached-picture precedence ([`resolve_image_input`]) into a final path.
     /// Raw image data is checked, PNG
     /// encoded, and spooled to SHM; `image-path` uses the body-image trust boundary. The positional
@@ -280,19 +289,25 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:reply(id, text)` (ADR-0033) requires `has_reply`, emits the encoded
-    /// `ActionInvoked`, and removes the notification. Unknown/no-reply ids log/no-op.
+    /// `notifications:reply(id, text)` requires `has_reply`, emits `NotificationReplied(id, text)`,
+    /// then removes unless `resident` is set, as [`NotificationsController::invoke_action`] does for
+    /// a button. Unknown/no-reply ids log/no-op.
+    ///
+    /// The text rides its own signal rather than an encoded `ActionInvoked` key; ADR-0033's
+    /// amendment says why. `Dismissed` rather than `ClosedByMethod`, because a sent reply is the
+    /// user finishing with the notification.
     pub async fn reply(&self, id: u32, text: String) {
-        let removed = {
+        let outcome = {
             let mut state = self.state.lock().unwrap();
             match state.queue.iter().position(|n| n.id == id) {
-                Some(index) if state.queue[index].has_reply => remove_by_id(&mut state.queue, id),
-                Some(_) => {
+                Some(index) if !state.queue[index].has_reply => {
                     eprintln!(
                         "notifications: reply({id}, ...) ignored: that notification does not accept an inline reply"
                     );
                     None
                 }
+                Some(index) if state.queue[index].resident => Some(None),
+                Some(_) => Some(remove_by_id(&mut state.queue, id)),
                 None => {
                     eprintln!(
                         "notifications: reply({id}, ...) ignored: no notification with that id is currently queued"
@@ -301,11 +316,14 @@ impl NotificationsController {
                 }
             }
         };
-        let Some(removed) = removed else { return };
-        if let Some(path) = removed.image_path {
-            delete_icon_file(&path);
+        let Some(removed) = outcome else { return };
+        self.emit_notification_replied(id, text).await;
+        if let Some(removed) = removed {
+            if let Some(path) = removed.image_path {
+                delete_icon_file(&path);
+            }
+            self.emit_notification_closed(id, CloseReason::Dismissed).await;
         }
-        self.emit_action_invoked(id, format_reply_action_key(&text)).await;
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
@@ -608,6 +626,15 @@ impl NotificationsController {
         id: u32,
         action_key: String,
     ) -> zbus::Result<()>;
+
+    /// The KDE inline-reply extension's signal, which is what advertising `"inline-reply"`
+    /// promises. Outside the base spec, so only a client that sent `x-kde-reply` is listening.
+    #[zbus(signal, name = "NotificationReplied")]
+    async fn notification_replied(
+        signal_emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        text: String,
+    ) -> zbus::Result<()>;
 }
 
 // Write-command argument parsers (§3.2, ADR-0033); set_dnd calls parse_bool_arg directly.
@@ -647,11 +674,6 @@ pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_reply_action_key_embeds_the_text() {
-        assert_eq!(format_reply_action_key("sounds good"), "inline-reply::sounds good");
-    }
 
     fn keys(actions: &[String], action_icons: bool) -> Vec<String> {
         parse_actions(actions, action_icons).actions.into_iter().map(|a| a.key).collect()

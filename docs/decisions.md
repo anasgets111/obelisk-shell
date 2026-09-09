@@ -924,6 +924,13 @@ Keep the standard two-argument ActionInvoked signal. Encode reply text as
 `inline-reply::<text>`; a bare inline-reply key is malformed. A third signal argument was
 rejected because it breaks client introspection.
 
+Amended: that encoding reached nothing. This decision follows the KDE `x-kde-reply` extension two
+lines above and then declines the signal that extension is. Plasma 5.18 defines
+`NotificationReplied(uint32 id, string text)`, and a client sending `x-kde-reply` listens for that
+alone, so a reply encoded into an action key was delivered to nobody. Being a separate signal, it
+leaves `ActionInvoked`'s two arguments and its introspection intact. `reply` now also honours
+`resident` and emits `NotificationClosed(id, reason=2)` when it removes, as `invoke_action` does.
+
 Sound priority is suppress-sound, trusted sound-file, configured urgency sound, then silence.
 Ignore sound-name without theme resolution. Playback uses an internal PipeWire channel, not a
 Lua round trip. DND is Supervisor-global, gates only sound and resets on Supervisor restart.
