@@ -97,9 +97,8 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
 /// The one live `xdg_toplevel` spec for a top-level `window` (§ 6, ADR-0040 decision 1). There is
 /// no `WindowTopology`: title, app id, and size hints update the live object; `visible` creates and
 /// destroys it rather than swapping the generation. Only `id` changes the declared set and swaps
-/// generation (ADR-0001, ADR-0049 decisions 1-3). A window has
-/// one object regardless of outputs (ADR-0038 decision 3); callbacks and visibility remain scene
-/// properties.
+/// generation (ADR-0001, ADR-0049 decisions 1-3). A window has one object regardless of outputs
+/// (ADR-0038 decision 3); callbacks and visibility remain scene properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSpec {
     pub id: String,

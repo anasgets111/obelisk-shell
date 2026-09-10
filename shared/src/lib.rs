@@ -377,10 +377,9 @@ pub enum RendererFrame {
     /// do not match the last one sent.
     RequestReload,
     /// Idempotently starts `capability`'s controller when this generation first reads
-    /// `oblisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it
-    /// (decision 5). No generation ID is needed because the socket identifies the sender, as with
-    /// [`Self::RequestReload`]. An
-    /// existing name is logged and dropped (decision 3).
+    /// `oblisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it (decision
+    /// 5). No generation ID is needed because the socket identifies the sender, as with
+    /// [`Self::RequestReload`]. An existing name is logged and dropped (decision 3).
     StartCapability {
         capability: String,
     },

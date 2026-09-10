@@ -11,8 +11,8 @@ use mlua::{Lua, Table, Value};
 
 /// § 5.2's eight geometric nodes plus § 6's four root roles: `panel`, `window`, `popup`, `lock`
 /// (ADR-0040). `lock` joined under ADR-0052 decision 2: declaration location is separate from
-/// Wayland
-/// object lifetime (ADR-0049); `window`/`popup` wait for `visible`, `lock` for compositor `locked`.
+/// Wayland object lifetime (ADR-0049); `window`/`popup` wait for `visible`, `lock` for compositor
+/// `locked`.
 const NODE_KINDS: [&str; 13] = [
     "rect",
     "row",
@@ -321,8 +321,7 @@ mod tests {
     #[test]
     fn image_is_a_constructor_and_is_the_one_kind_section_5_2_does_not_list() {
         // ADR-0054 decision 3 adds this outside § 5.2's eight; pin the name so dropping it fails
-        // loudly
-        // instead of silently removing wallpaper support.
+        // loudly instead of silently removing wallpaper support.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"image"));
         let table: Table = lua.load(r#"return image { source = "/tmp/wall.png", fit = "cover" }"#).eval().unwrap();

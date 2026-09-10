@@ -79,12 +79,10 @@ pub struct NetworkState {
     /// other fields describe a switched-off stack.
     pub networking_enabled: bool,
     /// A wired device is activated. This is the setter's read-back; carrier stays up when a cable
-    /// is
-    /// seated, so it would not reflect `network:set_ethernet_enabled(false)`.
+    /// is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
     pub ethernet_enabled: bool,
     /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and
-    /// clears
-    /// when the attempt reaches either verdict.
+    /// clears when the attempt reaches either verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_ssid: Option<String>,
     /// Display text for the last failed `network:connect`, or `nil` after success or before any
@@ -119,13 +117,11 @@ pub struct PendingNetworkConnect {
 }
 
 /// What forwarders report to `main.rs`'s top-level `select!`; `build_state` makes the payload with
-/// a
-/// fresh D-Bus round trip.
+/// a fresh D-Bus round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSignal {
     /// Any non-`scanning` field change: AP set, association, device state, or radio. All trigger
-    /// the
-    /// same full re-derive (ADR-0029), so one variant is enough.
+    /// the same full re-derive (ADR-0029), so one variant is enough.
     Changed,
     /// `LastScan` changed, so a Supervisor-triggered scan finished.
     ScanCompleted,
@@ -238,8 +234,7 @@ struct EthernetDevice {
 }
 
 /// One saved profile matched by SSID: the path for `ActivateConnection`, its proxy, and the
-/// settings
-/// already read by both callers.
+/// settings already read by both callers.
 struct SavedProfile {
     path: OwnedObjectPath,
     connection: SettingsConnectionProxy<'static>,
@@ -479,9 +474,8 @@ impl NetworkController {
     /// `network:cancel_connect()`: drops the pending intent and password prompt.
     ///
     /// The prompt's way out. Escape in a `secure_submit` field only clears its text and stays in
-    /// the
-    /// field (`wayland::input`'s `SecureKeyAction::Clear`), so without this a mis-click would hold
-    /// bar keyboard focus.
+    /// the field (`wayland::input`'s `SecureKeyAction::Clear`), so without this a mis-click would
+    /// hold bar keyboard focus.
     ///
     /// ponytail: an activation already in flight is untouched, although `NetworkService.qml`'s
     /// `cancelConnect` disconnects when nothing else is live. Letting NM finish costs seconds;

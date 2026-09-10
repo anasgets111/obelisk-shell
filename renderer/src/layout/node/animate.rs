@@ -437,8 +437,8 @@ impl Spring {
             }
             Regime::Critical => {
                 let half = decay / 2.0;
-                // `(1 + slope * t) * exp(-half * t)` peaks where its derivative vanishes; before that
-                // point it has not yet grown, so the value at `t = 0` stands.
+                // `(1 + slope * t) * exp(-half * t)` peaks where its derivative vanishes; before
+                // that point it has not yet grown, so the value at `t = 0` stands.
                 let peak = (1.0 / half - 1.0 / slope.abs()).max(0.0);
                 ((1.0 + slope.abs() * peak) * (-half * peak).exp(), half)
             }
@@ -689,15 +689,6 @@ fn parse_spec(property: &str, entry: &Value) -> Result<AnimationSpec, LayoutErro
     Ok(AnimationSpec { motion, delay, from })
 }
 
-/// One `duration` or `delay`, in whole milliseconds: `None` when the field is absent, an error
-/// when it is there and is not a number.
-///
-/// The two are told apart here rather than by `value_as_f32`, which answers `None` for a string as
-/// readily as for `nil` and would let a typo read as an omission and take the default. `least` is
-/// the smallest the field may round to, which is `1` wherever zero means no motion at all: a
-/// `duration` of `0.1` clears any bound written in floats and then rounds to nothing, leaving a
-/// tween that reports itself finished the instant it starts. Whole milliseconds because
-/// `from_secs_f32` would carry `200` as `200.000003ms`.
 /// `image.transition` (ADR-0181): how a `retain`ing image crosses from the picture it is holding to
 /// the one that has just landed. Duration and easing, and nothing else yet -- a cross-dissolve is
 /// the whole of it until the masks arrive with a shader stage, and `effect` is the key that will
@@ -849,6 +840,15 @@ impl Dissolve {
     }
 }
 
+/// One `duration` or `delay`, in whole milliseconds: `None` when the field is absent, an error
+/// when it is there and is not a number.
+///
+/// The two are told apart here rather than by `value_as_f32`, which answers `None` for a string as
+/// readily as for `nil` and would let a typo read as an omission and take the default. `least` is
+/// the smallest the field may round to, which is `1` wherever zero means no motion at all: a
+/// `duration` of `0.1` clears any bound written in floats and then rounds to nothing, leaving a
+/// tween that reports itself finished the instant it starts. Whole milliseconds because
+/// `from_secs_f32` would carry `200` as `200.000003ms`.
 fn parse_millis(field: &str, what: &str, value: &Value, least: u64) -> Result<Option<Duration>, LayoutError> {
     if value.is_nil() {
         return Ok(None);

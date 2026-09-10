@@ -1,8 +1,8 @@
-//! Lua VM bootstrap and loader (`CONTEXT.md`, Loader): evaluates `shell.lua` into top-level
-//! `panel` nodes and topology for a candidate's first evaluation and the
-//! authoritative generation's re-evaluation on an in-place reload. `Loader::evaluate_file`
-//! reads `~/.config/oblisk/shell.lua` (`shared::shell_lua_path`) and is the
-//! `renderer/src/socket.rs` entry point on startup and every Supervisor-triggered `Reevaluate`.
+//! Lua VM bootstrap and loader (`CONTEXT.md`, Loader): evaluates `shell.lua` into top-level `panel`
+//! nodes and topology for a candidate's first evaluation and the authoritative generation's
+//! re-evaluation on an in-place reload. `Loader::evaluate_file` reads `~/.config/oblisk/shell.lua`
+//! (`shared::shell_lua_path`) and is the `renderer/src/socket.rs` entry point on startup and every
+//! Supervisor-triggered `Reevaluate`.
 pub mod capability;
 pub mod fonts;
 pub mod idle;
@@ -195,11 +195,11 @@ impl Loader {
         json::to_lua(&self.lua, json)
     }
 
-    /// Drops config-owned `package.loaded` modules, preserving the standard library
-    /// (ADR-0047 decision 2). One VM per generation (ADR-0044 decision 4) and name-based `require`
-    /// caching would otherwise make
-    /// an edited `widgets/clock.lua` silently stale. Collect names before removal: mlua's iterator
-    /// holds the table, so clearing during traversal would mutate what it reads.
+    /// Drops config-owned `package.loaded` modules, preserving the standard library (ADR-0047
+    /// decision 2). One VM per generation (ADR-0044 decision 4) and name-based `require` caching
+    /// would otherwise make an edited `widgets/clock.lua` silently stale. Collect names before
+    /// removal: mlua's iterator holds the table, so clearing during traversal would mutate what it
+    /// reads.
     fn forget_config_modules(&self) -> mlua::Result<()> {
         let loaded = self.lua.globals().get::<Table>("package")?.get::<Table>("loaded")?;
         let stale: Vec<String> = loaded
@@ -337,8 +337,7 @@ mod tests {
     }
 
     /// ADR-0047 decision 2 / ADR-0044 decision 4: without clearing module cache, reload runs
-    /// `shell.lua` against a
-    /// stale required module and silently does nothing.
+    /// `shell.lua` against a stale required module and silently does nothing.
     #[test]
     fn a_re_evaluation_sees_an_edited_required_module_rather_than_the_cached_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -607,8 +606,7 @@ mod tests {
     #[test]
     fn evaluate_accepts_a_top_level_lock_because_declaring_one_is_not_the_same_as_locking() {
         // ADR-0052 decision 2: the compositor decides when the lock surface exists; this only
-        // admits its
-        // declaration location.
+        // admits its declaration location.
         let loader = test_loader();
         let output =
             loader.evaluate(r##"return lock { id = "screen", child = rect { background = "#000000FF" } }"##).unwrap();

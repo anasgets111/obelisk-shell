@@ -1,9 +1,9 @@
-//! Proves `SecureBuffer`'s `Drop` backup (ADR-0005) actually zeroizes, without reading
-//! memory after it's freed (which would be undefined behavior). Reading a Vec's own spare
-//! capacity while it's still owned (see the `explicit_zeroize` test in
-//! shared/src/secure_buffer.rs) can't reach this path: `Drop` runs *after* that memory is
-//! handed back to the allocator, so the only well-defined place left to observe it is the
-//! allocator's `dealloc` call itself, at the exact moment it receives the pointer back.
+//! Proves `SecureBuffer`'s `Drop` backup (ADR-0005) actually zeroizes, without reading memory after
+//! it's freed (which would be undefined behavior). Reading a Vec's own spare capacity while it's
+//! still owned (see the `explicit_zeroize` test in shared/src/secure_buffer.rs) can't reach this
+//! path: `Drop` runs *after* that memory is handed back to the allocator, so the only well-defined
+//! place left to observe it is the allocator's `dealloc` call itself, at the exact moment it
+//! receives the pointer back.
 //!
 //! Same technique `zeroize`'s own test suite uses for this (`zeroize-1.9.0/tests/alloc.rs`):
 //! a `#[global_allocator]` that inspects bytes right as they're deallocated. Unlike that

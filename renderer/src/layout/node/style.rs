@@ -96,10 +96,9 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 /// each geometry property once per node/pass fixes that. The reads also escaped ADR-0021's 5ms
 /// getter budget: `CpuBudget` hooked `Signal::get_value` and dropped the hook on return, covering
 /// only a signal getter's body; a `__index` loop of 200 million iterations made `Scene::apply` take
-/// 26.10s and
-/// return `Ok(())` with no `Signal`, on the VM's thread (ADR-0039). `LayoutPassBudget` now holds
-/// the hook for the whole pass and refuses it in 2s with `PassBudgetExceeded`. Scalar shorthand is
-/// shared by `margin`/`padding`/`border_width`; only the last keeps a range check.
+/// 26.10s and return `Ok(())` with no `Signal`, on the VM's thread (ADR-0039). `LayoutPassBudget`
+/// now holds the hook for the whole pass and refuses it in 2s with `PassBudgetExceeded`. Scalar
+/// shorthand is shared by `margin`/`padding`/`border_width`; only the last keeps a range check.
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation pass: a panel root's `margin` is the live layer-shell anchor
     // offset (`set_margin`, ADR-0038 decision 2), so zero is the absent-key placeholder.

@@ -17,14 +17,12 @@ use crate::lua::{LoadOutput, Loader, LoaderError};
 /// kill the connection. Catch config typos as `layout::node::LayoutError` during evaluation, in
 /// `rescue.error_log` (§ 2.10, ADR-0046).
 ///
-/// **Literal fast-fail only, not the authoritative spec** for moving properties
-/// (ADR-0049 decision 2): a
-/// `Signal` in `window.title` or `popup.anchor_rect` is skipped via
+/// **Literal fast-fail only, not the authoritative spec** for moving properties (ADR-0049 decision
+/// 2): a `Signal` in `window.title` or `popup.anchor_rect` is skipped via
 /// `layout::node::is_deferred_signal` and replaced by its parser placeholder; literals are fully
 /// checked. `App::apply_resolved_state` builds authoritative `WindowSpec`/`PopupSpec` from the
 /// resolved tree (ADR-0044 decision 1); resolving here would double ADR-0021's getter budget on
-/// every
-/// monitor hotplug through `RendererClient::applied_surface_specs`.
+/// every monitor hotplug through `RendererClient::applied_surface_specs`.
 ///
 /// Authoritative here: roster fingerprint, order, and roles. **`lock` is fully authoritative and
 /// the only role that is** (ADR-0052 decision 2): `id` is structural and `child` belongs to the

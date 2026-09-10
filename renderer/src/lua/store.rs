@@ -33,8 +33,7 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
 
             let storage = storage_capability(lua)?;
             // Send every evaluation: the Supervisor merges defaults (ADR-0136 decision 4), so
-            // edited
-            // defaults land on reload without reverting user values.
+            // edited defaults land on reload without reverting user values.
             let defaults = match defaults {
                 Value::Nil => Value::Table(lua.create_table()?),
                 defaults => defaults,

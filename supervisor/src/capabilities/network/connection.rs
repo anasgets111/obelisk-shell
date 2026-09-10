@@ -87,13 +87,11 @@ pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32)
 /// association. Dense apartment RF reaches 20 SSIDs easily.
 ///
 /// Merge `active` rather than carrying the winner's flag. NetworkManager once exposed two AP
-/// objects
-/// for one SSID at the same BSSID, strengths 62 and 58, with `ActiveAccessPoint` naming the 58.
-/// Keeping the stronger object dropped the flag and showed a connected machine as "offline".
+/// objects for one SSID at the same BSSID, strengths 62 and 58, with `ActiveAccessPoint` naming the
+/// 58. Keeping the stronger object dropped the flag and showed a connected machine as "offline".
 ///
 /// Strength belongs to an AP object; `active` belongs to the associated SSID. The strongest
-/// sighting
-/// supplies the numbers, and any sighting supplies the flag.
+/// sighting supplies the numbers, and any sighting supplies the flag.
 ///
 /// SSID is the last tiebreak because `HashMap::into_values` reshuffles as APs come and go. Stable
 /// sorting then prevents equal-strength rows from swapping, including at the 20th-place cutoff.
@@ -215,8 +213,7 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     if intent.hidden {
         wireless.insert("hidden", Value::new(true));
         // NM probes hidden networks from `hidden` alone, but §4.3 requires both. NM silently
-        // ignores
-        // the extra `scan-ssid` key.
+        // ignores the extra `scan-ssid` key.
         wireless.insert("scan-ssid", Value::new(true));
     }
     dict.insert("802-11-wireless", wireless);
@@ -393,8 +390,7 @@ mod tests {
     #[test]
     fn dedup_and_top20_cuts_a_boundary_tie_by_ssid_rather_than_by_luck() {
         // Nineteen strong entries and two tied for slot 20 must yield the same row on every
-        // rebuild;
-        // otherwise the panel flickers without a radio change.
+        // rebuild; otherwise the panel flickers without a radio change.
         let mut aps: Vec<AccessPointInfo> = (0..19).map(|i| ap(&format!("strong{i}"), 90)).collect();
         aps.push(ap("zulu", 40));
         aps.push(ap("kilo", 40));
@@ -524,8 +520,7 @@ mod tests {
     #[test]
     fn merge_psk_passes_every_other_section_through_untouched() {
         // `Update` replaces the whole profile; dropping any section loses static addresses,
-        // metrics,
-        // or autoconnect priority.
+        // metrics, or autoconnect priority.
         let settings: HashMap<String, HashMap<String, OwnedValue>> = HashMap::from([
             (
                 "connection".to_string(),

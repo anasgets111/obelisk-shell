@@ -1,7 +1,6 @@
 //! `Signal` (`oblisk-idl-api-specs.md` § 1.2): `get`, `map`, `set`, `computed(dependencies, fn)`,
 //! and `state(name, initial)` (ADR-0044 decision 5). Rust owns the userdata; `computed` calls `fn`
-//! with
-//! dependency values, not handles, so its body does not call `:get()` on declared deps.
+//! with dependency values, not handles, so its body does not call `:get()` on declared deps.
 //!
 //! ponytail: `computed`/`map` recompute on every layout pass, with no invalidation graph across
 //! passes. [`EvaluationMemo`] collapses repeats *within* one pass; nothing caches *between* them,
@@ -125,10 +124,9 @@ enum SignalKind {
         reveal: Rc<Cell<Option<usize>>>,
     },
     /// Lua-authored writable state (ADR-0044 decision 5), built by `state`. Separate from `Live`
-    /// even with
-    /// identical storage: accepting `set` on `Live` would let config overwrite a pushed network
-    /// SSID. The kind makes read-only capabilities a type-system fact. Carries the shared dirty
-    /// flag because `set` has no `RendererClient` in reach.
+    /// even with identical storage: accepting `set` on `Live` would let config overwrite a pushed
+    /// network SSID. The kind makes read-only capabilities a type-system fact. Carries the shared
+    /// dirty flag because `set` has no `RendererClient` in reach.
     State {
         cell: Rc<RefCell<Value>>,
         dirty: DirtyFlag,
@@ -308,10 +306,8 @@ impl Signal {
 
     /// Boolean written by `wl_pointer`, read-only to Lua (ADR-0062 decision 2). Starts `false`, not
     /// nil, because `visible` treats nil as absent (ADR-0044 decision 1 amendment). `initial_rect`
-    /// must be a
-    /// real non-zero 1x1 table: § 6 requires non-zero tooltip `anchor_rect` before any pointer
-    /// event,
-    /// and this constructor lacks a Lua to build the table.
+    /// must be a real non-zero 1x1 table: § 6 requires non-zero tooltip `anchor_rect` before any
+    /// pointer event, and this constructor lacks a Lua to build the table.
     pub fn new_hover(dirty: DirtyFlag, initial_rect: Value) -> (Self, Self) {
         let over = Rc::new(RefCell::new(Value::Boolean(false)));
         let rect = Rc::new(RefCell::new(initial_rect));
@@ -397,8 +393,8 @@ impl Signal {
     }
 
     /// Rect write end for the boolean hover half: last node position in surface logical
-    /// coordinates,
-    /// consumed by tooltip `popup.anchor_rect`. `None` for other kinds and the rect half itself.
+    /// coordinates, consumed by tooltip `popup.anchor_rect`. `None` for other kinds and the rect
+    /// half itself.
     pub(crate) fn hover_rect_handle(&self) -> Option<LiveSignalHandle> {
         match &self.0 {
             SignalKind::Hover { paired_rect: Some(rect), dirty, .. } => {
@@ -527,8 +523,7 @@ impl LiveSignalHandle {
     }
 
     /// Writes and marks the shared scene dirty (ADR-0044 decision 2); without a dependency graph
-    /// (decision 3), the
-    /// next poll re-resolves the whole scene.
+    /// (decision 3), the next poll re-resolves the whole scene.
     pub fn set(&self, value: Value) {
         *self.0.borrow_mut() = value;
         self.1.mark();
@@ -544,8 +539,7 @@ impl LiveSignalHandle {
 
     /// [`Self::set`] with equality deduplication. ADR-0062 decision 4 calls it for every
     /// device-rate `wl_pointer` motion; one mark re-resolves every surface (ADR-0044 decision 2),
-    /// so compare first to
-    /// re-resolve only on boundary crossings.
+    /// so compare first to re-resolve only on boundary crossings.
     pub fn set_changed(&self, value: Value) -> bool {
         let unchanged = *self.0.borrow() == value;
         if unchanged {
@@ -558,9 +552,8 @@ impl LiveSignalHandle {
 }
 
 /// One ADR-0044 decision 2 scene-dirty bool shared by every generation handle and `RendererClient`,
-/// not per
-/// signal/surface. `Rc<Cell<bool>>` fits the single Wayland thread (ADR-0039). ponytail: every push
-/// re-resolves every surface. Upgrade to per-surface flags keyed by read tracking.
+/// not per signal/surface. `Rc<Cell<bool>>` fits the single Wayland thread (ADR-0039). ponytail:
+/// every push re-resolves every surface. Upgrade to per-surface flags keyed by read tracking.
 #[derive(Clone)]
 pub struct DirtyFlag(Rc<Cell<bool>>);
 
@@ -663,18 +656,15 @@ pub fn write_state(lua: &Lua, set: &shared::SetState) -> Result<(), String> {
 }
 
 /// Whether config called `hover(name)`. `crate::wayland` checks first, so configs without tooltip
-/// or
-/// hover expansion pay no tree clone, walk, or signal writes at pointer-report rate.
+/// or hover expansion pay no tree clone, walk, or signal writes at pointer-report rate.
 pub fn any_hover_registered(lua: &Lua) -> bool {
     lua.app_data_ref::<HoverRegistry>().is_some_and(|registry| !registry.0.is_empty())
 }
 
 /// ADR-0044 decision 5 state registry: name preserves last-click values across in-place reloads;
-/// the stored
-/// literal detects an edited initial, which wins over live state (the wallpaper case). In
-/// `Lua::set_app_data`, so ADR-0044 decision 4's persistent VM preserves it and a generation swap's
-/// new
-/// process discards it.
+/// the stored literal detects an edited initial, which wins over live state (the wallpaper case).
+/// In `Lua::set_app_data`, so ADR-0044 decision 4's persistent VM preserves it and a generation
+/// swap's new process discards it.
 #[derive(Default)]
 struct StateRegistry(HashMap<String, (Signal, Value)>);
 
@@ -900,8 +890,7 @@ impl Drop for LayoutPassBudget<'_> {
 impl<'lua> CpuBudget<'lua> {
     /// Claims one nesting level, refusing past [`MAX_SIGNAL_NESTING_DEPTH`]. Install hook before
     /// pushing so early return cannot strand a deadline and disable the VM's cap; no Lua runs
-    /// between
-    /// the two, and the hook tolerates an empty stack.
+    /// between the two, and the hook tolerates an empty stack.
     pub(crate) fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
         if lua.app_data_ref::<Vec<Deadline>>().is_none() {
             lua.set_app_data(Vec::<Deadline>::new());
@@ -1484,8 +1473,8 @@ mod tests {
     #[test]
     fn hover_hands_the_same_name_the_same_signal_so_an_in_place_reload_keeps_it_open() {
         // Name is identity across reload (ADR-0044 decision 5, ADR-0062 decision 2), so the signal
-        // is reused, not
-        // reset false. Check storage, not userdata `==`, which compares object identity.
+        // is reused, not reset false. Check storage, not userdata `==`, which compares object
+        // identity.
         let (lua, _dirty) = lua_with_state();
         lua.load(r#"first = hover("volume") second = hover("volume") other = hover("battery")"#).exec().unwrap();
 
@@ -1983,8 +1972,7 @@ mod tests {
     fn a_map_chain_at_the_nesting_cap_is_accepted_and_one_link_past_it_is_rejected() {
         // At most N levels are admitted, N+1 rejected. This distinguishes gates: CPU measures this
         // thread, not descheduled wait, so a busy machine may hit 5ms at the admitted depth;
-        // nesting
-        // must not reject a depth it promises.
+        // nesting must not reject a depth it promises.
         let lua = lua_with_signal("a", Value::Integer(7));
         match lua.load(map_chain_source(MAX_SIGNAL_NESTING_DEPTH)).eval::<i64>() {
             Ok(value) => assert_eq!(value, 7, "exactly MAX_SIGNAL_NESTING_DEPTH nested levels must be admitted"),

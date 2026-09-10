@@ -81,8 +81,8 @@ pub struct App {
     /// blur, and it may withdraw the bit later.
     background_effect: Option<(ExtBackgroundEffectManagerV1, bool)>,
     /// `xdg_wm_base`, plus the `zxdg_decoration_manager_v1` that `XdgShell::bind` picks up beside
-    /// it, or `None`; panels still work without xdg-shell,
-    /// while a declared window logs the missing global once.
+    /// it, or `None`; panels still work without xdg-shell, while a declared window logs the missing
+    /// global once.
     xdg_shell: Option<XdgShell>,
     /// `ext_session_lock_manager_v1` through SCTK's `GlobalProxy` (ADR-0042). Missing support
     /// surfaces as `GlobalError::MissingGlobal` from `lock` (ADR-0052 decision 4), not startup;
@@ -212,11 +212,11 @@ pub struct App {
 
 /// Renderer main thread: Wayland, EGL, Lua, the retained `Scene`, and live signals (ADR-0039).
 /// `inbound_rx` carries socket-decoded `SupervisorFrame`s; `outbound_tx` carries every frame this
-/// thread sends back, including replies, readiness, presentation evidence, and lock reports.
-/// Ends the process on a dead Wayland connection, like the `EXIT_SUPERVISOR_GONE` arm below and for
-/// the same reason: `std::process::exit` skips destructors. Returning an error instead unwinds
-/// `App`, whose EGL surfaces and `wl_surface`s talk to the compositor that just left, which is how a
-/// log out became a `khronos-egl` `unwrap()` panic and exit code 101.
+/// thread sends back, including replies, readiness, presentation evidence, and lock reports. Ends
+/// the process on a dead Wayland connection, like the `EXIT_SUPERVISOR_GONE` arm below and for the
+/// same reason: `std::process::exit` skips destructors. Returning an error instead unwinds `App`,
+/// whose EGL surfaces and `wl_surface`s talk to the compositor that just left, which is how a log
+/// out became a `khronos-egl` `unwrap()` panic and exit code 101.
 fn exit_because_the_compositor_is_gone(what_failed: &str, err: &dyn std::fmt::Display) -> ! {
     eprintln!("[oblisk-renderer] {what_failed} failed ({err}); there is no compositor to talk to, so exiting");
     std::process::exit(shared::EXIT_COMPOSITOR_GONE);

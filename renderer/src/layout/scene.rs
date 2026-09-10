@@ -30,12 +30,12 @@ pub struct LogicalSize {
 /// nest signal evaluation.
 ///
 /// Measured end to end on a 2 MiB debug thread with a 31-deep `computed` chain on every level; the
-/// compound worst case reaches the abort boundary and counts all frames, including Lua and
-/// refusal error-formatting frames. A 64-level tree without signals uses 590 KiB, about 8,960
-/// B/level; 1,040 KiB with signals, the extra 450 KiB
-/// paid once as the chain unwinds. The 64-level case is a 1.97x margin, versus 1,400 KiB/1.44x for
-/// the old hand-written solver (ADR-0077). Production uses an 8 MiB main thread; real configs are
-/// 10-15 levels deep. Signal nesting remains 32 for dependency chains.
+/// compound worst case reaches the abort boundary and counts all frames, including Lua and refusal
+/// error-formatting frames. A 64-level tree without signals uses 590 KiB, about 8,960 B/level;
+/// 1,040 KiB with signals, the extra 450 KiB paid once as the chain unwinds. The 64-level case is a
+/// 1.97x margin, versus 1,400 KiB/1.44x for the old hand-written solver (ADR-0077). Production uses
+/// an 8 MiB main thread; real configs are 10-15 levels deep. Signal nesting remains 32 for
+/// dependency chains.
 const MAX_TREE_DEPTH: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -748,7 +748,8 @@ fn prepare_retained(
 /// Pairs children by identity (ADR-0045 decisions 1-2): an `id` matches only the same `id`, while
 /// id-less children match positionally among other id-less children. An id miss is new, never a
 /// positional fallback, so it cannot inherit an unrelated `NodeId`/subtree. Unclaimed retained
-/// nodes come back second, for `prepare` to see off. The linear match uses one `HashMap<&str, usize>` per parent; sibling
+/// nodes come back second, for `prepare` to see off. The linear match uses one `HashMap<&str,
+/// usize>` per parent; sibling
 /// count is unbounded (`1..10000` is legal Lua), and this runs on the Wayland dispatch thread at
 /// capability-push cadence (ADR-0044 decision 2).
 fn pair_children_by_id_then_position(
@@ -2631,7 +2632,8 @@ pub(super) mod tests {
         assert!(thawed.tweens.is_empty() || thawed.rect.width < 90.0, "the thaw settles or resumes, never stalls");
     }
 
-    /// The same runaway `__index` as `a_runaway_index_metamethod_fails_the_pass_instead_of_hanging_it`,
+    /// The same runaway `__index` as
+    /// `a_runaway_index_metamethod_fails_the_pass_instead_of_hanging_it`,
     /// armed only once the passes are done: a tick re-parses the retained edge table, so it runs
     /// the metamethod outside any `apply`. Slow on purpose, roughly `LAYOUT_PASS_CAP`.
     #[test]
@@ -3150,7 +3152,8 @@ pub(super) mod tests {
         apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
         lua.load(r#"state("w", 0):set("Fill")"#).exec().unwrap();
         apply_at(&mut scene, std::slice::from_ref(&surface), full(), &shaping, &lua).unwrap();
-        // `Fill` under a content-sized panel is zero (see `a_fill_child_of_a_content_sized_row_...`);
+        // `Fill` under a content-sized panel is zero (see
+        // `a_fill_child_of_a_content_sized_row_...`);
         // the point is that it got there in one pass with nothing left in flight.
         assert_eq!(child_width(&scene), 0.0);
         assert!(!scene.surface("bar@TEST").unwrap().animating());
@@ -5355,8 +5358,7 @@ pub(super) mod tests {
     }
 
     /// The guarantee most likely to be lost by a later edit: every getter fires exactly once, in
-    /// the order the config wrote it. An impure closure like
-    /// this one is what can observe it.
+    /// the order the config wrote it. An impure closure like this one is what can observe it.
     ///
     /// This used to read `abBA`, and the difference is worth keeping in view. The `Fill` child is
     /// declared first, and the hand-written pass recursed into it *last* so it could be sized from

@@ -1,12 +1,11 @@
 //! Paint properties are parsed during `Scene::apply`, not in `layout::paint`: keeping this type
 //! here avoids making `scene` depend on a module that already depends on it. Display-list builds
-//! run every dirty turn because list equality controls repaint (ADR-0063 decision 1), while
-//! applies run at capability-push cadence (ADR-0044 decision 2). This also makes malformed values
-//! fail once through `oblisk.rescue` instead of painting with a default every frame. Geometry
-//! already fails `apply` and reaches `oblisk.rescue`; one resolved map cannot give paint a second
-//! opinion on malformed values. Paint-time
-//! work remains arithmetic needing scale or focus; `icon.size` stays geometry for the scene's
-//! measure callback.
+//! run every dirty turn because list equality controls repaint (ADR-0063 decision 1), while applies
+//! run at capability-push cadence (ADR-0044 decision 2). This also makes malformed values fail once
+//! through `oblisk.rescue` instead of painting with a default every frame. Geometry already fails
+//! `apply` and reaches `oblisk.rescue`; one resolved map cannot give paint a second opinion on
+//! malformed values. Paint-time work remains arithmetic needing scale or focus; `icon.size` stays
+//! geometry for the scene's measure callback.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,9 +25,8 @@ pub enum PaintStyle {
     /// because it changes how the node's shape clips descendants.
     Box { background: Option<Rgba>, radius: f32, colors: BorderColor, widths: EdgeInsets, clip: ClipShape },
     /// Text before/after `Scene::finish` rewrites it to an ellipsized prefix under `elide` or
-    /// wrapped lines joined by `\n`; display-list paint
-    /// may therefore receive `\n`-joined lines. `elide`, `wrap`, and `max_lines` survive for that
-    /// rewrite but are dead to `layout::paint`.
+    /// wrapped lines joined by `\n`; display-list paint may therefore receive `\n`-joined lines.
+    /// `elide`, `wrap`, and `max_lines` survive for that rewrite but are dead to `layout::paint`.
     Text {
         content: String,
         /// Styled stretches of `content`, remapped when the scene rewrites it (ADR-0104).

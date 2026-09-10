@@ -357,11 +357,11 @@ impl ShapingHandle {
     }
 
     /// Entry count and a byte floor for `wayland::memory_profile`, which reports rather than
-    /// decides: no branch may read this, for `cached_len`'s reason. Sums the
-    /// heap each entry owns — the key's text and font runs, the result's lines and ranges — and
-    /// not the `HashMap`'s own table, so it under-reports and is labelled `approx` in the report.
-    /// `Arc` contents count once per entry even when two entries share one, which cannot
-    /// happen here: `shape` builds a fresh `ShapeResult` per miss.
+    /// decides: no branch may read this, for `cached_len`'s reason. Sums the heap each entry owns
+    /// -- the key's text and font runs, the result's lines and ranges -- and not the `HashMap`'s
+    /// own table, so it under-reports and is labelled `approx` in the report. `Arc` contents count
+    /// once per entry even when two entries share one, which cannot happen here: `shape` builds a
+    /// fresh `ShapeResult` per miss.
     pub fn census(&self) -> (usize, usize) {
         let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         let bytes: usize = cache
@@ -728,7 +728,6 @@ mod tests {
         }
     }
 
-    /// [`req`] in a named family, for the tests that need to tell two apart.
     fn req_in(text: &str, font_size: f32, family: Option<&str>) -> ShapeRequest {
         ShapeRequest { font: family.map(Arc::from), ..req(text, font_size) }
     }
@@ -959,7 +958,7 @@ mod tests {
         );
     }
 
-    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
+    /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
     /// looks like it worked. Uses the two families the shipped dev config names, and skips rather
     /// than fails on a machine that has neither installed.
     #[test]
@@ -976,7 +975,6 @@ mod tests {
         assert_eq!(after, wanted, "the worker measures against what the config asked for");
     }
 
-    /// The half the primary-family test does not reach, and the one that matters most here.
     /// `font_chain_data` is what `TextPainter::new` loads into femtovg, so a `set_chain` that moved
     /// the measuring side and not this one would reproduce the exact defect this module's doc
     /// records: text measured against one font and painted with another.

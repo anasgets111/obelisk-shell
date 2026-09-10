@@ -116,16 +116,16 @@ fn load_chain(
 }
 
 /// Loads the primary family's bold, italic and bold-italic files, when fontconfig has them, so a
-/// styled run (ADR-0104) is shaped and painted in a real face rather than the regular one standing
-/// in. Only for the primary: a fallback entry is there for codepoint coverage and nothing asks it
+/// styled run (ADR-0104) is shaped and painted in a real face rather than the regular one. Only
+/// the primary gets variants: a fallback entry is there for codepoint coverage and nothing asks it
 /// for a weight.
 ///
 /// Three more `fc-match` calls at startup, each asking for `family:weight=bold` and the like. A
 /// family shipped as one `.ttc` resolves every variant to the file already loaded, and
 /// `loaded_paths` makes that free; one shipped as separate files loads each. fontconfig answers a
 /// variant the family does not have with the nearest face it does, which is the regular file again
-/// or a different family entirely -- the same family check `fc_match` applies everywhere rejects the
-/// latter, and the former is a duplicate path and skipped.
+/// or a different family entirely -- the same family check `fc_match` applies everywhere rejects
+/// the latter, and the former is a duplicate path and skipped.
 fn load_variants(db: &mut Database, name: &str, resolved_family: &str, loaded_paths: &mut HashSet<PathBuf>) {
     for (variant, pattern) in
         [("bold", "weight=bold"), ("italic", "slant=italic"), ("bold italic", "weight=bold:slant=italic")]

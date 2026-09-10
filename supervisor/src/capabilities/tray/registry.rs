@@ -49,8 +49,7 @@ pub(super) type ItemKey = (OwnedUniqueName, OwnedObjectPath);
 pub(super) type ItemRegistry = Arc<Mutex<HashMap<ItemKey, ItemEntry>>>;
 
 /// Binds and hydrates a `StatusNotifierItem` and its menu (ADR-0031 eager fetch), spawns
-/// forwarders,
-/// and inserts it into `registry`. Replaces the same key and aborts its old forwarders.
+/// forwarders, and inserts it into `registry`. Replaces the same key and aborts its old forwarders.
 pub(super) async fn register_item(
     connection: &zbus::Connection,
     registry: &ItemRegistry,
@@ -106,8 +105,7 @@ pub(super) async fn register_item(
     // TOCTOU guard: the property/GetLayout awaits can outlive the connection, while
     // NameOwnerChanged only removes entries that already exist. Check liveness immediately before
     // insertion, with no await after it. Best-effort failures proceed; this narrows, not
-    // eliminates,
-    // the race.
+    // eliminates, the race.
     if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(connection).await {
         match dbus_proxy.name_has_owner(BusName::from(unique_name.clone())).await {
             Ok(false) => {

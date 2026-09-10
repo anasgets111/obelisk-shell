@@ -5,7 +5,7 @@
 //! That shape needs per-subsystem counters read at the same instant, which is what this prints.
 //!
 //! `mallinfo2`'s in-use/free split is the load-bearing pair: growing `in_use` is a live leak,
-//! while a growing `free` under a flat `in_use` is glibc holding freed chunks a
+//! while a growing `free` under a flat `in_use` is glibc holding freed chunks that a
 //! `supervisor::memory::return_free_pages_to_the_kernel`-style trim could hand back. Nothing else
 //! here distinguishes those two, and they have opposite fixes.
 //!
@@ -41,8 +41,7 @@ pub struct Malloc {
 }
 
 impl Malloc {
-    /// Reads every arena's totals. Zeroed on a platform without `mallinfo2`, which loses only
-    /// these columns.
+    /// Reads every arena's totals, or zeroes these columns on a platform without `mallinfo2`.
     #[cfg(target_env = "gnu")]
     fn now() -> Self {
         // SAFETY: plain FFI returning a POD struct by value. `mallinfo2` takes no arguments,

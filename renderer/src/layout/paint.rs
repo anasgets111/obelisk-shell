@@ -2459,10 +2459,9 @@ mod tests {
         assert!(!painter.fonts().is_empty(), "and the declared chain is still there to draw with");
     }
 
-    /// A `text` node's content
-    /// wider than the box layout gave it must stop at that box's edge, not paint over whatever
-    /// sits to its right. The live MPRIS-title-through-two-cells bug the doc comment
-    /// describes.
+    /// A `text` node's content wider than the box layout gave it must stop at that box's edge, not
+    /// paint over whatever sits to its right. The live MPRIS-title-through-two-cells bug the doc
+    /// comment describes.
     ///
     /// Proved this test is real, not just a green test: with `run`'s `save`/
     /// `intersect_scissor`/`restore` temporarily removed, this failed at the first scanned pixel
@@ -2497,11 +2496,10 @@ mod tests {
         }
     }
 
-    /// Regression test: a 1px border at a fractional
-    /// position must land on exactly one physical pixel row, not blur across two.
-    /// `padding.top = 10.3` puts the bordered rect's absolute y at a fractional offset --
-    /// unsnapped, femtovg's own antialiasing fills part of row 10 and part of row 11 at
-    /// partial coverage instead of one row at full coverage.
+    /// Regression test: a 1px border at a fractional position must land on exactly one physical
+    /// pixel row, not blur across two. `padding.top = 10.3` puts the bordered rect's absolute y at
+    /// a fractional offset -- unsnapped, femtovg's own antialiasing fills part of row 10 and part
+    /// of row 11 at partial coverage instead of one row at full coverage.
     ///
     /// Proved this catches the bug it exists for: with `snap_border_band` removed from
     /// `paint_border_edge`'s horizontal branch (using the raw, unsnapped `edge_rect` instead),
@@ -2615,11 +2613,10 @@ mod tests {
         );
     }
 
-    /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips
-    /// its glyphs. A `row` whose children overflow is the same defect as an overflowing `text`,
-    /// not a separate case. This is the
-    /// non-text half of that claim: a child rect explicitly larger than its parent must not paint
-    /// past the parent's own box.
+    /// A `row`/`column`/`rect` container clips its children just as much as a `text` node clips its
+    /// glyphs. A `row` whose children overflow is the same defect as an overflowing `text`, not a
+    /// separate case. This is the non-text half of that claim: a child rect explicitly larger than
+    /// its parent must not paint past the parent's own box.
     ///
     /// Proved this test is real the same way: with the clip removed, the assertion at (50, 50)
     /// failed, reading the child's green instead of the surface's magenta. Restored before

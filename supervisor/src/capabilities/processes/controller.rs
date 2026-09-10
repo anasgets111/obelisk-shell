@@ -92,8 +92,8 @@ struct Entry {
     public: SessionProcess,
 }
 
-/// The running half: the channel [`supervise`] is selecting on, and its handle for the shutdown
-/// reap to await.
+/// The running half: the channel [`supervise`] selects on and its handle for the shutdown reap to
+/// await.
 struct Live {
     requests: UnboundedSender<Request>,
     task: JoinHandle<()>,
@@ -208,8 +208,8 @@ impl ProcessesController {
         };
         for (name, live) in live {
             let _ = live.requests.send(Request::Stop);
-            // The sender is dropped with `live.requests` here, which `supervise` also reads as a
-            // stop; the explicit request above covers the ordinary case where it is still selecting.
+            // Dropping `live.requests` also reads as a stop to `supervise`; the explicit request
+            // above covers the ordinary case where it is still selecting.
             drop(live.requests);
             if let Err(err) = live.task.await {
                 eprintln!("processes: {name:?}'s supervising task did not finish cleanly on shutdown: {err}");
@@ -358,8 +358,7 @@ mod tests {
     /// The marker is the point of this: `start` sets `running` synchronously, before the child has
     /// reached its own first instruction, so a test that signals as soon as `running` is true
     /// races the `exec` and kills a process whose trap does not exist yet. That race produced a
-    /// signalled death with no status, which is exactly what these tests assert is *not* what
-    /// happened.
+    /// signalled death with no status, which is exactly what these tests assert did not happen.
     fn trapping_shell(trap: &str, marker: &Path) -> (String, Vec<String>) {
         shell(&format!("{trap}; : > {}; while :; do sleep 0.05; done", marker.display()))
     }

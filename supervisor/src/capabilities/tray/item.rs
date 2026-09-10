@@ -133,8 +133,7 @@ pub(super) async fn fetch_tray_item_base(
 
 /// One icon triple defined by docs/oblisk-idl-api-specs.md §2.5 (`{X}IconName`, `{X}IconPixmap`,
 /// `IconThemePath`) resolved to the config's `(name, path)` pair (ADR-0074). `spool_suffix` keeps
-/// the three PNGs distinct; otherwise the last
-/// write to `{unique_name}.png` would win.
+/// the three PNGs distinct; otherwise the last write to `{unique_name}.png` would win.
 fn resolve_variant(
     icon_name_prop: String,
     pixmaps_raw: Vec<(i32, i32, Vec<u8>)>,

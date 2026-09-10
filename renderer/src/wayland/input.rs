@@ -330,9 +330,10 @@ fn retarget_secure_submit(
 /// scopes without one `secure_submit` return `None` through [`App::focus_secure_submit`], so moving
 /// focus cannot leave keys addressed to the old field. Keep a current field only if still declared
 /// in scope, and still reachable there: a prompt that hides while focused is as gone as one a
-/// reload deleted. The compositor's `enter` commonly follows a press, so discarding current focus would
-/// make a multi-field surface untypable by clicking. Otherwise, [`sole_secure_submit_in_scope`]
-/// refuses to guess among several fields; reloads cannot keep deleted targets.
+/// reload deleted. The compositor's `enter` commonly follows a press, so discarding current focus
+/// would make a multi-field surface untypable by clicking. Otherwise,
+/// [`sole_secure_submit_in_scope`] refuses to guess among several fields; reloads cannot keep
+/// deleted targets.
 fn focus_on_enter(scope: &[(&str, &layout::ResolvedNode)], current: Option<&FocusedField>) -> Option<FocusedField> {
     let still_declared = |field: &&FocusedField| {
         scope
@@ -357,7 +358,8 @@ fn focus_is_still_armed(field: &FocusedField, scope: &[String], its_surface_is_l
 /// them all: the two focuses are held independently, and `apply_key` offers a key to both, so a
 /// prompt revealed while a plain field was already typing would otherwise put every character of a
 /// password through that field's `on_change` -- into Lua, which is the one place a `secure_submit`
-/// secret must never reach (ADR-0005). "Masked focus wins" is the rule `arm_autofocus_if_nothing_is_typing`
+/// secret must never reach (ADR-0005). "Masked focus wins" is the rule
+/// `arm_autofocus_if_nothing_is_typing`
 /// already states for arming; this is the same rule for the keys themselves.
 ///
 /// The draft survives, exactly as it does when the surface loses the keyboard (ADR-0108): the field
@@ -1625,9 +1627,9 @@ mod tests {
 
     #[test]
     fn secure_submit_frame_carries_the_accumulated_secret_and_zeroizes_the_buffer_it_read() {
-        // ADR-0005, ADR-0027: the frame carries the exact secret
-        // this thread accumulated, tagged with this process's own generation_id, and the source
-        // buffer is scrubbed in the same breath as the read rather than left live.
+        // ADR-0005, ADR-0027: the frame carries the exact secret this thread accumulated, tagged
+        // with this process's own generation_id, and the source buffer is scrubbed in the same
+        // breath as the read rather than left live.
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
 
@@ -2110,10 +2112,9 @@ mod tests {
     #[test]
     fn a_field_is_armed_only_while_its_own_surface_holds_the_keyboard_and_still_exists() {
         // One per-keystroke question replaces clearing calls at five or six teardown sites. The
-        // liveness half is the traced leak: type
-        // a login password on the lock screen, the compositor sends `finished`,
-        // `teardown_lock_surfaces` destroys the `wl_surface` with no `leave` required to follow, so
-        // the plaintext used to stay live in `App::secure_buffer`.
+        // liveness half is the traced leak: type a login password on the lock screen, the
+        // compositor sends `finished`, `teardown_lock_surfaces` destroys the `wl_surface` with no
+        // `leave` required to follow, so the plaintext used to stay live in `App::secure_buffer`.
         let armed = field("screen@TEST", "lock", "authenticate");
         let scope = |ids: &[&str]| ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
         assert!(focus_is_still_armed(&armed, &scope(&["screen@TEST"]), true));

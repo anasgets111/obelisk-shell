@@ -12,9 +12,8 @@ use super::*;
 /// § 6's `lock` has only `id` and `child` (ADR-0052 decision 2). `child` is walked into the
 /// retained tree, so the spec carries no layout field. It stays a struct rather than
 /// `SurfaceSpec::Lock(String)`, giving [`lock_spec`] a place to attach § 6's four refusals. There
-/// is no `LockTopology`: the protocol
-/// exposes only `ack_configure`, with size supplied by configure, so only declaration existence is
-/// fingerprinted.
+/// is no `LockTopology`: the protocol exposes only `ack_configure`, with size supplied by
+/// configure, so only declaration existence is fingerprinted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockSpec {
     pub id: String,
@@ -200,9 +199,9 @@ pub struct SecureSubmitTarget {
 }
 
 /// `secure_submit` is optional (§ 5.2 item 8) because an unread mask is unreadable from Lua, and it
-/// is non-structural, so signal-bound values arrive
-/// resolved. `capability`/`action` reject non-UTF-8 rather than collapsing distinct bytes onto one
-/// Supervisor capability name, as [`parse_node_id`] does.
+/// is non-structural, so signal-bound values arrive resolved. `capability`/`action` reject
+/// non-UTF-8 rather than collapsing distinct bytes onto one Supervisor capability name, as
+/// [`parse_node_id`] does.
 pub fn parse_secure_submit(properties: &HashMap<String, Value>) -> Result<Option<SecureSubmitTarget>, LayoutError> {
     let Some(value) = properties.get("secure_submit") else {
         return Ok(None);

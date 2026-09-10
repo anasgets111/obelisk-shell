@@ -1,11 +1,10 @@
 //! Typed, validated properties for `VirtualNode` (`docs/oblisk-idl-api-specs.md` § 5.1).
 //! `resolve_properties` reads each ordinary `Signal` once per node/pass (ADR-0044 decision 1);
-//! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals.
-//! A `panel`'s other § 6 properties are live fields, not exceptions. Plain tables remain
+//! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals. A
+//! `panel`'s other § 6 properties are live fields, not exceptions. Plain tables remain
 //! metamethod-backed, so each `table.get` can still run `__index`; see `parse_edge_insets`'s
-//! `ponytail:`. A signal resolving
-//! to another signal errors rather than reading again, while `MAX_TREE_DEPTH` bounds recursive
-//! tree construction.
+//! `ponytail:`. A signal resolving to another signal errors rather than reading again, while
+//! `MAX_TREE_DEPTH` bounds recursive tree construction.
 
 mod animate;
 mod content;
@@ -285,25 +284,23 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// Whether `property` is one [`resolve_properties`] copies through untouched on a node of this
 /// `kind`, so [`reject_signal_in_structural_field`] still sees a raw `Value::UserData` and can
 /// refuse it. Resolving then rejecting is unimplementable: once read, a signal's value is
-/// indistinguishable from a literal. Kind-aware because a skip is only sound where a parser runs
-/// to do the rejecting. `id` is
-/// skipped on every kind ([`parse_node_id`]/[`parse_surface_id`] read it wherever it appears).
-/// `layer`/`anchor`/`monitor`/`namespace` are read only by `surface::surface_topology` on
-/// top-level surfaces; skipping them on a `rect` (where no parser reads them) would leak a live
-/// `Signal` into `layout::scene::ResolvedNode::properties`, breaking its "never a `Signal`"
-/// invariant. Below a surface these resolve like any ordinary property.
+/// indistinguishable from a literal. Kind-aware because a skip is only sound where a parser runs to
+/// do the rejecting. `id` is skipped on every kind ([`parse_node_id`]/[`parse_surface_id`] read it
+/// wherever it appears). `layer`/`anchor`/`monitor`/`namespace` are read only by
+/// `surface::surface_topology` on top-level surfaces; skipping them on a `rect` (where no parser
+/// reads them) would leak a live `Signal` into `layout::scene::ResolvedNode::properties`, breaking
+/// its "never a `Signal`" invariant. Below a surface these resolve like any ordinary property.
 /// `namespace` joins the carve-out for the same protocol reason as `monitor`:
-/// `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at creation and no request changes
-/// it on a live surface. The in-place `panel` fields (`keyboard_interactivity`, `exclusive`,
-/// `margin`, `width`/`height`) are deliberately *not* here: layer-shell permits changing each on a
-/// live surface (ADR-0044 decision 1). `window`,
-/// `popup` and `lock` add nothing, by the same live-object test: a `window`'s
-/// `set_title`/`set_app_id`/`set_min_size`/`set_max_size` are all valid requests on a mapped
-/// toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on every open (ADR-0049 decision 1), so
-/// `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a `lock`'s § 6
-/// property list is only `id` and `child`, already the universal arm's as a reconcile identity
-/// rather than a protocol field. `hover` joins it there on any kind (ADR-0062 decision 3): it
-/// names the signal the pointer handler writes, and a resolved `hover` would arrive as the
+/// `zwlr_layer_shell_v1::get_layer_surface` fixes a namespace at creation and no request changes it
+/// on a live surface. The in-place `panel` fields (`keyboard_interactivity`, `exclusive`, `margin`,
+/// `width`/`height`) are deliberately *not* here: layer-shell permits changing each on a live
+/// surface (ADR-0044 decision 1). `window`, `popup` and `lock` add nothing, by the same live-object
+/// test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size` are all valid requests
+/// on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on every open (ADR-0049
+/// decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a
+/// `lock`'s § 6 property list is only `id` and `child`, already the universal arm's as a reconcile
+/// identity rather than a protocol field. `hover` joins it there on any kind (ADR-0062 decision 3):
+/// it names the signal the pointer handler writes, and a resolved `hover` would arrive as the
 /// boolean `false`, saying nothing about *which* signal that is.
 fn is_structural_property(kind: &str, property: &str) -> bool {
     property == "id"
@@ -316,35 +313,34 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
         || (kind == "panel" && matches!(property, "layer" | "anchor" | "monitor" | "namespace"))
 }
 
-/// One node's raw property map with every `Signal` replaced by its current value (ADR-0044
-/// decision 1). Called once per node per pass, as that node enters reconciliation; everything
-/// downstream (this module's parsers, `layout::scene`'s sizing/positioning passes,
-/// `ResolvedNode::properties`) reads the result, not the raw map. Once, and once is load-bearing:
-/// `Signal::get_value` runs a `computed` signal's Lua closure, and a closure that is not a pure
-/// function of unchanged state (`os.clock()`, `math.random`, an accumulator upvalue) answers
-/// differently on every call, so one read per property makes the resolved tree a snapshot of one
-/// pass and stops ADR-0021's per-`get_value` 5ms budget being paid four times over for one
-/// property. The snapshot covers the *signals* only: a plain table with an `__index` metamethod
-/// is copied through as-is, and each `table.get` a parser makes still runs it again; see
-/// [`parse_edge_insets`]'s `ponytail:`. Nor is this ADR-0044 decision 3's rejected memoization,
-/// which caches *across* pushes and needs an invalidation rule no push has. Per entry: a key
-/// [`is_structural_property`] names for this node's `kind` is copied through
-/// raw, signal and all. A `Value::UserData` holding a `Signal` is read through `Signal::get_value`
-/// and the *result* stored in its place; a result that is itself a `Signal` is an error naming
-/// the property, not a second read, avoiding an unbounded loop on a cyclic construction. A result
-/// of `Value::Nil` **omits the key entirely**: ADR-0044 decision 1's amendment ("a signal
-/// resolving to nil means the property is absent") falls out of the map rather than being
-/// re-checked in every parser. Matters at boot: `RendererClient::run_startup_evaluation` runs
-/// before the poll loop drains any inbound frame, so every `shared::Capability::ALL` signal still
-/// reads `nil` at the first `Scene::apply`, and a bare capability binding must not fail layout
-/// there; also consistent with a Lua table's own inability to store `nil`, so `visible = nil`
-/// reads the same. Everything else, including a `UserData` that is not a `Signal`, is copied
+/// One node's raw property map with every `Signal` replaced by its current value (ADR-0044 decision
+/// 1). Called once per node per pass, as that node enters reconciliation; everything downstream
+/// (this module's parsers, `layout::scene`'s sizing/positioning passes, `ResolvedNode::properties`)
+/// reads the result, not the raw map. Once, and once is load-bearing: `Signal::get_value` runs a
+/// `computed` signal's Lua closure, and a closure that is not a pure function of unchanged state
+/// (`os.clock()`, `math.random`, an accumulator upvalue) answers differently on every call, so one
+/// read per property makes the resolved tree a snapshot of one pass and stops ADR-0021's
+/// per-`get_value` 5ms budget being paid four times over for one property. The snapshot covers the
+/// *signals* only: a plain table with an `__index` metamethod is copied through as-is, and each
+/// `table.get` a parser makes still runs it again; see [`parse_edge_insets`]'s `ponytail:`. Nor is
+/// this ADR-0044 decision 3's rejected memoization, which caches *across* pushes and needs an
+/// invalidation rule no push has. Per entry: a key [`is_structural_property`] names for this node's
+/// `kind` is copied through raw, signal and all. A `Value::UserData` holding a `Signal` is read
+/// through `Signal::get_value` and the *result* stored in its place; a result that is itself a
+/// `Signal` is an error naming the property, not a second read, avoiding an unbounded loop on a
+/// cyclic construction. A result of `Value::Nil` **omits the key entirely**: ADR-0044 decision 1's
+/// amendment ("a signal resolving to nil means the property is absent") falls out of the map rather
+/// than being re-checked in every parser. Matters at boot: `RendererClient::run_startup_evaluation`
+/// runs before the poll loop drains any inbound frame, so every `shared::Capability::ALL` signal
+/// still reads `nil` at the first `Scene::apply`, and a bare capability binding must not fail
+/// layout there; also consistent with a Lua table's own inability to store `nil`, so `visible =
+/// nil` reads the same. Everything else, including a `UserData` that is not a `Signal`, is copied
 /// through unchanged, for whichever parser reads it. Every property resolves, including ones no
-/// parser reads today: the resolved map is what the
-/// paint stage reads a colour or radius straight off (`ResolvedNode::properties`), and § 5.1 puts
-/// no property out of a `Signal`'s reach, so there is no subset safe to skip. A getter that raises
-/// fails the whole apply, even for a property nothing downstream looked at: deferring would mean
-/// keeping the getter around to re-run later, the second read this function prevents.
+/// parser reads today: the resolved map is what the paint stage reads a colour or radius straight
+/// off (`ResolvedNode::properties`), and § 5.1 puts no property out of a `Signal`'s reach, so there
+/// is no subset safe to skip. A getter that raises fails the whole apply, even for a property
+/// nothing downstream looked at: deferring would mean keeping the getter around to re-run later,
+/// the second read this function prevents.
 ///
 /// ponytail: one fresh `HashMap` per node per pass, not reusing the retained node's allocation
 /// across passes. Costs more now that ADR-0044 decision 2's dirty flag makes a pass a per-push,

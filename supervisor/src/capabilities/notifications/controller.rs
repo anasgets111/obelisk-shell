@@ -235,9 +235,9 @@ impl NotificationsController {
     }
 
     /// Resolves `Notify`'s attached-picture precedence ([`resolve_image_input`]) into a final path.
-    /// Raw image data is checked, PNG
-    /// encoded, and spooled to SHM; `image-path` uses the body-image trust boundary. The positional
-    /// application icon is separate and handled by [`resolve_app_icon`] (ADR-0091).
+    /// Raw image data is checked, PNG encoded, and spooled to SHM; `image-path` uses the body-image
+    /// trust boundary. The positional application icon is separate and handled by
+    /// [`resolve_app_icon`] (ADR-0091).
     async fn resolve_and_spool_image(
         &self,
         id: u32,
@@ -290,8 +290,8 @@ impl NotificationsController {
     }
 
     /// `notifications:reply(id, text)` requires `has_reply`, emits `NotificationReplied(id, text)`,
-    /// then removes unless `resident` is set, as [`NotificationsController::invoke_action`] does for
-    /// a button. Unknown/no-reply ids log/no-op.
+    /// then removes unless `resident` is set, as [`NotificationsController::invoke_action`] does
+    /// for a button. Unknown/no-reply ids log/no-op.
     ///
     /// The text rides its own signal rather than an encoded `ActionInvoked` key; ADR-0033's
     /// amendment says why. `Dismissed` rather than `ClosedByMethod`, because a sent reply is the

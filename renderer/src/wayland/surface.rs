@@ -415,11 +415,11 @@ fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)
 }
 /// PBA § 14.2 staging gate. It takes `(null_buffered, exists)`: a hidden window has no
 /// `xdg_toplevel`, so `null_buffered` stays false forever and a plain `all(null_buffered)` would
-/// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also attaches a
-/// null buffer on its first configure. A `panel` gets a configure once it has a layer object, which
-/// it is created with unless it measures an axis and starts hidden -- and that one has no object,
-/// so it is complete by construction too. Popup visibility is frozen during the handshake.
-/// [`presenting_surface_ids`] uses the matching `Unmapped` filter.
+/// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also
+/// attaches a null buffer on its first configure. A `panel` gets a configure once it has a layer
+/// object, which it is created with unless it measures an axis and starts hidden -- and that one
+/// has no object, so it is complete by construction too. Popup visibility is frozen during the
+/// handshake. [`presenting_surface_ids`] uses the matching `Unmapped` filter.
 fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
     surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
 }
@@ -646,14 +646,13 @@ impl App {
         }
     }
 
-    /// Push a resolved root's live protocol fields, input region, and visibility
-    /// (ADR-0038 decision 2, ADR-0049 decisions 1-2). Window fields must come from the resolved
-    /// `WindowSpec`: raw evaluation values would freeze signal-bound `title`s. The socket parser
+    /// Push a resolved root's live protocol fields, input region, and visibility (ADR-0038 decision
+    /// 2, ADR-0049 decisions 1-2). Window fields must come from the resolved `WindowSpec`: raw
+    /// evaluation values would freeze signal-bound `title`s. The socket parser
     /// [`crate::socket::surface_specs`] still reads unresolved properties, which is right for a
     /// panel's topology fields but wrong for a window's live fields. Push before
-    /// `apply_visibility`,
-    /// so a newly shown window uses this pass's spec; callers commit all staged state together,
-    /// while create/destroy/map/unmap commit by definition.
+    /// `apply_visibility`, so a newly shown window uses this pass's spec; callers commit all staged
+    /// state together, while create/destroy/map/unmap commit by definition.
     fn apply_resolved_state(&mut self, index: usize) {
         let surface_id = self.surfaces[index].surface_id.clone();
         // `Scene::surface` lends its tree, so what the tree is read for is taken here and the
@@ -1521,7 +1520,8 @@ mod tests {
         slid.anchor_rect = LogicalRect { x: 400.0, ..spec.anchor_rect };
         assert_ne!(opened, Placement::of(&slid, card));
 
-        // And a declared axis is deaf to the measurement, so a fixed popup never repositions for it.
+        // And a declared axis is deaf to the measurement, so a fixed popup never repositions for
+        // it.
         let fixed = popup_spec_fixture();
         assert_eq!(Placement::of(&fixed, card), Placement::of(&fixed, grown));
     }

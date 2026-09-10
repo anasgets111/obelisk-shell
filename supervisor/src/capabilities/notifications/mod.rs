@@ -9,11 +9,11 @@
 //! delegates decisions to pure helpers. Queue/DND are global Supervisor state (ADR-0033), not
 //! per-generation; there is no `reset_registrations`.
 //!
-//! The parser replaces the base spec's blanket strip-to-plain-text sanitizer with a wider
-//! allowlist grammar: five constructs are allowlisted (`<b>`, `<i>`, `<u>`, `<a href>`,
-//! `<img src>`); everything else is rejected. Images, `image-path`, and action icons share
-//! [`validate_trusted_path`]: an
-//! existing regular file under a canonicalized trusted root, otherwise no icon and no error.
+//! The parser replaces the base spec's blanket strip-to-plain-text sanitizer with a wider allowlist
+//! grammar: five constructs are allowlisted (`<b>`, `<i>`, `<u>`, `<a href>`, `<img src>`);
+//! everything else is rejected. Images, `image-path`, and action icons share
+//! [`validate_trusted_path`]: an existing regular file under a canonicalized trusted root,
+//! otherwise no icon and no error.
 
 use serde::Serialize;
 
@@ -132,8 +132,7 @@ const DEFAULT_EXPIRE_MS: u64 = 5000;
 
 /// `GetCapabilities`'s exact 10 strings (ADR-0033). Only `icon-multi` is absent because `Notify`
 /// has no multi-size wire field. `sound` honors `sound-file`/tier default via
-/// [`should_play_sound`];
-/// only `sound-name` is unhonored.
+/// [`should_play_sound`]; only `sound-name` is unhonored.
 const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "action-icons",
     "actions",

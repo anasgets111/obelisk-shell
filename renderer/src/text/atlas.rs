@@ -190,10 +190,10 @@ impl TextPainter {
     /// Registers any faces the shaping worker has loaded since this painter was built, and
     /// rebuilds the chains around them (ADR-0144).
     ///
-    /// The point of the whole runtime path: a family a node names for the first time is resolved
-    /// on the shaping worker, and paint has to reach the same faces or it measures in one family
-    /// and draws in another. Called once a frame from `wayland::surface`, and a no-op on the
-    /// generation it was built from -- which is every frame but the few where a new family lands.
+    /// A newly named family resolves on the shaping worker; paint must reach the same faces or it
+    /// measures in one family and draws in another. Called once a frame from `wayland::surface`,
+    /// and a no-op when the generation is unchanged -- every frame except the few where a new
+    /// family lands.
     ///
     /// Chains are rebuilt, but faces are registered only once: `self.registered` is what keeps
     /// this from re-parsing every face and stranding femtovg's previous `Font` entries. The canvas

@@ -1,14 +1,13 @@
 //! Renderer-side Unix control-socket client and `SupervisorFrame` handling. Connects to
 //! `$XDG_RUNTIME_DIR/oblisk-shell.sock`; the Supervisor listens (`supervisor/src/socket.rs`) and
-//! sends `shared::ConnectionHandshake` first. Two threads/channels (ADR-0039): [`pump`] does
-//! framed I/O, while the Wayland thread owns Lua and the GL-context paint pass because
-//! `mlua::Lua` is `!Send`. `StateSnapshot` hydrates a capability signal and dirties the scene
-//! (ADR-0044 decision 2), then runs its `on_change` handlers (ADR-0115); only `Reevaluate` runs
-//! Lua,
-//! classifying against `applied_topology` as `Unchanged`, `TopologyChanged`, or `Failed`. `None`
-//! means "safe to apply", not "empty topology", or startup failure would blank the shell. No
-//! reconnect after disconnect (ADR-0059 decision 1): the Supervisor owns capabilities,
-//! `process.run` children, and PAM.
+//! sends `shared::ConnectionHandshake` first. Two threads/channels (ADR-0039): [`pump`] does framed
+//! I/O, while the Wayland thread owns Lua and the GL-context paint pass because `mlua::Lua` is
+//! `!Send`. `StateSnapshot` hydrates a capability signal and dirties the scene (ADR-0044 decision
+//! 2), then runs its `on_change` handlers (ADR-0115); only `Reevaluate` runs Lua, classifying
+//! against `applied_topology` as `Unchanged`, `TopologyChanged`, or `Failed`. `None` means "safe to
+//! apply", not "empty topology", or startup failure would blank the shell. No reconnect after
+//! disconnect (ADR-0059 decision 1): the Supervisor owns capabilities, `process.run` children, and
+//! PAM.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -639,10 +638,8 @@ impl RendererClient {
             });
         if let Err(err) = applied {
             // Rollback keeps the prior scene. Do not set rescue: that is for `shell.lua`
-            // evaluation,
-            // not a rejected capability push.
-            // ponytail: logging forever, nothing user-visible. Upgrade: rescue-adjacent channel
-            // for rejected pushed values.
+            // evaluation, not a rejected capability push. ponytail: logging forever, nothing
+            // user-visible. Upgrade: rescue-adjacent channel for rejected pushed values.
             eprintln!("control-socket client: dirty-scene re-resolve failed, keeping the prior scene: {err}");
             return false;
         }
@@ -999,8 +996,7 @@ mod tests {
     }
 
     /// Next queued non-start frame, or a panic naming what was missing. Reading `oblisk.lock`
-    /// queues
-    /// a start (ADR-0070 decision 1), so tests would otherwise step over it; the dedicated
+    /// queues a start (ADR-0070 decision 1), so tests would otherwise step over it; the dedicated
     /// `a_capability_read_asks_the_supervisor_to_start_it` test accounts for starts.
     fn queued_frame(outbound_rx: &mut mpsc::UnboundedReceiver<RendererFrame>) -> RendererFrame {
         loop {
@@ -1276,8 +1272,7 @@ mod tests {
         // Use `dev-config/oblisk/shell.lua`, not a fixture: it is the worked example split across
         // thirty-odd `require`d files, so renames or moved modules escape `components/` tests.
         // Evaluate as `run_startup_evaluation`: seeded capabilities read nil before the first
-        // snapshot,
-        // as at real boot.
+        // snapshot, as at real boot.
         let shell_lua = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk/shell.lua");
         let (client, _outbound_rx) = test_client(&shell_lua);
 
@@ -2365,9 +2360,8 @@ mod tests {
         // `expand_instances` makes one instance per lock spec/output. Two declarations make
         // `ensure_lock_surfaces` send two `get_lock_surface`s for one `wl_output`;
         // `ext-session-lock-v1` calls that `duplicate_output`, and the compositor kills the
-        // connection after lock, leaving
-        // only a VT switch. Both entry points reject it: startup returns no specs and `Reevaluate`
-        // reports `Failed`, never staging it.
+        // connection after lock, leaving only a VT switch. Both entry points reject it: startup
+        // returns no specs and `Reevaluate` reports `Failed`, never staging it.
         let dir = tempfile::tempdir().unwrap();
         let two_locks = r#"return { lock { id = "first" }, lock { id = "second" } }"#;
         let path = write_shell_lua(dir.path(), two_locks);
@@ -3019,8 +3013,8 @@ mod tests {
     #[test]
     fn a_config_binding_a_bare_rostered_signal_applies_at_startup_with_no_push_at_all() {
         // ADR-0044 decision 1: startup runs before an inbound frame drains, so rostered
-        // capabilities
-        // read `nil`; bare bindings still apply using each parser's absent-property default.
+        // capabilities read `nil`; bare bindings still apply using each parser's absent-property
+        // default.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
@@ -3557,13 +3551,11 @@ mod tests {
     }
 
     /// `shared::framing::read_frame` does two sequential `read_exact`s, so partial progress lives
-    /// in its future.
-    /// Old `pump` raced one `read_json_frame` against `outbound_rx.recv()` per `select!`; outbound
-    /// could drop a stalled read, losing consumed bytes, and the next iteration read a length
-    /// prefix
-    /// from the middle of JSON. This reproduces the race with an inbound frame split across writes
-    /// and outbound activity between them. Fixed `pump` gives each direction a long-lived loop, so
-    /// the stalled read survives.
+    /// in its future. Old `pump` raced one `read_json_frame` against `outbound_rx.recv()` per
+    /// `select!`; outbound could drop a stalled read, losing consumed bytes, and the next iteration
+    /// read a length prefix from the middle of JSON. This reproduces the race with an inbound frame
+    /// split across writes and outbound activity between them. Fixed `pump` gives each direction a
+    /// long-lived loop, so the stalled read survives.
     #[tokio::test]
     async fn pump_survives_an_inbound_frame_split_around_an_outbound_frame() {
         let (mut wire, server) = tokio::io::duplex(4096);

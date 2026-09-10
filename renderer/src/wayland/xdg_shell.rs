@@ -17,9 +17,9 @@ enum PopupAction {
     Nothing,
 }
 /// ADR-0051 decision 2's pure latch machine for § 5.1's `visible`. `dismissed_at` is the pointer
-/// count at dismissal;
-/// it holds while that count is unchanged (first amendment), since the `visible = false` edge is
-/// otherwise unobservable and a bool would latch forever. The caller clears it on that edge.
+/// count at dismissal; it holds while that count is unchanged (first amendment), since the `visible
+/// = false` edge is otherwise unobservable and a bool would latch forever. The caller clears it on
+/// that edge.
 ///
 /// `visible=true` with no object creates unless the count is latched; a moved count permits a fresh
 /// click. `visible=false` destroys an object and otherwise does nothing. An existing object stays,
@@ -142,12 +142,11 @@ const REPOSITION_SINCE: u32 = 3;
 /// with no min size, that is the opening size when the first configure leaves an axis zero.
 /// Upgrade: § 6 advisory initial size or solver-backed `Content` sizing (ADR-0077).
 const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
-/// Toplevel buffer size. `xdg_toplevel::configure` binds maximized and fullscreen sizes, so
-/// `Some` axes are authoritative; tiling compositors, including niri, always take this branch. A
-/// `None` axis means "the client picks", the ordinary first configure on a floating compositor.
-/// Choose `min_size`, then 640x480, then clamp by
-/// positive `max_size`; a zero max means unset per `set_max_size`. Clamp both axes to 1 because a
-/// zero `wl_egl_window` is invalid.
+/// Toplevel buffer size. `xdg_toplevel::configure` binds maximized and fullscreen sizes, so `Some`
+/// axes are authoritative; tiling compositors, including niri, always take this branch. A `None`
+/// axis means "the client picks", the ordinary first configure on a floating compositor. Choose
+/// `min_size`, then 640x480, then clamp by positive `max_size`; a zero max means unset per
+/// `set_max_size`. Clamp both axes to 1 because a zero `wl_egl_window` is invalid.
 fn toplevel_size_for(
     new_size: (Option<std::num::NonZeroU32>, Option<std::num::NonZeroU32>),
     spec: &WindowSpec,
@@ -410,8 +409,8 @@ impl App {
         };
         let spec = spec.clone();
         let placement = Placement::of(&spec, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
-        // `requested` is what `apply_resolved_state` measured; `Placement::of` above cannot know it,
-        // so take the measured pair and keep the placement fields it did read.
+        // `requested` is what `apply_resolved_state` measured; `Placement::of` above cannot know
+        // it, so take the measured pair and keep the placement fields it did read.
         let placement = Placement { size: *requested, ..placement };
 
         // Nothing measured on a `Content` axis yet, so there is no size to ask for. Decline and
@@ -730,10 +729,10 @@ impl PopupHandler for App {
 
     /// `popup_done` is compositor dismissal, not a request. It is why ADR-0040 uses a real
     /// `xdg_popup` instead of a second `panel`: layer-shell has no compositor-agnostic
-    /// click-outside dismissal. Then destroy children/object, latch ADR-0051 decision 2, and call
-    /// § 6 `on_dismiss` against the already-gone popup. A denied
-    /// grab arrives here as normal `popup_done` (ADR-0051 decision 3); clone callbacks and swallow
-    /// raises. The latch, not this callback, prevents the re-resolve livelock.
+    /// click-outside dismissal. Then destroy children/object, latch ADR-0051 decision 2, and call §
+    /// 6 `on_dismiss` against the already-gone popup. A denied grab arrives here as normal
+    /// `popup_done` (ADR-0051 decision 3); clone callbacks and swallow raises. The latch, not this
+    /// callback, prevents the re-resolve livelock.
     fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
         let Some(index) = self.index_of_surface(popup.wl_surface()) else {
             return;

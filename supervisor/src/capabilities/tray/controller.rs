@@ -177,8 +177,7 @@ impl TrayController {
 
     /// `tray:menu_will_show(id, submenu_id)` calls DBusMenu `AboutToShow(submenu_id)`, its
     /// lazy-population signal, then re-fetches and pushes the entire menu tree (ADR-0031). Full
-    /// refetch is adequate for
-    /// human-scale trees.
+    /// refetch is adequate for human-scale trees.
     pub async fn menu_will_show(&self, id: &str, submenu_id: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: menu_will_show({id:?}, {submenu_id}) failed: {}", TrayActionError::UnknownItem);

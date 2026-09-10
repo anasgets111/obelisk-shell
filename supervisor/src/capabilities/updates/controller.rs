@@ -74,9 +74,8 @@ pub struct UpdatesConfigure {
     /// Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
     pub interval_secs: u64,
     /// Remembered Unix time of the last successful check, likely from `system.state`. Optional
-    /// seed,
-    /// not override: used only before this process has checked, so restarts can answer "has an hour
-    /// passed?" without starting over.
+    /// seed, not override: used only before this process has checked, so restarts can answer "has
+    /// an hour passed?" without starting over.
     pub checked_at: Option<i64>,
     /// Remembered list from the check `checked_at` stamps, under the same seed rule: a restart
     /// inside the interval skips its first check, and without this it would show "up to date" for

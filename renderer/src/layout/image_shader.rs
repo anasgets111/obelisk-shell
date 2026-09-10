@@ -719,7 +719,8 @@ mod tests {
     }
 
     /// A box smaller than one logical pixel is legitimate -- a tween passes through it -- and must
-    /// not be clamped up to one, which would misplace the quad. Zero and below have nothing to draw.
+    /// not be clamped up to one, which would misplace the quad. Zero and below have nothing to
+    /// draw.
     #[test]
     fn a_fractional_box_is_kept_and_an_empty_one_is_refused() {
         assert_eq!(positive(0.25), Some(0.25));

@@ -130,10 +130,10 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     })
 }
 
-/// Validates `docs/oblisk-supervisor-services-dbus.md §1.1`'s image-data bounds and its "ARGB
-/// icon rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit
-/// samples only, channels matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length.
-/// ponytail: no 16-bit/float support until a real sender needs it.
+/// Validates `docs/oblisk-supervisor-services-dbus.md §1.1`'s image-data bounds and its "ARGB icon
+/// rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit samples only, channels
+/// matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length. ponytail: no 16-bit/float
+/// support until a real sender needs it.
 pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
     image.width > 0
         && image.height > 0
@@ -226,9 +226,9 @@ pub(super) fn resolve_image_input(
 /// Splits `image-path`/`image_path` into `(picture, theme name)` (ADR-0096).
 ///
 /// §1.2 allows a `file://` URI or a freedesktop theme name; `file://` is the only URI schema
-/// supported right now. Paths use [`validate_trusted_path`];
-/// names have no path to validate. Leaving names in the picture chain caused ADR-0091's
-/// `app_icon` bug, so they move to the application-icon path.
+/// supported right now. Paths use [`validate_trusted_path`]; names have no path to validate.
+/// Leaving names in the picture chain caused ADR-0091's `app_icon` bug, so they move to the
+/// application-icon path.
 ///
 /// Split on `/`: using `is_absolute` would misclassify `"../../etc/passwd"` as a theme name and
 /// pass it to renderer lookup.
