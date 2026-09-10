@@ -42,7 +42,11 @@ oblisk.battery:on_change(function(b, previous)
         return
     end
     -- OSDService.qml's two charge events. Both imply mains, so no `isACPowered` guard.
-    if b.state == "PendingCharge" and previous.state ~= "PendingCharge" then
+    -- Only a crossing out of `Charging` is the limit. `PendingCharge` also arrives from
+    -- `Discharging` for a few seconds at every plug-in, while the asus driver still reads
+    -- `Not charging`, and announcing that said "charge limit reached" at 37% against a limit of 70.
+    -- Charging up to a real limit passes through `Charging`, so no true announcement is lost.
+    if b.state == "PendingCharge" and previous.state == "Charging" then
         osd.show("battery", { glyph = icons.battery_ac, text = "charge limit reached" })
     elseif previous.state == "Charging" and b.state ~= "Charging" and (b.state == "FullyCharged" or b.percent >= 100) then
         osd.show("battery", { glyph = icons.battery_ac, text = "fully charged" })

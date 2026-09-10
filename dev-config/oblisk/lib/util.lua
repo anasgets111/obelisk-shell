@@ -21,14 +21,19 @@ end
 -- power menu, and lock screen.
 -- `PendingCharge` matters when a laptop with `charge_control_end_threshold` set sits plugged in at
 -- the limit; the old `charging` boolean called it "discharging", opposite to the cable state.
--- `PendingDischarge` is the mirror: draining to a lowered limit.
+-- Neither pending state *means* the limit, though. UPower says only "plugged in and not charging",
+-- and this machine reports it for a few seconds at every plug-in while the asus driver still reads
+-- `Not charging`; read as a limit it claimed one of 70 had been hit at 37%. The number is not
+-- available to say otherwise: UPower 1.91 carries `ChargeEndThreshold` but reports 80 with
+-- `ChargeThresholdEnabled` false here, against sysfs's 70, because asusd writes it behind UPower.
+-- So both phrases say what UPower observed and leave the cause to whoever set the limit.
 local BATTERY_PHRASES = {
     Charging = "charging",
     Discharging = "discharging",
     Empty = "empty",
     FullyCharged = "full",
-    PendingCharge = "charge limit reached",
-    PendingDischarge = "draining to limit",
+    PendingCharge = "plugged in, not charging",
+    PendingDischarge = "on mains, draining",
     Unknown = "state unknown",
 }
 
