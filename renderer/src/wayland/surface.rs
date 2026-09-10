@@ -772,13 +772,12 @@ impl App {
     /// nothing pushed and the config sees no error -- an unavailable compositor feature is not a
     /// config mistake.
     fn apply_blur_region(&mut self, index: usize, regions: Vec<crate::text::snap::PhysicalRect>) {
-        let Some((manager, true)) = self.background_effect.as_ref() else {
+        if !self.blur_supported {
             return;
-        };
+        }
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
         };
-        let manager = manager.clone();
         let qh = self.queue_handle.clone();
         // Identity first, and before the region compare below. An object whose `wl_surface` is
         // gone is inert, and a tooltip reopens at the same size constantly -- so the compare would
@@ -804,7 +803,18 @@ impl App {
             if regions.is_empty() {
                 return;
             }
-            self.surfaces[index].blur_effect = Some((manager.get_background_effect(&surface, &qh, ()), surface_id));
+            // `blur_supported` only ever comes from a `capabilities` event, and the manager
+            // global has to exist to send one, so this is unreachable. Logged rather than
+            // silently skipped for exactly that reason: firing means that is wrong.
+            let effect = match self.background_effect.get_background_effect(&surface, &qh) {
+                Ok(effect) => effect,
+                Err(e) => {
+                    let name = self.surfaces[index].surface_id.clone();
+                    log_bind_failure(&name, "ext_background_effect_manager_v1::get_background_effect", e);
+                    return;
+                }
+            };
+            self.surfaces[index].blur_effect = Some((effect, surface_id));
         }
         let region = match Region::new(&self.compositor_state) {
             Ok(region) => region,
