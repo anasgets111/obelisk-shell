@@ -1233,7 +1233,9 @@ mod tests {
 
         state.hydrated = true;
         state.publish_audio();
-        assert!(rx.try_recv().is_ok(), "opening the gate must publish on the next call");
+        state.publish_privacy();
+        assert!(rx.try_recv().is_ok(), "opening the gate must publish audio on the next call");
+        assert!(privacy_rx.try_recv().is_ok(), "opening the gate must publish privacy on the next call");
     }
 
     #[test]

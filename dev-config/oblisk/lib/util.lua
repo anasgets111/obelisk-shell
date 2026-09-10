@@ -32,7 +32,7 @@ local BATTERY_PHRASES = {
     Discharging = "discharging",
     Empty = "empty",
     FullyCharged = "full",
-    PendingCharge = "plugged in, not charging",
+    PendingCharge = "waiting to charge",
     PendingDischarge = "waiting to discharge",
     Unknown = "state unknown",
 }
@@ -90,10 +90,10 @@ function util.battery_glyph(b)
     end
     -- `BatteryIndicator.qml`'s order, which is not the obvious one: `isPendingCharge` is tested
     -- *first* and gets the charging bolt, and everything else on mains gets the plug -- so a
-    -- battery that is actually charging draws the plug, and only one held at a charge limit draws
-    -- the bolt. That reads correctly on a machine with a limit set, where "plugged in and moving"
-    -- is the ordinary state and "plugged in and parked" is the one worth a distinct glyph. Ours had
-    -- the two swapped, which is why this laptop showed a plug where the mirror showed a bolt.
+    -- battery that is actually charging draws the plug, and only a stopped one draws the bolt. That
+    -- reads correctly on a machine with a limit set, where charging is the ordinary state and
+    -- stopped is the one worth a distinct glyph. Ours had the two swapped, which is why this laptop
+    -- showed a plug where the mirror showed a bolt.
     if b.state == "PendingCharge" then
         return icons.battery_pending
     end

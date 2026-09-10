@@ -95,11 +95,52 @@ fn run_inner(
     let state_for_global = Rc::clone(&state);
     let state_for_remove = Rc::clone(&state);
 
+    // Publication is held until PipeWire has answered for everything this listener asked for.
+    // `core.sync`'s `done` is a barrier: it means every method issued before it, and every event
+    // those produced, has been handled.
+    //
+    // One sync cannot be enough, because the requests that matter are made *by* the events it is
+    // waiting on: `on_global` binds a node and subscribes to its params from inside the `global`
+    // callback, and a sink's volume arrives on the `param` event that follows. So every global
+    // handled while the gate is shut pushes the barrier back behind whatever it just asked for,
+    // and only the newest barrier opens the gate. A fixed pair of syncs would leave a sink
+    // discovered between the two publishing at volume zero, which is the bug this exists to close.
+    //
+    // Matched on the returned sequence, never on any `done`: `apply_command`'s writes are methods
+    // too, and their completion must not be read as hydration.
+    let barrier: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+    let core_weak = core.downgrade();
+
+    /// Re-arms the barrier behind the requests just issued. Opening early is the whole failure
+    /// mode, so a `sync` that cannot be issued opens the gate rather than shutting it forever.
+    fn rearm(core: &pw::core::CoreWeak, barrier: &Cell<Option<i32>>, state: &RefCell<MixerState>) {
+        match core.upgrade().map(|core| core.sync(0)) {
+            Some(Ok(seq)) => barrier.set(Some(seq.seq())),
+            other => {
+                if let Some(Err(err)) = other {
+                    eprintln!("audio: core.sync failed ({err}); publishing without waiting for PipeWire to settle");
+                }
+                let mut state = state.borrow_mut();
+                state.hydrated = true;
+                state.publish_audio();
+                state.publish_privacy();
+            }
+        }
+    }
+
+    let barrier_for_global = Rc::clone(&barrier);
+    let core_for_global = core.downgrade();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |obj| {
             if let Some(registry) = registry_weak.upgrade() {
                 on_global(&state_for_global, &registry, obj);
+            }
+            // Bind the read before the call: `rearm` takes the state mutably on its failure path,
+            // and a borrow held across it would panic inside a PipeWire callback.
+            let gated = !state_for_global.borrow().hydrated;
+            if gated {
+                rearm(&core_for_global, &barrier_for_global, &state_for_global);
             }
         })
         .global_remove(move |id| {
@@ -134,62 +175,41 @@ fn run_inner(
         })
         .register();
 
-    // Two barriers, then the first publish. `core.sync`'s `done` means every method issued before
-    // it, and every event those produced, has been handled -- so one sync placed here covers the
-    // initial `global` burst. It does not cover what that burst asks for: `on_global` binds nodes
-    // and calls `subscribe_params` from inside those callbacks, which is after this sync was
-    // requested. The second sync, issued from the first `done`, sits behind those and is the one
-    // that means a sink's `Props` have arrived. Without it the gate opens on sinks that still read
-    // as volume zero, which is the bug it exists to close.
-    //
-    // Matched on the returned sequence, not on any `done`: `apply_command`'s writes are methods
-    // too, and a `done` for one of those must not be mistaken for hydration.
-    //
-    // A failed `sync` opens the gate immediately. That is the old behaviour, a corrected volume a
-    // beat after startup, and it beats a shell whose audio never publishes at all.
+    // The gate itself. `error` opens it too: a core error means no further `done` is coming, and a
+    // shell whose audio never publishes at all is worse than one that publishes early.
     let state_for_done = Rc::clone(&state);
-    let core_weak = core.downgrade();
-    let binds_barrier: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
-    let barrier_for_done = Rc::clone(&binds_barrier);
-    let enumeration_barrier = match core.sync(0) {
-        Ok(seq) => Some(seq.seq()),
-        Err(err) => {
-            eprintln!("audio: core.sync failed ({err}); publishing without waiting for PipeWire to settle");
-            state.borrow_mut().hydrated = true;
-            None
-        }
-    };
-
+    let barrier_for_done = Rc::clone(&barrier);
+    let state_for_error = Rc::clone(&state);
     let _core_listener = core
         .add_listener_local()
         .done(move |id, seq| {
+            if id != pw::core::PW_ID_CORE || barrier_for_done.get() != Some(seq.seq()) {
+                return;
+            }
+            // Publish once here even with no sink at all: a machine with no audio hardware still
+            // owes the config an answer, and waiting for a nonempty map would never end.
+            let mut state = state_for_done.borrow_mut();
+            state.hydrated = true;
+            state.publish_audio();
+            state.publish_privacy();
+        })
+        .error(move |id, _seq, _res, message| {
             if id != pw::core::PW_ID_CORE {
                 return;
             }
-            let seq = seq.seq();
-            if enumeration_barrier == Some(seq) {
-                match core_weak.upgrade().map(|core| core.sync(0)) {
-                    Some(Ok(next)) => barrier_for_done.set(Some(next.seq())),
-                    other => {
-                        if let Some(Err(err)) = other {
-                            eprintln!("audio: second core.sync failed ({err}); publishing what has arrived so far");
-                        }
-                        let mut state = state_for_done.borrow_mut();
-                        state.hydrated = true;
-                        state.publish_audio();
-                        state.publish_privacy();
-                    }
-                }
-            } else if barrier_for_done.get() == Some(seq) {
-                // Publish once here even with no sink at all: a machine with no audio hardware
-                // still owes the config an answer, and waiting for a nonempty map never ends.
-                let mut state = state_for_done.borrow_mut();
+            let mut state = state_for_error.borrow_mut();
+            if !state.hydrated {
+                eprintln!("audio: PipeWire core error before the first snapshot ({message}); publishing what arrived");
                 state.hydrated = true;
                 state.publish_audio();
                 state.publish_privacy();
             }
         })
         .register();
+
+    // Arm the first barrier. Without a single global this is the one that opens the gate, which is
+    // what gives a machine with no audio hardware its empty first snapshot.
+    rearm(&core_weak, &barrier, &state);
 
     // Hold it for the loop lifetime; dropping AttachedReceiver detaches the eventfd source and
     // every later command is silently discarded.
