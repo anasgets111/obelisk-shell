@@ -291,7 +291,7 @@ async fn adopt_existing_items(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::test_support::p2p_pair;
+    use crate::capabilities::test_support::p2p_pair_serving;
 
     /// Answers the three daemon calls adoption makes: the name list it walks, the owner lookup
     /// `resolve_registration` performs for a well-known name, and the liveness check
@@ -357,26 +357,22 @@ mod tests {
     /// Adoption has no registration argument to read, so it guessed the spec default and stopped
     /// there -- which is no path at all for a Chromium application, and cost Slack its icon on
     /// every restart of the shell (ADR-0171).
+    ///
+    /// Stubs through `p2p_pair_serving` for the same reason as
+    /// `watcher::tests::register_status_notifier_item_accepts_a_unique_name_matching_the_real_sender`:
+    /// adoption calls the peer and waits for the verdict. This was one thread plus a throwaway
+    /// `ListNames` to spend the first call, which hid the dropped-call race rather than closing it.
     #[tokio::test]
     async fn adoption_finds_an_item_that_exports_only_the_chromium_path() {
-        let (connection, peer) = p2p_pair().await;
-        peer.object_server()
-            .at("/StatusNotifierItem/1", StubChromiumItem)
-            .await
-            .expect("failed to export the stub item");
-        peer.object_server()
-            .at("/org/freedesktop/DBus", StubDBusDaemon)
-            .await
-            .expect("failed to export the stub org.freedesktop.DBus");
+        let (connection, _peer) = p2p_pair_serving(|peer| {
+            peer.serve_at("/StatusNotifierItem/1", StubChromiumItem)?.serve_at("/org/freedesktop/DBus", StubDBusDaemon)
+        })
+        .await;
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let dbus_proxy = zbus::fdo::DBusProxy::new(&connection).await.expect("failed to bind the stub daemon");
 
-        // The first method call on a fresh `p2p_pair` connection times out inside its 200ms budget
-        // and every later one answers, so spend the first here rather than on `ListNames`, which
-        // adoption gives up after.
-        let _ = dbus_proxy.list_names().await;
         adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
 
         let paths: Vec<String> =

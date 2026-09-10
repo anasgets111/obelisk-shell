@@ -116,7 +116,7 @@ mod tests {
 
     use super::super::{DEFAULT_ITEM_OBJECT_PATH, RawIconPixmap, RawToolTip, WATCHER_OBJECT_PATH};
     use super::*;
-    use crate::capabilities::test_support::p2p_pair;
+    use crate::capabilities::test_support::{p2p_pair, p2p_pair_serving};
 
     // ---- fabricated unique names must be rejected ----
 
@@ -188,24 +188,21 @@ mod tests {
         }
     }
 
-    /// Two worker threads because this one really does call the peer. `bind_item` builds the item
-    /// proxy with `CacheProperties::No`, so `register_item`'s ADR-0168 `Status` probe is a live
-    /// `Properties.Get` rather than a cached read, and the stub can only answer it while the
-    /// server side is parked on the reply -- which a current-thread runtime cannot do.
+    /// One of the two tests here that really calls the peer, so its stubs go in through
+    /// `p2p_pair_serving` rather than `object_server().at(..)`; see `test_support::p2p_pair` for
+    /// why that ordering is the difference between a reply and a dropped call.
     ///
-    /// It passed on one thread before that change, which is the tell: the probe was being served
-    /// from the property cache and this test never exercised the refusal it exists to pin.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// It calls at all because `bind_item` builds the item proxy with `CacheProperties::No`, making
+    /// `register_item`'s ADR-0168 `Status` probe a live `Properties.Get`. It passed against a cached
+    /// proxy, which is the tell: the probe was served from the cache and this test never exercised
+    /// the refusal it exists to pin.
+    #[tokio::test]
     async fn register_status_notifier_item_accepts_a_unique_name_matching_the_real_sender() {
-        let (connection, peer) = p2p_pair().await;
-        peer.object_server()
-            .at(DEFAULT_ITEM_OBJECT_PATH, StubStatusNotifierItem)
-            .await
-            .expect("failed to export the stub StatusNotifierItem");
-        peer.object_server()
-            .at("/org/freedesktop/DBus", StubDBusDaemon)
-            .await
-            .expect("failed to export the stub org.freedesktop.DBus");
+        let (connection, _peer) = p2p_pair_serving(|peer| {
+            peer.serve_at(DEFAULT_ITEM_OBJECT_PATH, StubStatusNotifierItem)?
+                .serve_at("/org/freedesktop/DBus", StubDBusDaemon)
+        })
+        .await;
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let watcher = test_watcher(connection.clone(), registry.clone());
