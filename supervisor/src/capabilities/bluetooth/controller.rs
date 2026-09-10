@@ -98,7 +98,18 @@ impl BluetoothController {
 
         register_agent_best_effort(&connection).await;
 
-        Self { adapter, devices, state: Arc::new(Mutex::new(BluetoothState::default())), events }
+        let controller = Self { adapter, devices, state: Arc::new(Mutex::new(BluetoothState::default())), events };
+        // Hydrate before returning, because the forwarders above are already queueing and zbus
+        // yields a cached property's current value as its stream's first item: one of them writes
+        // the first snapshot a config ever sees. Each signal re-derives only its own half, so
+        // whichever won that race published the other half's `Default`. A `DeviceRegistryChanged`
+        // arriving first announced a powered adapter as `enabled = false`, and the `AdapterChanged`
+        // behind it then read as the user switching Bluetooth on -- `modules/osd/service.lua`
+        // showed "bluetooth on" at every shell start. `network` is safe by accident: every signal
+        // its forwarders can emit is a full re-derive.
+        controller.handle_signal(BluetoothSignal::AdapterChanged).await;
+        controller.handle_signal(BluetoothSignal::DeviceRegistryChanged).await;
+        controller
     }
 
     /// Applies one [`BluetoothSignal`] to [`BluetoothState`] for the main loop to push. No
