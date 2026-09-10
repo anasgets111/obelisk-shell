@@ -2,7 +2,7 @@
 //! and ALSA devices. `run` is the thread entry point; callbacks run in its blocking
 //! `main_loop.run()`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -68,6 +68,7 @@ fn run_inner(
     let registry = core.get_registry_rc()?;
 
     let state = Rc::new(RefCell::new(MixerState {
+        hydrated: false,
         apps: AudioApps::new(),
         video_sources: VideoSourceApps::new(),
         microphones: CaptureApps::new(),
@@ -128,6 +129,63 @@ fn run_inner(
             let was_microphone = state.microphones.remove(id);
             let was_screencast = state.screencasts.remove(id);
             if was_camera || was_microphone || was_screencast {
+                state.publish_privacy();
+            }
+        })
+        .register();
+
+    // Two barriers, then the first publish. `core.sync`'s `done` means every method issued before
+    // it, and every event those produced, has been handled -- so one sync placed here covers the
+    // initial `global` burst. It does not cover what that burst asks for: `on_global` binds nodes
+    // and calls `subscribe_params` from inside those callbacks, which is after this sync was
+    // requested. The second sync, issued from the first `done`, sits behind those and is the one
+    // that means a sink's `Props` have arrived. Without it the gate opens on sinks that still read
+    // as volume zero, which is the bug it exists to close.
+    //
+    // Matched on the returned sequence, not on any `done`: `apply_command`'s writes are methods
+    // too, and a `done` for one of those must not be mistaken for hydration.
+    //
+    // A failed `sync` opens the gate immediately. That is the old behaviour, a corrected volume a
+    // beat after startup, and it beats a shell whose audio never publishes at all.
+    let state_for_done = Rc::clone(&state);
+    let core_weak = core.downgrade();
+    let binds_barrier: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+    let barrier_for_done = Rc::clone(&binds_barrier);
+    let enumeration_barrier = match core.sync(0) {
+        Ok(seq) => Some(seq.seq()),
+        Err(err) => {
+            eprintln!("audio: core.sync failed ({err}); publishing without waiting for PipeWire to settle");
+            state.borrow_mut().hydrated = true;
+            None
+        }
+    };
+
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id != pw::core::PW_ID_CORE {
+                return;
+            }
+            let seq = seq.seq();
+            if enumeration_barrier == Some(seq) {
+                match core_weak.upgrade().map(|core| core.sync(0)) {
+                    Some(Ok(next)) => barrier_for_done.set(Some(next.seq())),
+                    other => {
+                        if let Some(Err(err)) = other {
+                            eprintln!("audio: second core.sync failed ({err}); publishing what has arrived so far");
+                        }
+                        let mut state = state_for_done.borrow_mut();
+                        state.hydrated = true;
+                        state.publish_audio();
+                        state.publish_privacy();
+                    }
+                }
+            } else if barrier_for_done.get() == Some(seq) {
+                // Publish once here even with no sink at all: a machine with no audio hardware
+                // still owes the config an answer, and waiting for a nonempty map never ends.
+                let mut state = state_for_done.borrow_mut();
+                state.hydrated = true;
+                state.publish_audio();
                 state.publish_privacy();
             }
         })

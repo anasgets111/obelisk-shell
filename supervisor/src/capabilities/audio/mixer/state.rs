@@ -485,6 +485,13 @@ pub enum AudioCommand {
 /// fields track § 2.4 master volume (ADR-0053 decision 3); sink proxies stay separate because
 /// they use `param`, while `nodes` handles stream/video `info`.
 pub(super) struct MixerState {
+    /// False until PipeWire has answered for everything the listener asked for at startup, which
+    /// `registry::run_inner` decides with two `core.sync` barriers. Both publishers build their
+    /// payload from the maps and send nothing while it is false, so the first snapshot a config
+    /// ever sees is a complete one rather than a default it will watch get corrected.
+    ///
+    /// The maps keep updating throughout. This gates sending, not tracking.
+    pub(super) hydrated: bool,
     pub(super) apps: AudioApps,
     pub(super) video_sources: VideoSourceApps,
     /// Running `Stream/Input/Audio` nodes (ADR-0137).
@@ -542,7 +549,16 @@ impl MixerState {
     }
 
     /// Publishes even if the receiver is absent; that is startup or shutdown, not a tracking error.
+    ///
+    /// Silent until [`MixerState::hydrated`]. A sink's `props` arrive on a later `param` event than
+    /// the `global` that binds it, and `compute_master` reads a missing `Props` as `0.0`, so every
+    /// publish before that lands claims a volume of zero. A config comparing against its previous
+    /// payload reads the correction as the user having changed the volume: the OSD showed a card
+    /// for the true volume at every shell start.
     pub(super) fn publish_audio(&self) {
+        if !self.hydrated {
+            return;
+        }
         let master = master::compute_master(
             self.default_sink_name.as_deref(),
             self.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
@@ -585,6 +601,9 @@ impl MixerState {
     /// Publishes all three privacy lists together (ADR-0137), even when only one changed.
     /// Recomputing the two it did not touch is three map walks.
     pub(super) fn publish_privacy(&self) {
+        if !self.hydrated {
+            return;
+        }
         let _ = self.privacy_updates.send(PrivacySources {
             cameras: self.video_sources.snapshot(),
             microphones: self.microphones.snapshot(),
@@ -1163,11 +1182,15 @@ mod tests {
     }
 
     /// `publish_audio` fixture with empty proxy maps; tests fill only fields they exercise.
+    ///
+    /// Hydrated, because every test below asserts on what a publish carries. The gate itself is
+    /// pinned by `a_state_that_has_not_hydrated_publishes_nothing`.
     fn mixer_state(
         updates: UnboundedSender<AudioState>,
         privacy_updates: UnboundedSender<PrivacySources>,
     ) -> MixerState {
         MixerState {
+            hydrated: true,
             apps: AudioApps::new(),
             video_sources: VideoSourceApps::new(),
             microphones: CaptureApps::new(),
@@ -1187,6 +1210,30 @@ mod tests {
             metadata: None,
             metadata_id: None,
         }
+    }
+
+    /// The startup gate. A sink whose `Props` have not arrived reads as volume zero, and a config
+    /// comparing against its previous payload sees the correction as a volume change, so the very
+    /// snapshot this suppresses is the one that put a spurious card on screen at every shell start.
+    #[test]
+    fn a_state_that_has_not_hydrated_publishes_nothing() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (privacy_updates, mut privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
+        state.hydrated = false;
+        // A bound sink with no `Props` yet: exactly the shape the first `global` burst leaves.
+        state.sinks = HashMap::from([(59, sink_at("alsa_output.pci-...analog-stereo", None, None))]);
+        state.default_sink_name = Some("alsa_output.pci-...analog-stereo".to_string());
+
+        state.publish_audio();
+        state.publish_privacy();
+
+        assert!(rx.try_recv().is_err(), "an unhydrated state must not publish its zeroed master volume");
+        assert!(privacy_rx.try_recv().is_err(), "an unhydrated state must not publish its empty privacy lists");
+
+        state.hydrated = true;
+        state.publish_audio();
+        assert!(rx.try_recv().is_ok(), "opening the gate must publish on the next call");
     }
 
     #[test]
