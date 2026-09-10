@@ -33,7 +33,7 @@ local BATTERY_PHRASES = {
     Empty = "empty",
     FullyCharged = "full",
     PendingCharge = "plugged in, not charging",
-    PendingDischarge = "on mains, draining",
+    PendingDischarge = "waiting to discharge",
     Unknown = "state unknown",
 }
 
@@ -41,8 +41,9 @@ function util.battery_phrase(state)
     return BATTERY_PHRASES[state] or "state unknown"
 end
 
--- Battery display helpers: warnings use `Discharging` and `Empty`; `PendingDischarge` is mains and
--- stops at its limit, so it does not warn. `battery_eta` returns `", 2h 14m left"` or `""`. UPower
+-- Battery display helpers: warnings use `Discharging` and `Empty`. `PendingDischarge` does not warn
+-- because it is not draining -- by its name the discharge is pending, and UPower defines it no
+-- further. `battery_eta` returns `", 2h 14m left"` or `""`. UPower
 -- UPower estimates one duration at a time and neither while learning the rate, so the empty string
 -- is common during the first minute after a plug or a boot, not an error.
 function util.battery_eta(b)
@@ -79,8 +80,9 @@ end
 -- Five-level glyph plus the two cable states, shared by `modules/bar/indicators/battery.lua` and
 -- the lock card's status row. It takes the raw payload so a caller with a `nil` battery still gets
 -- the AC glyph rather than a branch of its own.
--- `Charging` gets the bolt. Mains at a charge limit and full get the plug: the cable is in and the
--- level is not moving, a state once indistinguishable from running on battery.
+-- `PendingCharge` gets the bolt; `Charging` and `FullyCharged` get the plug. That is the mirror's
+-- order and not the obvious one, explained at the branch below. This line described the reverse
+-- until now, having survived the commit that swapped the two.
 function util.battery_glyph(b)
     local icons = require("config.icons")
     if b == nil or not b.present then

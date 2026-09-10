@@ -92,15 +92,15 @@
 ---| "Discharging" # Running off the battery, with no mains adapter supplying it.
 ---| "Empty" # Flat; UPower reports this instead of `Discharging` only at the very end.
 ---| "FullyCharged" # Full on mains and holding; a charge limit gives `PendingCharge` instead.
----| "PendingCharge" # On mains at the charge limit, not taking current.
----| "PendingDischarge" # On mains above the charge limit, draining down to it.
+---| "PendingCharge" # Plugged in and not taking current, which is all UPower defines it to mean.
+---| "PendingDischarge" # Waiting to discharge, by name; UPower defines it no further.
 ---§ 2.2's `battery.state`, one of UPower's seven `Device.State` values.
 ---
----A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making the charge
----limit indistinguishable from running on battery. This machine's `charge_control_end_threshold`
----is 70, so that distinction covers most of every day. The four laptop states are `Charging`,
----`PendingCharge` (limit reached, mains holding), `PendingDischarge` (above the limit, draining
----on mains), and `Discharging` (on battery).
+---A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making "plugged in and
+---parked" indistinguishable from running on battery. On a laptop that sets
+---`charge_control_end_threshold` -- 70 here -- that is most of every day, which is why the state
+---is carried by name. The three that occur on this hardware are `Charging`, `PendingCharge`
+---(plugged in, not taking current) and `Discharging` (on battery).
 ---
 ---Serialized by name, so Lua compares `b.state == "PendingCharge"`; `mpris.play_state` uses the
 ---same boundary shape.

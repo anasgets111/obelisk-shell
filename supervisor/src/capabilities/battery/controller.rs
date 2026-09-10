@@ -9,11 +9,11 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// § 2.2's `battery.state`, one of UPower's seven `Device.State` values.
 ///
-/// A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making the charge
-/// limit indistinguishable from running on battery. This machine's `charge_control_end_threshold`
-/// is 70, so that distinction covers most of every day. The four laptop states are `Charging`,
-/// `PendingCharge` (limit reached, mains holding), `PendingDischarge` (above the limit, draining
-/// on mains), and `Discharging` (on battery).
+/// A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making "plugged in and
+/// parked" indistinguishable from running on battery. On a laptop that sets
+/// `charge_control_end_threshold` -- 70 here -- that is most of every day, which is why the state
+/// is carried by name. The three that occur on this hardware are `Charging`, `PendingCharge`
+/// (plugged in, not taking current) and `Discharging` (on battery).
 ///
 /// Serialized by name, so Lua compares `b.state == "PendingCharge"`; `mpris.play_state` uses the
 /// same boundary shape.
@@ -30,9 +30,16 @@ pub enum BatteryStatus {
     Empty,
     /// Full on mains and holding; a charge limit gives `PendingCharge` instead.
     FullyCharged,
-    /// On mains at the charge limit, not taking current.
+    /// Plugged in and not taking current, which is all UPower defines it to mean.
+    ///
+    /// A reached charge limit is the usual cause on a laptop that sets one, but a weak charger, a
+    /// thermal pause, and the second or two after a plug while the driver still reads
+    /// `Not charging` all report it too, so nothing downstream may read a limit out of it. The
+    /// first line stands alone on purpose: `stubs.rs` gives a variant only that much.
     PendingCharge,
-    /// On mains above the charge limit, draining down to it.
+    /// Waiting to discharge, by name; UPower defines it no further.
+    ///
+    /// Linux battery sysfs has no status that produces it, so it is not expected on this hardware.
     PendingDischarge,
 }
 
