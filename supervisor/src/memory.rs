@@ -8,11 +8,17 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 /// `OBLISK_MEMORY_SAMPLE_SECS`: seconds between samples; unset/`0` disables the timer. Named here
 /// so `main.rs` and this module share the string.
 pub(crate) const SAMPLE_SECS_ENV: &str = "OBLISK_MEMORY_SAMPLE_SECS";
+
+/// Passed in at the one production call site, [`log_sample`], instead of being reached for inside
+/// the readers, so a test can point them at a tempdir of fake files. Every sysfs and procfs reader
+/// in `capabilities` takes its root the same way.
+const PROC_ROOT: &str = "/proc";
 
 /// One process's `smaps_rollup`, in KiB, `/proc`'s native unit. [`report_line`] converts to MiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,20 +214,22 @@ fn mib(kib: u64) -> f64 {
     kib as f64 / 1024.0
 }
 
-/// Reads `smaps_rollup` and readable `fdinfo` under `/proc/<who>` (`who` is a pid or `"self"`). A
-/// missing/malformed rollup errors; no DRM fds is a zeroed [`Gpu`].
-fn read_process_memory(who: &str) -> io::Result<ProcessMemory> {
-    let rollup_text = std::fs::read_to_string(format!("/proc/{who}/smaps_rollup"))?;
+/// Reads `smaps_rollup` and readable `fdinfo` under `<proc_root>/<who>` (`who` is a pid or
+/// `"self"`). A missing/malformed rollup errors; no DRM fds is a zeroed [`Gpu`].
+fn read_process_memory(proc_root: &Path, who: &str) -> io::Result<ProcessMemory> {
+    let process_dir = proc_root.join(who);
+    let rollup_path = process_dir.join("smaps_rollup");
+    let rollup_text = std::fs::read_to_string(&rollup_path)?;
     let rollup = parse_rollup(&rollup_text).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("/proc/{who}/smaps_rollup has no Pss: line"))
+        io::Error::new(io::ErrorKind::InvalidData, format!("{} has no Pss: line", rollup_path.display()))
     })?;
-    Ok(ProcessMemory { rollup, gpu: read_gpu(who) })
+    Ok(ProcessMemory { rollup, gpu: read_gpu(&process_dir) })
 }
 
-/// Sums DRM residency across `/proc/<who>/fdinfo`. A missing directory or fd vanishing between
+/// Sums DRM residency across `<process_dir>/fdinfo`. A missing directory or fd vanishing between
 /// `read_dir` and `read` (normal, as fds close constantly) means no DRM memory, not an error.
-fn read_gpu(who: &str) -> Gpu {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{who}/fdinfo")) else {
+fn read_gpu(process_dir: &Path) -> Gpu {
+    let Ok(entries) = std::fs::read_dir(process_dir.join("fdinfo")) else {
         return fold_drm_clients(std::iter::empty());
     };
     let clients = entries
@@ -230,14 +238,14 @@ fn read_gpu(who: &str) -> Gpu {
     fold_drm_clients(clients)
 }
 
-/// Reads `/proc/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A pid
-/// already exited during an ordinary PBA handoff or crash is logged and skipped; only the
+/// Reads `<proc_root>/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A
+/// pid already exited during an ordinary PBA handoff or crash is logged and skipped; only the
 /// supervisor read is fatal.
-pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
-    let supervisor = read_process_memory("self")?;
+pub(crate) fn sample(proc_root: &Path, renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
+    let supervisor = read_process_memory(proc_root, "self")?;
     let mut renderers = Vec::with_capacity(renderer_pids.len());
     for &(generation_id, pid) in renderer_pids {
-        match read_process_memory(&pid.to_string()) {
+        match read_process_memory(proc_root, &pid.to_string()) {
             Ok(memory) => renderers.push((generation_id, memory)),
             Err(err) => eprintln!(
                 "[oblisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"
@@ -264,7 +272,7 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
 pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)]) {
     let pids: Vec<(u32, u32)> =
         renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
-    match sample(&pids) {
+    match sample(Path::new(PROC_ROOT), &pids) {
         Ok(sample) => eprintln!("{}", report_line(label, &sample)),
         Err(err) => eprintln!("[oblisk-memory] {label} sample failed: {err}"),
     }
@@ -438,6 +446,74 @@ drm-engine-video-enhance:\t0 ns\n";
             parse_drm_client(text),
             Some(DrmClient { pdev: "0000:00:02.0".to_string(), client_id: 4, resident: 1000, shared: 0 })
         );
+    }
+
+    // ---- read_process_memory / read_gpu, against a fake proc root ----
+
+    /// Writes `<root>/<who>/smaps_rollup`, plus one `fdinfo/<fd>` file per entry in `fds`. An
+    /// empty `fds` writes no `fdinfo` directory at all, which is the process that holds no fds.
+    fn write_process(root: &Path, who: &str, rollup: Option<&str>, fds: &[(&str, &str)]) {
+        let dir = root.join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(rollup) = rollup {
+            std::fs::write(dir.join("smaps_rollup"), rollup).unwrap();
+        }
+        if !fds.is_empty() {
+            std::fs::create_dir_all(dir.join("fdinfo")).unwrap();
+            for (fd, text) in fds {
+                std::fs::write(dir.join("fdinfo").join(fd), text).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn read_process_memory_reads_the_rollup_and_reports_no_gpu_when_the_process_has_no_fdinfo() {
+        let root = tempfile::tempdir().unwrap();
+        write_process(root.path(), "self", Some(ROLLUP_FIXTURE), &[]);
+
+        let memory = read_process_memory(root.path(), "self").expect("a well-formed rollup must be read");
+
+        assert_eq!(memory.rollup, Rollup { pss: 208, uss: 156 });
+        assert_eq!(memory.gpu, Gpu { resident: 0, shared: 0, clients: 0 }, "no fdinfo is no GPU memory, not an error");
+    }
+
+    #[test]
+    fn read_process_memory_errors_when_the_process_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let err = read_process_memory(root.path(), "4242").expect_err("a pid that has exited must not read as zero");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_process_memory_errors_on_a_truncated_rollup_rather_than_reporting_a_zero_byte_process() {
+        let root = tempfile::tempdir().unwrap();
+        write_process(root.path(), "self", Some("Rss:                3932 kB\n"), &[]);
+
+        let err = read_process_memory(root.path(), "self").expect_err("a rollup without Pss: must be an error");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("smaps_rollup"), "the message must name the file that failed: {err}");
+    }
+
+    #[test]
+    fn read_gpu_dedupes_the_several_fds_one_drm_client_holds_and_skips_the_fds_that_are_not_drm() {
+        // Three fds of one client plus a pipe, which is what most of `fdinfo` actually is.
+        let root = tempfile::tempdir().unwrap();
+        write_process(
+            root.path(),
+            "self",
+            Some(ROLLUP_FIXTURE),
+            &[
+                ("0", "pos:\t0\nflags:\t02\nmnt_id:\t9\nino:\t123\n"),
+                ("1", DRM_FIXTURE),
+                ("2", DRM_FIXTURE),
+                ("3", DRM_FIXTURE),
+            ],
+        );
+
+        let memory = read_process_memory(root.path(), "self").expect("a well-formed rollup must be read");
+
+        assert_eq!(memory.gpu, Gpu { resident: 279968, shared: 192368, clients: 1 });
     }
 
     // ---- fold_drm_clients ----
