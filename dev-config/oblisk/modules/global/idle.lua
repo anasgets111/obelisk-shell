@@ -22,10 +22,6 @@
 local idle = require("lib.idle")
 local store = require("lib.store")
 
-local function detached(cmd, args)
-    process.run(cmd, args, function() end, function() end)
-end
-
 -- `CompositorService.setDisplaysPowered` maps to these niri actions. Pair it with
 -- `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen means blanking stopped
 -- halfway. `backlight_pct` is `-1` without a device (§ 2.8); setting it is a dropped write.
@@ -34,7 +30,7 @@ local function set_displays_powered(powered)
         return
     end
     idle.blanked:set(not powered)
-    detached("niri", { "msg", "action", powered and "power-on-monitors" or "power-off-monitors" })
+    process.detach("niri", { "msg", "action", powered and "power-on-monitors" or "power-off-monitors" })
     oblisk.keyboard:invoke("set_backlight", powered and 100 or 0)
 end
 
@@ -48,7 +44,7 @@ local ACTIONS = {
         oblisk.lock:invoke("lock")
     end,
     suspend = function()
-        detached("systemctl", { "suspend" })
+        process.detach("systemctl", { "suspend" })
     end,
 }
 

@@ -8,35 +8,23 @@ use std::time::Duration;
 use super::{DEFAULT_EXPIRE_MS, NOTIFICATION_FEED_VIEW, NOTIFICATION_QUEUE_CAP, Notification, Urgency};
 
 /// Whether a notification auto-expires, and when.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExpiryPolicy {
-    Never,
-    After(Duration),
-}
-
 /// Resolves `expire_timeout` (§1; ADR-0033): critical never expires; otherwise `0` means never,
 /// negative means [`DEFAULT_EXPIRE_MS`] (mako/dunst convention), and positive means milliseconds.
-pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> ExpiryPolicy {
+pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> Option<Duration> {
     if urgency == Urgency::Critical {
-        return ExpiryPolicy::Never;
+        return None;
     }
     match expire_timeout {
-        0 => ExpiryPolicy::Never,
-        t if t < 0 => ExpiryPolicy::After(Duration::from_millis(DEFAULT_EXPIRE_MS)),
-        t => ExpiryPolicy::After(Duration::from_millis(t as u64)),
+        0 => None,
+        t if t < 0 => Some(Duration::from_millis(DEFAULT_EXPIRE_MS)),
+        t => Some(Duration::from_millis(t as u64)),
     }
 }
 
 /// Whether sound plays (ADR-0033): it needs a registered tier sound and bypasses DND only for
 /// critical urgency.
 pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: bool) -> bool {
-    if !sound_registered {
-        return false;
-    }
-    if dnd && urgency != Urgency::Critical {
-        return false;
-    }
-    true
+    sound_registered && (!dnd || urgency == Urgency::Critical)
 }
 
 /// Selects one `Notify` sound (ADR-0033): `suppress` wins; otherwise `client_sound_file`, already
@@ -182,26 +170,26 @@ mod tests {
 
     #[test]
     fn resolve_expiry_critical_never_expires_regardless_of_timeout() {
-        assert_eq!(resolve_expiry(Urgency::Critical, 1000), ExpiryPolicy::Never);
-        assert_eq!(resolve_expiry(Urgency::Critical, 0), ExpiryPolicy::Never);
-        assert_eq!(resolve_expiry(Urgency::Critical, -1), ExpiryPolicy::Never);
+        assert_eq!(resolve_expiry(Urgency::Critical, 1000), None);
+        assert_eq!(resolve_expiry(Urgency::Critical, 0), None);
+        assert_eq!(resolve_expiry(Urgency::Critical, -1), None);
     }
 
     #[test]
     fn resolve_expiry_zero_means_never_for_non_critical() {
-        assert_eq!(resolve_expiry(Urgency::Normal, 0), ExpiryPolicy::Never);
-        assert_eq!(resolve_expiry(Urgency::Low, 0), ExpiryPolicy::Never);
+        assert_eq!(resolve_expiry(Urgency::Normal, 0), None);
+        assert_eq!(resolve_expiry(Urgency::Low, 0), None);
     }
 
     #[test]
     fn resolve_expiry_negative_one_uses_the_server_default() {
-        assert_eq!(resolve_expiry(Urgency::Normal, -1), ExpiryPolicy::After(Duration::from_millis(DEFAULT_EXPIRE_MS)));
+        assert_eq!(resolve_expiry(Urgency::Normal, -1), Some(Duration::from_millis(DEFAULT_EXPIRE_MS)));
     }
 
     #[test]
     fn resolve_expiry_positive_uses_that_many_milliseconds() {
-        assert_eq!(resolve_expiry(Urgency::Normal, 2500), ExpiryPolicy::After(Duration::from_millis(2500)));
-        assert_eq!(resolve_expiry(Urgency::Low, 100), ExpiryPolicy::After(Duration::from_millis(100)));
+        assert_eq!(resolve_expiry(Urgency::Normal, 2500), Some(Duration::from_millis(2500)));
+        assert_eq!(resolve_expiry(Urgency::Low, 100), Some(Duration::from_millis(100)));
     }
 
     #[test]

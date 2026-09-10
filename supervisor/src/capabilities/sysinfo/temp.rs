@@ -14,16 +14,11 @@ fn round_milli_c(milli_c: i64) -> i64 {
 pub fn resolve_chip(hwmon_root: &Path, preference: &[&str]) -> Option<PathBuf> {
     let entries: Vec<PathBuf> =
         std::fs::read_dir(hwmon_root).ok()?.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
-    for wanted in preference {
-        for dir in &entries {
-            if let Ok(name) = std::fs::read_to_string(dir.join("name"))
-                && name.trim() == *wanted
-            {
-                return Some(dir.clone());
-            }
-        }
-    }
-    None
+    preference.iter().find_map(|wanted| {
+        entries.iter().find_map(|dir| {
+            (crate::capabilities::read_attr(dir, "name").as_deref() == Some(*wanted)).then(|| dir.clone())
+        })
+    })
 }
 
 /// Reads `tempN_input` sensors whose paired `tempN_label` matches `Core \d+`, converting to Celsius

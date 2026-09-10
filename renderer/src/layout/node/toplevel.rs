@@ -45,10 +45,7 @@ pub struct SizeHint {
 /// both axes; use `0` for an unconstrained axis.
 fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Result<Option<SizeHint>, LayoutError> {
     // Deferred on the evaluation pass; `show_window` sends the resolved request.
-    if is_deferred_signal(properties, property) {
-        return Ok(None);
-    }
-    let Some(value) = properties.get(property) else {
+    let Some(value) = non_deferred_property(properties, property) else {
         return Ok(None);
     };
     let Value::Table(table) = value else {
@@ -138,10 +135,7 @@ pub enum PopupAnchor {
 /// Parses either § 6 anchor field; `property` names errors. Absent defaults to the protocol's
 /// [`PopupAnchor::Center`], unlike constraint adjustments.
 pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -> Result<PopupAnchor, LayoutError> {
-    if is_deferred_signal(properties, property) {
-        return Ok(PopupAnchor::Center);
-    }
-    let Some(value) = properties.get(property) else {
+    let Some(value) = non_deferred_property(properties, property) else {
         return Ok(PopupAnchor::Center);
     };
     let Value::String(s) = value else {
@@ -192,10 +186,7 @@ impl Default for ConstraintAdjustment {
 }
 
 pub fn parse_constraint_adjustment(properties: &HashMap<String, Value>) -> Result<ConstraintAdjustment, LayoutError> {
-    if is_deferred_signal(properties, "constraint_adjustment") {
-        return Ok(ConstraintAdjustment::default());
-    }
-    let Some(value) = properties.get("constraint_adjustment") else {
+    let Some(value) = non_deferred_property(properties, "constraint_adjustment") else {
         return Ok(ConstraintAdjustment::default());
     };
     let Value::Table(table) = value else {
@@ -242,10 +233,7 @@ pub struct PopupOffset {
 }
 
 pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOffset, LayoutError> {
-    if is_deferred_signal(properties, "offset") {
-        return Ok(PopupOffset::default());
-    }
-    let Some(value) = properties.get("offset") else {
+    let Some(value) = non_deferred_property(properties, "offset") else {
         return Ok(PopupOffset::default());
     };
     let Value::Table(table) = value else {
@@ -337,10 +325,7 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
 /// Taking the grab needs a real input serial for one poll turn, and the compositor may deny it
 /// (ADR-0049 amendment).
 pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
-    if is_deferred_signal(properties, "grab") {
-        return Ok(true);
-    }
-    let Some(value) = properties.get("grab") else {
+    let Some(value) = non_deferred_property(properties, "grab") else {
         return Ok(true);
     };
     match value {

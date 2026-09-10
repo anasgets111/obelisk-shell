@@ -38,7 +38,7 @@ return window {
             return "up since " .. os.date("%H:%M:%S", s.time)
         end), theme.DIM, theme.font.xs),
         cell(util.label(oblisk.audio, function(a)
-            return string.format("%d playback stream(s)", util.count(a.apps))
+            return string.format("%d playback stream(s)", #(a.apps or {}))
         end), theme.DIM, theme.font.xs),
         cell(util.label(oblisk.screens, function(s)
             return string.format("%d output(s)", #s)

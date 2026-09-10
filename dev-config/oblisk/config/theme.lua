@@ -67,8 +67,6 @@ end
 
 local s = theme.s
 
-theme.scale = SCALE
-
 -- ## Colour helpers
 --
 -- Helpers use the engine's `#RRGGBB`/`#RRGGBBAA` strings, checked by
@@ -133,7 +131,6 @@ theme.opacity                   = {
     light    = 0.25,
     medium   = 0.35,
     disabled = 0.5,
-    solid    = 0.6,
     muted    = 0.7,
     strong   = 0.8,
     full     = 0.95,
@@ -243,7 +240,6 @@ theme.font                      = {
 }
 
 theme.radius                    = {
-    xs = s(3, 2),
     sm = s(6, 4),
     md = s(12, 8),
     lg = s(18, 12),
@@ -300,9 +296,6 @@ theme.center_zone_width         = math.floor(MAIN_WIDTH / 3)
 theme.item_height               = s(34, 20)
 theme.item_width                = s(34, 20)
 theme.item_radius               = s(18, 6)
--- Workspace dots use `control.sm`, not item size: twelve full-size controls consume 416px of a
--- 1920px bar, while the digit-and-state strip costs about 300px and no longer dominates the left.
-theme.workspace_size            = theme.control.sm
 -- The mirror's `batteryPillWidth`, enough for a glyph and "100%"; the bar's non-circular item.
 theme.battery_pill_width        = s(80, 60)
 -- Width when the pointer hovers the volume control; it leaves room for the percentage. Collapsed

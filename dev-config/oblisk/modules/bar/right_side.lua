@@ -24,21 +24,15 @@ local hovered = hover(clock_slot)
 
 -- `panelOpen` is the third state above hover; `border.color: panelOpen ? activeColor : ...`
 -- Rings it while the panel is up; the pill says which panel is showing, not the panel's position.
-local panel_showing = computed({ ui_state.panel_open, ui_state.panel_kind }, function(open, kind)
-    return open and kind == bell.kind
-end)
-
-local lit = computed({ hovered, panel_showing }, function(is_hovered, is_open)
-    return is_hovered or is_open
-end)
+local panel_showing = ui_state.panel_showing(bell.kind)
 
 local clock_pill = button {
     height = theme.item_height,
     align_v = "Center",
     hover = hovered,
     radius = theme.item_radius,
-    background = lit:map(function(on)
-        return on and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
+    background = computed({ hovered, panel_showing }, function(is_hovered, is_open)
+        return (is_hovered or is_open) and theme.GLASS_CONTROL_HOVER or theme.GLASS_CONTROL
     end),
     border_width = theme.border_width,
     border_color = computed({ hovered, panel_showing }, function(is_hovered, is_open)

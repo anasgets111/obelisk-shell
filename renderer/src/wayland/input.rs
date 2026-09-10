@@ -444,15 +444,12 @@ fn release_completes_click(
     released_on: Option<(LogicalRect, Option<&str>)>,
     button: u32,
 ) -> bool {
-    match (armed, released_on) {
-        (Some(armed), Some((rect, link))) => {
-            armed.instance_id == instance_id
-                && armed.rect == rect
-                && armed.link.as_deref() == link
-                && armed.button == button
-        }
-        _ => false,
-    }
+    armed.zip(released_on).is_some_and(|(armed, (rect, link))| {
+        armed.instance_id == instance_id
+            && armed.rect == rect
+            && armed.link.as_deref() == link
+            && armed.button == button
+    })
 }
 /// Call `on_click` with its button rect in surface logical coordinates (ADR-0050 decision 3). The
 /// rect round-trips to popup `anchor_rect` through Lua (§ 6). Error labels distinguish building the
@@ -951,8 +948,8 @@ impl App {
         let path = layout::hit::hit_path(tree, point);
         // Deepest scrollable under the pointer wins.
         let scrollable = path.iter().enumerate().rev().find_map(|(depth, node)| {
-            let signal = layout::scene::scroll_signal_of(node)?;
-            let axis = layout::scene::scrolling_axis(&node.kind, &node.properties).ok()??;
+            let signal = layout::scene::scroll_signal(&node.properties)?;
+            let axis = layout::scene::main_axis_of(&node.kind, &node.properties).ok()??;
             Some((depth, signal, axis))
         });
         let wheel = wheel_button(&path);

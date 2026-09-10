@@ -368,7 +368,7 @@ mod tests {
         let commands = capability::CommandSender::new(0, tx);
         let (idle_state, _idle_handle) =
             capability::Capability::new("idle", signal::DirtyFlag::new(), commands.clone());
-        let registry = idle::IdleRegistry::new(commands, idle_state);
+        let registry = idle::IdleRegistry::new(idle_state);
         loader.set_global("idle", registry.member()).unwrap();
         loader.register_idle(registry.clone());
         let source = r#"
@@ -421,9 +421,9 @@ mod tests {
             "the palette entry has to be a #rrggbbaa string, got `{accent}`"
         );
 
-        // Also proves `components.pill` can require `config.theme` before returning.
+        // Also proves `components.panel_card` can require `config.theme` before returning.
         let is_builder: bool =
-            loader.lua().load(r#"return type(require("components.pill")) == "function""#).eval().unwrap();
+            loader.lua().load(r#"return type(require("components.panel_card")) == "function""#).eval().unwrap();
         assert!(is_builder, "a component has to come back as the builder it returns");
     }
 

@@ -76,8 +76,8 @@ pub enum LaunchError {
     Spawn(String),
 }
 
-/// Cheap `Arc`-backed clone for `main.rs`'s blocking scan task, like `UpdatesController::install`.
-#[derive(Clone)]
+/// `Arc`-backed fields, so `refresh` hands the blocking scan task its own handles without
+/// cloning the controller; nothing clones the whole thing.
 pub struct ApplicationsController {
     state: Arc<Mutex<ApplicationsState>>,
     /// Not in the snapshot: exposing argv would let config rewrite it before `launch` (ADR-0061
@@ -169,7 +169,7 @@ impl ApplicationsController {
             targets.get(id).cloned().ok_or(LaunchError::Unknown)?
         };
         let (command, args) = command_line(std::env::var("TERMINAL").ok(), target)?;
-        match crate::process::spawn_detached(&command, &args, &[]) {
+        match crate::process::spawn_detached(&command, &args) {
             Ok(()) => Ok(()),
             Err(err) => Err(LaunchError::Spawn(err.to_string())),
         }
@@ -184,7 +184,7 @@ impl ApplicationsController {
     /// spawn error.
     pub fn open_url(&self, url: &str) -> Result<(), OpenUrlError> {
         openable_url(url).map_err(OpenUrlError::Refused)?;
-        match crate::process::spawn_detached("xdg-open", &[url.to_string()], &[]) {
+        match crate::process::spawn_detached("xdg-open", &[url.to_string()]) {
             Ok(()) => Ok(()),
             Err(err) => Err(OpenUrlError::Spawn(err.to_string())),
         }

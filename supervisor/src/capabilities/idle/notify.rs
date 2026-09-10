@@ -155,9 +155,6 @@ pub(crate) struct LiveNotify {
     pub(crate) connection: Connection,
     pub(crate) queue_handle: QueueHandle<WaylandThreadState>,
     pub(crate) registry: Arc<Mutex<NotifyRegistry>>,
-    /// Keeps the dispatch thread alive; never joined on shutdown.
-    #[allow(dead_code)]
-    dispatch_thread: std::thread::JoinHandle<()>,
 }
 
 pub(crate) enum NotifyState {
@@ -194,7 +191,7 @@ pub(crate) fn connect_wayland_idle()
     // Roundtrip so freshly bound proxies are live before returning them.
     event_queue.roundtrip(&mut state)?;
 
-    let dispatch_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         loop {
             if event_queue.blocking_dispatch(&mut state).is_err() {
                 // Compositor/socket died; exit quietly rather than spin.
@@ -209,7 +206,6 @@ pub(crate) fn connect_wayland_idle()
         connection,
         queue_handle: qh,
         registry: Arc::new(Mutex::new(NotifyRegistry::default())),
-        dispatch_thread,
     };
     Ok((live, raw_events_rx))
 }

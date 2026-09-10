@@ -43,7 +43,7 @@ async fn wait_or_classify(child: &mut Child, grace: Duration) -> io::Result<Time
 }
 
 /// Sends `signal` to `pgid`; `ESRCH` is success because the group may die before `kill(2)` lands.
-fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
+pub(crate) fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
     match killpg(pgid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(err) => Err(err.into()),
@@ -77,14 +77,9 @@ pub fn spawn_group_leader(cmd: &str, args: &[String], envs: &[(String, String)])
 /// The three standard streams go to `/dev/null`. A detached program has nowhere to write: the
 /// Supervisor is not holding pipes for it, and leaving them inherited would let it scribble on the
 /// shell's own stdout long after nobody is reading.
-pub fn spawn_detached(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<()> {
+pub fn spawn_detached(cmd: &str, args: &[String]) -> io::Result<()> {
     let mut command = Command::new(cmd);
-    command
-        .args(args)
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: `pre_exec` runs in the forked child between `fork` and `exec`, where only the calling
     // thread exists. Every call here is async-signal-safe and on POSIX's list for that window:
     // `setsid`, `fork` and `_exit`. Nothing allocates, takes a lock, or touches Rust state.
@@ -110,14 +105,8 @@ pub fn spawn_detached(cmd: &str, args: &[String], envs: &[(String, String)]) -> 
 
 /// [`spawn_group_leader`] with piped stdout/stderr for `process.run` (ADR-0026) to forward as
 /// `SupervisorFrame::ProcessOutput`; stdin stays inherited.
-pub fn spawn_group_leader_piped(cmd: &str, args: &[String], envs: &[(String, String)]) -> io::Result<Child> {
-    Command::new(cmd)
-        .args(args)
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+pub fn spawn_group_leader_piped(cmd: &str, args: &[String]) -> io::Result<Child> {
+    Command::new(cmd).args(args).process_group(0).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
 }
 
 /// [`spawn_group_leader`] with piped stdin/stdout for PAM (ADR-0028): write one password,
@@ -315,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_group_leader_piped_also_puts_the_child_in_its_own_process_group() {
         // Guard the piped variant's process-group behavior.
-        let mut child = spawn_group_leader_piped("sh", &sh_args("sleep 5"), &[]).expect("failed to spawn");
+        let mut child = spawn_group_leader_piped("sh", &sh_args("sleep 5")).expect("failed to spawn");
         let child_pid = child.id().expect("freshly spawned child has a pid");
 
         let child_pgid = nix::unistd::getpgid(Some(Pid::from_raw(child_pid as i32))).expect("getpgid on the child");
@@ -327,8 +316,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_group_leader_piped_pipes_stdout_and_stderr_separately_with_the_real_exit_code() {
-        let mut child = spawn_group_leader_piped("sh", &sh_args("echo line1; echo line2 >&2; exit 3"), &[])
-            .expect("failed to spawn");
+        let mut child =
+            spawn_group_leader_piped("sh", &sh_args("echo line1; echo line2 >&2; exit 3")).expect("failed to spawn");
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -385,7 +374,7 @@ mod tests {
         // answer is a pid that is not this process -- the intermediate's, or the reaper's. Waiting
         // for the handover would make the test's timing part of what it asserts, for nothing.
         let script = format!("printf %s \"$PPID\" > {}", out.display());
-        spawn_detached("sh", &["-c".to_string(), script], &[]).expect("spawn");
+        spawn_detached("sh", &["-c".to_string(), script]).expect("spawn");
 
         let mut waited = 0;
         while !out.exists() && waited < 200 {

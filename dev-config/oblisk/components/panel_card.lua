@@ -1,6 +1,6 @@
 -- Shared background, padding, and radius for dropdowns and panel bodies.
 -- `modules/shell/panel_host.lua` and `modules/bar/panels/settings.lua` repeated the same six
--- properties, meeting the two-call-site rule used by `components/pill.lua`.
+-- properties, which is the two-call-site bar for a shared component.
 --
 -- `opts` overrides defaults. By default, dropdowns use `theme.radius.md` and `theme.spacing.sm`.
 -- The opaque settings toplevel passes `radius = 0` and its own padding because it has no edge to

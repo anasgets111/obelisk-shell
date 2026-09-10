@@ -64,12 +64,7 @@ pub struct SysinfoConfigure {
 /// present-key type drops the whole call (`None`), with no partial apply.
 pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoConfigure> {
     let table = arguments.first()?.as_object()?;
-    let read_seconds = |key: &str| -> Option<Option<u64>> {
-        match table.get(key) {
-            Some(value) => value.as_u64().map(Some),
-            None => Some(None),
-        }
-    };
+    let read_seconds = |key: &str| table.get(key).map_or(Some(None), |value| value.as_u64().map(Some));
     Some(SysinfoConfigure {
         cpu_interval: read_seconds("cpu_interval")?,
         ram_interval: read_seconds("ram_interval")?,
@@ -114,21 +109,16 @@ impl SysinfoController {
     /// Applies parsed `sysinfo:configure(cfg)`: present intervals wake, retime, or suspend their
     /// task at `0`; absent ones stay unchanged. `send` errors only after task panic, logged here.
     pub fn configure(&self, cfg: SysinfoConfigure) {
-        if let Some(sec) = cfg.cpu_interval
-            && self.cpu_interval.send(Duration::from_secs(sec)).is_err()
-        {
-            eprintln!("sysinfo: cpu task is gone, cpu_interval update dropped");
-        }
-        if let Some(sec) = cfg.ram_interval
-            && self.ram_interval.send(Duration::from_secs(sec)).is_err()
-        {
-            eprintln!("sysinfo: ram task is gone, ram_interval update dropped");
-        }
-        if let Some(sec) = cfg.temp_interval
-            && self.temp_interval.send(Duration::from_secs(sec)).is_err()
-        {
-            eprintln!("sysinfo: temp task is gone, temp_interval update dropped");
-        }
+        let send = |seconds: Option<u64>, sender: &tokio::sync::watch::Sender<Duration>, name: &str| {
+            if let Some(sec) = seconds
+                && sender.send(Duration::from_secs(sec)).is_err()
+            {
+                eprintln!("sysinfo: {name} task is gone, {name}_interval update dropped");
+            }
+        };
+        send(cfg.cpu_interval, &self.cpu_interval, "cpu");
+        send(cfg.ram_interval, &self.ram_interval, "ram");
+        send(cfg.temp_interval, &self.temp_interval, "temp");
     }
 
     /// Current combined state for `main.rs`'s signal-channel `select!` snapshot push.

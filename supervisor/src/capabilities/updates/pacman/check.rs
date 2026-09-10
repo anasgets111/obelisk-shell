@@ -33,8 +33,7 @@ pub fn check_for_updates(
         .pkgs()
         .into_iter()
         .filter_map(|installed| {
-            let newer = installed.sync_new_version(syncdbs)?;
-            Some(UpdateCandidate {
+            installed.sync_new_version(syncdbs).map(|newer| UpdateCandidate {
                 name: installed.name().to_string(),
                 old_version: installed.version().to_string(),
                 new_version: newer.version().to_string(),

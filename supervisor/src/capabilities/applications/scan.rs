@@ -39,7 +39,6 @@ pub struct LaunchTarget {
 }
 
 /// One scan's result.
-#[derive(Debug, Default)]
 pub struct ScanResult {
     /// Entries sorted by display name. Sorting in Lua would repeat work on every reload.
     pub entries: Vec<AppSummary>,

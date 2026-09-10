@@ -98,10 +98,6 @@ function util.battery_glyph(b)
     return icons.battery_levels[math.max(1, math.min(5, bucket))]
 end
 
-function util.count(list)
-    return list and #list or 0
-end
-
 -- Resolve an `app_id` through `oblisk.applications.by_app_id` (ADR-0061). Callers supply different
 -- spellings: a desktop file id (`modules/global/launcher.lua`), compositor toplevel `app_id`
 -- (`modules/bar/indicators/active_window.lua`), or StatusNotifierItem `Id`
@@ -119,10 +115,10 @@ function util.app_entry(applications, app_id)
     return by_app_id[app_id] or by_app_id[string.lower(app_id)]
 end
 
--- Shared icon mapping for `modules/bar/indicators/volume.lua`, `modules/osd/popup.lua`, and
--- `components/pill.lua`. It takes raw `oblisk.audio`, not a signal, so callers choose their `nil`
--- behavior. It mirrors `volume_icon_name`'s five steps as Nerd Font glyphs because the OSD
--- accent-tints them and themed icons cannot be tinted.
+-- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`. It
+-- takes raw `oblisk.audio`, not a signal, so callers choose their `nil` behavior. Muted, then four
+-- steps by level, as Nerd Font glyphs rather than themed icon names: the OSD accent-tints them and
+-- themed icons cannot be tinted.
 function util.volume_glyph(a)
     local icons = require("config.icons")
     if a == nil or a.muted then
@@ -196,22 +192,6 @@ function util.active_access_point(n)
         end
     end
     return nil
-end
-
-function util.volume_icon_name(a)
-    if a == nil then
-        return ""
-    end
-    if a.muted then
-        return "audio-volume-muted"
-    end
-    local percent = (a.volume or 0) * 100
-    if percent < 34 then
-        return "audio-volume-low"
-    elseif percent < 67 then
-        return "audio-volume-medium"
-    end
-    return "audio-volume-high"
 end
 
 -- Hide a module with no content instead of showing a "--" pill. `visible` is a signal-bound base

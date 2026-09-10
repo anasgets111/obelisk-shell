@@ -182,42 +182,25 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
                 controller.stop_discovery().await;
             });
         }
-        BluetoothAction::Pair => match parse_mac_arg(&params.arguments) {
-            Some(mac) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.pair(&mac).await;
-                });
+        // The four device actions differ only in the method they call. The outer match stays
+        // exhaustive over `BluetoothAction`, so a new variant is still a compile error here.
+        BluetoothAction::Pair | BluetoothAction::Connect | BluetoothAction::Disconnect | BluetoothAction::Forget => {
+            match parse_mac_arg(&params.arguments) {
+                Some(mac) => {
+                    let controller = controller.clone();
+                    tokio::spawn(async move {
+                        match action {
+                            BluetoothAction::Pair => controller.pair(&mac).await,
+                            BluetoothAction::Connect => controller.connect(&mac).await,
+                            BluetoothAction::Disconnect => controller.disconnect(&mac).await,
+                            BluetoothAction::Forget => controller.forget(&mac).await,
+                            other => unreachable!("the arm above admits four actions, not {other:?}"),
+                        }
+                    });
+                }
+                None => crate::log_malformed_command(params),
             }
-            None => crate::log_malformed_command(params),
-        },
-        BluetoothAction::Connect => match parse_mac_arg(&params.arguments) {
-            Some(mac) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.connect(&mac).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        BluetoothAction::Disconnect => match parse_mac_arg(&params.arguments) {
-            Some(mac) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.disconnect(&mac).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        BluetoothAction::Forget => match parse_mac_arg(&params.arguments) {
-            Some(mac) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.forget(&mac).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        }
     }
 }
 

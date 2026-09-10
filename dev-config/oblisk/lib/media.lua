@@ -93,6 +93,4 @@ function media.is_playing_video(m)
     return false
 end
 
-media.video_playing = oblisk.mpris:map(media.is_playing_video)
-
 return media

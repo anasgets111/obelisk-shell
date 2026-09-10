@@ -46,7 +46,7 @@ fn read_max_brightness(entry_dir: &Path) -> i32 {
 /// Picks one `max_brightness > 0` device (ADR-0053), ranked by [`device_type_rank`] and then
 /// sorted directory name for deterministic boot-to-boot selection. `None` if none qualifies.
 fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
-    let mut entries: Vec<(PathBuf, i32)> = std::fs::read_dir(backlight_root)
+    std::fs::read_dir(backlight_root)
         .ok()?
         .flatten()
         .map(|entry| entry.path())
@@ -54,11 +54,9 @@ fn select_backlight_device(backlight_root: &Path) -> Option<(PathBuf, i32)> {
             let max = read_max_brightness(&dir);
             (max > 0).then_some((dir, max))
         })
-        .collect();
-    entries.sort_by(|(dir_a, _), (dir_b, _)| {
-        device_type_rank(dir_a).cmp(&device_type_rank(dir_b)).then_with(|| dir_a.cmp(dir_b))
-    });
-    entries.into_iter().next()
+        .min_by(|(dir_a, _), (dir_b, _)| {
+            device_type_rank(dir_a).cmp(&device_type_rank(dir_b)).then_with(|| dir_a.cmp(dir_b))
+        })
 }
 
 /// Reads `brightness` (the last requested value), not `actual_brightness`: a driver fade or

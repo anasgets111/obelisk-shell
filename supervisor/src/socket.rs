@@ -440,12 +440,9 @@ fn refuse_frame(control_client: bool, generation_id: u32, frame: &RendererFrame)
         // The rest carry no generation: the socket identifies the sender.
         _ => None,
     };
-    match claimed {
-        Some(claimed) if claimed != generation_id => {
-            Some(format!("it names generation {claimed}, but this connection is generation {generation_id}"))
-        }
-        _ => None,
-    }
+    claimed
+        .filter(|claimed| *claimed != generation_id)
+        .map(|claimed| format!("it names generation {claimed}, but this connection is generation {generation_id}"))
 }
 
 /// Sends `frame`, logging rather than propagating failure. `NoConnection` is expected before boot

@@ -24,8 +24,6 @@ pub(super) trait StatusNotifierItem {
 
     #[zbus(property, name = "Id")]
     fn id(&self) -> zbus::Result<String>;
-    #[zbus(property, name = "Category")]
-    fn category(&self) -> zbus::Result<String>;
     #[zbus(property, name = "Status")]
     fn status(&self) -> zbus::Result<String>;
     #[zbus(property, name = "Title")]
@@ -48,8 +46,6 @@ pub(super) trait StatusNotifierItem {
     fn item_is_menu(&self) -> zbus::Result<bool>;
     #[zbus(property, name = "Menu")]
     fn menu(&self) -> zbus::Result<OwnedObjectPath>;
-    #[zbus(property, name = "WindowId")]
-    fn window_id(&self) -> zbus::Result<i32>;
     /// Application icon directory, searched before the session theme.
     #[zbus(property, name = "IconThemePath")]
     fn icon_theme_path(&self) -> zbus::Result<String>;

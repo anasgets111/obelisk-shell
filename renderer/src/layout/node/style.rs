@@ -407,11 +407,7 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
 /// A node that asks and a compositor that cannot is silently nothing, which is what every other
 /// unavailable compositor feature already does here.
 pub fn parse_blur(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
-    match properties.get("blur") {
-        None | Some(Value::Boolean(false)) => Ok(false),
-        Some(Value::Boolean(true)) => Ok(true),
-        Some(other) => Err(invalid("blur", format!("must be a boolean, got {}", preview_for_error(other)))),
-    }
+    content::parse_bool(properties, "blur", false)
 }
 
 pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
@@ -428,13 +424,7 @@ pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
 }
 
 pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
-    let Some(value) = properties.get("visible") else {
-        return Ok(true);
-    };
-    match value {
-        Value::Boolean(b) => Ok(*b),
-        other => Err(invalid("visible", format!("expected a boolean, got {}", preview_for_error(other)))),
-    }
+    content::parse_bool(properties, "visible", true)
 }
 
 /// § 5.1 `cursor`: CSS names such as `"pointer"`, `"text"`, `"grab"`, and resize edges, or `None`
@@ -454,11 +444,7 @@ pub fn parse_cursor(properties: &HashMap<String, Value>) -> Result<Option<Cursor
 }
 
 pub fn parse_spacing(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let Some(value) = properties.get("spacing") else {
-        return Ok(0.0);
-    };
-    value_as_f32("spacing", value)?
-        .ok_or_else(|| invalid("spacing", format!("expected a number, got {}", preview_for_error(value))))
+    content::parse_number(properties, "spacing", 0.0)
 }
 
 #[cfg(test)]

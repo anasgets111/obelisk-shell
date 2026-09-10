@@ -230,11 +230,6 @@ fn read_gpu(who: &str) -> Gpu {
     fold_drm_clients(clients)
 }
 
-/// Reads one renderer by pid, unlike the supervisor's `/proc/self` read.
-fn read_process(pid: u32) -> io::Result<ProcessMemory> {
-    read_process_memory(&pid.to_string())
-}
-
 /// Reads `/proc/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A pid
 /// already exited during an ordinary PBA handoff or crash is logged and skipped; only the
 /// supervisor read is fatal.
@@ -242,7 +237,7 @@ pub(crate) fn sample(renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
     let supervisor = read_process_memory("self")?;
     let mut renderers = Vec::with_capacity(renderer_pids.len());
     for &(generation_id, pid) in renderer_pids {
-        match read_process(pid) {
+        match read_process_memory(&pid.to_string()) {
             Ok(memory) => renderers.push((generation_id, memory)),
             Err(err) => eprintln!(
                 "[oblisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"

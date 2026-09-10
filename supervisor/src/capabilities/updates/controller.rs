@@ -309,7 +309,7 @@ async fn run_one_check(
 
     let mut guard = state.lock().unwrap();
     guard.checking = false;
-    match result {
+    match result.map_err(|join_err| format!("check task panicked: {join_err}")) {
         Ok(Ok(candidates)) => {
             guard.count = candidates.len() as u32;
             guard.packages = candidates;
@@ -317,12 +317,8 @@ async fn run_one_check(
             guard.check_error = None;
             guard.consecutive_check_failures = 0;
         }
-        Ok(Err(err)) => {
+        Ok(Err(err)) | Err(err) => {
             guard.check_error = Some(err);
-            guard.consecutive_check_failures = guard.consecutive_check_failures.saturating_add(1);
-        }
-        Err(join_err) => {
-            guard.check_error = Some(format!("check task panicked: {join_err}"));
             guard.consecutive_check_failures = guard.consecutive_check_failures.saturating_add(1);
         }
     }
@@ -351,7 +347,7 @@ async fn run_install(
     events: UnboundedSender<UpdatesSignal>,
 ) {
     let command = backend.install_command();
-    let child = match process::spawn_group_leader_piped(&command.program, &command.arguments, &[]) {
+    let child = match process::spawn_group_leader_piped(&command.program, &command.arguments) {
         Ok(child) => child,
         Err(err) => {
             let mut guard = state.lock().unwrap();
@@ -714,7 +710,6 @@ mod tests {
         let child = process::spawn_group_leader_piped(
             "sh",
             &["-c".to_string(), "echo ':: Synchronizing package databases...'; echo '(1/2) installing nss (3.127-1 -> 3.128-1)'; echo '(2/2) upgrading gnome-autoar'; exit 0".to_string()],
-            &[],
         )
         .expect("spawn a stub install script");
 
@@ -739,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn run_install_with_child_reports_pacmans_own_exit_code_rather_than_a_sentence() {
         let state = Arc::new(Mutex::new(UpdatesState::default()));
-        let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "exit 1".to_string()], &[])
+        let child = process::spawn_group_leader_piped("sh", &["-c".to_string(), "exit 1".to_string()])
             .expect("spawn a failing stub");
 
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -761,7 +756,6 @@ mod tests {
         let child = process::spawn_group_leader_piped(
             "sh",
             &["-c".to_string(), "echo ':: Synchronizing package databases...'; echo 'error: target not found' 1>&2; echo '(1/1) upgrading nss'; exit 0".to_string()],
-            &[],
         )
         .expect("spawn a chatty stub");
 
@@ -796,7 +790,6 @@ mod tests {
         let child = process::spawn_group_leader_piped(
             "sh",
             &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
-            &[],
         )
         .expect("spawn a stub install script");
 
@@ -813,7 +806,6 @@ mod tests {
         let kernel_child = process::spawn_group_leader_piped(
             "sh",
             &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
-            &[],
         )
         .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -823,7 +815,6 @@ mod tests {
         let unrelated_child = process::spawn_group_leader_piped(
             "sh",
             &["-c".to_string(), "echo '(1/1) upgrading nss'; exit 0".to_string()],
-            &[],
         )
         .expect("spawn a stub install script");
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();

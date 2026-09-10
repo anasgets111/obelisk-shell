@@ -185,10 +185,6 @@ pub struct ShaderStage {
 }
 
 impl ShaderStage {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Draws `run` with the config shader at `effect`, or with the engine's own [`FADE`] when
     /// `effect` is `None` *or* the config's would not build. Answers `false` for anything that
     /// stops it, which leaves the caller's two-draw approximation to take the frame.
@@ -264,15 +260,11 @@ impl ShaderStage {
     ///
     /// The context is current.
     unsafe fn ensure_quad(&mut self, gl: &glow::Context) -> Option<(glow::VertexArray, glow::Buffer)> {
-        match self.quad {
-            Some(quad) => Some(quad),
-            None => {
-                // SAFETY: caller's contract.
-                let quad = unsafe { make_quad(gl) }?;
-                self.quad = Some(quad);
-                Some(quad)
-            }
+        if self.quad.is_none() {
+            // SAFETY: caller's contract.
+            self.quad = Some(unsafe { make_quad(gl) }?);
         }
+        self.quad
     }
 
     /// Compiles and links `path` if this version of it is not already known. Answers whether a
@@ -517,11 +509,9 @@ fn quad_corners(
     let (target_width, target_height) = (target_size.0.max(1.0), target_size.1.max(1.0));
     let corner = |u: f32, v: f32| {
         let (mut x, mut y) = (rect.x + u * size.0, rect.y + v * size.1);
-        if let Some([a, b, c, d, e, f]) = transform {
+        if let Some(matrix) = transform {
             // femtovg's `Transform2D` order, which is what `Draw::Transformed` hands the canvas.
-            let (px, py) = (x, y);
-            x = a * px + c * py + e;
-            y = b * px + d * py + f;
+            (x, y) = node::apply_affine(matrix, x, y);
         }
         // Into the target, then into clip space, with y flipped: GL's origin is the bottom left.
         let ndc_x = (x - target_origin.0) / target_width * 2.0 - 1.0;

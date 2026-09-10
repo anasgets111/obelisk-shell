@@ -772,12 +772,9 @@ impl App {
     /// nothing pushed and the config sees no error -- an unavailable compositor feature is not a
     /// config mistake.
     fn apply_blur_region(&mut self, index: usize, regions: Vec<crate::text::snap::PhysicalRect>) {
-        let Some((manager, supported)) = self.background_effect.as_ref() else {
+        let Some((manager, true)) = self.background_effect.as_ref() else {
             return;
         };
-        if !supported {
-            return;
-        }
         let Some(surface) = self.surfaces[index].role.wl_surface().cloned() else {
             return;
         };

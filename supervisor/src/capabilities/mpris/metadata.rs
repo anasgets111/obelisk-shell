@@ -39,8 +39,7 @@ fn value_as_i64(value: &Value<'_>) -> Option<i64> {
 fn value_as_trackid(value: &Value<'_>) -> Option<String> {
     match value {
         Value::ObjectPath(path) => Some(path.as_str().to_string()),
-        Value::Str(s) => Some(s.as_str().to_string()),
-        _ => None,
+        _ => value_as_str(value).map(str::to_string),
     }
 }
 

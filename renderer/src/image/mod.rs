@@ -157,9 +157,8 @@ impl Fit {
 /// Whether a draw waits for pixels (ADR-0122). `Inline` is the default for icons and wallpaper:
 /// decode in the first frame so its presentation is complete (ADR-0003). `Background` queues the
 /// decode and draws nothing until it lands, avoiding a second of frozen shell for forty tiles.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Load {
-    #[default]
     Inline,
     Background,
 }
@@ -565,7 +564,6 @@ impl ImageCache {
         load: Load,
     ) -> Option<ImageId> {
         let vector = is_vector(path);
-        let box_px = (box_px.0.max(1), box_px.1.max(1));
         let key = CacheKey {
             path: path.to_path_buf(),
             box_px: cache_box(path, box_px),
@@ -1043,11 +1041,6 @@ fn packed_rgb(color: Rgba) -> u32 {
     (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
 }
 
-/// `#RRGGBB` for a parsed colour.
-fn hex_rgb(color: Rgba) -> String {
-    format!("#{:06x}", packed_rgb(color))
-}
-
 /// Replace `currentColor` with `tint`, or leave data untouched without one (ADR-0072). Symbolic
 /// icons use two shapes. Breeze/Adwaita ship `<style id="current-color-scheme">` with
 /// `color:#232629` on each path's class; Plasma rewrites it at load, and so does this, avoiding
@@ -1063,7 +1056,7 @@ fn tinted_svg(data: &[u8], tint: Rgba) -> Vec<u8> {
     if !text.contains("currentColor") {
         return data.to_vec();
     }
-    let hex = hex_rgb(tint);
+    let hex = format!("#{:06x}", packed_rgb(tint));
     let rewritten = rewrite_color_declarations(text, &hex);
     match rewritten.find("<svg") {
         Some(at) => {
@@ -1226,7 +1219,7 @@ mod tests {
     #[test]
     fn a_tint_packs_to_rgb_and_drops_alpha() {
         assert_eq!(packed_rgb(Rgba { r: 1.0, g: 0.0, b: 0.0, a: 0.25 }), 0xff0000);
-        assert_eq!(hex_rgb(Rgba { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), "#0000ff");
+        assert_eq!(format!("#{:06x}", packed_rgb(Rgba { r: 0.0, g: 0.0, b: 1.0, a: 1.0 })), "#0000ff");
     }
 
     /// `#cdd6f4`, the dev config's `theme.FG`, so a test asserting on the hex asserts on a value it

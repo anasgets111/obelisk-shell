@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use zbus::zvariant::Value;
 
-use crate::capabilities::shm_icons::{self, PngEncodeError};
+use crate::capabilities::shm_icons;
 
 use super::markup::parse_markup;
 use super::{MAX_APP_ICON_NAME_BYTES, MAX_BODY_BYTES, MAX_IMAGE_DIMENSION, NotificationSpan};
@@ -148,14 +148,14 @@ pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
 /// Encodes checked [`RawImageData`] to PNG. Unlike `dbus::tray`'s `encode_argb32_to_png`, no
 /// channel reorder is needed: freedesktop data is RGB(A) row-major, not ARGB network-byte-order
 /// pixmaps.
-pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, PngEncodeError> {
+pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, png::EncodingError> {
     let mut buffer = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut buffer, image.width as u32, image.height as u32);
         encoder.set_color(if image.has_alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(PngEncodeError::Png)?;
-        writer.write_image_data(&image.data).map_err(PngEncodeError::Png)?;
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&image.data)?;
     }
     Ok(buffer)
 }

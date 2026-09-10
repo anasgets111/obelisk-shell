@@ -17,13 +17,10 @@ pub struct LockLeds {
 /// Finds a `leds_root` directory ending in `::<suffix>`; LED-class names are
 /// `<device>::<function>`.
 fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(leds_root).ok()?;
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().ends_with(suffix) {
-            return Some(entry.path());
-        }
-    }
-    None
+    std::fs::read_dir(leds_root)
+        .ok()?
+        .flatten()
+        .find_map(|entry| entry.file_name().to_string_lossy().ends_with(suffix).then(|| entry.path()))
 }
 
 pub fn resolve_lock_leds(leds_root: &Path) -> Option<LockLeds> {

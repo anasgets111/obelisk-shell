@@ -20,16 +20,7 @@ pub(super) trait Adapter1 {
     fn set_powered(&self, value: bool) -> zbus::Result<()>;
 
     #[zbus(property)]
-    fn discoverable(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
-    fn pairable(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
     fn discovering(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
-    fn address(&self) -> zbus::Result<String>;
 }
 
 #[zbus::proxy(interface = "org.bluez.Device1", default_service = "org.bluez")]
@@ -43,17 +34,11 @@ pub(super) trait Device1 {
     #[zbus(name = "Pair")]
     fn pair(&self) -> zbus::Result<()>;
 
-    #[zbus(name = "CancelPairing")]
-    fn cancel_pairing(&self) -> zbus::Result<()>;
-
     #[zbus(property)]
     fn address(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
-
-    #[zbus(property)]
-    fn icon(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
     fn class(&self) -> zbus::Result<u32>;
@@ -63,9 +48,6 @@ pub(super) trait Device1 {
 
     #[zbus(property)]
     fn connected(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
-    fn trusted(&self) -> zbus::Result<bool>;
 }
 
 #[zbus::proxy(interface = "org.bluez.Battery1", default_service = "org.bluez")]

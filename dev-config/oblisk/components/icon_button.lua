@@ -91,7 +91,6 @@ return function(glyph, on_activate, opts)
             return is_hovered and theme.GLASS_BORDER_HOVER or theme.GLASS_BORDER
         end)
     end
-    local background = ground
 
     -- `selected` marks which of five indicators owns the open panel's popup. Its accent ring
     -- replaces the hover border so selection remains legible under the pointer.
@@ -111,7 +110,7 @@ return function(glyph, on_activate, opts)
         align_v = "Center",
         hover = hovered,
         radius = radius,
-        background = background,
+        background = ground,
         opacity = opts.opacity,
         visible = opts.visible,
         -- `opts.border == false` drops the ring. Use an `if`: `x and nil or y` is always `y`, which

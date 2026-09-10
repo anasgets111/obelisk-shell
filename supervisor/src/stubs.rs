@@ -135,8 +135,7 @@ fn payload_class(schema: &Schema) -> String {
 /// Action variants as declaration-ordered wire strings for `invoke`. schemars' fieldless `enum`
 /// array uses `rename_all` spellings, exactly what `parse_action` accepts.
 fn action_names(schema: &Schema) -> Vec<String> {
-    let value = serde_json::to_value(schema).expect("a schema serializes");
-    value
+    schema
         .get("enum")
         .and_then(|e| e.as_array())
         .map_or_else(Vec::new, |v| v.iter().filter_map(|n| n.as_str()).map(str::to_string).collect())
@@ -216,10 +215,7 @@ fn lua_type(fragment: &serde_json::Value) -> String {
         _ => return "any".to_string(),
     };
     match type_name.as_str() {
-        "string" => "string".to_string(),
-        "integer" => "integer".to_string(),
-        "number" => "number".to_string(),
-        "boolean" => "boolean".to_string(),
+        "string" | "integer" | "number" | "boolean" => type_name.to_string(),
         "array" => {
             let item = fragment.get("items").map_or_else(|| "any".to_string(), lua_type);
             format!("{item}[]")
@@ -246,6 +242,16 @@ fn one_line(description: Option<&serde_json::Value>) -> String {
 
 /// Renders an object schema as `---@class` plus one `---@field` per property.
 ///
+/// A schema's own `description`, one `---` line each. One of the three callers guarded the empty
+/// line with `if line.is_empty() { "" } else { line }`, which is the identity.
+fn append_description(body: &serde_json::Value, out: &mut String) {
+    if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
+        for line in description.lines() {
+            out.push_str(&format!("---{line}\n"));
+        }
+    }
+}
+
 /// `oneOf` tagged enums flatten. `NotificationSpan` is `#[serde(tag = "kind")]`: one variant's
 /// fields plus `kind`. LuaCATS lacks tagged unions, so emit one class with all variant fields
 /// optional; configs check `kind` before using them.
@@ -257,11 +263,7 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
         && let Some(union) = string_enum(body)
     {
         out.push_str(&format!("\n---@alias {name} {union}\n"));
-        if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
-            for line in description.lines() {
-                out.push_str(&format!("---{line}\n"));
-            }
-        }
+        append_description(body, out);
         return;
     }
     // Documented enum form: one line per variant; the flat union has nowhere for descriptions.
@@ -275,19 +277,11 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
                 None => out.push_str(&format!("---| \"{variant}\"\n")),
             }
         }
-        if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
-            for line in description.lines() {
-                out.push_str(&format!("---{line}\n"));
-            }
-        }
+        append_description(body, out);
         return;
     }
     out.push_str(&format!("\n---@class {name}\n"));
-    if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
-        for line in description.lines() {
-            out.push_str(&format!("---{}\n", if line.is_empty() { "" } else { line }));
-        }
-    }
+    append_description(body, out);
 
     let mut fields: BTreeMap<String, (String, bool, String)> = BTreeMap::new();
     let mut variants: Vec<&serde_json::Value> = Vec::new();
@@ -442,10 +436,7 @@ const GENERATED_HEADER: &str = r#"---@meta
 /// but a config calling `forget_thresholds` would silently unregister its own idle thresholds
 /// (ADR-0158).
 fn internal_actions(capability: &str) -> &'static [&'static str] {
-    match capability {
-        "idle" => &["forget_thresholds"],
-        _ => &[],
-    }
+    if capability == "idle" { &["forget_thresholds"] } else { &[] }
 }
 
 /// Methods no action schema can describe, appended to the generated class. Only `idle` has them:

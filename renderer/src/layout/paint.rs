@@ -685,10 +685,8 @@ fn draw_for(
                 alpha: opacity,
                 load: *load,
                 retained: cover.clone(),
-                shader: dissolve.and_then(|dissolve| {
-                    let path = dissolve.spec.shader.clone()?;
-                    Some((path, dissolve.spec.params.clone()))
-                }),
+                shader: dissolve
+                    .and_then(|dissolve| dissolve.spec.shader.clone().map(|path| (path, dissolve.spec.params.clone()))),
                 dissolve: match dissolve {
                     Some(dissolve) => Some(dissolve.progress),
                     // A declared transition still covering a gap opens its cross *here*, at zero,
@@ -709,9 +707,10 @@ fn draw_for(
             let content = match focus {
                 // An empty masked field remains a prompt.
                 Some(FieldFocus::Masked { target: focused, filled }) if *filled > 0 => {
-                    match target.as_ref().is_some_and(|declared| declared == *focused) {
-                        true => mask.repeat(*filled),
-                        false => placeholder.clone(),
+                    if target.as_ref().is_some_and(|declared| declared == *focused) {
+                        mask.repeat(*filled)
+                    } else {
+                        placeholder.clone()
                     }
                 }
                 // Empty focused fields also show the placeholder (ADR-0135). The old caret-only
@@ -933,38 +932,25 @@ fn paint_border(
 
     // Corners overlap here rather than mitre: each edge is its own filled rect spanning the node's
     // full width or height, so two adjacent non-zero edges both cover the corner they share.
-    paint_border_edge(
-        canvas,
-        colors.top,
-        widths.top,
-        LogicalRect { x: rect.x, y: rect.y, width: rect.width, height: widths.top },
-        EdgeAxis::Horizontal,
-        scale,
-    );
-    paint_border_edge(
-        canvas,
-        colors.bottom,
-        widths.bottom,
-        LogicalRect { x: rect.x, y: rect.y + rect.height - widths.bottom, width: rect.width, height: widths.bottom },
-        EdgeAxis::Horizontal,
-        scale,
-    );
-    paint_border_edge(
-        canvas,
-        colors.left,
-        widths.left,
-        LogicalRect { x: rect.x, y: rect.y, width: widths.left, height: rect.height },
-        EdgeAxis::Vertical,
-        scale,
-    );
-    paint_border_edge(
-        canvas,
-        colors.right,
-        widths.right,
-        LogicalRect { x: rect.x + rect.width - widths.right, y: rect.y, width: widths.right, height: rect.height },
-        EdgeAxis::Vertical,
-        scale,
-    );
+    let LogicalRect { x, y, width: w, height: h } = rect;
+    for (color, thickness, edge_rect, axis) in [
+        (colors.top, widths.top, LogicalRect { x, y, width: w, height: widths.top }, EdgeAxis::Horizontal),
+        (
+            colors.bottom,
+            widths.bottom,
+            LogicalRect { x, y: y + h - widths.bottom, width: w, height: widths.bottom },
+            EdgeAxis::Horizontal,
+        ),
+        (colors.left, widths.left, LogicalRect { x, y, width: widths.left, height: h }, EdgeAxis::Vertical),
+        (
+            colors.right,
+            widths.right,
+            LogicalRect { x: x + w - widths.right, y, width: widths.right, height: h },
+            EdgeAxis::Vertical,
+        ),
+    ] {
+        paint_border_edge(canvas, color, thickness, edge_rect, axis, scale);
+    }
 }
 
 /// Which dimension of an edge rect is the thin one: top/bottom are thin in y, left/right in x.

@@ -85,7 +85,7 @@ pub fn parse_content(properties: &HashMap<String, Value>) -> Result<(String, Vec
 fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError> {
     let mut content = String::new();
     let mut styles = Vec::new();
-    for (position, run) in runs.clone().sequence_values::<Value>().enumerate() {
+    for (position, run) in runs.sequence_values::<Value>().enumerate() {
         if styles.len() == MAX_ARRAY_ELEMENTS {
             return Err(invalid("content", format!("more than {MAX_ARRAY_ELEMENTS} runs in one text node")));
         }
@@ -198,22 +198,14 @@ pub fn parse_fit(properties: &HashMap<String, Value>) -> Result<Fit, LayoutError
 /// `image.async` (ADR-0122): absent/`false` decodes in the frame; `true` uses the pool and draws
 /// nothing until the result lands. A signal resolving to `nil` arrives as an absent key.
 pub fn parse_load(properties: &HashMap<String, Value>) -> Result<Load, LayoutError> {
-    match properties.get("async") {
-        None | Some(Value::Boolean(false)) => Ok(Load::Inline),
-        Some(Value::Boolean(true)) => Ok(Load::Background),
-        Some(other) => Err(invalid("async", format!("expected a boolean, got {}", preview_for_error(other)))),
-    }
+    Ok(if parse_bool(properties, "async", false)? { Load::Background } else { Load::Inline })
 }
 
 /// `image.retain` (ADR-0180): while a new `source` decodes, keep drawing the one this node last
 /// had pixels for instead of nothing. Inert without `async = true`, because an inline decode is
 /// finished by the time the draw asks for it and never leaves a gap to cover.
 pub fn parse_retain(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
-    match properties.get("retain") {
-        None | Some(Value::Boolean(false)) => Ok(false),
-        Some(Value::Boolean(true)) => Ok(true),
-        Some(other) => Err(invalid("retain", format!("expected a boolean, got {}", preview_for_error(other)))),
-    }
+    parse_bool(properties, "retain", false)
 }
 
 fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) -> Result<String, LayoutError> {
@@ -267,10 +259,10 @@ pub fn parse_font_family(properties: &HashMap<String, Value>) -> Result<Option<A
     let family = checked_string("font", s)?;
     // An empty string is a config bug that would otherwise look like "no family named", and the
     // node would silently draw in the declared chain with nothing to point at.
-    match family.is_empty() {
-        true => Err(invalid("font", "must be a family name, got an empty string".to_string())),
-        false => Ok(Some(Arc::from(family.as_str()))),
+    if family.is_empty() {
+        return Err(invalid("font", "must be a family name, got an empty string".to_string()));
     }
+    Ok(Some(Arc::from(family)))
 }
 
 /// What to do with text too wide for its box.
@@ -383,22 +375,43 @@ pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, Lay
 }
 
 pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let Some(value) = properties.get("font_size") else {
-        return Ok(12.0);
-    };
-    value_as_f32("font_size", value)?
-        .ok_or_else(|| invalid("font_size", format!("expected a number, got {}", preview_for_error(value))))
+    parse_number(properties, "font_size", 12.0)
 }
 
 /// Absent `size` defaults to 12.0, matching [`parse_font_size`] and ADR-0044's nil rule. A typo
 /// such as `icon { sizee = 24 }` therefore draws a 12.0-sized icon rather than rejecting the tree;
 /// text and icons share the same default visual scale.
 pub fn parse_icon_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    let Some(value) = properties.get("size") else {
-        return Ok(12.0);
+    parse_number(properties, "size", 12.0)
+}
+
+/// Shared boolean parser behind [`parse_load`], [`parse_retain`], `style::parse_blur` and
+/// `style::parse_visible`, the way [`parse_string_property`] is shared by the string ones. An
+/// absent key takes `default`; anything that is not a boolean is an error naming the property.
+pub(super) fn parse_bool(
+    properties: &HashMap<String, Value>,
+    property: &str,
+    default: bool,
+) -> Result<bool, LayoutError> {
+    match properties.get(property) {
+        None => Ok(default),
+        Some(Value::Boolean(b)) => Ok(*b),
+        Some(other) => Err(invalid(property, format!("expected a boolean, got {}", preview_for_error(other)))),
+    }
+}
+
+/// Shared number parser behind [`parse_font_size`], [`parse_icon_size`] and `style::parse_spacing`.
+/// `style::parse_opacity` keeps its own body: it range-checks on top of this.
+pub(super) fn parse_number(
+    properties: &HashMap<String, Value>,
+    property: &str,
+    default: f32,
+) -> Result<f32, LayoutError> {
+    let Some(value) = properties.get(property) else {
+        return Ok(default);
     };
-    value_as_f32("size", value)?
-        .ok_or_else(|| invalid("size", format!("expected a number, got {}", preview_for_error(value))))
+    value_as_f32(property, value)?
+        .ok_or_else(|| invalid(property, format!("expected a number, got {}", preview_for_error(value))))
 }
 
 /// Shared structural-string parser behind [`parse_surface_id`], `surface::parse_layer`, and

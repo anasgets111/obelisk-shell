@@ -90,10 +90,7 @@ pub enum KeyboardInteractivity {
 pub fn parse_keyboard_interactivity(properties: &HashMap<String, Value>) -> Result<KeyboardInteractivity, LayoutError> {
     // Deferred on the evaluation-time pass ([`is_deferred_signal`]), same split as
     // [`parse_title`]'s: a field valid on a live surface is one only the resolved pass can read.
-    if is_deferred_signal(properties, "keyboard_interactivity") {
-        return Ok(KeyboardInteractivity::None);
-    }
-    let Some(value) = properties.get("keyboard_interactivity") else {
+    let Some(value) = non_deferred_property(properties, "keyboard_interactivity") else {
         return Ok(KeyboardInteractivity::None);
     };
     let Value::String(s) = value else {
@@ -133,10 +130,7 @@ pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive,
     // `Respect` is the placeholder: a signal is unknown before its getter runs, and the other
     // answers are visible mistakes for a frame -- `Ignore` paints over the bar, `Reserve` shoves
     // every window aside.
-    if is_deferred_signal(properties, "exclusive") {
-        return Ok(Exclusive::Respect);
-    }
-    let Some(value) = properties.get("exclusive") else {
+    let Some(value) = non_deferred_property(properties, "exclusive") else {
         return Ok(Exclusive::Respect);
     };
     match value {

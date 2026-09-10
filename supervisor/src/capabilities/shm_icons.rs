@@ -4,22 +4,6 @@
 
 use std::path::PathBuf;
 
-/// PNG encoding failure wrapping the `png` crate error used by both controllers.
-#[derive(Debug)]
-pub enum PngEncodeError {
-    Png(png::EncodingError),
-}
-
-impl std::fmt::Display for PngEncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Png(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for PngEncodeError {}
-
 /// `$XDG_RUNTIME_DIR/oblisk/{subdir}` (ADR-0142; previously `/dev/shm/oblisk-$UID` under ADR-0031).
 ///
 /// Not `/dev/shm`: mode 1777 lets another user create `oblisk-$UID` first, redirecting [`sweep`]'s

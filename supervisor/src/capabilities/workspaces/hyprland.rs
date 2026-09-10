@@ -267,8 +267,7 @@ fn read_state(socket_path: &PathBuf) -> Option<State> {
 }
 
 fn signature() -> Option<String> {
-    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-    (!signature.is_empty()).then_some(signature)
+    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|signature| !signature.is_empty())
 }
 
 /// Connects to the event socket before the first state read, so an intervening change remains a

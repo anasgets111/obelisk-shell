@@ -69,7 +69,7 @@ fn walk(
         let path = entry.path();
         // `file_type()` would skip symlinked `widgets -> ~/dotfiles/oblisk/widgets`; `metadata()`
         // follows the link.
-        if !path.metadata().is_ok_and(|kind| kind.is_dir()) {
+        if !path.is_dir() {
             continue;
         }
         if let Err(err) = walk(watches, wd_to_dir, visited, &path) {
@@ -105,9 +105,8 @@ fn forget_subtree(
 /// Hashes current contents, or `None` if delete/move won the race. `DefaultHasher` is neither
 /// specified nor cryptographic; neither matters here.
 fn hash_file(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
     let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
+    std::fs::read(path).ok()?.hash(&mut hasher);
     Some(hasher.finish())
 }
 

@@ -86,10 +86,8 @@ return function(label, on_activate, slot, opts)
         padding = { left = theme.spacing.md, right = theme.spacing.md },
         animate = { background = theme.animation_ms },
         on_click = function(_, mouse_button)
-            if mouse_button == "left" then
-                if on_activate then
-                    on_activate()
-                end
+            if mouse_button == "left" and on_activate then
+                on_activate()
             end
         end,
         children = { row { width = fill, height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },

@@ -19,7 +19,7 @@ use crate::generation::{
 };
 use crate::pam_worker;
 use crate::polkit::AgentRequest;
-use crate::process::registry::{LiveProcesses, reap_all_processes, take_exited_process, wait_and_report_exit};
+use crate::process::registry::{LiveProcesses, reap_all_processes, wait_and_report_exit};
 use crate::reload_link::SocketCandidateLink;
 use crate::snapshot::push_snapshot;
 use crate::socket::{self, InboundFrame};
@@ -384,14 +384,14 @@ impl Supervisor {
             eprintln!(
                 "lock: dropping a pam outcome for acquisition {acquisition}, which is no longer the lock on the glass"
             );
-        } else if succeeded {
+        } else {
             // Push before scheduling: `unlocking` is now true, and the config cannot animate a
             // window it has not been told about (ADR-0190). The release is already committed by
-            // the time the config sees it.
+            // the time the config sees it. Every accepted outcome pushes exactly once.
             self.push_lock_state();
-            self.lock.unlock_after_animation();
-        } else {
-            self.push_lock_state();
+            if succeeded {
+                self.lock.unlock_after_animation();
+            }
         }
     }
 
@@ -521,7 +521,7 @@ impl Supervisor {
     /// Removes one finished `process.run` child inline; `wait` stays off `select!` (see
     /// `wait_and_report_exit`).
     pub(crate) fn reap_exited_process(&mut self, generation_id: u32, id: u64) {
-        if let Some(child) = take_exited_process(&mut self.processes, generation_id, id) {
+        if let Some(child) = self.processes.remove(&(generation_id, id)) {
             tokio::spawn(wait_and_report_exit(self.registry.clone(), generation_id, id, child));
         }
     }

@@ -30,7 +30,7 @@ use std::rc::Rc;
 
 use mlua::{Function, UserData, UserDataMethods};
 
-use crate::lua::capability::{Capability, CommandSender};
+use crate::lua::capability::Capability;
 
 /// Callbacks left by one `register_threshold` call.
 struct Threshold {
@@ -50,12 +50,11 @@ pub struct IdleRegistry {
 struct Inner {
     /// Keyed by seconds, the only field `shared::IdleEvent` carries for matching.
     thresholds: HashMap<u64, Vec<Threshold>>,
-    commands: CommandSender,
 }
 
 impl IdleRegistry {
-    pub fn new(commands: CommandSender, state: Capability) -> Self {
-        IdleRegistry { inner: Rc::new(RefCell::new(Inner { thresholds: HashMap::new(), commands })), state }
+    pub fn new(state: Capability) -> Self {
+        IdleRegistry { inner: Rc::new(RefCell::new(Inner { thresholds: HashMap::new() })), state }
     }
 
     /// Read half for the wrapper's `get`/`map` and `signal::from_userdata`.
@@ -71,25 +70,22 @@ impl IdleRegistry {
     /// acknowledgement. Without `ext_idle_notifier_v1` (ADR-0032), the inert notify half never
     /// fires, which is indistinguishable from a user who never went idle.
     fn register_threshold(&self, sec: u64, on_idle: Function, on_resume: Function) {
-        let mut inner = self.inner.borrow_mut();
-        inner.thresholds.entry(sec).or_default().push(Threshold { on_idle, on_resume });
-        inner.commands.start_capability("idle");
-        inner.commands.send("idle", "register", vec![serde_json::json!(sec)], 0);
+        self.inner.borrow_mut().thresholds.entry(sec).or_default().push(Threshold { on_idle, on_resume });
+        self.state.commands().start_capability("idle");
+        self.state.commands().send("idle", "register", vec![serde_json::json!(sec)], 0);
     }
 
     /// `idle:inhibit(reason)` (ADR-0032). The Supervisor counts holds per generation, so two
     /// callers hold two references to one logind fd and either release leaves the other alive.
     fn inhibit(&self, reason: String) {
-        let inner = self.inner.borrow();
-        inner.commands.start_capability("idle");
-        inner.commands.send("idle", "inhibit", vec![serde_json::json!(reason)], 0);
+        self.state.commands().start_capability("idle");
+        self.state.commands().send("idle", "inhibit", vec![serde_json::json!(reason)], 0);
     }
 
     /// `idle:release_inhibit()`, releasing one hold rather than every hold.
     fn release_inhibit(&self) {
-        let inner = self.inner.borrow();
-        inner.commands.start_capability("idle");
-        inner.commands.send("idle", "release_inhibit", Vec::new(), 0);
+        self.state.commands().start_capability("idle");
+        self.state.commands().send("idle", "release_inhibit", Vec::new(), 0);
     }
 
     /// Dispatches `SupervisorFrame::IdleEvent` to every callback for `threshold_sec`. An
@@ -133,7 +129,8 @@ impl IdleRegistry {
             return;
         }
         inner.thresholds.clear();
-        inner.commands.send("idle", "forget_thresholds", Vec::new(), 0);
+        drop(inner);
+        self.state.commands().send("idle", "forget_thresholds", Vec::new(), 0);
     }
 
     /// The `oblisk.idle` member.
@@ -205,10 +202,10 @@ mod tests {
     fn lua_with_idle(generation_id: u32) -> (Lua, IdleRegistry, mpsc::UnboundedReceiver<RendererFrame>) {
         let lua = Lua::new();
         let (tx, rx) = mpsc::unbounded_channel();
-        let commands = CommandSender::new(generation_id, tx);
+        let commands = crate::lua::capability::CommandSender::new(generation_id, tx);
         // Tests exercise the method half; drop the `oblisk.idle` roster handle (ADR-0141).
         let (state, _handle) = Capability::new("idle", crate::lua::signal::DirtyFlag::new(), commands.clone());
-        let registry = IdleRegistry::new(commands, state);
+        let registry = IdleRegistry::new(state);
         lua.globals().set("idle", registry.member()).unwrap();
         (lua, registry, rx)
     }

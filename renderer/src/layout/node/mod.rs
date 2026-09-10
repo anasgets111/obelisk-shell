@@ -134,12 +134,10 @@ impl LayoutError {
     /// this enum has to learn a wrapper. The other variants already name the node kind or the whole
     /// pass, which is enough to find them, and none of them has a free-form field to extend.
     pub(crate) fn on_surface(self, surface: &str) -> Self {
-        match self {
-            Self::InvalidProperty { property, detail } => {
-                Self::InvalidProperty { property, detail: format!("on `{surface}`: {detail}") }
-            }
-            other => other,
-        }
+        let Self::InvalidProperty { property, detail } = self else {
+            return self;
+        };
+        Self::InvalidProperty { property, detail: format!("on `{surface}`: {detail}") }
     }
 
     /// Prepends one step of the walk that reached the failing node, added by `layout::scene`'s
@@ -155,12 +153,10 @@ impl LayoutError {
     /// Indices are positions among a parent's `children`, so they are stable to read against the
     /// config but not identities: a `list` renumbers its rows as its source changes.
     pub(crate) fn in_child(self, index: usize, kind: &str) -> Self {
-        match self {
-            Self::InvalidProperty { property, detail } => {
-                Self::InvalidProperty { property, detail: format!("{kind}[{index}] > {detail}") }
-            }
-            other => other,
-        }
+        let Self::InvalidProperty { property, detail } = self else {
+            return self;
+        };
+        Self::InvalidProperty { property, detail: format!("{kind}[{index}] > {detail}") }
     }
 }
 
@@ -454,6 +450,18 @@ fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bo
     matches!(properties.get(property), Some(Value::UserData(ud)) if is_signal(ud))
 }
 
+/// The value under `property`, or `None` when it is absent *or* a deferred `Signal`.
+///
+/// Seven § 6 parsers take the same default for both, so they read the property through this
+/// instead of writing [`is_deferred_signal`] and `properties.get` one after the other. Order does
+/// not matter: a deferred property missing from the map takes the default either way. Parsers whose
+/// deferred and absent answers differ -- `parse_anchor_rect`, `parse_popup_extent` -- keep both
+/// checks, because for them the distinction is the point.
+fn non_deferred_property<'a>(properties: &'a HashMap<String, Value>, property: &str) -> Option<&'a Value> {
+    let value = properties.get(property)?;
+    (!is_deferred_signal(properties, property)).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +527,7 @@ mod tests {
         assert!(parse_visible(&props_with_nil_signal(&lua, "rect", "visible")).unwrap());
         assert_eq!(parse_spacing(&props_with_nil_signal(&lua, "row", "spacing")).unwrap(), 0.0);
         assert_eq!(parse_font_size(&props_with_nil_signal(&lua, "text", "font_size")).unwrap(), 12.0);
-        assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child"), "child").unwrap().is_none());
+        assert!(parse_single_child(&props_with_nil_signal(&lua, "panel", "child")).unwrap().is_none());
         assert!(parse_children(&props_with_nil_signal(&lua, "row", "children")).unwrap().is_empty());
         assert_eq!(parse_content(&props_with_nil_signal(&lua, "text", "content")).unwrap().0, "");
         assert_eq!(parse_icon_size(&props_with_nil_signal(&lua, "icon", "size")).unwrap(), 12.0);

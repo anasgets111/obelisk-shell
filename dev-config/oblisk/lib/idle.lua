@@ -350,8 +350,8 @@ function idle.set_manual(on)
     idle.sync_inhibit()
 end
 
---- Runnable stages in order and their post-arming delays. `from`/`at` are display totals only; no
---- stage fires from them because its clock starts when it arms.
+--- Runnable stages in order and their post-arming delays. `at` is a display total only; no stage
+--- fires from it because its clock starts when it arms.
 --- @param settings table the result of [`idle.read`]
 --- @param profile string `"ac"` or `"battery"`
 --- @return { list: table[], total: integer }
@@ -367,7 +367,6 @@ function idle.plan(settings, profile)
                 key = key,
                 icon = stage.icon,
                 title = stage.title,
-                from = from,
                 at = from + delay,
                 delay = delay,
             }

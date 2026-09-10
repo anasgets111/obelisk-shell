@@ -131,10 +131,6 @@ local elapsed_text = computed(
     end
 )
 
-local function detached(cmd, args)
-    process.run(cmd, args, function() end, function() end)
-end
-
 -- `_launchRecorder`. The file name is the launch time, so two captures in one session cannot
 -- collide, and the extension follows the container the panel chose.
 local function launch(capture_args, label)
@@ -227,14 +223,6 @@ local function toggle_pause()
     end
 end
 
-local function toggle()
-    if recording:get() then
-        stop()
-    else
-        start()
-    end
-end
-
 -- Notify on every end, not only a requested one: a recorder that died on its own still
 -- wrote a file; saying nothing loses the capture.
 --
@@ -283,7 +271,7 @@ local function announce_saved(finished_at, began, exit_code)
     end, function()
         local key = chosen:match("^%s*(.-)%s*$")
         if key == "default" or key == "play" then
-            detached("xdg-open", { path })
+            process.detach("xdg-open", { path })
         end
     end)
 end
@@ -320,20 +308,17 @@ return {
     starting = starting,
     elapsed_text = elapsed_text,
     capture_label = capture_label,
-    output_path = output_path,
     start_error = recorder.start_error,
     monitor = monitor,
     directory = directory,
-    setting = setting,
     set_setting = set_setting,
     start = start,
     stop = stop,
     toggle_pause = toggle_pause,
-    toggle = toggle,
     open_directory = function()
         local dir = directory:get()
         if dir ~= "" then
-            detached("xdg-open", { dir })
+            process.detach("xdg-open", { dir })
         end
     end,
 }

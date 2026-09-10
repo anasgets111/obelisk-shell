@@ -639,13 +639,9 @@ impl App {
     /// parent cycles, including self-parenting, never open and cannot recurse through this walk.
     pub(super) fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
         let parent_id = self.surfaces[index].surface_id.clone();
-        let children: Vec<usize> = (0..self.surfaces.len())
-            .filter(|&child| child != index)
-            .filter(|&child| {
-                matches!(&self.surfaces[child].role, TrackedRole::Popup { popup: Some(_), spec, .. } if is_instance_of(&parent_id, &spec.parent))
-            })
-            .collect();
-        for child in children {
+        for child in (0..self.surfaces.len()).filter(|&child| child != index).filter(|&child| {
+            matches!(&self.surfaces[child].role, TrackedRole::Popup { popup: Some(_), spec, .. } if is_instance_of(&parent_id, &spec.parent))
+        }) {
             self.shown_popups_under(child, out);
             out.push(child);
         }

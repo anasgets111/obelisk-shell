@@ -72,7 +72,7 @@ pub(crate) async fn dispatch(
         // from `run`, and it is why this sends no `ProcessExited` -- there is no `exit_cb` waiting.
         "detach" => match process_run_args(&envelope.params.arguments) {
             Some((cmd, args)) => {
-                if let Err(err) = crate::process::spawn_detached(&cmd, &args, &[]) {
+                if let Err(err) = crate::process::spawn_detached(&cmd, &args) {
                     eprintln!("process.detach: spawning {cmd:?} failed: {err}");
                 }
             }
@@ -109,7 +109,7 @@ pub(crate) fn spawn_and_register_process(
     cmd: &str,
     args: &[String],
 ) -> Option<(ChildStdout, ChildStderr)> {
-    match super::spawn_group_leader_piped(cmd, args, &[]) {
+    match super::spawn_group_leader_piped(cmd, args) {
         Ok(mut child) => {
             let stdout = child.stdout.take().expect("spawn_group_leader_piped always pipes stdout");
             let stderr = child.stderr.take().expect("spawn_group_leader_piped always pipes stderr");
@@ -157,31 +157,24 @@ struct BoundedLines<R> {
     label: String,
     /// Whether that warning has been logged, so a runaway child says it once, not once per line.
     warned: bool,
-    /// Set while the tail of an over-long line is being dropped. On `self` for the same reason
-    /// `line` is: a cancelled discard must resume discarding, not start emitting the tail it was
-    /// halfway through throwing away.
-    discarding: bool,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
     fn new(inner: R, label: String) -> Self {
-        Self { reader: tokio::io::BufReader::new(inner), line: Vec::new(), label, warned: false, discarding: false }
+        Self { reader: tokio::io::BufReader::new(inner), line: Vec::new(), label, warned: false }
     }
 
     /// The next line, truncated to [`MAX_LINE_BYTES`], or `Ok(None)` at EOF.
     async fn next_line(&mut self) -> io::Result<Option<String>> {
         loop {
-            // One discard-and-return path, reached both when this call fills the line and when a
-            // previous call was cancelled midway through discarding. Two separate discards here
-            // would run a second one after the resumed one finished, eating the *next* line.
-            if self.discarding {
+            // A full `line` is the whole discard state. `discard_to_newline` reads into its own
+            // buffer, so a cancelled discard leaves `line` at the cap and the next call resumes
+            // here; and once that await resolves there is no yield point before `take_line`
+            // empties it. One branch, so no second discard can run after the resumed one and eat
+            // the *next* line.
+            if self.line.len() as u64 == MAX_LINE_BYTES {
                 self.discard_to_newline().await?;
                 return Ok(Some(self.take_line()));
-            }
-            if self.line.len() as u64 == MAX_LINE_BYTES {
-                // Full without a newline: keep the head, drop the rest on the next turn.
-                self.discarding = true;
-                continue;
             }
             let room = MAX_LINE_BYTES - self.line.len() as u64;
             let read = (&mut self.reader).take(room).read_until(b'\n', &mut self.line).await?;
@@ -205,7 +198,6 @@ impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
 
     /// Reads and drops the rest of an over-long line, so the next one starts clean.
     async fn discard_to_newline(&mut self) -> io::Result<()> {
-        self.discarding = true;
         if !self.warned {
             self.warned = true;
             eprintln!(
@@ -219,7 +211,6 @@ impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
             dropped.clear();
             let read = (&mut self.reader).take(MAX_LINE_BYTES).read_until(b'\n', &mut dropped).await?;
             if read == 0 || dropped.last() == Some(&b'\n') {
-                self.discarding = false;
                 return Ok(());
             }
         }
@@ -306,13 +297,8 @@ pub(crate) async fn kill_registered_process(processes: &mut LiveProcesses, gener
     }
 }
 
-/// Fast `process_done` half: after both streams close, remove the entry without awaiting. Safe in
-/// `main()`'s `select!`; [`wait_and_report_exit`] performs the real `wait()`.
-pub(crate) fn take_exited_process(processes: &mut LiveProcesses, generation_id: u32, id: u64) -> Option<Child> {
-    processes.remove(&(generation_id, id))
-}
-
-/// Slow `process_done` half: waits for the real exit and reports it to Lua. Detach it, never await
+/// Slow `process_done` half: waits for the real exit and reports it to Lua. The caller has already
+/// taken the `Child` out of `LiveProcesses`; this owns it from here. Detach it, never await
 /// inline in `main()`'s `select!`: streams can close while a daemonizing child keeps running after
 /// redirecting them to `/dev/null`.
 pub(crate) async fn wait_and_report_exit(
@@ -554,22 +540,22 @@ mod tests {
         assert!(lines.iter().any(|l| l.id == 9 && l.stream == ProcessStream::Stderr && l.line == "err1"));
 
         // stream_process_output never learns the exit code itself (it doesn't own the Child) --
-        // that's take_exited_process + wait_and_report_exit's job, via a detached task.
-        let mut child = take_exited_process(&mut processes, 1, 9).expect("process must still be registered");
+        // that's the caller's `remove` + wait_and_report_exit's job, via a detached task.
+        let mut child = processes.remove(&(1, 9)).expect("process must still be registered");
         assert_eq!(child.wait().await.unwrap().code(), Some(3));
     }
 
     #[tokio::test]
-    async fn take_exited_process_on_an_unregistered_id_returns_none() {
+    async fn taking_an_unregistered_id_returns_none() {
         let mut processes: LiveProcesses = HashMap::new();
-        assert!(take_exited_process(&mut processes, 1, 1).is_none());
+        assert!(processes.remove(&(1, 1)).is_none());
     }
 
     #[tokio::test]
     async fn wait_and_report_exit_sends_the_real_exit_code_back_to_the_generation_that_spawned_it() {
         let mut processes: LiveProcesses = HashMap::new();
         spawn_and_register_process(&mut processes, 1, 9, "sh", &sh_args("exit 7"));
-        let child = take_exited_process(&mut processes, 1, 9).unwrap();
+        let child = processes.remove(&(1, 9)).unwrap();
         let (registry, mut rx) = registry_with_connection(1);
 
         wait_and_report_exit(registry, 1, 9, child).await;

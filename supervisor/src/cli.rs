@@ -86,7 +86,7 @@ fn is_option(arg: &str) -> bool {
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
-    let mut args = argv.into_iter().skip(1).peekable();
+    let mut args = argv.into_iter().skip(1);
     let mut command = None;
     let mut config_dir = None;
     let mut force = false;

@@ -387,7 +387,7 @@ impl Capabilities {
                             eprintln!(
                                 "mpris: failed to connect to the session bus; player discovery disabled for this run: {err}"
                             );
-                            MprisController::inert(self.senders.mpris.clone())
+                            MprisController::inert()
                         }
                     });
                 }

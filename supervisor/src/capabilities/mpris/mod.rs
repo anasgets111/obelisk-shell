@@ -47,20 +47,16 @@ pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope
             }
             None => crate::log_malformed_command(params),
         },
-        MprisAction::Seek => match parse_seek_args(&params.arguments) {
-            Some((id, pos_us)) => {
+        // Same wire shape and same spawn; only the controller method differs.
+        MprisAction::Seek | MprisAction::SeekRelative => match parse_seek_args(&params.arguments) {
+            Some((id, position)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
-                    controller.seek(&id, pos_us).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        MprisAction::SeekRelative => match parse_seek_args(&params.arguments) {
-            Some((id, off)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.seek_relative(&id, off).await;
+                    match action {
+                        MprisAction::Seek => controller.seek(&id, position).await,
+                        MprisAction::SeekRelative => controller.seek_relative(&id, position).await,
+                        other => unreachable!("the arm above admits two actions, not {other:?}"),
+                    }
                 });
             }
             None => crate::log_malformed_command(params),

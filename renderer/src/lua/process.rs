@@ -72,9 +72,9 @@ impl ProcessRegistry {
         id
     }
 
-    fn send(&self, envelope: CommandEnvelope) {
-        let id = envelope.id;
-        let action = envelope.params.action.clone();
+    fn send(&self, action: &str, arguments: Vec<serde_json::Value>, id: u64) {
+        let generation_id = self.0.borrow().generation_id;
+        let envelope = process_command(generation_id, action, arguments, id);
         if self.0.borrow().outbound_tx.send(RendererFrame::Command(envelope)).is_err() {
             eprintln!("process.{action}(id={id}): failed to queue request, the control-socket writer is gone");
         }
@@ -83,8 +83,7 @@ impl ProcessRegistry {
     fn run(&self, cmd: String, args: Vec<String>, out_cb: Function, exit_cb: Function) -> ProcessHandle {
         let id = self.allocate_id();
         self.0.borrow_mut().pending.insert(id, PendingProcess { out_cb, exit_cb });
-        let generation_id = self.0.borrow().generation_id;
-        self.send(process_command(generation_id, "run", vec![serde_json::json!(cmd), serde_json::json!(args)], id));
+        self.send("run", vec![serde_json::json!(cmd), serde_json::json!(args)], id);
         ProcessHandle { id, registry: self.clone() }
     }
 
@@ -93,13 +92,11 @@ impl ProcessRegistry {
     /// envelope still carries an id because every command does; nothing ever answers it.
     fn detach(&self, cmd: String, args: Vec<String>) {
         let id = self.allocate_id();
-        let generation_id = self.0.borrow().generation_id;
-        self.send(process_command(generation_id, "detach", vec![serde_json::json!(cmd), serde_json::json!(args)], id));
+        self.send("detach", vec![serde_json::json!(cmd), serde_json::json!(args)], id);
     }
 
     fn kill(&self, id: u64) {
-        let generation_id = self.0.borrow().generation_id;
-        self.send(process_command(generation_id, "kill", Vec::new(), id));
+        self.send("kill", Vec::new(), id);
     }
 
     /// Dispatches `SupervisorFrame::ProcessOutput` to `id`'s `out_cb`. Stale/unknown ids, including

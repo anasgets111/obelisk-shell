@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::process::Child;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -281,14 +281,14 @@ async fn stop_group(
     pgid: Pid,
     stop_signal: Signal,
 ) -> io::Result<std::process::ExitStatus> {
-    if let Err(err) = killpg_best_effort(pgid, stop_signal) {
+    if let Err(err) = crate::process::signal_group_best_effort(pgid, stop_signal) {
         eprintln!("processes: {name:?} could not be sent {stop_signal}: {err}");
     }
     if let Ok(status) = tokio::time::timeout(STOP_GRACE, child.wait()).await {
         return status;
     }
     eprintln!("processes: {name:?} ignored {stop_signal} for {STOP_GRACE:?}; escalating to SIGKILL");
-    if let Err(err) = killpg_best_effort(pgid, Signal::SIGKILL) {
+    if let Err(err) = crate::process::signal_group_best_effort(pgid, Signal::SIGKILL) {
         eprintln!("processes: {name:?} could not be sent SIGKILL: {err}");
     }
     // Bounded like the SIGTERM wait: uninterruptible I/O can defer even SIGKILL.
@@ -298,16 +298,10 @@ async fn stop_group(
     }
 }
 
-/// `ESRCH` is success in both helpers: the target may die between the check and the signal.
+/// `ESRCH` is success here as in `process::signal_group_best_effort`: the target may die between
+/// the check and the signal.
 fn kill_best_effort(pid: Pid, signal: Signal) -> io::Result<()> {
     match kill(pid, signal) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn killpg_best_effort(pgid: Pid, signal: Signal) -> io::Result<()> {
-    match killpg(pgid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(err) => Err(err.into()),
     }

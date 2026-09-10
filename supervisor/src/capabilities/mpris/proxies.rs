@@ -51,16 +51,6 @@ pub(super) trait MprisPlayer {
     fn position(&self) -> zbus::Result<i64>;
     #[zbus(property, name = "CanControl")]
     fn can_control(&self) -> zbus::Result<bool>;
-    #[zbus(property, name = "CanPlay")]
-    fn can_play(&self) -> zbus::Result<bool>;
-    #[zbus(property, name = "CanPause")]
-    fn can_pause(&self) -> zbus::Result<bool>;
-    #[zbus(property, name = "CanSeek")]
-    fn can_seek(&self) -> zbus::Result<bool>;
-    #[zbus(property, name = "CanGoNext")]
-    fn can_go_next(&self) -> zbus::Result<bool>;
-    #[zbus(property, name = "CanGoPrevious")]
-    fn can_go_previous(&self) -> zbus::Result<bool>;
 
     /// Freedesktop excludes `Position` from `PropertiesChanged`; this signal marks discontinuous
     /// jumps. `player.rs` waits on it for position-only changes beside `PlaybackStatus`/`Metadata`.

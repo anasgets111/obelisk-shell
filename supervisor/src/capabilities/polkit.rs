@@ -38,7 +38,10 @@ pub enum PolkitAction {
 
 /// polkitd's pending `BeginAuthentication` call and its completing reply.
 struct Pending {
-    call: BeginAuthenticationCall,
+    /// Only the cookie outlives `begin`. The display fields move into [`PolkitState`] and the
+    /// identities are read for the uid and then dropped, so keeping the whole call would hold an
+    /// authentication request's message and subject resident for the life of the challenge.
+    cookie: String,
     uid: u32,
     reply: oneshot::Sender<Result<(), AgentError>>,
 }
@@ -82,25 +85,22 @@ impl PolkitController {
         }
         self.state = PolkitState {
             active: true,
-            message: call.message.clone(),
-            action_id: call.action_id.clone(),
-            icon_name: call.icon_name.clone(),
+            message: call.message,
+            action_id: call.action_id,
+            icon_name: call.icon_name,
             ..PolkitState::default()
         };
-        self.pending = Some(Pending { call, uid, reply });
+        self.pending = Some(Pending { cookie: call.cookie, uid, reply });
         true
     }
 
     /// Ends the challenge with `Cancelled`: dialog cancel (`None`) or polkitd's
     /// `CancelAuthentication` for the matching `Some(cookie)`. Returns whether one was open.
     pub fn cancel(&mut self, cookie: Option<&str>) -> bool {
-        let matches = self.pending.as_ref().is_some_and(|p| cookie.is_none_or(|c| c == p.call.cookie));
-        if !matches {
+        let Some(pending) = self.pending.take_if(|p| cookie.is_none_or(|c| c == p.cookie)) else {
             return false;
-        }
-        if let Some(pending) = self.pending.take() {
-            let _ = pending.reply.send(Err(AgentError::Cancelled));
-        }
+        };
+        let _ = pending.reply.send(Err(AgentError::Cancelled));
         self.state = PolkitState::default();
         true
     }
@@ -110,13 +110,13 @@ impl PolkitController {
     pub fn try_begin_authentication(&mut self) -> Option<(u32, String)> {
         let pending = self.pending.as_ref().filter(|_| !self.state.authenticating)?;
         self.state.authenticating = true;
-        Some((pending.uid, pending.call.cookie.clone()))
+        Some((pending.uid, pending.cookie.clone()))
     }
 
     /// Applies the PAM answer for `cookie`. Success returns the reply that ends the held call; the
     /// controller has already forgotten the challenge.
     pub fn record_outcome(&mut self, cookie: &str, outcome: shared::PamOutcome) -> Answer {
-        if !self.pending.as_ref().is_some_and(|p| p.call.cookie == cookie) {
+        if !self.pending.as_ref().is_some_and(|p| p.cookie == cookie) {
             return Answer::Stale;
         }
         self.state.authenticating = false;

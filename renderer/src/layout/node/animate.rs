@@ -916,7 +916,7 @@ fn parse_sequence(
     for (index, frame) in keyframes.sequence_values::<Value>().enumerate() {
         let frame = frame.map_err(|e| invalid(field, e.to_string()))?;
         let at = format!("{field}.keyframes[{}]", index + 1);
-        let (value, duration, easing) = match &frame {
+        let (value, duration, easing) = match frame {
             // A frame that names nothing of its own is still a table when the value is one, so an
             // explicit `value` key is what tells the two apart.
             Value::Table(table) if table.contains_key("value").unwrap_or(false) => {
@@ -929,7 +929,7 @@ fn parse_sequence(
                 let named = if named.is_nil() { easing } else { parse_easing(&at, &named)? };
                 (value, own, named)
             }
-            plain => (plain.clone(), duration, easing),
+            plain => (plain, duration, easing),
         };
         let value = Animatable::from_value(property, Some(&value))?.ok_or_else(|| {
             invalid(&at, format!("must be a value a tween can carry, got {}", preview_for_error(&value)))

@@ -32,10 +32,8 @@ fn classify_service_arg(service: &str) -> RegistrationTarget {
     if service.starts_with('/') {
         return RegistrationTarget::ObjectPathFromSender { object_path: service.to_string() };
     }
-    let (name, object_path) = match service.find('/') {
-        Some(split) => (&service[..split], Some(service[split..].to_string())),
-        None => (service, None),
-    };
+    let (name, object_path) =
+        service.split_once('/').map_or((service, None), |(name, path)| (name, Some(format!("/{path}"))));
     if name.starts_with(':') {
         RegistrationTarget::UniqueName { unique_name: name.to_string(), object_path }
     } else {

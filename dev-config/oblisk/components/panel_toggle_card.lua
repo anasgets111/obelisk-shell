@@ -6,6 +6,7 @@
 local theme = require("config.theme")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
+local util = require("lib.util")
 
 ---@class PanelToggleCardOpts
 ---@field slot string The hover region's name; one per tile.
@@ -64,8 +65,8 @@ return function(opts)
         local shown = true
         if type(detail) == "userdata" then
             ---@cast detail Signal
-            shown = detail:map(function(text)
-                return text ~= nil and text ~= ""
+            shown = util.shown_when(detail, function(text)
+                return text ~= ""
             end)
         end
         lines[#lines + 1] = cell(detail, theme.DIM, theme.font.xs, { align = "Center", visible = shown })

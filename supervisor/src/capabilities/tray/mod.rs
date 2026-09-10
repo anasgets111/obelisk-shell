@@ -90,8 +90,6 @@ impl std::fmt::Display for TrayActionError {
     }
 }
 
-impl std::error::Error for TrayActionError {}
-
 /// `tray:activate` gate (ADR-0031): `ItemIsMenu == true` means show the menu, not `Activate`,
 /// enforced here once and centrally rather than trusted to every `shell.lua` author.
 fn should_call_activate(item_is_menu: bool) -> bool {
@@ -120,16 +118,11 @@ pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32
 }
 
 /// `tray:activate_menu_item(id, menu_item_id)`'s `arguments: [id, menu_item_id]`.
+/// Also `tray:menu_will_show(id, submenu_id)`: the wire shape is the same `[id, i32]` pair.
 pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
     let id = arguments.first()?.as_str()?.to_string();
     let menu_item_id = arguments.get(1)?.as_i64()? as i32;
     Some((id, menu_item_id))
-}
-
-/// `tray:menu_will_show(id, submenu_id)`'s `[id, submenu_id]`, kept separate from
-/// [`parse_activate_menu_item_args`] so each action names its own parser.
-pub fn parse_menu_will_show_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
-    parse_activate_menu_item_args(arguments)
 }
 
 /// Actions accepted by `oblisk.tray:invoke(...)`; `dispatch` keeps the table compiler-checked.
@@ -186,7 +179,7 @@ pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope)
             }
             None => crate::log_malformed_command(params),
         },
-        TrayAction::MenuWillShow => match parse_menu_will_show_args(&params.arguments) {
+        TrayAction::MenuWillShow => match parse_activate_menu_item_args(&params.arguments) {
             Some((id, submenu_id)) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
@@ -276,9 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_menu_will_show_args_reads_id_and_submenu_id() {
+    fn parse_activate_menu_item_args_reads_id_and_submenu_id() {
         assert_eq!(
-            parse_menu_will_show_args(&[serde_json::json!("1.42"), serde_json::json!(3)]),
+            parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(3)]),
             Some(("1.42".to_string(), 3))
         );
     }

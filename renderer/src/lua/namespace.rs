@@ -61,7 +61,7 @@ pub(crate) fn build(
     }
     install_capability_index(loader, &table, pending, commands.clone())?;
     let idle_state = idle_member.expect("shared::Capability::ALL must contain Idle");
-    let idle = IdleRegistry::new(commands.clone(), idle_state);
+    let idle = IdleRegistry::new(idle_state);
     table.set("idle", idle.member())?;
     loader.register_idle(idle.clone());
     let rescue = register_rescue_signal(loader, &table, dirty.clone())?;

@@ -29,13 +29,11 @@ local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
-local section_header = require("components.section_header")
 local ui_state = require("lib.ui_state")
 local modal = require("components.modal")
 local idle = require("lib.idle")
 local store = require("lib.store")
 
-local open = ui_state.idle_settings_open
 local settings = store.idle:map(idle.read)
 
 -- Whether UPower reports a battery. `present` is false on desktops (§ 2.2), so no battery column;
@@ -118,9 +116,7 @@ local header = panel_header {
 
 -- ## Timeline
 
-local plan_now = computed({ settings, idle.active_profile }, function(resolved, profile)
-    return idle.plan(resolved, profile)
-end)
+local plan_now = idle.schedule
 
 local counting_down = computed({ settings, plan_now, idle.inhibited }, function(resolved, plan, held)
     return resolved.enabled and plan.total > 0 and not held

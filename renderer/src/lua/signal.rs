@@ -48,12 +48,10 @@ impl Deadline {
     }
 
     fn expired(&self) -> bool {
-        if Instant::now() <= self.wall {
-            return false;
-        }
         // Past wall pre-filter, so CPU decides. An unreadable clock expires; an unmeasurable cap
         // must fire rather than disappear.
-        self.cpu.is_none_or(|deadline| thread_cpu_time().is_none_or(|used| used > deadline))
+        Instant::now() > self.wall
+            && self.cpu.is_none_or(|deadline| thread_cpu_time().is_none_or(|used| used > deadline))
     }
 }
 
@@ -334,74 +332,54 @@ impl Signal {
     /// Requests the next positioning pass scroll visible child `index` (1-based) into view, marking
     /// dirty (ADR-0112). Other kinds return false for `signal:reveal()`'s named refusal.
     pub(crate) fn request_reveal(&self, index: usize) -> bool {
-        match &self.0 {
-            SignalKind::Scroll { reveal, dirty, .. } => {
-                reveal.set(Some(index));
-                dirty.mark();
-                true
-            }
-            _ => false,
-        }
+        let SignalKind::Scroll { reveal, dirty, .. } = &self.0 else { return false };
+        reveal.set(Some(index));
+        dirty.mark();
+        true
     }
 
     /// Consumes the reveal in `layout::scene`'s positioning pass, so a later wheel event does not
     /// fight an already honored request.
     pub(crate) fn take_reveal(&self) -> Option<usize> {
-        match &self.0 {
-            SignalKind::Scroll { reveal, .. } => reveal.take(),
-            _ => None,
-        }
+        if let SignalKind::Scroll { reveal, .. } = &self.0 { reveal.take() } else { None }
     }
 
     /// Scroll write end for wheel and positioning clamp; `None` for other kinds keeps wheels off
     /// capability signals.
     pub(crate) fn scroll_handle(&self) -> Option<LiveSignalHandle> {
-        match &self.0 {
-            SignalKind::Scroll { cell, dirty, .. } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
-            _ => None,
-        }
+        let SignalKind::Scroll { cell, dirty, .. } = &self.0 else { return None };
+        Some(LiveSignalHandle(Rc::clone(cell), dirty.clone()))
     }
 
     /// Scroll offset without `Lua`: `layout::scene` clamps deep in a pass holding no VM reference,
     /// and threading one through every layout frame just to read a `RefCell` would add a parameter.
     pub(crate) fn scroll_offset(&self) -> Option<f32> {
-        match &self.0 {
-            SignalKind::Scroll { cell, .. } => match *cell.borrow() {
-                Value::Number(n) => Some(n as f32),
-                Value::Integer(n) => Some(n as f32),
-                _ => Some(0.0),
-            },
-            _ => None,
-        }
+        let SignalKind::Scroll { cell, .. } = &self.0 else { return None };
+        Some(match *cell.borrow() {
+            Value::Number(n) => n as f32,
+            Value::Integer(n) => n as f32,
+            _ => 0.0,
+        })
     }
 
     /// Geometry write end for `layout::scene`; `None` for other kinds, so `geometry = hover(...)`
     /// or a state signal is inert rather than overwritten.
     pub(crate) fn geometry_cell(&self) -> Option<Rc<RefCell<Value>>> {
-        match &self.0 {
-            SignalKind::Geometry(cell) => Some(Rc::clone(cell)),
-            _ => None,
-        }
+        if let SignalKind::Geometry(cell) = &self.0 { Some(Rc::clone(cell)) } else { None }
     }
 
     /// Hover write end for `crate::wayland`; `None` for other kinds by design.
     pub(crate) fn hover_handle(&self) -> Option<LiveSignalHandle> {
-        match &self.0 {
-            SignalKind::Hover { cell, dirty, .. } => Some(LiveSignalHandle(Rc::clone(cell), dirty.clone())),
-            _ => None,
-        }
+        let SignalKind::Hover { cell, dirty, .. } = &self.0 else { return None };
+        Some(LiveSignalHandle(Rc::clone(cell), dirty.clone()))
     }
 
     /// Rect write end for the boolean hover half: last node position in surface logical
     /// coordinates, consumed by tooltip `popup.anchor_rect`. `None` for other kinds and the rect
     /// half itself.
     pub(crate) fn hover_rect_handle(&self) -> Option<LiveSignalHandle> {
-        match &self.0 {
-            SignalKind::Hover { paired_rect: Some(rect), dirty, .. } => {
-                Some(LiveSignalHandle(Rc::clone(rect), dirty.clone()))
-            }
-            _ => None,
-        }
+        let SignalKind::Hover { paired_rect: Some(rect), dirty, .. } = &self.0 else { return None };
+        Some(LiveSignalHandle(Rc::clone(rect), dirty.clone()))
     }
 
     /// `map(f)` as a one-dependency `Computed`, recomputed on every read (ADR-0044 decision 3).
@@ -419,11 +397,11 @@ impl Signal {
     pub(crate) fn get_value(&self, lua: &Lua) -> mlua::Result<Value> {
         match &self.0 {
             SignalKind::Direct(value) => Ok(value.clone()),
-            SignalKind::Live(cell) => Ok(cell.borrow().clone()),
-            SignalKind::Hover { cell, .. } => Ok(cell.borrow().clone()),
-            SignalKind::Scroll { cell, .. } => Ok(cell.borrow().clone()),
-            SignalKind::State { cell, .. } => Ok(cell.borrow().clone()),
-            SignalKind::Geometry(cell) => Ok(cell.borrow().clone()),
+            SignalKind::Live(cell)
+            | SignalKind::Hover { cell, .. }
+            | SignalKind::Scroll { cell, .. }
+            | SignalKind::State { cell, .. }
+            | SignalKind::Geometry(cell) => Ok(cell.borrow().clone()),
             SignalKind::Delayed { source, hold, cell } => {
                 let fresh = source.get_value(lua)?;
                 Ok(cell.borrow_mut().follow(fresh, *hold, Instant::now(), |due| arm_wake(lua, due)))
@@ -498,15 +476,12 @@ impl PulseCell {
             self.seen = fresh;
             self.until = Some(now + hold);
         }
-        match self.until {
-            Some(until) if now < until => {
-                arm(until);
-                true
-            }
-            _ => {
-                self.until = None;
-                false
-            }
+        if let Some(until) = self.until.filter(|until| now < *until) {
+            arm(until);
+            true
+        } else {
+            self.until = None;
+            false
         }
     }
 }
@@ -545,8 +520,7 @@ impl LiveSignalHandle {
         if unchanged {
             return false;
         }
-        *self.0.borrow_mut() = value;
-        self.1.mark();
+        self.set(value);
         true
     }
 }
@@ -990,15 +964,15 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
     lua.globals().set(
         "computed",
         lua.create_function(|_, (deps, func): (Table, Function)| {
-            let mut collected = Vec::new();
-            for dep in deps.sequence_values::<mlua::AnyUserData>() {
-                let dep = dep?;
-                // Name the expected type; `borrow`'s error does not.
-                let signal = from_userdata(&dep).ok_or_else(|| {
-                    mlua::Error::runtime("computed() dependencies must be Signals or `oblisk` capabilities, § 1.2")
-                })?;
-                collected.push(signal);
-            }
+            let collected = deps
+                .sequence_values::<mlua::AnyUserData>()
+                .map(|dep| {
+                    // Name the expected type; `borrow`'s error does not.
+                    from_userdata(&dep?).ok_or_else(|| {
+                        mlua::Error::runtime("computed() dependencies must be Signals or `oblisk` capabilities, § 1.2")
+                    })
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
             Ok(Signal(SignalKind::Computed { id: next_computed_id(), deps: Rc::new(collected), func }))
         })?,
     )?;
@@ -1110,21 +1084,13 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
             if lua.app_data_ref::<ScrollRegistry>().is_none() {
                 lua.set_app_data(ScrollRegistry::default());
             }
-            let existing = lua
-                .app_data_ref::<ScrollRegistry>()
+            Ok(lua
+                .app_data_mut::<ScrollRegistry>()
                 .expect("just ensured the scroll registry exists")
                 .0
-                .get(&name)
-                .cloned();
-            if let Some(signal) = existing {
-                return Ok(signal);
-            }
-            let signal = Signal::new_scroll(scroll_dirty.clone());
-            lua.app_data_mut::<ScrollRegistry>()
-                .expect("just ensured the scroll registry exists")
-                .0
-                .insert(name, signal.clone());
-            Ok(signal)
+                .entry(name)
+                .or_insert_with(|| Signal::new_scroll(scroll_dirty.clone()))
+                .clone())
         })?,
     )
 }
@@ -1164,8 +1130,7 @@ mod tests {
     use super::*;
 
     fn lua_with_signal(name: &str, value: Value) -> Lua {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         let signal = Signal::try_new_direct(value).unwrap();
         lua.globals().set(name, signal).unwrap();
         lua
@@ -1828,8 +1793,7 @@ mod tests {
 
     #[test]
     fn computed_combines_multiple_dependencies_current_values() {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         lua.globals().set("a", Signal::try_new_direct(Value::Integer(3)).unwrap()).unwrap();
         lua.globals().set("b", Signal::try_new_direct(Value::Integer(4)).unwrap()).unwrap();
 
@@ -1840,9 +1804,7 @@ mod tests {
     #[test]
     fn computed_reflects_a_later_direct_signal_reconstruction_not_a_stale_cache() {
         // No memoization: later `get` sees a rebuilt dependency, not a cached first read.
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
-        lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
+        let lua = lua_with_signal("a", Value::Integer(1));
         lua.load("doubled = computed({a}, function(x) return x * 2 end)").exec().unwrap();
 
         let first: i64 = lua.load("return doubled:get()").eval().unwrap();
@@ -1856,9 +1818,7 @@ mod tests {
 
     #[test]
     fn computed_aborts_a_runaway_closure_instead_of_hanging_or_returning_a_wrong_value() {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
-        lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
+        let lua = lua_with_signal("a", Value::Integer(1));
 
         let start = Instant::now();
         let result: mlua::Result<i64> =
@@ -1873,9 +1833,7 @@ mod tests {
     fn a_nested_get_call_inside_a_computed_body_does_not_strip_the_outer_calls_cap() {
         // A body reading a second Signal re-enters the budget; inner return must preserve the outer
         // cap.
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
-        lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
+        let lua = lua_with_signal("a", Value::Integer(1));
         lua.globals().set("other", Signal::try_new_direct(Value::Integer(2)).unwrap()).unwrap();
 
         let start = Instant::now();
@@ -1889,8 +1847,7 @@ mod tests {
 
     #[test]
     fn a_live_signal_reflects_a_value_pushed_after_construction_not_a_frozen_snapshot() {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         let (signal, handle) = Signal::new_live(Value::Integer(1), DirtyFlag::new());
         lua.globals().set("live", signal).unwrap();
 
@@ -1906,8 +1863,7 @@ mod tests {
     fn a_self_referential_computed_is_rejected_with_a_nesting_depth_error_not_an_abort() {
         // Self-reference recurses through `get_value` beyond what CPU cap can stop; before this cap
         // the exact case ended in `fatal runtime error: stack overflow`.
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         let start = Instant::now();
         let result: mlua::Result<i64> = lua
             .load(
@@ -1926,8 +1882,7 @@ mod tests {
 
     #[test]
     fn a_mutually_recursive_computed_pair_is_rejected_with_a_nesting_depth_error_not_an_abort() {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         let start = Instant::now();
         let result: mlua::Result<i64> = lua
             .load(
@@ -2099,9 +2054,7 @@ mod tests {
 
     #[test]
     fn a_cap_abort_does_not_leave_the_hook_installed_for_later_unrelated_evaluation() {
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
-        lua.globals().set("a", Signal::try_new_direct(Value::Integer(1)).unwrap()).unwrap();
+        let lua = lua_with_signal("a", Value::Integer(1));
         let _: mlua::Result<i64> = lua.load("return computed({a}, function(x) while true do end end):get()").eval();
 
         // A legitimate top-level script slower than 5ms must not inherit an aborted hook.
@@ -2157,8 +2110,7 @@ mod tests {
     fn computed_accepts_a_capability_as_a_dependency_and_names_what_it_rejects() {
         use crate::lua::capability::{Capability, CommandSender};
 
-        let lua = Lua::new();
-        register(&lua, DirtyFlag::new()).unwrap();
+        let lua = lua_with_state().0;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (capability, handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(0, tx));
         handle.hydrate(Value::Integer(3), 1);

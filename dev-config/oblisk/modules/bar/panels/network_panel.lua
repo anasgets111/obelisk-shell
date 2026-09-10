@@ -83,6 +83,12 @@ end
 
 -- Enrich each row with joined state and `blockedByOtherConnection`; `parse_list_children` already
 -- calls `itemfn` for every element each pass.
+-- Both the scanned list and the hidden-network row appear under the same condition, so they share
+-- one signal rather than each recomputing it on every network push.
+local radio_up_and_idle = computed({ oblisk.network, ui.hidden_join }, function(n, joining)
+    return radio_on(n) and not joining
+end)
+
 local rows = oblisk.network:map(function(n)
     local out = {}
     local connecting = n and n.connecting_ssid
@@ -425,9 +431,7 @@ local body = {
         max_height = theme.panel_list_height,
         scroll = SCROLL,
         spacing = theme.spacing.xs,
-        visible = computed({ oblisk.network, ui.hidden_join }, function(n, joining)
-            return radio_on(n) and not joining
-        end),
+        visible = radio_up_and_idle,
         source = rows,
         itemfn = access_point_row,
         key = function(entry)
@@ -441,9 +445,7 @@ local body = {
         slot = "network-hidden",
         icon = icons.wifi_hidden,
         title = "hidden network…",
-        visible = computed({ oblisk.network, ui.hidden_join }, function(n, joining)
-            return radio_on(n) and not joining
-        end),
+        visible = radio_up_and_idle,
         trailing = glyph(icons.chevron_right, theme.DIM, theme.font.sm, { align_v = "Center" }),
         on_activate = ui.open_hidden_prompt,
     },

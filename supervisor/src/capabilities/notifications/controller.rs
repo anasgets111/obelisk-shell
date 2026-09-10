@@ -20,8 +20,8 @@ use super::icon::{
     write_icon_png,
 };
 use super::queue::{
-    Expiry, ExpiryPolicy, QueueCleanup, expire_entry, feed_view, next_incarnation, remove_by_id, replace_or_push,
-    resolve_expiry, resolve_notification_id, resolve_sound_path, should_play_sound,
+    Expiry, QueueCleanup, expire_entry, feed_view, next_incarnation, remove_by_id, replace_or_push, resolve_expiry,
+    resolve_notification_id, resolve_sound_path, should_play_sound,
 };
 use super::sound::SoundSender;
 use super::{
@@ -129,7 +129,7 @@ pub struct NotificationsController {
     trusted_roots: Arc<Vec<PathBuf>>,
     /// Deadline stopping all expiry countdowns, or `None` (ADR-0094). A `watch` wakes spawned
     /// countdowns when it changes; a queue field would only be seen on their next check.
-    expiry_hold: Arc<watch::Sender<Option<Instant>>>,
+    expiry_hold: watch::Sender<Option<Instant>>,
 }
 
 impl NotificationsController {
@@ -169,7 +169,7 @@ impl NotificationsController {
             events,
             sound_tx,
             trusted_roots,
-            expiry_hold: Arc::new(watch::Sender::new(None)),
+            expiry_hold: watch::Sender::new(None),
         };
 
         if let Some(live_connection) = &live_connection
@@ -192,7 +192,7 @@ impl NotificationsController {
             events,
             sound_tx,
             trusted_roots: Arc::new(default_trusted_icon_roots()),
-            expiry_hold: Arc::new(watch::Sender::new(None)),
+            expiry_hold: watch::Sender::new(None),
         }
     }
 
@@ -547,7 +547,7 @@ impl NotificationsController {
         }
         let _ = self.events.send(NotificationsSignal::Changed);
 
-        if let ExpiryPolicy::After(duration) = resolve_expiry(urgency, expire_timeout) {
+        if let Some(duration) = resolve_expiry(urgency, expire_timeout) {
             // ponytail: replacing or dismissing a notification leaves this task sleeping rather
             // than aborting it; the `(id, incarnation)` recheck in `expire_entry` is what makes
             // that correct, and the queue stays the only authority on what is live. Ceiling: an

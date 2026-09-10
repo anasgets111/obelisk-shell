@@ -60,7 +60,6 @@ struct Watch {
     extensions: Vec<String>,
 }
 
-#[derive(Clone)]
 pub struct FilesController {
     state: Arc<Mutex<FilesState>>,
     watches: Arc<Mutex<HashMap<String, Watch>>>,

@@ -95,7 +95,6 @@ icons.player_switch   = "\u{F0CB0}"
 icons.cpu             = "\u{F035B}"
 icons.ram             = "\u{F061A}"
 icons.gpu             = "\u{F08AE}"
-icons.disk            = "\u{F02CA}"
 
 -- Bluetooth device categories, one per § 2.6 `category`, avoid using the generic glyph for a mouse
 -- or headset.
@@ -118,7 +117,6 @@ icons.display         = "\u{F0379}"
 
 icons.refresh         = "\u{F0450}"
 icons.clear_all       = "\u{F0234}"
-icons.info            = "\u{F02FD}"
 
 -- List-row actions, matching `PanelActionIcon`: delete a saved network or paired device, or cut a
 -- live connection.
@@ -145,14 +143,13 @@ icons.file_mkv        = "\u{F0FCE}"
 icons.warning         = "\u{F0026}"
 icons.close           = "\u{F0156}"
 
--- Notification card controls: chevrons expand/collapse a group or message; `reply` opens the inline
--- field and `send` submits its text.
+-- Notification card controls: chevrons expand/collapse a group or message; `send` submits the
+-- inline reply field's text.
 icons.chevron_up      = "\u{F0143}"
 icons.chevron_down    = "\u{F0140}"
 -- `SystemInfoWidget.qml` and `PanelRow.qml` point right while collapsed rather than up, because
 -- the row opens downwards and nothing above it moves.
 icons.chevron_right   = "\u{F0142}"
-icons.reply           = "\u{F0468}"
 icons.send            = "\u{F048A}"
 icons.plus            = "\u{F0415}"
 icons.minus           = "\u{F0374}"

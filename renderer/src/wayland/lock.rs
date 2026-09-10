@@ -173,11 +173,11 @@ impl App {
     /// [`tree_can_authenticate`] predicate keyboard focus uses. `any`, not `all`, is enough across
     /// outputs. Protocol failure is reported as refusal so the shell keeps painting.
     pub(super) fn set_session_lock(&mut self, qh: &QueueHandle<App>, locked: bool) {
-        let lock_instances: Vec<String> = self
+        let lock_instances: Vec<&str> = self
             .surfaces
             .iter()
             .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { .. }))
-            .map(|tracked| tracked.surface_id.clone())
+            .map(|tracked| tracked.surface_id.as_str())
             .collect();
         let can_authenticate =
             lock_instances.iter().filter_map(|id| self.client.scene().surface(id)).any(tree_can_authenticate);

@@ -8,6 +8,7 @@
 //! temp-file-and-rename with `0600` files and `0700` dirs. Not implemented: `fail/` (a decode miss
 //! is `Slot::Failed` for this generation), `Thumb::Size`, or `/usr/share/thumbnails` lookup.
 
+use std::fmt::Write as _;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -49,10 +50,9 @@ pub fn file_uri(path: &Path) -> String {
 
 /// The `dir`-size thumbnail path for `uri` under `cache_root`.
 pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
-    let digest = Md5::digest(uri.as_bytes());
     let mut name = String::with_capacity(36);
-    for byte in digest {
-        name.push_str(&format!("{byte:02x}"));
+    for byte in Md5::digest(uri.as_bytes()) {
+        let _ = write!(name, "{byte:02x}");
     }
     name.push_str(".png");
     cache_root.join("thumbnails").join(dir).join(name)
@@ -150,7 +150,7 @@ impl Slot {
         let decoded =
             super::decode_within_limits(&self.path, self.px, super::Charge::Free, &|| true).ok()?.into_rgba8();
         let (width, height) = decoded.dimensions();
-        Ok::<_, ()>((decoded.into_raw(), width, height)).ok()
+        Some((decoded.into_raw(), width, height))
     }
 
     /// Writes straight-alpha `rgba` as the spec requires: `0700` dir, `0600` temp beside the final

@@ -28,7 +28,7 @@ function pill.new(opts)
             return open or held
         end)
         or lingering
-    local self = { hovered = hovered, expanded = expanded }
+    local self = { expanded = expanded }
 
     --- One cell: `circle` fills it, so a cell narrowing to zero narrows its circle with it, the
     --- way the mirror's delegate fills its cell. `shown` is whether this is the circle the

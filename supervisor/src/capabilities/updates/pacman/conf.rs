@@ -10,10 +10,6 @@ pub struct RepoServers {
     pub servers: Vec<String>,
 }
 
-fn strip_comment_and_trim(line: &str) -> &str {
-    line.trim()
-}
-
 /// Parses real `pacman.conf` text into each non-`[options]` section's name, include paths, and
 /// inline servers in file order. Pure and testable without mirrorlist files.
 fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
@@ -21,7 +17,7 @@ fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     let mut current: Option<(String, Vec<String>, Vec<String>)> = None;
 
     for line in text.lines() {
-        let line = strip_comment_and_trim(line);
+        let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -54,7 +50,7 @@ fn parse_pacman_conf(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
 /// `parse_pacman_conf`.
 fn parse_mirrorlist(text: &str) -> Vec<String> {
     text.lines()
-        .map(strip_comment_and_trim)
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split_once('='))
         .filter(|(key, _)| key.trim() == "Server")

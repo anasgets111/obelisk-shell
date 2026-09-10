@@ -271,7 +271,7 @@ pub fn run(
     let mut app = App {
         registry_state,
         output_state,
-        shader_stage: crate::layout::image_shader::ShaderStage::new(),
+        shader_stage: crate::layout::image_shader::ShaderStage::default(),
         compositor_state,
         seat_state,
         layer_shell,

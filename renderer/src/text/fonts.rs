@@ -52,7 +52,7 @@ pub struct ResolvedFonts {
 pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
     let mut db = Database::new();
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
-    match load_chain(&mut db, chain, &mut loaded_paths, true) {
+    match load_chain(&mut db, chain, &mut loaded_paths) {
         Some(primary_family) => ResolvedFonts { db, primary_family, loaded_paths },
         None => system_fallback(chain),
     }
@@ -70,17 +70,12 @@ pub fn resolve_chain(chain: &[&str]) -> ResolvedFonts {
 /// `None` for a family nothing on the system answers. The caller draws in the declared chain and
 /// says so once; a missing font is a diagnostic, not a dead node.
 pub fn load_family(db: &mut Database, name: &str, loaded_paths: &mut HashSet<PathBuf>) -> Option<String> {
-    load_chain(db, &[name], loaded_paths, true)
+    load_chain(db, &[name], loaded_paths)
 }
 
 /// Loads every entry of one chain into `db` and returns the first that hit, which is that chain's
-/// primary family. `with_variants` asks for the primary's bold, italic and bold-italic files too.
-fn load_chain(
-    db: &mut Database,
-    chain: &[&str],
-    loaded_paths: &mut HashSet<PathBuf>,
-    with_variants: bool,
-) -> Option<String> {
+/// primary family, along with that primary's bold, italic and bold-italic files.
+fn load_chain(db: &mut Database, chain: &[&str], loaded_paths: &mut HashSet<PathBuf>) -> Option<String> {
     let mut primary_family: Option<String> = None;
 
     for &name in chain {
@@ -105,9 +100,7 @@ fn load_chain(
         }
 
         if primary_family.is_none() {
-            if with_variants {
-                load_variants(db, name, &resolved_family, loaded_paths);
-            }
+            load_variants(db, name, &resolved_family, loaded_paths);
             primary_family = Some(resolved_family);
         }
     }

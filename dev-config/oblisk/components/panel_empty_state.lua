@@ -9,6 +9,7 @@
 local theme = require("config.theme")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
+local util = require("lib.util")
 
 ---@param message string|Bound
 ---@param visible boolean|Bound
@@ -30,8 +31,8 @@ return function(message, visible, opts)
         local shown = true
         if type(subtext) == "userdata" then
             ---@cast subtext Signal
-            shown = subtext:map(function(value)
-                return value ~= nil and value ~= ""
+            shown = util.shown_when(subtext, function(value)
+                return value ~= ""
             end)
         end
         lines[#lines + 1] = cell(subtext, theme.with_opacity(theme.DIM, theme.opacity.muted), theme.font.sm, {

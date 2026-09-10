@@ -34,10 +34,15 @@ pub fn stub_version(dir: &Path) -> Option<String> {
 /// `renderer_binary_path` resolves its sibling: `$PREFIX/lib/oblisk/oblisk` implies
 /// `$PREFIX/share/oblisk/lua-meta`. `None` is the normal answer for `cargo install` and `target/`.
 pub fn packaged_stub_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-    // Try `just install`'s `$PREFIX/lib/oblisk` (two levels up), then flat `$PREFIX/bin` (one up).
-    // Check rather than assume; a wrong path silently falls back to embedded stubs.
+    packaged_stub_dir_from(std::env::current_exe().ok()?.parent()?)
+}
+
+/// The layout probe itself, taking the directory rather than reading `current_exe`, so the tests
+/// below exercise this resolver instead of restating it.
+///
+/// Try `just install`'s `$PREFIX/lib/oblisk` (two levels up), then flat `$PREFIX/bin` (one up).
+/// Check rather than assume; a wrong path silently falls back to embedded stubs.
+fn packaged_stub_dir_from(exe_dir: &Path) -> Option<PathBuf> {
     ["../..", ".."]
         .iter()
         .map(|up| exe_dir.join(up).join("share").join("oblisk").join("lua-meta"))
@@ -57,14 +62,14 @@ fn user_stub_dir() -> io::Result<PathBuf> {
 }
 
 /// Writes `path` unless present; `force` overwrites. Reports the result.
-fn write_unless_present(path: &Path, contents: &str, force: bool) -> io::Result<bool> {
+fn write_unless_present(path: &Path, contents: &str, force: bool) -> io::Result<()> {
     if path.exists() && !force {
         println!("  kept    {} (exists)", path.display());
-        return Ok(false);
+        return Ok(());
     }
     std::fs::write(path, contents)?;
     println!("  wrote   {}", path.display());
-    Ok(true)
+    Ok(())
 }
 
 /// `.luarc.json` body, pointing `workspace.library` at `stub_dir`.
@@ -210,12 +215,7 @@ mod tests {
             let stubs = prefix.join("share/oblisk/lua-meta");
             std::fs::create_dir_all(&stubs).unwrap();
 
-            let exe_dir = exe.parent().unwrap();
-            let found = ["../..", ".."]
-                .iter()
-                .map(|up| exe_dir.join(up).join("share").join("oblisk").join("lua-meta"))
-                .find(|dir| dir.is_dir())
-                .and_then(|dir| dir.canonicalize().ok());
+            let found = packaged_stub_dir_from(exe.parent().unwrap());
             assert_eq!(found, Some(stubs.canonicalize().unwrap()), "{label} layout must resolve its stubs");
         }
     }
@@ -265,10 +265,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let exe_dir = root.path().join("lib/oblisk");
         std::fs::create_dir_all(&exe_dir).unwrap();
-        let found = ["../..", ".."]
-            .iter()
-            .map(|up| exe_dir.join(up).join("share").join("oblisk").join("lua-meta"))
-            .find(|dir| dir.is_dir());
+        let found = packaged_stub_dir_from(&exe_dir);
         assert_eq!(found, None);
     }
 

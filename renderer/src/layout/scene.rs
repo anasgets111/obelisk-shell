@@ -556,9 +556,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 /// buffer stays on `App` (ADR-0005).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
     match kind {
-        "panel" | "window" | "popup" | "lock" => {
-            Ok(node::parse_single_child(properties, "child")?.into_iter().collect())
-        }
+        "panel" | "window" | "popup" | "lock" => Ok(node::parse_single_child(properties)?.into_iter().collect()),
         "rect" | "row" | "column" | "button" => node::parse_children(properties),
         // ADR-0045 decision 3: list children are generated from `source`, not a literal table.
         "list" => node::parse_list_children(properties),
@@ -813,8 +811,12 @@ pub(crate) enum MainAxis {
     Vertical,
 }
 
-/// Which axis `kind` flows along; a `list` borrows its `direction` from [`flow_kind`].
-fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
+/// Which axis `kind` flows along, or `None` when it does not flow at all; a `list` borrows its
+/// `direction` from [`flow_kind`], so a horizontal `list` takes a horizontal wheel.
+///
+/// `pub(crate)` for `wayland::input`'s wheel handler, which has to know whether a node under the
+/// pointer takes a horizontal or a vertical wheel before it writes anything.
+pub(crate) fn main_axis_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
     Ok(match flow_kind(kind, properties)? {
         "row" => Some(MainAxis::Horizontal),
         "column" => Some(MainAxis::Vertical),
@@ -1580,20 +1582,9 @@ fn flow_kind<'a>(kind: &'a str, properties: &HashMap<String, Value>) -> Result<&
 /// `state()` signal, a capability) is silently inert rather than an error, matching
 /// `layout::hover::hover_signal`: `Signal::scroll_handle` refuses every kind this must not write,
 /// so naming the wrong thing gets no scrolling instead of a wheel writing somewhere it should not.
-pub(crate) fn scroll_signal_of(node: &ResolvedNode) -> Option<crate::lua::signal::Signal> {
-    scroll_signal(&node.properties)
-}
-
-/// Which axis this container scrolls along, or `None` when it does not flow at all.
 ///
-/// `pub(crate)` for `wayland::input`'s wheel handler, which has to know whether a node under the
-/// pointer takes a horizontal or a vertical wheel before it writes anything. Reads a `list`'s
-/// `direction` through [`main_axis_of`], so a horizontal `list` takes a horizontal wheel.
-pub(crate) fn scrolling_axis(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<MainAxis>, LayoutError> {
-    main_axis_of(kind, properties)
-}
-
-fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::signal::Signal> {
+/// `pub(crate)` for `wayland::input`'s wheel handler.
+pub(crate) fn scroll_signal(properties: &HashMap<String, Value>) -> Option<crate::lua::signal::Signal> {
     let Some(Value::UserData(ud)) = properties.get("scroll") else {
         return None;
     };
@@ -2183,17 +2174,7 @@ fn painted_bounds(node: &ResolvedNode, rect: LogicalRect) -> LogicalRect {
     if node.transform.is_identity() {
         return rect;
     }
-    let m = node.transform.matrix(rect);
-    let corners = [
-        (rect.x, rect.y),
-        (rect.x + rect.width, rect.y),
-        (rect.x, rect.y + rect.height),
-        (rect.x + rect.width, rect.y + rect.height),
-    ]
-    .map(|(x, y)| node::apply_affine(m, x, y));
-    let (x0, y0) = corners.iter().fold((f32::MAX, f32::MAX), |(x0, y0), &(x, y)| (x0.min(x), y0.min(y)));
-    let (x1, y1) = corners.iter().fold((f32::MIN, f32::MIN), |(x1, y1), &(x, y)| (x1.max(x), y1.max(y)));
-    LogicalRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+    transformed_bounds(node.transform.matrix(rect), rect)
 }
 
 /// [`overlay_input_regions`]'s "solid" test. A `background` of `#00000000` counts: the IDL says it
@@ -4457,13 +4438,7 @@ pub(super) mod tests {
         let next_id_before = scene.next_id;
 
         let (_lua2, v2) = surface_from(r#"panel { id = "bar", width = 99, height = 99 }"#);
-        let instances = vec![SurfaceInstance {
-            instance_id: "bar@TEST".to_string(),
-            declared_id: "bar".to_string(),
-            output: "TEST".to_string(),
-            available: full(),
-            measured_axes: (false, false),
-        }];
+        let instances = [instance_at(&v2, full())];
         let err = scene
             .apply_admitting(&[v2], &instances, &shaping, &_lua2, |_| {
                 Err(node::invalid("child", "the finished scene is not admissible"))
@@ -5724,57 +5699,10 @@ pub(super) mod tests {
 
     #[test]
     fn overlay_input_regions_includes_only_visible_direct_children() {
-        let visible_child = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(102),
-            kind: "rect".to_string(),
-            rect: LogicalRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 },
-            visible: true,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: solid_paint(),
-            children: Vec::new(),
-        };
-        let hidden_child = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(103),
-            kind: "rect".to_string(),
-            rect: LogicalRect { x: 20.0, y: 20.0, width: 10.0, height: 10.0 },
-            visible: false,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: None,
-            children: Vec::new(),
-        };
-        let root = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(104),
-            kind: "panel".to_string(),
-            rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
-            visible: true,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: None,
-            children: vec![visible_child, hidden_child],
-        };
+        let visible_child = region_node(102, "rect", (0.0, 0.0, 10.0, 10.0), solid_paint(), Vec::new());
+        let mut hidden_child = region_node(103, "rect", (20.0, 20.0, 10.0, 10.0), None, Vec::new());
+        hidden_child.visible = false;
+        let root = region_node(104, "panel", (0.0, 0.0, 100.0, 100.0), None, vec![visible_child, hidden_child]);
 
         let regions = overlay_input_regions(&root, 1.0);
         assert_eq!(regions.len(), 1);
@@ -5783,40 +5711,9 @@ pub(super) mod tests {
 
     #[test]
     fn a_surface_with_nothing_visible_in_it_claims_no_input_at_all() {
-        let hidden_child = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(105),
-            kind: "rect".to_string(),
-            rect: LogicalRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
-            visible: false,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: None,
-            children: Vec::new(),
-        };
-        let mut root = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(106),
-            kind: "panel".to_string(),
-            rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 },
-            visible: true,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: None,
-            children: vec![hidden_child],
-        };
+        let mut hidden_child = region_node(105, "rect", (0.0, 0.0, 100.0, 100.0), None, Vec::new());
+        hidden_child.visible = false;
+        let mut root = region_node(106, "panel", (0.0, 0.0, 1920.0, 1080.0), None, vec![hidden_child]);
         assert!(overlay_input_regions(&root, 1.0).is_empty());
 
         root.children.clear();
@@ -5825,39 +5722,8 @@ pub(super) mod tests {
 
     #[test]
     fn a_child_that_fills_its_surface_claims_the_whole_surface() {
-        let root = ResolvedNode {
-            displayed_source: None,
-            dissolve: None,
-            tweens: Vec::new(),
-            leaving: false,
-            blur: false,
-            transform: node::Transform::default(),
-            margin: crate::layout::node::EdgeInsets::default(),
-            id: NodeId::test(107),
-            kind: "panel".to_string(),
-            rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
-            visible: true,
-            opacity: 1.0,
-            properties: HashMap::new(),
-            paint: None,
-            children: vec![ResolvedNode {
-                displayed_source: None,
-                dissolve: None,
-                tweens: Vec::new(),
-                leaving: false,
-                blur: false,
-                transform: node::Transform::default(),
-                margin: crate::layout::node::EdgeInsets::default(),
-                id: NodeId::test(120),
-                kind: "row".to_string(),
-                rect: LogicalRect { x: 0.0, y: 0.0, width: 1920.0, height: 32.0 },
-                visible: true,
-                opacity: 1.0,
-                properties: HashMap::new(),
-                paint: solid_paint(),
-                children: Vec::new(),
-            }],
-        };
+        let filling = region_node(120, "row", (0.0, 0.0, 1920.0, 32.0), solid_paint(), Vec::new());
+        let root = region_node(107, "panel", (0.0, 0.0, 1920.0, 32.0), None, vec![filling]);
 
         assert_eq!(overlay_input_regions(&root, 1.0), [PhysicalRect { x0: 0, y0: 0, x1: 1920, y1: 32 }]);
     }

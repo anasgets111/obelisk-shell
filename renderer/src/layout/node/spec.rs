@@ -84,17 +84,14 @@ pub enum SurfaceFingerprint {
 }
 
 /// A single-node property converted with `deserialize_lua_table`.
-pub fn parse_single_child(
-    properties: &HashMap<String, Value>,
-    property: &str,
-) -> Result<Option<VirtualNode>, LayoutError> {
-    let Some(value) = properties.get(property) else {
+pub fn parse_single_child(properties: &HashMap<String, Value>) -> Result<Option<VirtualNode>, LayoutError> {
+    let Some(value) = properties.get("child") else {
         return Ok(None);
     };
     let Value::Table(table) = value else {
-        return Err(invalid(property, format!("expected a node table, got {}", preview_for_error(value))));
+        return Err(invalid("child", format!("expected a node table, got {}", preview_for_error(value))));
     };
-    let node = deserialize_lua_table(table).map_err(|e| invalid(property, e.to_string()))?;
+    let node = deserialize_lua_table(table).map_err(|e| invalid("child", e.to_string()))?;
     Ok(Some(node))
 }
 
@@ -268,14 +265,14 @@ mod tests {
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "panel", child = { kind = "rect" } }"#).eval().unwrap();
         let props = props_from_table(&table);
-        let child = parse_single_child(&props, "child").unwrap();
+        let child = parse_single_child(&props).unwrap();
         assert_eq!(child.unwrap().kind, "rect");
     }
 
     #[test]
     fn parse_single_child_absent_is_none() {
         let props = HashMap::new();
-        assert!(parse_single_child(&props, "child").unwrap().is_none());
+        assert!(parse_single_child(&props).unwrap().is_none());
     }
 
     #[test]

@@ -69,7 +69,7 @@ impl MprisController {
 
     /// Inert controller with an empty registry and no discovery task, used when the session-bus
     /// connection cannot be established.
-    pub fn inert(_events: UnboundedSender<MprisSignal>) -> Self {
+    pub fn inert() -> Self {
         Self { registry: Arc::new(Mutex::new(HashMap::new())) }
     }
 

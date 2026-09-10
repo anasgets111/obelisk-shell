@@ -142,6 +142,16 @@ pub struct RendererClient {
     /// `shared::Capability::ALL` (ADR-0037). `RefCell` permits access through `&self`.
     capabilities: RefCell<HashMap<String, CapabilityHandle>>,
     /// Cloned into every [`Capability`], including lazy ones.
+    /// Also this client's outbound half: [`CommandSender::frames`] hands out the Renderer ->
+    /// Supervisor sender that socket-thread [`pump`] drains to the wire.
+    ///
+    /// ponytail: unbounded, and deliberately so for now. `send` is called from synchronous Wayland
+    /// dispatch callbacks, which cannot await, so backpressure is not available here; and
+    /// `try_send` dropping a `SecureSubmit` would lose a password mid-unlock rather than delay it.
+    /// The ceiling is therefore a config that produces frames faster than the socket drains.
+    /// Upgrade path: give the callbacks a non-blocking handoff to an async sender that can park,
+    /// so the bound lands on the queue instead of on the callback. Bounding this channel as it
+    /// stands would trade a memory bug for a correctness one.
     commands: CommandSender,
     rescue_handle: LiveSignalHandle,
     /// Renderer-sourced `oblisk.screens` handle (ADR-0041 decision 2), not in `capabilities`.
@@ -156,17 +166,6 @@ pub struct RendererClient {
     /// Scene-dirty flag (ADR-0044 decision 2), cloned into every handed-out `LiveSignalHandle`.
     dirty: DirtyFlag,
     state: ReloadState,
-    /// `ReevaluateReport` destination; socket-thread [`pump`] drains it to the wire.
-    /// Renderer -> Supervisor frames.
-    ///
-    /// ponytail: unbounded, and deliberately so for now. `send` is called from synchronous Wayland
-    /// dispatch callbacks, which cannot await, so backpressure is not available here; and
-    /// `try_send` dropping a `SecureSubmit` would lose a password mid-unlock rather than delay it.
-    /// The ceiling is therefore a config that produces frames faster than the socket drains.
-    /// Upgrade path: give the callbacks a non-blocking handoff to an async sender that can park,
-    /// so the bound lands on the queue instead of on the callback. Bounding this channel as it
-    /// stands would trade a memory bug for a correctness one.
-    outbound_tx: mpsc::UnboundedSender<RendererFrame>,
     /// `oblisk` table for lazy members. Above `loader` for drop order.
     oblisk: mlua::Table,
     /// Last, load-bearing; see the struct docs.
@@ -214,7 +213,6 @@ impl RendererClient {
         dirty: DirtyFlag,
     ) -> mlua::Result<Self> {
         // Take it from `commands`, avoiding a drifting clone.
-        let outbound_tx = commands.frames();
         let namespace = lua::namespace::build(&loader, &dirty, &commands, &shell_lua_path)?;
         Ok(Self {
             shell_lua_path,
@@ -234,7 +232,6 @@ impl RendererClient {
             idle_registry: namespace.idle,
             dirty,
             state: ReloadState { applied_topology: None, applied_output: None, pending: None },
-            outbound_tx,
             oblisk: namespace.table,
             loader,
         })
@@ -363,7 +360,7 @@ impl RendererClient {
     /// without its `next_sequence`, so this only begins a cycle. Used when a `screens` loop changes
     /// the surface set.
     pub fn request_reload(&self) {
-        if let Err(err) = self.outbound_tx.send(RendererFrame::RequestReload) {
+        if let Err(err) = self.commands.frames().send(RendererFrame::RequestReload) {
             eprintln!("control-socket client: failed to request a reload after an output change: {err}");
         }
     }
@@ -580,7 +577,7 @@ impl RendererClient {
             }
         };
 
-        if let Err(err) = self.outbound_tx.send(RendererFrame::ReevaluateReport(report)) {
+        if let Err(err) = self.commands.frames().send(RendererFrame::ReevaluateReport(report)) {
             eprintln!("control-socket client: failed to send a ReevaluateReport: {err}");
         }
     }
@@ -1072,13 +1069,11 @@ mod tests {
     #[test]
     fn a_secure_submit_target_starts_the_capability_it_names() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shell.lua");
-        std::fs::write(
-            &path,
+        let path = write_shell_lua(
+            dir.path(),
             r#"return panel { id = "prompt", layer = "Top", child = textfield {
                    secure_submit = { capability = "polkit", action = "authenticate" } } }"#,
-        )
-        .unwrap();
+        );
         let (mut client, mut outbound_rx) = test_client(&path);
 
         client.run_startup_evaluation().unwrap();

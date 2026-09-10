@@ -2,8 +2,9 @@
 -- only proved the input path by opening settings and the popup.
 --
 -- The bar pill, `power_button` below, offers log out, restart, and power off behind ten-second
--- countdowns. A second click skips; right-click or cancel stops. `process.run` shells out to
--- `systemctl` and the compositor, as `PowerManagementService` does.
+-- countdowns. A second click skips; right-click or cancel stops. `process.detach` shells out to
+-- `systemctl` and the compositor, as `PowerManagementService` does: a shutdown must not be reaped
+-- by a generation swap landing mid-flight (ADR-0188).
 --
 -- The panel adds lock, sleep, settings, and a brightness slider. Settings has no other door; lock
 -- and sleep lose nothing, so need no countdown. Sleep calls `systemctl suspend`; the mirror's
@@ -40,34 +41,27 @@ local seconds_left = computed({ oblisk.system, deadline }, function(s, at)
     return math.max(0, at - ((s and s.time) or 0))
 end)
 
-local function detached(cmd, args)
-    process.run(cmd, args, function() end, function() end)
-end
-
 -- Mirror `actions`, in order. `logout` is niri's `CompositorImpl.exitSession`.
 local ACTIONS = {
     {
         key = "logout",
-        title = "log out",
         icon = icons.logout,
         run = function()
-            detached("niri", { "msg", "action", "quit", "--skip-confirmation" })
+            process.detach("niri", { "msg", "action", "quit", "--skip-confirmation" })
         end
     },
     {
         key = "reboot",
-        title = "restart",
         icon = icons.power,
         run = function()
-            detached("systemctl", { "reboot" })
+            process.detach("systemctl", { "reboot" })
         end
     },
     {
         key = "poweroff",
-        title = "power off",
         icon = icons.shutdown,
         run = function()
-            detached("systemctl", { "poweroff" })
+            process.detach("systemctl", { "poweroff" })
         end
     },
 }
@@ -281,7 +275,7 @@ local body = {
         title = "sleep",
         color = theme.MAUVE,
         on_activate = function()
-            detached("systemctl", { "suspend" })
+            process.detach("systemctl", { "suspend" })
         end,
     },
     panel_row {

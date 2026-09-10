@@ -24,9 +24,10 @@ fn workspace_rows(
     workspaces
         .values()
         .map(|workspace| {
-            let mut here: Vec<&niri_ipc::Window> =
-                windows.values().filter(|window| window.workspace_id == Some(workspace.id)).collect();
-            here.sort_by_key(|window| (!window.is_focused, window.id));
+            let standing = windows
+                .values()
+                .filter(|window| window.workspace_id == Some(workspace.id))
+                .min_by_key(|window| (!window.is_focused, window.id));
             WorkspaceRow {
                 id: workspace.id,
                 idx: workspace.idx,
@@ -34,8 +35,8 @@ fn workspace_rows(
                 output: workspace.output.clone(),
                 is_active: workspace.is_active,
                 is_focused: workspace.is_focused,
-                populated: !here.is_empty(),
-                app_id: here.first().and_then(|window| window.app_id.clone()).filter(|id| !id.is_empty()),
+                populated: standing.is_some(),
+                app_id: standing.and_then(|window| window.app_id.clone()).filter(|id| !id.is_empty()),
             }
         })
         .collect()
