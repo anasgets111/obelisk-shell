@@ -65,7 +65,7 @@ pub mod storage;
 pub mod sysinfo;
 pub mod system;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod tray;
 pub mod updates;
 pub mod workspaces;

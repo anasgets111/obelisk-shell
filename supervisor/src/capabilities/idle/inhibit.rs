@@ -193,17 +193,7 @@ mod tests {
 
     // ---- Login1ManagerProxy::inhibit (TDD seam 3: real D-Bus call, p2p pattern) ----
 
-    use tokio::net::UnixStream;
-
-    /// A connected p2p zbus pair without a bus daemon.
-    async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
-        let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
-        let guid = zbus::Guid::generate();
-        let server_builder =
-            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
-        let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
-        tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
-    }
+    use crate::capabilities::test_support::p2p_pair_serving;
 
     /// Stand-in for logind's `org.freedesktop.login1.Manager`; returns `/dev/null` so the proxy
     /// receives a real `OwnedFd`.
@@ -224,13 +214,10 @@ mod tests {
 
     #[tokio::test]
     async fn login1_manager_inhibit_sends_the_expected_arguments_and_returns_a_fd() {
-        let (manager_side, caller_side) = p2p_pair().await;
         let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel();
-        manager_side
-            .object_server()
-            .at("/org/freedesktop/login1", StubLogin1Manager { calls: calls_tx })
-            .await
-            .expect("failed to export the stub Login1Manager");
+        let (caller_side, _manager_side) =
+            p2p_pair_serving(|peer| peer.serve_at("/org/freedesktop/login1", StubLogin1Manager { calls: calls_tx }))
+                .await;
 
         let proxy: Login1ManagerProxy<'_> = zbus::proxy::Builder::new(&caller_side)
             .destination("org.oblisk.test")

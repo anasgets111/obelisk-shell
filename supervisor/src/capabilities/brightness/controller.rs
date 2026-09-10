@@ -258,6 +258,7 @@ async fn run_brightness_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::test_support::p2p_pair;
 
     fn write_entry(root: &Path, name: &str, attrs: &[(&str, &str)]) {
         let dir = root.join(name);
@@ -349,15 +350,6 @@ mod tests {
         assert_eq!(parse_set_args(&[]), None);
         let args = vec![serde_json::json!("not a number")];
         assert_eq!(parse_set_args(&args), None);
-    }
-
-    async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
-        let (a, b) = tokio::net::UnixStream::pair().expect("failed to create a unix socket pair");
-        let guid = zbus::Guid::generate();
-        let server_builder =
-            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
-        let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
-        tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
     }
 
     #[tokio::test]

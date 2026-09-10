@@ -1,8 +1,11 @@
 //! Test helpers shared across capabilities.
 //!
 //! Capability-specific fixtures stay local; `notifications` builds its body span in its own
-//! `test_support`. This file currently holds [`p2p_pair`], shared by `tray` and `mpris`, rather
-//! than duplicating or reaching across modules.
+//! `test_support`. This file currently holds [`p2p_pair`], rather than duplicating or reaching
+//! across modules.
+//!
+//! `pub(crate)` rather than `pub(super)`, because `polkit` is a D-Bus test outside `capabilities`
+//! and needs the same pair. A second copy there is what this file exists to prevent.
 
 use tokio::net::UnixStream;
 
@@ -24,13 +27,13 @@ use tokio::net::UnixStream;
 /// Both sides get a `method_timeout` only as a backstop, because zbus's default is `None` and a
 /// call nobody answers then waits for ever, wedging the suite instead of failing it. Nothing here
 /// should come near five seconds.
-pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
+pub(crate) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
     p2p_pair_serving(Ok).await
 }
 
 /// [`p2p_pair`] with stub interfaces installed on the client, which is where its doc explains why
 /// they have to go in here rather than through `object_server().at(..)` afterwards.
-pub(super) async fn p2p_pair_serving<F>(serve: F) -> (zbus::Connection, zbus::Connection)
+pub(crate) async fn p2p_pair_serving<F>(serve: F) -> (zbus::Connection, zbus::Connection)
 where
     F: FnOnce(zbus::connection::Builder<'static>) -> zbus::Result<zbus::connection::Builder<'static>>,
 {

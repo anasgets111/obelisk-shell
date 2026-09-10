@@ -20,17 +20,7 @@ pub(crate) trait KbdBacklight {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use tokio::net::UnixStream;
-
-    async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
-        let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
-        let guid = zbus::Guid::generate();
-        let server_builder =
-            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
-        let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
-        tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
-    }
+    use crate::capabilities::test_support::p2p_pair_serving;
 
     struct StubKbdBacklight {
         brightness: std::sync::Arc<std::sync::atomic::AtomicI32>,
@@ -70,17 +60,15 @@ mod tests {
 
     #[tokio::test]
     async fn kbd_backlight_proxy_reads_brightness_and_max_and_sets_a_new_value() {
-        let (service_side, caller_side) = p2p_pair().await;
         let (set_tx, mut set_rx) = tokio::sync::mpsc::unbounded_channel();
         let brightness = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(1));
-        service_side
-            .object_server()
-            .at(
+        let (caller_side, _service_side) = p2p_pair_serving(|peer| {
+            peer.serve_at(
                 "/org/freedesktop/UPower/KbdBacklight",
                 StubKbdBacklight { brightness: brightness.clone(), max: 3, set_calls: set_tx },
             )
-            .await
-            .expect("failed to export the stub KbdBacklight");
+        })
+        .await;
 
         let proxy = build_proxy(&caller_side).await;
 

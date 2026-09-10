@@ -189,7 +189,7 @@ pub async fn register_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UnixStream;
+    use crate::capabilities::test_support::p2p_pair_serving;
     use tokio::sync::mpsc;
 
     /// Stand-in Authority on the p2p peer, exercising the real wire call without a system bus.
@@ -204,18 +204,6 @@ mod tests {
         }
     }
 
-    /// Connected p2p zbus pair, with no daemon. Build both ends via `try_join!`: SASL needs both
-    /// peers reading and writing concurrently. Mirrors zbus `tests/e2e.rs`'s
-    /// `iface_and_proxy_unix_p2p`.
-    async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
-        let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
-        let guid = zbus::Guid::generate();
-        let server_builder =
-            zbus::connection::Builder::unix_stream(a).server(guid).expect("p2p server builder setup").p2p();
-        let client_builder = zbus::connection::Builder::unix_stream(b).p2p();
-        tokio::try_join!(server_builder.build(), client_builder.build()).expect("p2p handshake")
-    }
-
     fn test_subject() -> Subject {
         let mut subject_details = HashMap::new();
         subject_details.insert("session-id".to_string(), OwnedValue::try_from(Value::from("c1")).unwrap());
@@ -224,13 +212,11 @@ mod tests {
 
     #[tokio::test]
     async fn register_agent_sends_register_authentication_agent_with_the_right_args() {
-        let (authority_side, agent_side) = p2p_pair().await;
         let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
-        authority_side
-            .object_server()
-            .at("/org/freedesktop/PolicyKit1/Authority", MockAuthority { calls: calls_tx })
-            .await
-            .expect("failed to export the mock Authority");
+        let (agent_side, _authority_side) = p2p_pair_serving(|peer| {
+            peer.serve_at("/org/freedesktop/PolicyKit1/Authority", MockAuthority { calls: calls_tx })
+        })
+        .await;
 
         let (challenges_tx, _challenges_rx) = mpsc::unbounded_channel();
         let agent = AuthenticationAgent::new(challenges_tx);
@@ -255,13 +241,11 @@ mod tests {
     /// sends its own starts, so it is reachable (ADR-0070 decision 3).
     #[tokio::test]
     async fn registering_twice_makes_only_one_wire_call() {
-        let (authority_side, agent_side) = p2p_pair().await;
         let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
-        authority_side
-            .object_server()
-            .at("/org/freedesktop/PolicyKit1/Authority", MockAuthority { calls: calls_tx })
-            .await
-            .expect("failed to export the mock Authority");
+        let (agent_side, _authority_side) = p2p_pair_serving(|peer| {
+            peer.serve_at("/org/freedesktop/PolicyKit1/Authority", MockAuthority { calls: calls_tx })
+        })
+        .await;
         let (challenges_tx, _challenges_rx) = mpsc::unbounded_channel();
         let mut agent = PolkitAgent::new(challenges_tx);
 
@@ -287,13 +271,9 @@ mod tests {
 
     #[tokio::test]
     async fn begin_authentication_forwards_the_parsed_challenge_and_returns_only_once_answered() {
-        let (agent_side, caller_side) = p2p_pair().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        agent_side
-            .object_server()
-            .at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))
-            .await
-            .expect("failed to export AuthenticationAgent");
+        let (caller_side, _agent_side) =
+            p2p_pair_serving(|peer| peer.serve_at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))).await;
 
         let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&caller_side)
             .destination("org.oblisk.Supervisor")
@@ -349,13 +329,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_authentication_forwards_the_cookie() {
-        let (agent_side, caller_side) = p2p_pair().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        agent_side
-            .object_server()
-            .at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))
-            .await
-            .expect("failed to export AuthenticationAgent");
+        let (caller_side, _agent_side) =
+            p2p_pair_serving(|peer| peer.serve_at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))).await;
 
         let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&caller_side)
             .destination("org.oblisk.Supervisor")
