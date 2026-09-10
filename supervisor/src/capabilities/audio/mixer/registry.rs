@@ -192,7 +192,13 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
             let has_props_change = info.change_mask().contains(pw::node::NodeChangeMask::PROPS);
             match kind {
                 NodeKind::Audio => {
-                    apply_info_event(&mut state_mut.apps, node_id, has_props_change, info.props());
+                    apply_info_event(
+                        std::path::Path::new("/proc"),
+                        &mut state_mut.apps,
+                        node_id,
+                        has_props_change,
+                        info.props(),
+                    );
                     state_mut.publish_audio();
                 }
                 NodeKind::Video => {

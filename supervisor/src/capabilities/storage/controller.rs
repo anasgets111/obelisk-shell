@@ -191,7 +191,15 @@ fn save(path: &Path, contents: &serde_json::Value) -> std::io::Result<()> {
     let mut serialized = serde_json::to_vec_pretty(contents).map_err(std::io::Error::other)?;
     serialized.push(b'\n');
 
-    let temporary = path.with_extension("json.tmp");
+    // The temporary has to be a name no declared table can also be. `Path::with_extension` was
+    // worse than it looked: it derives from the *stem*, so `notes.json` and `notes.db` shared one
+    // `notes.json.tmp` and either rename could publish the other's bytes. Appending alone is not
+    // enough either -- a config declaring both `foo` and `foo.tmp` would have the first table's
+    // temporary land on the second table's file. The leading dot and the pid together are outside
+    // what `persistent_table` hands us, and the pid keeps a second supervisor off this one's
+    // temporary.
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&temporary, &serialized)?;
     std::fs::rename(&temporary, path)
 }

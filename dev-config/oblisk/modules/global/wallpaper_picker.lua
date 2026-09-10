@@ -313,7 +313,7 @@ local grid = list {
     end,
 }
 
-local folder_state = computed({ oblisk.files, trimmed }, function(f, needle)
+local folder_state = computed({ oblisk.files, filtered }, function(f, shown)
     local folder = wallpaper.folder_in(f)
     if folder == nil or not folder.ready then
         return "loading"
@@ -321,14 +321,10 @@ local folder_state = computed({ oblisk.files, trimmed }, function(f, needle)
         return "error"
     elseif #folder.entries == 0 then
         return "empty"
-    elseif needle ~= "" then
-        local shown = 0
-        for _, entry in ipairs(folder.entries) do
-            if entry.name:lower():find(needle, 1, true) then
-                shown = shown + 1
-            end
-        end
-        return shown == 0 and "no_match" or "ok"
+    elseif #shown == 0 then
+        -- Only reachable with a query: an empty needle leaves `filtered` holding every entry, and
+        -- the empty folder is already answered above.
+        return "no_match"
     end
     return "ok"
 end)
@@ -518,7 +514,13 @@ local effect_grid = list {
         return row { width = "Fill", spacing = theme.spacing.xs, children = buttons }
     end,
     key = function(slots)
-        return table.concat(slots, "|")
+        -- `slots` pads a short last row with `false`, which `table.concat` refuses. It only stays
+        -- unhit because there are six effects today and six divides by three.
+        local names = {}
+        for index, name in ipairs(slots) do
+            names[index] = name or ""
+        end
+        return table.concat(names, "|")
     end,
 }
 
@@ -555,10 +557,7 @@ local sidebar = panel_card({
     padding = { top = theme.spacing.md, right = theme.spacing.md, bottom = theme.spacing.md, left = theme.spacing.md },
 })
 
-local grid_card_children = { grid }
-for _, empty in ipairs(empty_states) do
-    grid_card_children[#grid_card_children + 1] = empty
-end
+local grid_card_children = { grid, table.unpack(empty_states) }
 
 local body = row {
     width = "Fill",

@@ -235,7 +235,12 @@ fn spawn_menu_signal_forwarder(
 /// Removes entries whose unique name drops off the bus (`new_owner` empty). SNI has no
 /// `UnregisterStatusNotifierItem` signal, so this one global subscription supplies liveness
 /// (ADR-0031).
+/// `connection` is here only to emit `StatusNotifierItemUnregistered`. Registration announced
+/// itself from the day it was written and departure never did, so another host on the bus kept
+/// every item that ever left. Oblisk's own tray reads this registry rather than the signal, which
+/// is why nothing here noticed.
 pub(super) fn spawn_name_owner_changed_forwarder(
+    connection: zbus::Connection,
     dbus_proxy: zbus::fdo::DBusProxy<'static>,
     registry: ItemRegistry,
     events: UnboundedSender<TraySignal>,
@@ -249,16 +254,19 @@ pub(super) fn spawn_name_owner_changed_forwarder(
             }
             let dropped_name = args.name.to_string();
 
-            let removed: Vec<ItemEntry> = {
+            let removed: Vec<(ItemKey, ItemEntry)> = {
                 let mut guard = registry.lock().unwrap();
                 let stale_keys: Vec<ItemKey> =
                     guard.keys().filter(|(unique_name, _)| unique_name.as_str() == dropped_name).cloned().collect();
-                stale_keys.into_iter().filter_map(|key| guard.remove(&key)).collect()
+                stale_keys.into_iter().filter_map(|key| guard.remove(&key).map(|entry| (key, entry))).collect()
             };
             if removed.is_empty() {
                 continue;
             }
-            for entry in removed {
+            let mut departed = Vec::with_capacity(removed.len());
+            for ((unique_name, object_path), entry) in removed {
+                // The same `service + path` spelling `register_item` announces (ADR-0172).
+                departed.push(format!("{}{}", unique_name.as_str(), object_path.as_str()));
                 entry.properties_forwarder.abort();
                 if let Some(handle) = entry.menu_forwarder {
                     handle.abort();
@@ -279,6 +287,15 @@ pub(super) fn spawn_name_owner_changed_forwarder(
             }
             if events.send(TraySignal::RegistryChanged).is_err() {
                 break;
+            }
+            // Emitted last, and never between the cleanup steps: a stalled D-Bus write would
+            // otherwise hold up aborting the forwarders, reaping the spooled PNGs and telling our
+            // own config the registry moved. Nothing here depends on the signal landing.
+            if let Ok(emitter) = zbus::object_server::SignalEmitter::new(&connection, super::WATCHER_OBJECT_PATH) {
+                for id in departed {
+                    let _ =
+                        super::watcher::StatusNotifierWatcher::status_notifier_item_unregistered(&emitter, &id).await;
+                }
             }
         }
     })

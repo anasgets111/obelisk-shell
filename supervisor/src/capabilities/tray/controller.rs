@@ -71,7 +71,7 @@ impl TrayController {
         match zbus::fdo::DBusProxy::new(&connection).await {
             Ok(dbus_proxy) => {
                 adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
-                spawn_name_owner_changed_forwarder(dbus_proxy, registry.clone(), events.clone());
+                spawn_name_owner_changed_forwarder(connection.clone(), dbus_proxy, registry.clone(), events.clone());
             }
             Err(err) => eprintln!("tray: failed to bind org.freedesktop.DBus for NameOwnerChanged tracking: {err}"),
         }

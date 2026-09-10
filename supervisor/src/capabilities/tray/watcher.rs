@@ -94,7 +94,7 @@ impl StatusNotifierWatcher {
         service: &str,
     ) -> zbus::Result<()>;
     #[zbus(signal)]
-    async fn status_notifier_item_unregistered(
+    pub(super) async fn status_notifier_item_unregistered(
         signal_emitter: &zbus::object_server::SignalEmitter<'_>,
         service: &str,
     ) -> zbus::Result<()>;

@@ -58,9 +58,18 @@ return {
     initials = identity:map(function(i)
         local name = i.name ~= "" and i.name or USER
         local letters = ""
+        local taken = 0
         for word in name:gmatch("%S+") do
-            letters = letters .. word:sub(1, 1):upper()
-            if #letters == 2 then
+            -- One *character*, not one byte: `sub(1, 1)` splits a multibyte letter in half, and
+            -- counting bytes to stop ended the loop mid-name. Count words instead.
+            --
+            -- `upper` is byte-oriented, so a non-ASCII initial keeps its own case: "eclair Dupont"
+            -- spelled with a leading accent gives "eD", not "ED". A whole-codepoint lowercase
+            -- letter is the readable answer; half a sequence was not.
+            local stop = utf8.offset(word, 2)
+            letters = letters .. word:sub(1, stop and stop - 1 or #word):upper()
+            taken = taken + 1
+            if taken == 2 then
                 break
             end
         end

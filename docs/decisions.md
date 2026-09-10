@@ -3267,8 +3267,12 @@ Not taken from KDE: its watcher accepts every registration and lets `NameOwnerCh
 ADR-0168 refuses objects that answer nothing, avoiding blank icons for items at another path. The
 probe is optional because duplicate ids cannot reach config.
 
-Still open: `StatusNotifierItemUnregistered` is declared but never emitted. Nothing consumes the
-watcher's signals but us, and `NameOwnerChanged` still drops the registry entry.
+Amendment: `StatusNotifierItemUnregistered` is emitted now, from
+`tray::registry::spawn_name_owner_changed_forwarder`, under the same `service + path` id
+`RegisterStatusNotifierItem` announces. It is sent after the registry entry is dropped and its
+spool files are reaped, so a stalled D-Bus write delays only the signal. Nothing of ours consumes
+it -- our own tray reads the registry -- which is why announcing arrivals and never departures went
+unnoticed; a second host on the bus kept every item that ever left.
 
 ## 0173. The notifications panel is the shell's status sheet, not a feed
 

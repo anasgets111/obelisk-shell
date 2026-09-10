@@ -78,7 +78,9 @@ oblisk.updates:on_change(function(u, previous)
     store:set("updates_notified", key)
     local fresh = 0
     for _, name in ipairs(names) do
-        if not announced:find(name, 1, true) then
+        -- Anchored on newlines: a bare `find` matches inside a neighbour, so a new `python`
+        -- counted as already announced whenever `python-pip` was in the stored list.
+        if not ("\n" .. announced .. "\n"):find("\n" .. name .. "\n", 1, true) then
             fresh = fresh + 1
         end
     end

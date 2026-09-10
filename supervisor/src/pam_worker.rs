@@ -117,14 +117,16 @@ fn run_conversation(username: &str, password: &[u8]) -> shared::PamOutcome {
 }
 
 /// Reads `reader` to EOF. On a mid-read error, zeroize bytes already in the buffer before
-/// propagating; otherwise `?` would drop password bytes unscrubbed.
-fn read_password(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+/// propagating; otherwise `?` would drop password bytes unscrubbed. The success path returns
+/// `Zeroizing`, so every later exit scrubs on drop -- including an unwind out of
+/// `run_conversation`, which an explicit scrub after the call would miss.
+fn read_password(mut reader: impl std::io::Read) -> std::io::Result<shared::Zeroizing<Vec<u8>>> {
     let mut password = Vec::new();
     if let Err(err) = reader.read_to_end(&mut password) {
         shared::Zeroize::zeroize(&mut password);
         return Err(err);
     }
-    Ok(password)
+    Ok(shared::Zeroizing::new(password))
 }
 
 /// ADR-0028 worker path for `OBLISK_PAM_WORKER=1`. `main.rs` enters it before D-Bus/runtime/audio
@@ -134,10 +136,10 @@ fn read_password(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
 pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
     let username = std::env::var("OBLISK_PAM_USERNAME")?;
 
-    let mut password = read_password(std::io::stdin().lock())?;
+    let password = read_password(std::io::stdin().lock())?;
 
     let outcome = run_conversation(&username, &password);
-    shared::Zeroize::zeroize(&mut password);
+    drop(password);
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
@@ -186,11 +188,7 @@ pub async fn run_polkit_helper(
         Err(reason) => shared::PamOutcome::StartFailed(reason),
     };
     shared::Zeroize::zeroize(&mut *secret);
-    if let Some((tag, tx)) = guard.pending.take()
-        && tx.send((tag, outcome)).is_err()
-    {
-        eprintln!("polkit: the outcome channel is closed; dropping an authentication result");
-    }
+    guard.report(outcome, "polkit");
 }
 
 async fn authenticate_via_helper(uid: u32, cookie: &str, secret: &[u8]) -> Result<shared::PamOutcome, String> {
@@ -262,17 +260,25 @@ pub async fn run_authentication<T: Send + 'static>(
         Err(reason) => shared::PamOutcome::StartFailed(reason),
     };
     shared::Zeroize::zeroize(&mut *secret);
-    if let Some((tag, tx)) = guard.pending.take() {
-        // A closed channel means `main.rs`'s loop is gone, which `LockController::send` permits.
-        if tx.send((tag, outcome)).is_err() {
-            eprintln!("pam: the outcome channel is closed; dropping an authentication result");
-        }
-    }
+    guard.report(outcome, "pam");
 }
 
 /// [`run_authentication`]'s `Drop` backstop: reports once if dropped before ordinary `.take()`.
 struct ReportOnDrop<T> {
     pending: Option<(T, UnboundedSender<(T, shared::PamOutcome)>)>,
+}
+
+impl<T> ReportOnDrop<T> {
+    /// Sends the one outcome this authentication owes, or logs that nobody is left to hear it.
+    /// `label` names the caller because the two paths log under their own names.
+    fn report(&mut self, outcome: shared::PamOutcome, label: &str) {
+        if let Some((tag, tx)) = self.pending.take()
+            && tx.send((tag, outcome)).is_err()
+        {
+            // A closed channel means `main.rs`'s loop is gone, which `LockController::send` permits.
+            eprintln!("{label}: the outcome channel is closed; dropping an authentication result");
+        }
+    }
 }
 
 impl<T> Drop for ReportOnDrop<T> {

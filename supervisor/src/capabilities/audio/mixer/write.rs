@@ -65,10 +65,36 @@ fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volu
 /// channel count because mute carries no `channelVolumes`.
 fn set_default_muted(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, muted: Option<bool>) {
     let Some((node_id, current)) = resolve_default(state, kind) else {
-        eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
+        // A toggle needs the current value; an explicit set does not, so only the toggle waits for
+        // the first `Props`. Requiring it for both dropped a mute keypress during startup.
+        //
+        // Not a total fix: a hardware sink whose `Route` has not arrived yet still looks node-owned
+        // here, and `write_node_props` addresses the node rather than the device. That window is
+        // narrower than the one this closes, and the write is attempted rather than refused.
+        let Some(muted) = muted else {
+            eprintln!("audio: a {kind:?} mute toggle has no resolved default device to read; ignored");
+            return;
+        };
+        let Some(node_id) = resolve_default_node(state, kind) else {
+            eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
+            return;
+        };
+        write_device_volume(state, kind, node_id, None, Some(muted));
         return;
     };
     write_device_volume(state, kind, node_id, None, Some(muted.unwrap_or(!current.mute)));
+}
+
+/// The default node id alone, without waiting for its `Props`. A mute carries no `channelVolumes`,
+/// so an explicit set needs only this; [`resolve_default`] is for the paths that read the current
+/// value.
+fn resolve_default_node(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Option<u32> {
+    let state = state.borrow();
+    let entries = state.device_entries(kind);
+    master::resolve_default_device(
+        state.default_name(kind),
+        entries.iter().map(|(&id, entry)| (id, entry.names.node_name.as_str())),
+    )
 }
 
 /// Resolves one direction's node and last-read `Props`, or `None` while unresolved, in the same
@@ -174,10 +200,7 @@ fn write_node_props(
 /// (`pw-metadata` shows `update: id:0 key:'default.audio.sink'`).
 fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id: u32) {
     let state = state.borrow();
-    let node_name = match kind {
-        DefaultDevice::Sink => state.sinks.get(&id).map(|sink| sink.names.node_name.clone()),
-        DefaultDevice::Source => state.sources.get(&id).map(|source| source.names.node_name.clone()),
-    };
+    let node_name = state.device_entries(kind).get(&id).map(|entry| entry.names.node_name.clone());
     let Some(node_name) = node_name else {
         eprintln!("audio: no tracked {kind:?} with registry id {id}; ignored");
         return;

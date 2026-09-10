@@ -2,7 +2,7 @@
 //! properties without a live PipeWire proxy.
 
 use std::collections::HashMap;
-use std::fs;
+use std::path::Path;
 
 use pipewire as pw;
 use pw::keys;
@@ -78,10 +78,6 @@ struct ParsedStream {
     app_name: Option<String>,
 }
 
-fn is_stream_output_audio(props: &impl PropsLookup) -> bool {
-    props.get_prop(*keys::MEDIA_CLASS) == Some(STREAM_OUTPUT_AUDIO)
-}
-
 /// Node kind chosen at `global` time and carried into `info`; state-only `info` props can be empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NodeKind {
@@ -89,18 +85,6 @@ pub(super) enum NodeKind {
     Video,
     Microphone,
     Screencast,
-}
-
-impl NodeKind {
-    /// The `media.class` for this kind, shared by [`classify`] and [`parse_capture_props`].
-    fn media_class(self) -> &'static str {
-        match self {
-            NodeKind::Audio => STREAM_OUTPUT_AUDIO,
-            NodeKind::Video => VIDEO_SOURCE,
-            NodeKind::Microphone => STREAM_INPUT_AUDIO,
-            NodeKind::Screencast => STREAM_OUTPUT_VIDEO,
-        }
-    }
 }
 
 /// Classifies a `global` event by `media.class`; `None` covers sinks, sources, and other nodes.
@@ -117,7 +101,7 @@ pub(super) fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
 /// Parses a `Stream/Output/Audio` with a valid `application.process.id`; `None` also covers a
 /// node PipeWire has not finished populating (see [`apply_info_event`]).
 fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
-    if !is_stream_output_audio(props) {
+    if classify(props) != Some(NodeKind::Audio) {
         return None;
     }
     let pid = props.get_prop(*keys::APP_PROCESS_ID)?.parse().ok()?;
@@ -125,16 +109,19 @@ fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
     Some(ParsedStream { pid, app_name })
 }
 
-/// Reads `/proc/{pid}/comm`; `None` if the process exited or `/proc` is unreadable.
-fn resolve_process_name(pid: i32) -> Option<String> {
-    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    Some(comm.trim_end().to_string())
+/// Reads `{proc_root}/{pid}/comm`; `None` if the process exited or procfs is unreadable.
+///
+/// Takes the root rather than hard-coding `/proc`, which is the repository rule for every procfs
+/// reader in `capabilities/` -- it is what lets the tests below point at a tempdir. Shares
+/// `privacy::video::read_comm`, which was already built that way.
+fn resolve_process_name(proc_root: &Path, pid: i32) -> Option<String> {
+    crate::capabilities::privacy::video::read_comm(proc_root, pid.try_into().ok()?)
 }
 
 /// Parses `props` and resolves the owning process name for both registry and `info` handlers.
-fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
+fn build_app_stream(proc_root: &Path, node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
     let parsed = parse_stream_props(props)?;
-    let process_name = resolve_process_name(parsed.pid);
+    let process_name = resolve_process_name(proc_root, parsed.pid);
     Some(AppStream {
         id: node_id,
         pid: parsed.pid,
@@ -151,6 +138,7 @@ fn build_app_stream(node_id: u32, props: &impl PropsLookup) -> Option<AppStream>
 /// Applies a bound node's `info`. Gate upsert/remove on `NodeChangeMask::PROPS`: state-only events
 /// carry empty props and must not drop a live stream. `global_bind`'s first `info` has PROPS.
 pub(super) fn apply_info_event(
+    proc_root: &Path,
     apps: &mut AudioApps,
     node_id: u32,
     has_props_change: bool,
@@ -159,7 +147,7 @@ pub(super) fn apply_info_event(
     if !has_props_change {
         return;
     }
-    match props.and_then(|props| build_app_stream(node_id, props)) {
+    match props.and_then(|props| build_app_stream(proc_root, node_id, props)) {
         Some(app) => apps.upsert(app),
         None => {
             apps.remove(node_id);
@@ -319,7 +307,7 @@ pub struct VideoSourceApp {
 
 /// Parses a `Video/Source` with valid `application.process.id` into [`VideoSourceApp`].
 fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<VideoSourceApp> {
-    if props.get_prop(*keys::MEDIA_CLASS) != Some(VIDEO_SOURCE) {
+    if classify(props) != Some(NodeKind::Video) {
         return None;
     }
     let pid = props.get_prop(*keys::APP_PROCESS_ID)?.parse().ok()?;
@@ -392,7 +380,7 @@ pub struct CaptureApp {
 /// cross-reference `/dev/videoN` openers by pid, but these lists have only PipeWire, so dropping a
 /// pid-less node would drop the capture.
 fn parse_capture_props(node_id: u32, kind: NodeKind, props: &impl PropsLookup) -> Option<CaptureApp> {
-    if props.get_prop(*keys::MEDIA_CLASS) != Some(kind.media_class()) {
+    if classify(props) != Some(kind) {
         return None;
     }
     if kind == NodeKind::Microphone && props.get_prop(STREAM_CAPTURE_SINK) == Some("true") {
@@ -870,20 +858,21 @@ mod tests {
     fn resolve_process_name_reads_proc_comm_for_a_real_process() {
         // Use this process's pid: a spawned child raced with parallel test threads in this binary.
         let pid = std::process::id() as i32;
-        let name = resolve_process_name(pid).expect("this process's own /proc entry must be readable");
+        let name =
+            resolve_process_name(Path::new("/proc"), pid).expect("this process's own /proc entry must be readable");
         assert!(!name.is_empty());
         assert!(!name.ends_with('\n'), "trim_end should have stripped comm's trailing newline");
     }
 
     #[test]
     fn resolve_process_name_returns_none_for_a_pid_that_does_not_exist() {
-        assert_eq!(resolve_process_name(i32::MAX), None);
+        assert_eq!(resolve_process_name(Path::new("/proc"), i32::MAX), None);
     }
 
     #[test]
     fn build_app_stream_combines_parsing_and_pid_resolution() {
         let pid = std::process::id();
-        let expected_process_name = resolve_process_name(pid as i32);
+        let expected_process_name = resolve_process_name(Path::new("/proc"), pid as i32);
 
         let props = HashMap::from([
             ("media.class".to_string(), "Stream/Output/Audio".to_string()),
@@ -891,7 +880,7 @@ mod tests {
             ("application.name".to_string(), "Test App".to_string()),
         ]);
 
-        let app = build_app_stream(42, &props).expect("should build an AppStream");
+        let app = build_app_stream(Path::new("/proc"), 42, &props).expect("should build an AppStream");
         assert_eq!(app.id, 42);
         assert_eq!(app.pid, pid as i32);
         assert_eq!(app.name, Some("Test App".to_string()));
@@ -904,7 +893,7 @@ mod tests {
     #[test]
     fn build_app_stream_rejects_a_non_audio_node() {
         let props = HashMap::from([("media.class".to_string(), "Video/Source".to_string())]);
-        assert!(build_app_stream(1, &props).is_none());
+        assert!(build_app_stream(Path::new("/proc"), 1, &props).is_none());
     }
 
     fn sample_stream(node_id: u32) -> AppStream {
@@ -946,12 +935,12 @@ mod tests {
     fn apply_info_event_keeps_a_tracked_stream_through_a_state_only_info_event() {
         let mut apps = AudioApps::new();
         // Bind-time global_bind guarantees the first info event carries PROPS and full props.
-        apply_info_event(&mut apps, 1, true, Some(&zen_browser_stream_props()));
+        apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
         assert_eq!(apps.snapshot().len(), 1, "the initial props-bearing info event should track the stream");
 
         // A state-only transition (e.g. RUNNING -> IDLE) sends empty props, not stream removal.
         let state_only_props: HashMap<String, String> = HashMap::new();
-        apply_info_event(&mut apps, 1, false, Some(&state_only_props));
+        apply_info_event(Path::new("/proc"), &mut apps, 1, false, Some(&state_only_props));
 
         assert_eq!(
             apps.snapshot().len(),
@@ -963,18 +952,21 @@ mod tests {
     #[test]
     fn apply_info_event_upserts_on_a_props_bearing_event() {
         let mut apps = AudioApps::new();
-        apply_info_event(&mut apps, 1, true, Some(&zen_browser_stream_props()));
-        assert_eq!(apps.snapshot(), vec![build_app_stream(1, &zen_browser_stream_props()).unwrap()]);
+        apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
+        assert_eq!(
+            apps.snapshot(),
+            vec![build_app_stream(Path::new("/proc"), 1, &zen_browser_stream_props()).unwrap()]
+        );
     }
 
     #[test]
     fn apply_info_event_removes_when_a_props_bearing_event_no_longer_parses() {
         let mut apps = AudioApps::new();
-        apply_info_event(&mut apps, 1, true, Some(&zen_browser_stream_props()));
+        apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
         assert_eq!(apps.snapshot().len(), 1);
 
         let non_stream_props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
-        apply_info_event(&mut apps, 1, true, Some(&non_stream_props));
+        apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&non_stream_props));
 
         assert!(apps.snapshot().is_empty(), "a PROPS-bearing event that no longer parses as a stream should remove it");
     }
