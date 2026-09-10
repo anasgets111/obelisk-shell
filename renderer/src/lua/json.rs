@@ -9,7 +9,7 @@
 //! Upgrade with `encode` beside `decode`, reversing [`to_lua`]'s options; nothing needs it yet, and
 //! an unused writer has no checked round trip.
 
-use mlua::{IntoLua, Lua, LuaSerdeExt, MultiValue, Value};
+use mlua::{Lua, LuaSerdeExt, Value};
 
 /// The sole JSON-to-Lua mapping, used by pushed capability payloads (`Loader::to_lua_value`) and
 /// `json.decode`.
@@ -41,8 +41,9 @@ fn decode(lua: &Lua, bytes: &[u8]) -> Result<Value, String> {
 /// Registers `json.decode(text)`.
 ///
 /// Returns one value on success, or `nil` plus a message on failure, matching Lua's `io.open`, not
-/// cjson. Decode failure is routine because `out_cb` supplies lines, including partial buffers and
-/// non-JSON stdout; raising would force `pcall` at every call site. No trailing `nil`: with three
+/// cjson. mlua's `IntoLuaMulti for Result` is already that shape, so [`decode`]'s `Result` goes
+/// back whole. Decode failure is routine because `out_cb` supplies lines, including partial buffers
+/// and non-JSON stdout; raising would force `pcall` at every call site. No trailing `nil`: with three
 /// arguments, `table.insert(t, decoded, nil)` treats the second as a position and raises "bad
 /// argument #2 to 'insert' (number expected, got table)". Measured, not assumed.
 ///
@@ -57,13 +58,7 @@ fn decode(lua: &Lua, bytes: &[u8]) -> Result<Value, String> {
 /// message string.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     let table = lua.create_table()?;
-    table.set(
-        "decode",
-        lua.create_function(|lua, text: mlua::LuaString| match decode(lua, &text.as_bytes()) {
-            Ok(value) => Ok(MultiValue::from_vec(vec![value])),
-            Err(message) => Ok(MultiValue::from_vec(vec![Value::Nil, lua.create_string(message)?.into_lua(lua)?])),
-        })?,
-    )?;
+    table.set("decode", lua.create_function(|lua, text: mlua::LuaString| Ok(decode(lua, &text.as_bytes())))?)?;
     lua.globals().set("json", table)
 }
 
