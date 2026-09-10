@@ -1,32 +1,30 @@
--- Mirrors `TrayMenuPanel.qml`: the DBusMenu an application hangs off its tray icon, opened by a
--- right click on that icon.
+-- Mirrors `TrayMenuPanel.qml`: the DBusMenu attached to a tray icon, opened by right-clicking it.
 --
 -- `oblisk.tray` already carries the whole tree. `MenuItem.children` comes from one
--- `GetLayout(0, -1)` at registration, so no `tray:menu_will_show` round trip is needed to draw a
--- submenu; the command exists for applications that populate lazily, and nothing here has needed it.
+-- `GetLayout(0, -1)` at registration, so drawing a submenu needs no
+-- `tray:menu_will_show` round trip.
+-- That command remains available for applications that populate menus lazily.
 --
 -- ## Submenus expand in place
 --
--- The mirror opens each submenu as its own `PopupWindow` anchored beside the row, revealed on hover
--- and retired by a 450ms timer. Neither half is available: a popup per submenu is a surface per
--- level, and hover-driven reveal cannot be exercised here at all. A click expands the row instead
--- and the children are drawn under it, indented -- the shape `modules/bar/panels/audio_panel.lua`
--- already uses for its device pickers.
+-- The mirror opens each submenu in a `PopupWindow` beside the row, revealed on hover and retired by
+-- a 450ms timer. Neither half is available here: a popup per submenu is a surface per level, and
+-- hover reveal cannot be exercised. A click expands the row, drawing indented children as in
+-- `modules/bar/panels/audio_panel.lua`.
 --
--- Depth is whatever the application sent, up to the Supervisor's `MAX_MENU_DEPTH`, because the rows
--- are flattened from the tree rather than nested as nodes.
+-- Depth follows the application up to the Supervisor's `MAX_MENU_DEPTH`; rows flatten the tree.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local ui_state = require("lib.ui_state")
 
 local KIND = "tray_menu"
 
--- Which item's menu is showing. A tray icon is not a panel kind of its own -- every item shares one
--- card, as they share one `panel_host` section -- so the id travels beside `panel_kind`.
+-- Every tray item shares one card and one `panel_host` section, so its id travels beside
+-- `panel_kind`.
 local item_id = state("tray_menu_item", "")
 
--- Ids of the submenus the user has opened. A set rather than one id: the tree can be deeper than
--- two levels, and collapsing an ancestor should not have to remember what was open beneath it.
+-- A set of opened submenu ids supports trees deeper than two levels without losing descendants when
+-- an ancestor collapses.
 local expanded = state("tray_menu_expanded", {})
 
 -- `components/panel_action_icon.lua` uses the same literal for the same reason.
@@ -43,7 +41,7 @@ local function menu_of(t, id)
     return nil
 end
 
--- Depth-first, carrying the indent, so `list` gets a flat source and one row shape.
+-- Flatten depth-first so `list` gets one row shape and carries each row's indent.
 local function flatten(entries, depth, open, out)
     for _, entry in ipairs(entries or {}) do
         out[#out + 1] = { entry = entry, depth = depth }
@@ -59,15 +57,14 @@ local rows = computed({ oblisk.tray, item_id, expanded }, function(t, id, open)
     return out
 end)
 
--- The mirror's own three markers, which are plain characters rather than glyphs from
--- `config/icons.lua`: this row draws an application's menu, and a checkmark here means what the
--- application's own toolkit would have drawn, not one of the shell's icons.
+-- The mirror's own three plain-character markers, not glyphs from `config/icons.lua`, preserve what
+-- the application's toolkit would draw.
 local SUBMENU = "\u{203A}"
 local CHECKED = "\u{2713}"
 local SELECTED = "\u{25CF}"
 
--- `hasChildren ? SUBMENU : checkState === Checked ? CHECKED or SELECTED : ""`. A toggle that is off
--- or indeterminate draws nothing, as the mirror's ternary chain does.
+-- `hasChildren ? SUBMENU : checkState === Checked ? CHECKED or SELECTED : ""`; off and
+-- indeterminate toggles draw nothing.
 local function marker(entry)
     if #(entry.children or {}) > 0 then
         return SUBMENU
@@ -78,15 +75,13 @@ local function marker(entry)
     return entry.toggle_type == "radio" and SELECTED or CHECKED
 end
 
--- DBusMenu marks a keyboard mnemonic with `_` before the letter, and the payload carries the label
--- exactly as sent (`MenuItem.label`), so `"_Quit"` arrives with the underscore in it. Drawing that
--- literally is wrong in every toolkit.
+-- DBusMenu puts `_` before a mnemonic, and `MenuItem.label` carries it literally, so `"_Quit"`
+-- arrives with the underscore. Drawing it literally is wrong.
 --
--- The mirror underlines the letter instead (`dbusmenu.cpp` rewrites `_X` to `<u>X</u>`), but an
--- underline in a menu means "press this letter to run this entry", and nothing here listens for it:
--- the panel takes no keyboard focus and the row is a pointer target. Advertising an accelerator
--- that does nothing is worse than not marking it, so the marker is simply removed -- Quickshell
--- keeps the same string as `mCleanLabel`. Underline it once the key actually works.
+-- The mirror underlines the letter (`dbusmenu.cpp` rewrites `_X` to `<u>X</u>`), but this panel
+-- takes no keyboard focus and listens only to pointer clicks. Advertising an accelerator that does
+-- nothing is worse than omitting it, so the marker is removed; Quickshell keeps the same string as
+-- `mCleanLabel`. Underline it once the key works.
 --
 -- `__` is DBusMenu's escape for a real underscore, so a pair collapses to one plain character.
 ---@param label string?
@@ -107,8 +102,8 @@ local function activate(entry)
         expanded:set(next_open)
         return
     end
-    -- A disabled entry is drawn, not filtered, so the application's own layout survives; activating
-    -- it is the no-op the spec says it is, and the Supervisor would refuse it anyway.
+    -- Draw disabled entries so the application's layout survives; the Supervisor refuses their
+    -- action anyway.
     if entry.enabled then
         oblisk.tray:invoke("activate_menu_item", item_id:get(), entry.id)
     end
@@ -157,12 +152,12 @@ local function row_for(row_entry)
         height = theme.item_height,
         radius = theme.item_radius,
         hover = hovered,
-        -- `color: containsMouse ? glassControlHoverColor : "transparent"`, transparent and not
-        -- `nil` because that is the colour the mirror names.
+        -- `color: containsMouse ? glassControlHoverColor : "transparent"`, so use transparent, not
+        -- `nil`, because that is the colour the mirror names.
         background = hovered:map(function(on)
             return on and theme.GLASS_CONTROL_HOVER or CLEAR
         end),
-        -- `opacity: entry.enabled ? 1 : opacityDisabled`, on the row so the icon dims with the word.
+        -- `opacity: entry.enabled ? 1 : opacityDisabled` applies to the row, dimming icon and word.
         opacity = entry.enabled and 1 or theme.opacity.disabled,
         on_click = function(_, mouse_button)
             if mouse_button == "left" then

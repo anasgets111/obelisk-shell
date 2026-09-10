@@ -1,29 +1,22 @@
 -- Mirrors `IdleSettingsPanel.qml`: an `OModal`, a full-screen layer over a scrim with one centred
 -- glass card, like `modules/global/launcher.lua` and `wallpaper_picker.lua`.
 --
--- Not a bar panel. Its three-action by AC/battery matrix needs both profiles visible; the panel
--- host's 340px card cannot fit it.
---
--- Kept from the mirror: action rows, timeout and switch per profile/action, live-profile heading,
--- header master switch, and two behavior toggles.
+-- Not a bar panel. Its three-action AC/battery matrix needs both profiles visible; the panel host's
+-- 340px card cannot fit it.
 --
 -- Dropped: action-order combo (`lib/store.lua` makes timeout order canonical), "respect inhibitors"
 -- (foreign inhibitors are unconditional, ADR-0139), and the unrelated input-overlay section.
 --
--- ## Timeline
+-- The mirror's static `FlowSummary`, "Lock · 5 min → Display · 30 sec → Suspend · Off", shows
+-- configuration, not progress. One equal-width chamber per runnable stage fills over its own window
+-- and shows how close the screen is to going dark.
 --
--- Added timeline. The mirror's static `FlowSummary`, "Lock · 5 min → Display · 30 sec → Suspend ·
--- Off", shows configuration, not progress. One chamber per runnable stage, soonest first, fills
--- over its own window,
--- answering how close the screen is to going dark.
+-- Chambers are not delay-proportional: with a 30-second stage followed by 15 minutes, the first
+-- would be 3% of the card and its glyph would not fit. Each prints its delay, so proportions are
+-- readable but not to scale.
 --
--- Chambers are equal-width, not delay-proportional: with a 30-second stage followed by 15 minutes,
--- the first would be 3% of the card and its glyph would not fit. Each chamber prints its delay, so
--- proportions remain readable but are not drawn to scale.
---
--- A chamber prints its stage delay, matching the matrix row, not the running total. The first pass
--- showed "1m" in the row and "1m 30s" beside it. The masthead keeps the total by counting down to
--- the next stage.
+-- A chamber prints its stage delay, not the running total. The first pass showed "1m" in the row
+-- and "1m 30s" beside it. The masthead keeps the total by counting down to the next stage.
 --
 -- Replace the timeline, rather than dim it, when a hold blocks countdown or no action is scheduled;
 -- a bar that can never fill is worse than the reason.
@@ -51,7 +44,6 @@ local has_battery = oblisk.battery:map(function(b)
     return b ~= nil and b.present
 end)
 
--- ## Header
 
 local subtitle = computed(
     { store.idle, idle.active_profile, idle.elapsed, idle.reasons, idle.arming },
@@ -72,9 +64,8 @@ local subtitle = computed(
             local first = plan.list[1]
             return string.format("%s · %s after %s", where, first.title, idle.format(first.at))
         end
-        -- Count down the armed stage's delay, not the running total: its clock starts when the
-        -- prior
-        -- stage finishes, and only this answers "how long have I got".
+        -- Count down the armed stage's delay, not the running total. Its clock starts when the
+        -- prior stage finishes, and only this answers "how long have I got".
         for _, entry in ipairs(plan.list) do
             if entry.key == arming.key then
                 return string.format(
@@ -135,11 +126,9 @@ local counting_down = computed({ settings, plan_now, idle.inhibited }, function(
     return resolved.enabled and plan.total > 0 and not held
 end)
 
--- Chamber state comes from `idle.arming`: earlier stages are full, later stages empty, and the
--- armed
+-- Chamber state comes from `idle.arming`: earlier stages are full, later stages are empty, and the
 -- stage fills over its delay. The first version used the running total and showed an unstarted
--- stage
--- as partly done.
+-- stage as partly done.
 local function chamber_progress(entry)
     return computed({ idle.arming, plan_now }, function(arming, plan)
         local position, armed_position
@@ -170,7 +159,6 @@ local function chamber(entry)
     local fill = progress:map(function(fraction)
         return string.format("%d%%", math.floor(fraction * 100 + 0.5))
     end)
-    -- Lit once this stage's clock runs or has run; dim during another stage's turn.
     local ink = progress:map(function(fraction)
         return fraction > 0 and theme.FG or theme.DIM
     end)
@@ -273,8 +261,7 @@ local function setting(profile, key, suffix)
 end
 
 -- Click cycles forward through seven options; right-click cycles back. The config lacks
--- `OComboBox`,
--- and this interaction is enough without building one.
+-- `OComboBox`, and this interaction is enough without building one.
 local function duration_button(profile, stage)
     local slot = "idle-sec-" .. profile .. "-" .. stage.key
     local hovered = hover(slot)
@@ -315,7 +302,6 @@ local function duration_button(profile, stage)
     }
 end
 
--- One profile cell: stage delay and its enable switch.
 local function profile_control(profile, stage)
     local on = setting(profile, stage.key, "_on")
     return row {
@@ -345,9 +331,7 @@ local function bold_when(on, title)
     end)
 end
 
--- `ProfileHeading`: accent and label the active column, so desk-side configuration still shows
--- which
--- profile is running.
+-- `ProfileHeading` marks the active column so desk-side configuration shows the running profile.
 local function column_heading(profile, label)
     return cell(
         idle.active_profile:map(function(active)
@@ -397,8 +381,7 @@ end
 local function stage_row(item)
     local stage = item.stage
     -- Accent while either profile enables this stage, `ActionSettingRow`'s `anyEnabled`; dim in
-    -- both
-    -- columns means the stage never runs.
+    -- both columns means the stage never runs.
     local any = settings:map(function(resolved)
         for _, profile in ipairs({ "ac", "battery" }) do
             if resolved[profile][item.key .. "_on"] and resolved[profile][item.key .. "_sec"] > 0 then

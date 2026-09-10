@@ -1,20 +1,11 @@
 -- Mirrors `Services/SystemInfo/ScreenRecordingService.qml`: one `gpu-screen-recorder`, started on a
 -- region or a whole output, pausable, and saved with a notification offering to play it.
 --
--- ## Why this is a fifth of the mirror's size
+-- The mirror is 223 lines, with about 180 for reload-safe pid ownership. `session_process`
+-- (ADR-0175) lets the Supervisor hold the child across reloads; `oblisk.processes` reports it, so
+-- this file needs no launch script, lock file, or poll.
 --
--- The mirror is 223 lines and about 180 of them answer one question: after Quickshell reloads, is
--- that pid still my recorder? It orphans the process through a shell script, checks
--- `/proc/$pid/exe` for the right binary, reads field 22 of `/proc/$pid/stat` for the kernel start
--- time, writes both to a lock file, re-probes before every signal, and polls the same probe every
--- two seconds to notice a crash.
---
--- `session_process` (ADR-0175) removes the question. The Supervisor holds the child, does not
--- restart on a config edit, and answers for it in `oblisk.processes`, so a reload finds `running`
--- already true and this file has no launch script, no lock file, and no poll.
---
--- What stays here is what is genuinely the config's: the argv, the file name, the pause arithmetic,
--- and the notification.
+-- The config owns the argv, file name, pause arithmetic, and notification.
 local store = require("lib.store")
 
 local RECORDER = "screen-recorder"
@@ -112,7 +103,6 @@ local function set_setting(key, value)
     store:set("screen_recorder", next_settings)
 end
 
--- `_formatElapsed`: minutes and seconds until an hour, then hours.
 local function format_elapsed(seconds)
     seconds = math.max(0, math.floor(seconds))
     local hours = math.floor(seconds / 3600)
@@ -207,7 +197,7 @@ local function start(mode)
         end
         -- `-w <WxH+X+Y>` rather than the mirror's `-w region -region <WxH+X+Y>`. The installed
         -- gpu-screen-recorder deprecates the second form -- "use -w with region directly instead"
-        -- -- and on this version it also fails: a live region capture logged
+        -- and on this version it also fails: a live region capture logged
         -- `gsr_encoder_receive_packets: failed to write frame index 1 to muxer, Invalid argument`
         -- and wrote nothing, while the same geometry through `-w` records cleanly.
         launch({ "-w", selected }, string.format("Region %s", selected:match("^[^+]*")))
@@ -245,14 +235,13 @@ local function toggle()
     end
 end
 
--- `_clearRecording(true)`'s notification, on every end rather than only a requested one: a recorder
--- that died on its own still wrote a file up to that point, and saying nothing is how a capture
--- gets lost.
+-- Notify on every end, not only a requested one: a recorder that died on its own still
+-- wrote a file; saying nothing loses the capture.
 --
--- The exit status decides which notification. `gpu-screen-recorder` answers `SIGINT` by writing the
+-- Exit status decides the notification. `gpu-screen-recorder` answers `SIGINT` by writing the
 -- container's index and exiting 0, so zero means there is a file worth offering. Anything else is a
--- refusal -- a codec it cannot open, an audio device that is not there -- and it happens fast
--- enough that the mirror's unconditional "Recording saved" lands on a file that does not exist.
+-- refusal -- a codec it cannot open or an audio device that is not there -- and it happens fast
+-- enough that the mirror's unconditional "Recording saved" lands on a missing file.
 -- Verified: a bad `-a` argument produced "Recording saved · 0:00" over nothing.
 --
 -- `-A default=Play` arms clicking the popup itself and is hidden from the action row, so one button

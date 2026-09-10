@@ -1,38 +1,31 @@
--- Hover tooltip: a `popup` following one hover slot (ADR-0062).
--- Two bindings, no state machine: hover is a signal. `visible` takes its boolean and `anchor_rect`
--- takes the rect the engine wrote beside it, leaving nothing to reset when re-resolve replaces the
--- node under the pointer.
--- `grab = false` is required. A grabbing popup takes the pointer off the node whose hover opened
--- it, causing endless flicker. It also avoids the armed input serial required by § 6, which hover
--- has no click to carry.
--- The 4px offset opens below the anchor, keeping a pointer resting on the pill out of the tooltip
--- so their hover states do not fight. Moving down onto it closes it when leaving the bar turns
--- hover off, which is right for a tooltip. A hover-open panel needs its own hover region, OR-ed
--- with the bar's,
--- so the pointer can travel into it.
+-- Hover tooltip: a `popup` following one hover slot (ADR-0062). Two bindings are enough: `visible`
+-- takes the hover boolean and `anchor_rect` takes the engine-written rect.
 --
--- Nothing opens while a panel is up. `DateTimeDisplay.qml` gates its own loader that way
--- (`requested: mouseArea.containsMouse && !panelOpen`), and the reason generalises to every slot on
--- the bar: the panel card hangs directly under the bar, so a tooltip opening into the same space is
--- a second sheet over the one the user just asked for. Gated on any panel, not this indicator's
--- own, because it is the card's position that collides, not its subject.
+-- `grab = false` is required. A grabbing popup takes the pointer off its source node and flickers;
+-- hover also has no click to carry the armed input serial required by § 6.
+--
+-- The 4px offset opens below the anchor, keeping a pointer resting on the pill out of the tooltip
+-- so their hover states do not fight. Moving down closes it when leaving the bar turns hover off.
+-- A hover-open panel needs its own hover region, OR-ed with the bar's, so the pointer can enter it.
+--
+-- Nothing opens while a panel is up. `DateTimeDisplay.qml` gates its loader with
+-- (`requested: mouseArea.containsMouse && !panelOpen`) because the panel card hangs under every
+-- slot. Gate on any panel: its position collides, not its subject.
 --
 -- ## Sizing
 -- `Tooltip.qml` is `Math.max(controlWidthLg, content.implicitWidth + hPadding * 2)` on both axes:
--- the window is whatever its words need. Omitting `width`/`height` says the same thing here -- a
--- `popup` axis left off is `Content`, measured off the resolved tree on the pass that opens it
+-- the window is whatever its words need. Omitting `width`/`height` leaves the `popup` axis at
+-- `Content`, measured from the resolved tree when it opens
 -- (`layout::node::toplevel::parse_popup_extent`).
 --
--- Every tooltip carried a hand-guessed pair of numbers before the engine could measure one, and
--- they were wrong wherever the text was not the sentence the number was guessed against: a battery
--- reading "69% charge limit reached, 1h 20m left" wants 253px and had 180, a headset named
--- "SteelSeries Arctis Nova Pro Wireless" wants 241 and had 220, an idle hold naming three programs
--- wants 266 and had 240. The card is content-sized, so it kept its natural width inside the smaller
--- surface and the surface cut it -- no ellipsis, because `text` elides only when it is given a
--- width to elide into. The heights were wrong the other way: 44 to 64 declared for 36 of content.
+-- Before the engine could measure one, hand-guessed widths were wrong: "69% charge limit reached,
+-- 1h 20m left" wants 253px but had 180, "SteelSeries Arctis Nova Pro Wireless" wants 241 but had
+-- 220, and an idle hold naming three programs wants 266 but had 240. Content sizing kept the
+-- natural width inside the smaller surface, which clipped it; `text` elides only with a width to
+-- elide into, so there was no ellipsis. Heights had the opposite error: 44 to 64 declared for 36.
 --
--- No floor. The mirror's exists because a two-word tooltip should still look like one; nothing here
--- comes near it, and a number no tooltip reaches is a number that only has to be maintained.
+-- No floor. The mirror keeps one so a two-word tooltip still looks like one; no tooltip here
+-- approaches it, so adding an unreachable number would only add maintenance.
 local theme = require("config.theme")
 local panel_card = require("components.panel_card")
 local ui_state = require("lib.ui_state")
@@ -45,22 +38,20 @@ return function(opts)
         visible = computed({ hover(opts.slot), ui_state.panel_open }, function(is_hovered, panel_open)
             return is_hovered and not panel_open
         end),
-        -- Omitted on purpose: the surface is the card's own box. `date_time.lua` is the one
-        -- caller that still declares them, because its rows fill the card rather than sizing it.
+        -- The surface is the card's own box. `date_time.lua` is the one caller that still declares
+        -- width and height because its rows fill the card rather than sizing it.
         width = opts.width,
         height = opts.height,
         -- § 6 defaults `grab` to `true`, but hover cannot produce the required input serial.
-        -- Without
-        -- this, `visible = true` resolves then gets refused on every re-resolve, as the first live
-        -- run did.
+        -- Without this, `visible = true` resolves and is refused on every re-resolve.
         grab = false,
-        -- Centred under the indicator, which is `Tooltip.qml`'s
+        -- Centre under the indicator, matching `Tooltip.qml`'s
         -- `anchor.rect: Qt.rect(target.width / 2, ...)` with `edges` and `gravity` both `Bottom`.
         -- `BottomLeft`/`BottomRight` hung it from the slot's left edge and let it run rightwards,
         -- which put a 250px tip on a 24px icon almost entirely to one side of what it describes --
         -- and pushed the rightmost indicators' tips off the screen for `SlideX` to drag back.
-        -- Worth restating now that the width is the words' own: a tip that changes width would
-        -- otherwise grow in one direction only, walking away from its anchor as its text changed.
+        -- Content-sized tips must stay centred as their text changes, or they grow in one direction
+        -- and walk away from the anchor.
         anchor = "Bottom",
         gravity = "Bottom",
         constraint_adjustment = { "FlipY", "SlideX" },
@@ -70,9 +61,8 @@ return function(opts)
             blur = true,
             border_width = theme.border_width,
             border_color = theme.BORDER,
-            -- `padding_v` is per-tip because a two-line tip and a month grid do not want the same
-            -- air above them: `xs` reads as a label's inset, `md` as a card's. The surface now
-            -- follows whichever is asked for instead of having to be told about it.
+            -- `padding_v` is per-tip: `xs` suits a label's inset and `md` suits a month grid's
+            -- card. The surface follows the requested value.
             padding = {
                 top = opts.padding_v or theme.spacing.xs,
                 right = theme.spacing.sm,

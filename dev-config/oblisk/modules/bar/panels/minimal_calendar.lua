@@ -1,14 +1,13 @@
 -- Mirrors MinimalCalendar.qml: current month grid with today marked.
 --
--- Pure arithmetic and existing nodes, so it needs no capability, subprocess, or engine feature. A
--- grid is a `column` of `row`s once the offsets are computed.
+-- Pure arithmetic and existing nodes need no capability, subprocess, or engine feature. A grid is a
+-- `column` of `row`s once the offsets are computed.
 --
 -- Use `os.date`/`os.time`, with `oblisk.system.time` supplying *today*. § 2.x has no calendar
 -- capability and should not grow one.
 --
--- Not a panel. `DateTimeDisplay.qml` hangs this off the clock's hover tooltip, and a click on the
--- clock opens the notifications panel; here it had been the other way round, so clicking the one
--- always-visible readout on the bar produced a month grid instead of the shell's status sheet.
+-- Not a panel. `DateTimeDisplay.qml` puts this in the clock's hover tooltip; a click opens the
+-- notifications panel, so the always-visible bar readout does not open a month grid.
 -- `modules/bar/indicators/date_time.lua` owns the tooltip this goes in.
 local theme = require("config.theme")
 local cell = require("components.cell")
@@ -22,8 +21,7 @@ local DAY_SIDE = theme.s(30, 24)
 -- Where the month starts in the week and how long it is.
 --
 -- Lua's normalizing `os.time` makes `day = 0` the previous month's last day and `day = 32` roll
--- into
--- the next, avoiding a month-length table and leap-year branch.
+-- into the next, avoiding a month-length table and leap-year branch.
 local function month_of(now)
     local today = os.date("*t", now)
     local first = os.date("*t", os.time({ year = today.year, month = today.month, day = 1, hour = 12 }))
@@ -33,9 +31,9 @@ local function month_of(now)
     return today, lead, days_in_month
 end
 
--- `rowCount: Math.ceil((firstDayOffset + daysInMonth) / 7)`. Four to six, and the mirror sizes
--- itself to the answer rather than always drawing six: a fixed six put a row of seven blank cells
--- under September 2026, which reads as the tooltip being too tall for its contents.
+-- `rowCount: Math.ceil((firstDayOffset + daysInMonth) / 7)`. Four to six rows; the mirror sizes
+-- itself to the answer. Fixed six-week sizing left seven blank cells under September 2026.
+-- That made the tooltip too tall for its contents.
 local function rows_in(now)
     local _, lead, days_in_month = month_of(now)
     return math.ceil((lead + days_in_month) / COLUMNS)
@@ -147,10 +145,9 @@ local title = cell(oblisk.system:map(function(s)
     return { { text = os.date("%B %Y", (s and s.time) or os.time()), bold = true } }
 end), theme.FG, theme.font.sm, { width = "Fill", align = "Center" })
 
--- `implicitWidth`/`implicitHeight`, which the mirror hands to its layout and a `popup` has to be
--- told: § 6 sizes a popup surface explicitly, so its host cannot measure this the way a `Column`
--- would. The height is a signal because the row count is: a five-week month is one `DAY_SIDE`
--- shorter than a six-week one, and § 6 takes `integer|Bound` for exactly this.
+-- `implicitWidth`/`implicitHeight` are measured by the mirror, but § 6 sizes a popup surface
+-- explicitly, so its host cannot measure this like a `Column`. Height follows row count: a
+-- five-week month is one `DAY_SIDE` shorter than a six-week one, and § 6 takes `integer|Bound`.
 --
 -- 1.2 is `renderer::text::shaping::LINE_HEIGHT_RATIO`. Sizing a fixed surface is the one place a
 -- config has to know it; everything else lets the engine measure.

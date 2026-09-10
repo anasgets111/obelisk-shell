@@ -1,6 +1,5 @@
--- Classifies whether a player shows video rather than playing a song.
--- Rust deliberately does not answer this (ADR-0137). The Supervisor exposes only `url` and
--- `desktop_entry`; these four preference lists live in config and may go stale independently.
+-- Rust deliberately does not answer this (ADR-0137). The Supervisor provides no video flag; config
+-- uses `url`, `desktop_entry`, and fallback `identity`; four lists may go stale independently.
 -- Mirrors `MediaService.qml`'s `_isVideo`; order is load-bearing:
 --   1. A known video application is video whatever it plays.
 --   2. A non-browser is not video; a music player publishing `.mp4` remains a music player.
@@ -94,7 +93,6 @@ function media.is_playing_video(m)
     return false
 end
 
---- The same question as a signal, for anything that draws it.
 media.video_playing = oblisk.mpris:map(media.is_playing_video)
 
 return media

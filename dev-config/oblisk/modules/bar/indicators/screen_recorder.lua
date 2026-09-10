@@ -1,16 +1,15 @@
 -- Mirrors ScreenRecorder.qml: one circle with three states, and three mouse buttons that do
 -- different things.
 --
--- Left starts a region and stops a running capture, middle records the focused output, right opens
--- the panel. Three buttons on one indicator is unusual here -- every other one is left-click only,
--- and `components/icon_button.lua` guards that deliberately -- but it is the mirror's own design
--- and it is the right one: the two captures differ only in extent, so making the common pair one
--- click each beats a panel round trip, while the panel keeps every choice reachable without
--- remembering which button is which.
+-- Left starts a region or stops a capture; middle records focused output; right opens the panel.
+-- Three buttons on one indicator are unusual here: every other one is left-click only, and
+-- `components/icon_button.lua` deliberately guards that. Mirror makes each capture one click
+-- because they differ only in extent; that beats a panel round trip.
+-- The panel keeps every choice reachable without remembering which button is which.
 --
--- The ground says recording, the glyph says what a click will do. `activeColor` while recording and
--- the plain control ground while paused, matching the mirror: a paused capture is not consuming
--- anything, so it should not keep the bar lit.
+-- Ground says recording; glyph says click action. `activeColor` while recording;
+-- plain control ground while paused matches mirror: a paused capture consumes nothing,
+-- so the bar need not stay lit.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -61,9 +60,8 @@ end), nil, {
     end,
 })
 
--- Two lines rather than the mirror's one string: its tooltip is a sentence listing three buttons,
--- which at `font.xs` is either 400px wide or wrapped into something nobody reads. The first line is
--- the state, the second is what the buttons do -- the same facts, sorted.
+-- Two lines rather than mirror's one tooltip: three buttons. At `font.xs`, it is 400px wide or
+-- wraps into something nobody reads; first line is state, second is actions, facts stay sorted.
 local screen_recorder_tooltip = tooltip({
     id = "screen_recorder_tooltip",
     slot = SLOT,

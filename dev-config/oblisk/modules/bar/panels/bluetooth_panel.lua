@@ -1,11 +1,7 @@
 -- Mirrors BluetoothPanel.qml: radio switch, then paired and discovered devices in named sections.
 --
--- The old header opened with a grey `bluetooth` word, an `enabled` switch, and a `scanning` line
--- with a refresh button. Its single list made a connected headset and anonymous beacon identical;
--- discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` does not skip an empty string.
--- Two lists in one column would each want their own extent, and neither knows what the other took.
--- Now paired devices are ringed with a battery badge and disconnect/forget actions; available
--- devices use their address when unnamed and show only the pair action.
+-- Discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` keeps an empty string. Paired
+-- rows can show battery, disconnect and forget; available rows fall back to MAC and show pair.
 --
 -- Dropped: the "Visible" tile (`set_discoverable` is unavailable) and codec picker (`codec` is
 -- always `nil`, ADR-0030). Discovery is a header button so both radio panels open the same way.
@@ -25,8 +21,7 @@ local panel_empty_state = require("components.panel_empty_state")
 local KIND = "bluetooth"
 local SCROLL = scroll("bluetooth_devices")
 
--- One glyph per § 2.6 `category`, centralized in `config/icons.lua`; discovered devices without one
--- use the generic glyph.
+-- One glyph per § 2.6 `category`, from `config/icons.lua`; missing categories use `generic`.
 local function device_icon(device)
     return icons.device[device.category or "generic"] or icons.device.generic
 end
@@ -58,7 +53,6 @@ local function enabled(b)
     return b ~= nil and b.enabled
 end
 
--- Header subtitle: connection count/name/battery, or the radio's current activity.
 local function state_line(b)
     if not b.enabled then
         return "off"
@@ -75,8 +69,8 @@ local function state_line(b)
     return b.discovering and "scanning…" or "no devices connected"
 end
 
--- `BatteryBadge`: the level as a small filled pill, red under 10%, amber under 20%, accent above.
--- The capsule itself is `components/info_badge.lua`; only the level's colour is bluetooth's.
+-- `BatteryBadge` is red under 10%, amber under 20%, and accent above; its capsule is
+-- `components/info_badge.lua`.
 local function battery_badge(device)
     local text = battery_text(device)
     if not text then
@@ -172,9 +166,7 @@ local body = {
         active = oblisk.bluetooth:map(enabled),
         subtitle = util.label(oblisk.bluetooth, state_line),
         trailing = {
-            -- Scan toggles discovery. It used to start discovery with no stop except BlueZ's
-            -- timeout;
-            -- the header now says "scanning…" while it runs.
+            -- Scan toggles discovery; the header says "scanning…" while it runs.
             icon_button(icons.refresh, function()
                 local b = oblisk.bluetooth:get()
                 oblisk.bluetooth:invoke((b and b.discovering) and "stop_discovery" or "start_discovery")

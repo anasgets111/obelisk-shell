@@ -2,8 +2,8 @@
 -- list. The bar only reports the count; installs happen here (ADR-0113 amendment).
 --
 -- This file owns wording, formatting, and thresholds; `oblisk.updates` stays unchanged. The
--- Supervisor publishes `install_exit_code` and pacman's output; here "failed retrieving file" maps
--- to "check your connection". Numbers are language-neutral; that sentence is not.
+-- Supervisor publishes `install_exit_code` and pacman's output; "failed retrieving file" becomes
+-- "could not download; check the connection". Numbers are language-neutral; that sentence is not.
 --
 -- Not carried over: spinner (no per-frame property, ADR-0021) and copy-log button (no clipboard
 -- primitive). Restart-safe check scheduling lives in `modules/bar/indicators/updates.lua` now that
@@ -24,8 +24,7 @@ local PACKAGE_SCROLL = scroll("update_packages")
 local LOG_SCROLL = scroll("update_log")
 
 -- Close clears this and the next install sets it. "I have read the result" belongs to the panel,
--- not
--- pacman; QML keeps the same state in `dismissResult()`.
+-- not pacman; QML keeps the same state in `dismissResult()`.
 local dismissed = state("updates_result_dismissed", false)
 
 -- Stamp the install-start click: `install_finished_at` is published, and the click is the only
@@ -170,8 +169,7 @@ local function last_check_line(u)
     return "checked " .. os.date("%b %d, %H:%M", at)
 end
 
--- Sort by name. The capability uses `alpm`'s installed-database order, which has no useful reading
--- order.
+-- Sort by name; `alpm`'s installed-database order has no useful reading order.
 local sorted_packages = oblisk.updates:map(function(u)
     local list = {}
     for _, package in ipairs(packages(u)) do
@@ -254,13 +252,11 @@ local body = {
             }),
         },
     },
-    -- Status and detail.
     panel_card({
         cell(util.label(oblisk.updates, status_line), theme.FG, theme.font.md),
         cell(util.label(oblisk.updates, detail_line), theme.DIM, theme.font.xs),
         -- Determinate only while pacman counts packages. An unanimated indeterminate bar only
-        -- repeats
-        -- "wait"; wrap it because `meter` has no `visible` property.
+        -- repeats "wait"; wrap it because `meter` has no `visible` property.
         row {
             width = "Fill",
             visible = util.shown_when(oblisk.updates, function(u)
@@ -280,10 +276,10 @@ local body = {
     -- List: name left, old/new versions in fixed columns, arrow between them. A heading row would
     -- duplicate the table's headings.
     --
-    -- Fixed columns make versions readable down the table; the name takes the remainder and elides.
+    -- Fixed columns keep versions readable down the table; the name takes the remainder and elides.
     --
-    -- Own card, like every mirror section. A list on the panel's glass looked like package names
-    -- floating over the window behind it.
+    -- Own card, like every mirror section. A list on the panel's glass made package names float
+    -- over the window behind it.
     panel_card({
         list {
             width = "Fill",
@@ -353,7 +349,6 @@ local body = {
                 end,
                 "updates-install",
                 {
-                    -- The panel's purpose, and its only solid control.
                     tone = "solid",
                     width = "Fill",
                     visible = oblisk.updates:map(function(u)

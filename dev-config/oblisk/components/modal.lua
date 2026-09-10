@@ -1,8 +1,7 @@
--- One modal's card and the motion `OModal.qml` gives it, for `modules/global/modal_host.lua` to
--- stack with the others under one scrim. The card fades, scales from 0.97 and rises by
--- `spacingMd`, OutCubic opening and InCubic closing (ADR-0146, ADR-0149). The wrapper lingers
--- visible through the exit, so switching modals cross-fades the old card out against the new one
--- coming in.
+-- One modal card and the motion `OModal.qml` gives it, for `modules/global/modal_host.lua` to stack
+-- under one scrim. The card fades, scales from 0.97, rises by `spacingMd`, and uses OutCubic
+-- opening and InCubic closing (ADR-0146, ADR-0149). The wrapper lingers through exit. A modal
+-- switch cross-fades the old card against the new one.
 local theme = require("config.theme")
 local util = require("lib.util")
 local ui_state = require("lib.ui_state")
@@ -36,12 +35,10 @@ return function(opts)
     return {
         kind = opts.kind,
         keyboard = opts.keyboard or false,
-        -- Screen-sized, so the card keeps its own placement (a computed `margin`, or centre
-        -- aligns) inside it, and the scale pivots on the screen's centre, where the card sits.
-        -- Stacking, not a column: a column governs its children's vertical placement itself, so a
-        -- card's own `align_v` would be dropped and every card would hang from the top.
-        -- Hidden once the exit has run: a hidden subtree is frozen and its fields are out of the
-        -- keyboard's reach.
+        -- Screen-sized, so the card keeps its own `margin` or centre alignment, and scale pivots on
+        -- the screen's centre. Stacking, not a column: columns control child placement, which would
+        -- drop a card's own `align_v` and hang every card from the top. Hidden after exit, subtrees
+        -- freeze and their fields cannot receive keyboard input.
         node = rect {
             width = "Fill",
             height = "Fill",

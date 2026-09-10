@@ -1,10 +1,9 @@
--- Development bar, real-session fixture, and worked example. Where fixture and example conflict,
--- the fixture wins.
+-- Development bar, real-session fixture, and worked example. If they conflict, the fixture wins.
 -- `cargo build --workspace && XDG_CONFIG_HOME=dev-config target/debug/supervisor`.
--- Build both binaries first. Supervisor finds Renderer beside its binary via
--- `supervisor/src/generation.rs`'s `renderer_binary_path`, not through Cargo; `cargo run -p
--- supervisor` can rebuild one half and launch stale `target/debug/renderer`. A Renderer older than
--- `fonts` then reports `attempt to call a nil value (global 'fonts')` at this file.
+-- Supervisor finds Renderer beside its binary via `supervisor/src/generation.rs`'s
+-- `renderer_binary_path`, not through Cargo; `cargo run -p supervisor` can rebuild one half and
+-- launch stale `target/debug/renderer`. A Renderer older than `fonts` then reports `attempt to call
+-- a nil value (global 'fonts')` at this file.
 --
 -- Zones and module order copy `~/.config/quickshell`, including the rightmost clock. ADR-0053
 -- exposed the need for clock, battery and volume data sources; none had a source until that ADR.
@@ -13,11 +12,11 @@
 -- topology and triggers a full PBA generation swap (dbus spec § 14); other edits reload in place on
 -- the same Lua VM.
 
--- Imports mirror the Quickshell tree. `config/` holds tokens; `components/` holds dumb reusable
--- widgets, not feature logic; `lib/` holds node-free functions; `modules/` assembles
--- `bar/indicators/`, `bar/panels/`, `global/` for surfaces outside the bar, `notification/`,
--- `osd/`, and `shell/`'s panel host. There is no `services/`: Quickshell's 25
--- singleton `*Service.qml` files each own their D-Bus connection, poll loop or socket.
+-- Imports mirror the Quickshell tree. `config/` holds tokens, `components/` dumb reusable widgets,
+-- `lib/` node-free functions, and `modules/` assembles `bar/indicators/`, `bar/panels/`,
+-- `global/`, `notification/`, `osd/`, and `shell/`'s panel host. There is no `services/`:
+-- Quickshell's 25 singleton `*Service.qml` files each own their D-Bus connection, poll loop or
+-- socket.
 -- Supervisor-owned capabilities push signals on `oblisk`; the config reads `oblisk.audio`, and the
 -- data layer is not this config's job.
 --
@@ -54,8 +53,7 @@ local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
 local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip
 local wallpaper_tooltip = require("modules.bar.indicators.wallpaper_button").tooltip
--- Icon-only wifi/Bluetooth indicators show strength, not network/device names; tooltips restore
--- the labels they lost.
+-- Icon-only wifi/Bluetooth indicators show strength; tooltips restore network/device labels.
 local network_tooltip = require("modules.bar.indicators.network").tooltip
 local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 local screen_recorder_tooltip = require("modules.bar.indicators.screen_recorder").tooltip

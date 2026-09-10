@@ -1,24 +1,24 @@
--- `IdleService.qml`'s three `IdleMonitor`s and `setDisplaysPowered`, as one threshold and handler.
+-- `IdleService.qml`'s three `IdleMonitor`s and `setDisplaysPowered`, as one threshold plus handler.
 --
--- No surface, like `modules/global/power_events.lua`. `shell.lua` requires this registration for
--- side effects; `lib/idle.lua` holds shared facts so the bar need not require this file.
+-- No surface, like `modules/global/power_events.lua`. `shell.lua` requires this for side effects;
+-- `lib/idle.lua` holds shared facts so the bar need not require this file.
 --
 -- ## Why the clock
 --
--- `lib/idle.lua` has the argument: thresholds cannot be unregistered, so editable timeouts must be
+-- `lib/idle.lua` has the clock: thresholds cannot be unregistered, so editable timeouts must be
 -- numbers rather than registrations.
 --
 -- ## What is not guarded here
 --
 -- No `armed` or inhibitor check, and no manual-toggle reread. Any logind inhibitor, including ours
 -- or `systemd-inhibit`'s, makes the Supervisor hold threshold events and return `Resumed` for work
--- already idle (ADR-0139). `on_resume` zeros `idle.since`, so the handler returns while held. Only
--- the master switch is unknown to the framework and checked here.
+-- already idle (ADR-0139). `on_resume` zeros `idle.since`, so the handler returns while held; only
+-- the master switch is checked here.
 --
 -- ## Live testing
 --
--- Set tested thresholds to their shortest option and leave `suspend` off. A stage suspending the
--- machine thirty seconds after typing stops cannot be watched firing.
+-- Test with the shortest thresholds and `suspend` off. A stage suspending the machine thirty
+-- seconds after typing stops cannot be watched firing.
 local idle = require("lib.idle")
 local store = require("lib.store")
 
@@ -67,16 +67,15 @@ end, function()
 end)
 
 -- One pass per `oblisk.system` tick, once a second; the bar clock and `power_menu.lua` countdown
--- already use it. Cost is one comparison while idle and an early return otherwise.
+-- already use it. Idle work is one comparison, with an early return otherwise.
 --
 -- This is `IdleService.qml`'s shape, not a scheduler: find the stage armed *now*, stamp it once,
--- and
--- fire after its delay. Clear every other stamp, like `IdleMonitor { enabled: false }` tearing down
--- a timer.
+-- and fire after its delay. Clear every other stamp, like `IdleMonitor { enabled: false }` tearing
+-- down a timer.
 --
--- Clearing matters after unlock: the lock stage becomes armed again and its successor loses its
--- stamp, so the screen does not blank a minute after a lock the user already answered. No unlock
--- watcher is needed; the question is recomputed each second.
+-- After unlock, the lock stage arms again and its successor loses its stamp, so the screen does not
+-- blank a minute after a lock the user already answered. No unlock watcher is needed; recompute it
+-- each second.
 oblisk.system:on_change(function(s)
     local since = idle.since:get()
     if since == 0 then
@@ -84,9 +83,8 @@ oblisk.system:on_change(function(s)
     end
     local settings = idle.read(store.idle:get())
     if not settings.enabled then
-        -- Clear on the way out, not just on the way in. Turning automation off mid-countdown used
-        -- to leave the stamp behind, so turning it back on resumed from where it stopped rather
-        -- than from now.
+        -- Clear on the way out: disabling automation mid-countdown must not leave a stamp that
+        -- makes re-enabling resume from where it stopped rather than from now.
         if next(idle.armed_at:get() or {}) ~= nil then
             idle.armed_at:set({})
             idle.fired_at:set({})
@@ -108,8 +106,8 @@ oblisk.system:on_change(function(s)
     idle.armed_at:set(next_stamps)
 
     if armed and s.time - next_stamps[armed.key] >= armed.delay then
-        -- Once per arming. A stage that reports `done` is walked past on the next tick, but a
-        -- terminal one is still armed after it acts, so it would fire again every second.
+        -- Fire once per arming. A stage with `done` is walked past next tick; a terminal stage
+        -- stays armed after acting and would otherwise fire every second.
         local fired = idle.fired_at:get() or {}
         if fired[armed.key] ~= next_stamps[armed.key] then
             idle.fired_at:set({ [armed.key] = next_stamps[armed.key] })
@@ -119,8 +117,8 @@ oblisk.system:on_change(function(s)
 end)
 
 -- Non-button changes to "is something holding this awake". The button uses `idle.set_manual`;
--- settings
--- land on `oblisk.storage`, so disabling "keep awake for media" drops the hold during playback.
+-- settings land on `oblisk.storage`, so disabling "keep awake for media" drops the hold during
+-- playback.
 oblisk.privacy:on_change(idle.sync_inhibit)
 oblisk.mpris:on_change(idle.sync_inhibit)
 oblisk.storage:on_change(idle.sync_inhibit)

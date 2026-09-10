@@ -5,13 +5,11 @@
 -- `getent passwd`, the node name out of `uname -n`. Both are decoration -- callers draw `$USER` and
 -- "localhost" until they answer, and keep them if they never do.
 --
--- Extracted from `modules/global/lock.lua` when the notifications panel wanted the same name for
--- its greeting. Two readers is the extraction rule, and it matters more than usual here: the two
--- processes must run once for the session, not once per module that asks.
+-- Shared with `modules/global/lock.lua` and the notifications panel. Two process calls run once per
+-- session, not per module that asks.
 --
--- Kept in `state` rather than a module local because a reload re-runs this file: the guard below is
--- what stops a save spawning two more processes, since the value outlives the evaluation that set
--- it and a table `initial` never re-seeds.
+-- Kept in `state`, not a module local. Reload re-runs this file; guard stops a save spawning two
+-- more processes. The value outlives its evaluation; a table `initial` never re-seeds.
 local identity = state("lock_identity", { name = "", host = "" })
 
 local USER = os.getenv("USER") or "user"

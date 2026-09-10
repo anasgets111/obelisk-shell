@@ -2,21 +2,18 @@
 -- `on_click` receives the button rect (ADR-0050 decision 3) and writes the named `state` read by
 -- the surface.
 -- Only `x` is read now that `modules/shell/panel_host.lua` is a layer surface: it places the card
--- below the bar and clamps it to the output instead of using popup `anchor_rect`/`gravity`. Keep
--- the
+-- below the bar and clamps it to the output instead of popup `anchor_rect`/`gravity`. Keep the
 -- other fields because `on_click` still supplies this shape; narrowing it only hides destructuring.
--- The initial is the indicator's declared size, no longer needed to keep evaluation alive but still
--- honest.
--- The sole require is one-way: pure `lib/util` has no nodes/signals and cannot create a cycle.
+-- The initial is the indicator's declared size. The sole require is one-way: pure `lib/util` has no
+-- nodes/signals and cannot create a cycle.
 local util = require("lib.util")
 
 local popup_anchor = state("popup_anchor", { x = 0, y = 0, width = 70, height = 24 })
 local settings_open = state("settings_open", false)
 
--- `modules/shell/panel_host.lua`'s shared-surface signals: whether it is up and which panel it
--- shows.
--- One surface serves every bar panel, matching Quickshell's `Modules/Shell/PanelHost.qml`; only one
--- can be on screen, and one slot enforces that rather than five files coordinating.
+-- `modules/shell/panel_host.lua`'s shared-surface signals: whether it is up and its current panel.
+-- One surface serves every bar panel, matching Quickshell's `Modules/Shell/PanelHost.qml`; one slot
+-- enforces that rather than five files coordinating.
 local panel_open = state("panel_open", false)
 local panel_kind = state("panel_kind", "")
 
@@ -47,8 +44,8 @@ end
 -- ## Joining a network that broadcasts no name
 -- The Supervisor drops empty-SSID access points from `available_networks`, so a hidden network has
 -- no row to click: the join starts from a typed name instead. `NetworkPanel.qml` walks one sheet
--- through three steps for it -- name, then a wait, then the password -- and these are the three
--- signals that sheet is drawn from.
+-- through three steps -- name, then a wait, then the password -- and these are the three signals it
+-- is drawn from.
 --
 -- `hidden_prompt` is the mirror's `isHiddenTarget`: the flow is running. `hidden_draft` is what is
 -- in the name field this instant, kept because the Next button needs the text a `textfield` only
@@ -61,21 +58,18 @@ local hidden_ssid = state("network_hidden_ssid", "")
 
 -- Which step of the credential sheet is on screen, `""` for none: the mirror's
 -- `ssidMode`/`waitingMode`/`passwordMode` as one string, because they are points on one path and
--- never two at once. `panel_host` reads it to decide whether to hold the keyboard, and the panel to
--- decide what the sheet draws.
+-- never two at once. `panel_host` reads it for keyboard focus, and the panel reads it for drawing.
 --
--- A password prompt outranks the hidden steps because it also answers a plain click on a secured
--- row, where no name was ever typed. `password_ssid` names whichever network is being asked about
--- (§ 2.5).
+-- A password prompt outranks the hidden steps because it answers a plain click on a secured row,
+-- where no name was typed. `password_ssid` names whichever network is being asked about (§ 2.5).
 --
 -- The end of a hidden join is *read*, not latched. A `computed` may not have side effects
--- (ADR-0021) and nothing else in a config runs on a capability push, so there is no
--- `onConnectSucceeded` to close the sheet the way the mirror does: the sheet is up while the join
--- is unfinished, and `n.ssid` reaching the typed name is what finishes it.
+-- (ADR-0021), so `n.ssid` reaching the typed name finishes the sheet instead of an
+-- `onConnectSucceeded` callback.
 --
--- `connect_error` is checked last. Every fresh attempt clears it -- `begin_connect` and
--- `request_password` both do -- but only once the Supervisor has answered, so an error still
--- standing from the previous try must not outvote the attempt now in flight.
+-- `connect_error` is checked last. `begin_connect` and `request_password` clear it on each fresh
+-- attempt, but only once the Supervisor has answered, so an old error cannot outvote the attempt in
+-- flight.
 local credential_step = computed({ hidden_prompt, hidden_ssid, oblisk.network }, function(active, name, n)
     if n and n.password_ssid ~= nil then
         return "password"
@@ -118,11 +112,10 @@ local function open_hidden_prompt()
 end
 
 -- The panel host's single close path, including prompts. `network:connect` on an unsaved secured
--- network parks intent and raises `password_ssid` (ADR-0085); closing hides the field, while
--- `cancel_connect` clears that intent and is a no-op otherwise, so generic close cannot clear
--- `connect_error` accidentally.
--- Keep it here rather than in `panel_host`'s click-outside catcher and the toggle: one writer per
--- edge costs one capability call in `ui_state`.
+-- network parks intent and raises `password_ssid` (ADR-0085); `cancel_connect` clears it and
+-- is a no-op otherwise, so generic close cannot clear `connect_error` accidentally.
+-- Keep it here rather than in `panel_host`'s click-outside catcher and the toggle.
+-- One writer per edge costs one capability call in `ui_state`.
 local function close_panel()
     -- Reading history counts as seeing its notifications. Mark on the way out, not only in, so
     -- arrivals while the panel was open do not get another popup turn.
@@ -137,9 +130,8 @@ end
 -- `panel_host` stopped being an `xdg_popup` (ADR-0087).
 -- Set-only was required under the old grab: niri delivered the opening-button click because the bar
 -- was the popup's parent inside the grab tree, so toggling closed the panel just opened. It also
--- fought `on_dismiss`, which already wrote false; switching network while bluetooth was open hit
--- both edges, and `on_dismiss` had no token identifying the popup, sometimes requiring a second
--- click.
+-- fought `on_dismiss`, which already wrote false; switching panels hit both edges, and `on_dismiss`
+-- had no token identifying the popup, sometimes requiring a second click.
 -- A layer surface removes those cases: nothing dismisses it behind our back and switching clicks
 -- reach the indicator directly. The showing panel closes, a different one replaces it, or a closed
 -- host opens.
@@ -161,8 +153,7 @@ local function toggle_panel(kind, rect)
     panel_open:set(true)
 end
 
--- Whether `kind` is on screen, matching `ShellUiState.isPanelOpen(kind)` and indicator accent
--- rings.
+-- Whether `kind` is on screen, matching `ShellUiState.isPanelOpen(kind)` and indicator rings.
 -- Both signals matter: `panel_kind` survives close, so reading it alone leaves the former indicator
 -- ringed.
 local function panel_showing(kind)
@@ -210,24 +201,20 @@ local idle_settings_open = modal_showing("idle_settings")
 -- Keep them here because the card is drawn in both `modules/notification/popup.lua` and
 -- `modules/bar/panels/notification_history.lua`, and expansion must match between them.
 -- Use tables, not one signal per group: application keys appear only when notifications arrive, and
--- minting registry entries at resolve time would grow for the session. Table `initial` is not an
--- edit
+-- Minting registry entries at resolve time would grow the session. Table `initial` is not edited
 -- on reload (ADR-0044 decision 5), so open state survives config saves.
 local expanded_groups = state("notification_expanded_groups", {})
 local expanded_messages = state("notification_expanded_messages", {})
 
--- Reply draft: notification id (`0` means none) and text. One slot matches the Renderer, which
--- holds
--- one plain-field buffer; the id keeps Send honest, so Send on A with B's draft sends nothing
--- (ADR-0109). Every inline-reply card draws its field
--- (`Loader { active: hasInlineReply }`); no open
--- state or Reply button remains.
+-- Reply draft: id (`0` means none) and text. One slot matches the Renderer's plain-field buffer.
+-- The id keeps Send honest, so Send on A with B's draft sends nothing (ADR-0109).
+-- Every inline-reply card draws `Loader { active: hasInlineReply }`; no open state remains.
+-- No Reply button remains.
 local reply_draft_id = state("notification_reply_draft_id", 0)
 local reply_draft = state("notification_reply_draft", "")
 
--- Toggle one table key. Identity comparison requires a fresh copy and prevents mutating the
--- previous
--- value during a resolve that may roll back.
+-- Toggle one table key. Copy first so identity comparison does not mutate the previous value during
+-- resolve that may roll back.
 local function toggle_key(signal, key)
     local next_open = {}
     for k, open in pairs(signal:get() or {}) do
@@ -260,9 +247,8 @@ local function clear_reply(id)
 end
 
 -- Whether nonempty draft text belongs to a notification still in the feed. A surface binds
--- `keyboard_interactivity` to this and its hover (ADR-0109): click-to-focus compositors must not
--- drop
--- the keyboard when the pointer leaves mid-sentence. Pure, so it can be `computed`.
+-- `keyboard_interactivity` to this and its hover (ADR-0109), so click-to-focus compositors do not
+-- drop the keyboard when the pointer leaves mid-sentence. Pure, so it can be `computed`.
 local reply_pending = computed({ reply_draft_id, reply_draft, oblisk.notifications }, function(id, text, n)
     if id == 0 or text == nil or text == "" then
         return false

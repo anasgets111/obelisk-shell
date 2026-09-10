@@ -1,8 +1,7 @@
--- The mirror's `MainScreen`: one surface holding the scrim, the outside-click catcher and every
--- modal, with `ShellUiState.activeModal` choosing which card shows. One surface, not one per
--- modal: two cross-fading surfaces each brought a scrim, stacking to nearly double darkness on
--- frames never in step, and a separate scrim surface stacked above the modal and took its outside
--- click, since same-layer order is the compositor's to decide.
+-- The mirror's `MainScreen`: one surface holds the scrim, outside-click catcher, and every modal;
+-- `ShellUiState.activeModal` chooses the card. One surface, not one per modal: two cross-fading
+-- surfaces each brought a scrim, nearly doubling darkness on frames never in step. A separate scrim
+-- above the modal also took outside clicks, since same-layer order is the compositor's to decide.
 local theme = require("config.theme")
 local util = require("lib.util")
 local ui_state = require("lib.ui_state")
@@ -32,8 +31,8 @@ return panel {
     height = "Fill",
     -- Mapped through the last card's exit fade (ADR-0146).
     visible = util.linger(any_modal, theme.animation_ms),
-    -- Exclusive only while a modal that wants it is showing, not while one is on its way out: a
-    -- field must be typable without a click, and a surface fading out must hold nothing.
+    -- Exclusive only while a modal that wants it shows, not while it exits: a field must be typable
+    -- without a click, and a fading surface must hold nothing.
     keyboard_interactivity = ui_state.active_modal:map(function(kind)
         for _, modal in ipairs(modals) do
             if modal.kind == kind and modal.keyboard then
@@ -51,16 +50,13 @@ return panel {
                 width = "Fill",
                 height = "Fill",
                 background = theme.SCRIM,
-                -- Dims, and does not blur. Blurring the whole screen here was tried and is the
-                -- louder reading: the desktop stops being legible at all, and a modal that only
-                -- wants attention does not need the rest of the screen destroyed. The cards ask
-                -- for themselves instead (ADR-0195), so what is blurred is the glass, and the
-                -- scrim behind it stays a dim over a sharp desktop.
+                -- Dims, not blur. Full-screen blur made the desktop illegible; a modal that needs
+                -- attention does not need the rest destroyed. Cards request blur themselves
+                -- (ADR-0195), so only the glass blurs and the scrim dims a sharp desktop.
                 --
-                -- Blur cannot fade either way. `set_blur_region` carries a region and nothing
-                -- else, so the step is a step; keeping it inside the card's own box is what makes
-                -- that unnoticeable, where the full-screen version had to be timed against the dim
-                -- to hide it.
+                -- Blur cannot fade: `set_blur_region` carries only a region, so the step is a step.
+                -- Keeping it inside the card's box makes it unnoticeable; the full-screen version
+                -- had to be timed against the dim to hide it.
                 opacity = any_modal:map(function(open)
                     return open and 1 or 0
                 end),
@@ -70,9 +66,9 @@ return panel {
                     }
                 end),
             },
-            -- Outside catcher and the cards' parent in one screen-sized node: `hit::descend` stops
-            -- at the first child containing the point, so the catcher has to be the node the cards
-            -- sit in, not a sibling under them. Clicks on a card stop at the card.
+            -- Outside catcher and cards' parent in one screen-sized node: `hit::descend` stops at
+            -- the first child containing the point, so the catcher must contain cards, not sit
+            -- under them. Card clicks stop at the card.
             button {
                 width = "Fill",
                 height = "Fill",

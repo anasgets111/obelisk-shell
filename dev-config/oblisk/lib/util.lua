@@ -1,5 +1,5 @@
--- Pure helpers with no nodes, kept out of `components/`; like the mirrored config, `Components/`
--- holds widgets and `Services/Utils/` holds functions.
+-- Pure helpers with no nodes, kept out of `components/`; the mirrored config keeps widgets in
+-- `Components/` and functions in `Services/Utils/`.
 local util = {}
 
 -- Capability signals are `nil` until the first Supervisor snapshot, and payload readers may raise.
@@ -17,9 +17,8 @@ function util.label(signal, read)
     end)
 end
 
--- Human-readable words for `oblisk.battery.state`'s seven UPower names. The pill tooltip, power
--- menu,
--- and lock screen share this wording.
+-- Human-readable words for `oblisk.battery.state`'s seven UPower names, shared by the pill tooltip,
+-- power menu, and lock screen.
 -- `PendingCharge` matters when a laptop with `charge_control_end_threshold` set sits plugged in at
 -- the limit; the old `charging` boolean called it "discharging", opposite to the cable state.
 -- `PendingDischarge` is the mirror: draining to a lowered limit.
@@ -37,12 +36,10 @@ function util.battery_phrase(state)
     return BATTERY_PHRASES[state] or "state unknown"
 end
 
--- Whether a battery is actually running down, the only time a low reading is coloured.
--- `Discharging`
--- is not mains; `PendingDischarge` is mains and stops at its limit, so it does not warn.
--- ETA is `", 2h 14m left"` or `""`. UPower estimates one duration at a time and neither while it
--- is still learning the rate, so the empty string is common during the first minute after a plug or
--- a boot, not an error.
+-- Battery display helpers: warnings use `Discharging` and `Empty`; `PendingDischarge` is mains and
+-- stops at its limit, so it does not warn. `battery_eta` returns `", 2h 14m left"` or `""`. UPower
+-- UPower estimates one duration at a time and neither while learning the rate, so the empty string
+-- is common during the first minute after a plug or a boot, not an error.
 function util.battery_eta(b)
     local seconds, suffix
     if b.time_to_empty then
@@ -77,7 +74,6 @@ end
 -- Five-level glyph plus the two cable states, shared by `modules/bar/indicators/battery.lua` and
 -- the lock card's status row. It takes the raw payload so a caller with a `nil` battery still gets
 -- the AC glyph rather than a branch of its own.
---
 -- `Charging` gets the bolt. Mains at a charge limit and full get the plug: the cable is in and the
 -- level is not moving, a state once indistinguishable from running on battery.
 function util.battery_glyph(b)
@@ -123,11 +119,10 @@ function util.app_entry(applications, app_id)
     return by_app_id[app_id] or by_app_id[string.lower(app_id)]
 end
 
--- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`,
--- extracted
--- at the second call site (`components/pill.lua`). It takes raw `oblisk.audio`, not a signal, so
--- callers choose their `nil` behavior. It mirrors `volume_icon_name`'s five steps as Nerd Font
--- glyphs because the OSD accent-tints them and themed icons cannot be tinted.
+-- Shared icon mapping for `modules/bar/indicators/volume.lua`, `modules/osd/popup.lua`, and
+-- `components/pill.lua`. It takes raw `oblisk.audio`, not a signal, so callers choose their `nil`
+-- behavior. It mirrors `volume_icon_name`'s five steps as Nerd Font glyphs because the OSD
+-- accent-tints them and themed icons cannot be tinted.
 function util.volume_glyph(a)
     local icons = require("config.icons")
     if a == nil or a.muted then
@@ -169,10 +164,10 @@ function util.network_glyph(n)
 end
 
 -- `Theme.networkBandColor` plus the short label the panel draws beside the bars: "6G", "5G", "2.4".
--- Shared because the bar tints its glyph by the associated band and the panel tints every row, and
--- two copies of the mapping had already drifted apart -- one had 2.4 GHz yellow, the mirror's is
--- `warning`. Shaped like `volume_glyph`: raw payload in, no signal, caller decides about `nil`.
--- `nil` label with `FG` is the honest answer for ethernet and for a band nothing reported.
+-- Shared because the bar tints its glyph by the associated band and the panel tints every row; two
+-- copies had already drifted apart, with 2.4 GHz yellow in one and `warning` in the mirror. Like
+-- `volume_glyph`, it takes raw payload with no signal, and the caller decides about `nil`. A `nil`
+-- label with `FG` is the honest answer for ethernet and for a band nothing reported.
 ---@param ap AccessPointInfo?
 ---@return string? # Short band label, or `nil` when there is no band to name.
 ---@return Color # The band's colour, or `FG`.
@@ -221,14 +216,12 @@ end
 
 -- Hide a module with no content instead of showing a "--" pill. `visible` is a signal-bound base
 -- property (§ 5.1), so hidden children are skipped by row positioning rather than laid out at zero
--- width.
--- Use a codepoint budget here, the exception to `components/cell.lua`'s pixel-box rule. Centre-zone
--- modules need content-sized nodes between two `Fill` sides; bounding them made short
--- "(1) WhatsApp"
--- sit a hundred pixels left of centre.
--- ponytail: "WWWW" and "iiii" share four codepoints but differ in width, so this cuts to a ragged
--- pixel width. Upgrade with `text.max_width`, letting the engine measure/elide while reporting the
--- string's own width when it fits; that requires a layout change, not config.
+-- width. Use a codepoint budget here, the exception to `components/cell.lua`'s pixel-box rule.
+-- Centre-zone modules need content-sized nodes between two `Fill` sides; bounding them made short
+-- "(1) WhatsApp" sit a hundred pixels left of centre. ponytail: "WWWW" and "iiii" share four
+-- codepoints but differ in width, so this cuts to a ragged pixel width. Upgrade with
+-- `text.max_width`, letting the engine measure/elide while reporting the string's own width when it
+-- fits; that requires a layout change, not config.
 function util.truncate(value, limit)
     local s = tostring(value or "")
     local count = utf8.len(s)
@@ -238,16 +231,13 @@ function util.truncate(value, limit)
     return s:sub(1, utf8.offset(s, limit + 1) - 1) .. "..."
 end
 
--- `notification.body` is a parsed freedesktop markup span array (§ 2.7, ADR-0033), not a string.
--- The Supervisor parses it once, so config consumes it without reparsing.
--- `text.content` accepts the same run shape (ADR-0104): text passes through; links become
--- underlined `link_color` runs with `href`. The engine draws/reports pressed runs but knows no
--- URLs.
--- Image spans go to `util.notification_images`: `text` refuses runs without `text`, and pictures
--- have no place inside a text line. Like `NotificationText`'s `linkify`, scan only unlinked text so
--- senders' commonly pasted web/file addresses become pressable instead of forcing retyping, while
--- `<a href>` targets survive. Strip trailing sentence punctuation, which is almost never part of a
--- URL.
+-- `notification.body` is a parsed freedesktop markup span array (§ 2.7, ADR-0033). The Supervisor
+-- parses it once, and `text.content` accepts the same run shape (ADR-0104): links become underlined
+-- `link_color` runs with `href`, while the engine draws/reports pressed runs but knows no URLs.
+-- Image spans go to `util.notification_images` because `text` refuses runs without `text`. Like
+-- `NotificationText`'s `linkify`, scan only unlinked text so pasted web/file addresses become
+-- pressable while `<a href>` targets survive. Strip trailing sentence punctuation, which is almost
+-- never part of a URL.
 local URL_PATTERNS = { "%f[%S]https?://[^%s<>'\"]+", "%f[%S]file://[^%s<>'\"]+" }
 
 local function linkified(spans)
@@ -314,8 +304,7 @@ function util.notification_body(spans, link_color)
                 italic = span.italic or false,
                 underline = span.underline or is_link,
                 color = is_link and link_color or nil,
-                -- Carries the target to node `on_link` (ADR-0106); the engine never opens it, the
-                -- card does.
+                -- Carries `href` to `on_link` (ADR-0106). The engine never opens it; the card does.
                 href = is_link and span.href or nil,
             }
         end
@@ -345,9 +334,8 @@ function util.notification_links(spans)
     return links
 end
 
--- Inline body pictures (`<img src>`), trusted-root validated by the Supervisor; draw under text,
--- not
--- in it, as `util.notification_body` does.
+-- Inline body pictures (`<img src>`), trusted-root validated by the Supervisor; draw under text, as
+-- `util.notification_body` does.
 function util.notification_images(spans)
     local paths = {}
     for _, span in ipairs(spans or {}) do
@@ -375,15 +363,13 @@ function util.notification_key(notification)
 end
 
 -- Group the feed by sending application, turning eight chat messages into one card
--- (`NotificationCard.qml`'s `group`).
--- Key by sender `desktop_entry` (ADR-0101), or `app_name` when absent. Desktop ids avoid shared or
--- changing display names and key `applications.by_app_id` (ADR-0061), supplying installed `Name=`/
--- `Icon=`; before the first `oblisk.applications` push (`nil`), use the sender's name and icon.
--- Match `_compareGroups`: critical first, then newest notification. The newest-first feed keeps a
--- recently speaking app above one silent for an hour; key breaks equal-second ties between passes.
--- `opts.skip_transient` omits sender-marked `transient` notifications (ADR-0100): history omits
--- them,
--- popup does not.
+-- (`NotificationCard.qml`'s `group`). Key by sender `desktop_entry` (ADR-0101), or `app_name` when
+-- absent. Desktop ids avoid shared or changing display names and key `applications.by_app_id`
+-- (ADR-0061), supplying installed `Name=`/ `Icon=`; before the first `oblisk.applications` push
+-- (`nil`), use the sender's name and icon. Match `_compareGroups`: critical first, then newest
+-- notification. The newest-first feed keeps a recently speaking app above one silent for an hour;
+-- key breaks equal-second ties between passes. `opts.skip_transient` omits sender-marked
+-- `transient` notifications (ADR-0100): history omits them; popup does not.
 function util.group_notifications(feed, applications, opts)
     opts = opts or {}
     local groups, by_key = {}, {}

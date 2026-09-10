@@ -1,16 +1,16 @@
--- Fraction-filled track matching `Components/Slider.qml`: drag anywhere to set the value and wheel
--- to step. `button`'s `on_drag`/`on_wheel` provide track-local pointer coordinates and wheel
--- notches
--- (ADR-0116); the rest is arithmetic.
--- During a drag, the fill follows owned `state()` `pending`, avoiding a Supervisor round trip per
--- pixel. Release calls `on_commit` once at the final position, matching `Slider.qml`'s `committed`.
--- Keep `pending` until the capability snapshot carries the value, then clear it from one
--- `on_change` per slider name: clearing on release showed the old value during the PipeWire round
--- trip and flashed new, old, new. A signal without `on_change` (plain `state`) clears on release.
--- `pending` is numeric because `state()` fixes its signal type from the initial value and `nil` has
--- none; `-1` means "nothing held", outside the fraction range.
--- `children` stack over the fill, letting the volume pill lay its glyph and percentage over the
--- track as `Volume.qml` fills the whole control.
+-- Fraction-filled track matching `Components/Slider.qml`: drag sets value anywhere; wheel steps it.
+-- `button`'s `on_drag`/`on_wheel` provide track-local coordinates and wheel notches (ADR-0116).
+--
+-- During a drag, `state()` `pending` keeps fill local and avoids a Supervisor round trip per pixel.
+-- Release calls `on_commit` once at the final position, matching `Slider.qml`'s `committed`.
+--
+-- Keep `pending` until the capability snapshot carries the value.
+-- Clear it with one `on_change` per slider name. Clearing on release showed the old value during a
+-- PipeWire round trip showed old value, then flashed new, old, new.
+-- Plain `state` without `on_change` clears on release.
+-- `pending` is numeric because `state()` fixes its type at creation; `nil` has none.
+-- `-1` means "nothing held", outside the fraction range. `children` stack over the fill;
+-- `Volume.qml` fills the whole control.
 local theme = require("config.theme")
 
 ---@class SliderOpts
@@ -58,8 +58,8 @@ local function fraction_of(read, payload)
     return clamp(value)
 end
 
--- Names whose signal already has this component's `on_change`. A `list` rebuilds rows and sliders,
--- but one named `state()` signal needs one handler; a second would clear it twice.
+-- `watched` prevents duplicate `on_change` handlers when a `list` rebuilds rows and sliders.
+-- One named `state()` signal needs only one handler.
 local watched = {}
 
 ---@param opts SliderOpts

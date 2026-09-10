@@ -1,11 +1,6 @@
 -- Catppuccin Mocha. An invented palette would be a worse version of one already balanced.
 -- Shared tokens live here because every `shell.lua` module reads them and no module owns them.
 -- ADR-0047 clears the module cache before each re-evaluation, so edits recolour the bar in place.
---
--- Before Phase 26, Lua's compiled-in `package.path` searched `/usr/local/share/lua/5.4/` and the
--- process cwd, which nothing sets; resolved files were also cached, so edits silently did nothing.
--- Ten colours were enough for text pills, not shared spacing. Mirrored `Config/Theme.qml`
--- is 272 lines of named steps, keeping panel and bar geometry in sync.
 local theme = {}
 
 -- ## The responsive scale
@@ -20,12 +15,11 @@ local theme = {}
 -- consumers already accept (§ 5.1), at one `computed` per token when a second monitor matters.
 local function main_screen()
     -- The only module-scope signal read. Component tests in `renderer/src/lua/mod.rs` load
-    -- `components/` through a bare `Loader` with no `oblisk` namespace; an unguarded read takes
-    -- down every test with a traceback here. Other capabilities are read inside node properties
-    -- after evaluation.
+    -- `components/` through a bare `Loader` with no `oblisk` namespace, so other capabilities are
+    -- read inside node properties after evaluation.
     local screens = oblisk and oblisk.screens and oblisk.screens:get() or {}
-    -- First output, matching `MonitorService.activeMainScreen` on one head and guessing on many;
-    -- focused-output selection is not available here.
+    -- First output, matching `MonitorService.activeMainScreen` on one head; focused-output
+    -- selection is not available here.
     return screens[1]
 end
 
@@ -55,10 +49,8 @@ end)()
 
 local SCALE = (function()
     local screen = main_screen()
-    -- Use `screen.height` directly. `wayland/output.rs` already divides once: a 3840x2160 panel at
-    -- scale 2 arrives as 1080. `screen.scale` is an integer factor, not a fractional value, so the
-    -- old stub invited a second division. That failure was silent and affected only HiDPI machines:
-    -- 4K then read as 540px, floored `factor` at 0.75, and shrank every shell to smallest tokens.
+    -- Use `screen.height` directly. `wayland/output.rs` reports logical pixels, so a 3840x2160
+    -- panel at scale 2 arrives as 1080; `screen.scale` is not another divisor.
     local logical_height = FALLBACK_HEIGHT
     if screen ~= nil and screen.height ~= nil then
         logical_height = screen.height
@@ -93,9 +85,8 @@ local function alpha_of(hex)
     return (tonumber(digits:sub(7, 8), 16) or 255) / 255
 end
 
--- Replaces rather than multiplies alpha like `Theme.qml`'s `withOpacity`. Callers pass opaque bases
--- and the steps below; multiplying would make `withOpacity(bgSubtle, 0.5)` differ from
--- `withOpacity(bgColor, 0.5)`.
+-- Replaces rather than multiplies alpha like `Theme.qml`'s `withOpacity`; otherwise
+-- `withOpacity(bgSubtle, 0.5)` would differ from `withOpacity(bgColor, 0.5)`.
 function theme.with_opacity(hex, alpha)
     local r, g, b = channels(hex)
     return string.format("#%02x%02x%02x%02x", r, g, b, math.floor(math.max(0, math.min(1, alpha)) * 255 + 0.5))
@@ -114,9 +105,7 @@ end
 -- WCAG relative luminance and the mirror's 0.179 black/white threshold, matching `Theme.qml`'s
 -- `textContrast`. Composite translucent colours over `BG` first. Measuring the swatch made every
 -- hover glyph black: light-purple `ON_HOVER` at 45% alpha reaches the screen dark; alpha 1 is a
--- no-op.
--- Callers that choose a button background need its matching foreground too; this keeps them from
--- having to remember both.
+-- no-op. Callers get the matching foreground with the background.
 function theme.text_contrast(hex)
     local function linear(byte)
         local c = byte / 255
@@ -160,16 +149,14 @@ theme.SURFACE                   = "#313244ff"
 -- (ADR-0062).
 theme.HOVER                     = "#45475aff"
 theme.FG                        = "#cdd6f4ff"
--- Catppuccin subtext0, `Theme.qml`'s `textInactiveColor`. The old overlay0 (#6c7086), two steps
--- darker, made the keyboard layout and date look disabled instead of secondary.
+-- Catppuccin subtext0, `Theme.qml`'s `textInactiveColor`. Overlay0 (#6c7086) made the keyboard
+-- layout and date look disabled instead of secondary.
 --
--- This is the mirror's one secondary-text colour: 73 uses against a single `textDisabled`. Every
--- subtitle, every off state, every unlit heading is this swatch at full strength, and a control the
--- mirror wants faded gets `opacity` on the node instead. Reach for a dimmer colour only with a QML
--- line that asks for one.
+-- This is the mirror's one secondary-text colour: 73 uses against a single `textDisabled`. Faded
+-- controls use node `opacity`; use a dimmer colour only when a QML line asks for one.
 theme.DIM                       = "#a6adc8ff"
--- Mauve, not blue: the mirror's `activeColor` and every accent are #cba6f7. This config's old
--- #89b4fa made the bars look like different themes. `MAUVE` exposes the same swatch by colour name.
+-- Mauve, not blue: the mirror's `activeColor` and every accent are #cba6f7. `MAUVE` exposes the
+-- swatch by colour name.
 theme.ACCENT                    = "#cba6f7ff"
 theme.GREEN                     = "#a6e3a1ff"
 theme.YELLOW                    = "#f9e2afff"
@@ -186,21 +173,17 @@ theme.DISABLED                  = "#232634ff"
 -- Derived steps from the eleven swatches, so a scheme swap remains eleven edits.
 theme.ELEVATED                  = lighten(theme.BG, 0.12)
 theme.ELEVATED_HOVER            = lighten(theme.BG, 0.18)
--- `textDisabled`: `withOpacity(textInactiveColor, opacityMedium)`, dimmer than DIM. Nearly unused,
--- and deliberately so -- the mirror spends it once, on `OToggle`'s disabled border, and this config
--- has no disabled toggle. It had spread to thirty-one places that the mirror draws in plain
--- `textInactiveColor`, which is why so much secondary text sat at 35% alpha. Use `DIM`.
+-- `textDisabled`: `withOpacity(textInactiveColor, opacityMedium)`, dimmer than DIM. The mirror uses
+-- it once on `OToggle`'s disabled border; this config has no disabled toggle. It had spread to
+-- thirty-one places at 35% alpha, so use `DIM` for secondary text.
 theme.TEXT_OFF                  = theme.with_opacity(theme.DIM, theme.opacity.medium)
 theme.BORDER                    = theme.with_opacity(theme.SURFACE, 0.75)
 theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
--- Shared translucent card ground for every panel, menu, popup and card. Mantle rather than `BG`,
--- so a card reads as a sheet above the bar rather than the same tone as it.
+-- Shared translucent card ground for panels, menus, popups and cards. Mantle makes a card read as a
+-- sheet above the bar rather than the same tone as it. The tunable alpha fell from 0.933 to 0.88
 --
--- The alpha is a number rather than the `ee` this was written as, because it is the one value in
--- the palette anybody tunes. It came down from 0.933 once the compositor started blurring behind
--- these surfaces (ADR-0195): the old value existed to keep text legible over whatever window
--- happened to be underneath, and a blurred backdrop carries no detail to fight. Glass that cannot
--- be seen through is just a dark rectangle.
+-- after compositor blur was added (ADR-0195); glass that cannot be seen through is a dark
+-- rectangle.
 theme.GLASS                     = theme.with_opacity("#181825", 0.88)
 theme.GLASS_CONTENT             = theme.with_opacity(theme.ELEVATED, 0.46)
 theme.GLASS_HOVER               = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
@@ -229,7 +212,6 @@ theme.GLASS_CONTROL             = theme.with_opacity(theme.INACTIVE, 0.42)
 theme.GLASS_CONTROL_HOVER       = theme.with_opacity(theme.ON_HOVER, 0.45)
 theme.GLASS_BORDER              = theme.with_opacity(theme.FG, 0.18)
 theme.GLASS_BORDER_HOVER        = theme.with_opacity(theme.FG, 0.34)
--- Shared alert ground formerly hand-written by `rescue` and `privacy`.
 theme.ALERT_BG                  = "#45253aff"
 -- `modalScrimColor` is 0.45 rather than the mirror's 0.88: it lays over wallpaper, where 0.88 is a
 -- blackout.
@@ -246,12 +228,8 @@ theme.spacing                   = {
     xl = s(24, 16),
 }
 
--- The family `components/glyph.lua` names on every icon node (ADR-0144). `fonts` in `shell.lua`
--- declares `Propo`, which spaces the patched Nerd Font icons proportionally and fills most of the
--- em with them; `Mono` fits each into one cell, so a row of indicators keeps an even rhythm and an
--- icon sits at the size its token asked for. Both families carry these codepoints, so a longer
--- `fonts` chain could not choose between them -- the declared face wins per-glyph fallback every
--- time, which is why the node names this one.
+-- `components/glyph.lua` names the font on every icon node (ADR-0144). `shell.lua` declares both
+-- `Propo` and `Mono`; the latter keeps indicators to one cell, so the node names it explicitly.
 theme.icon_font                 = "JetBrainsMono Nerd Font Mono"
 
 theme.font                      = {
@@ -282,10 +260,8 @@ theme.icon                      = {
 
 -- Control heights keep adjacent toggles and buttons aligned without pixel literals.
 --
--- `Theme.qml`'s `_controlHeights`, step for step. These used to sit one step low -- this `sm` was
--- the mirror's `xs` -- so a module asking for the size the mirror asks for got the size below it,
--- and `IconButton`'s `size: "sm"` came out at 24px against the mirror's 28. Every call site named
--- the right step already; only the numbers behind the names were wrong.
+-- `Theme.qml`'s `_controlHeights`, step for step. `IconButton`'s `size: "sm"` is 28px here, not
+-- the old 24px, because the call sites already named the mirror's intended step.
 theme.control                   = {
     xs = s(24, 20),
     sm = s(28, 24),
@@ -332,46 +308,39 @@ theme.battery_pill_width        = s(80, 60)
 -- Width when the pointer hovers the volume control; it leaves room for the percentage. Collapsed
 -- width is `item_width`.
 theme.volume_expanded_width     = s(120, 90)
--- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The easing is
--- the engine's default, `InOutQuad`, which is also the mirror's most-used. `animation_fast_ms` is
--- its `animationFast`, the hover zooms.
+-- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The engine's
+-- default is `InOutQuad`; `animation_fast_ms` mirrors `animationFast` for hover zooms.
 theme.animation_ms              = 147
 theme.animation_fast_ms         = 100
 -- `animationSlow`, the pace of a pulse rather than a transition: slow enough to read as breathing.
 theme.animation_slow_ms         = 250
 -- `NotificationService.qml`'s own `animationDuration`, not `Theme.animationDuration`:
--- `Math.round(Theme.animationDuration * 1.4)`. Only the notification card uses it, for a card's
--- travel and a message's; the colour transitions there stay at `animation_ms`. Derived rather
--- than written as 206, so it follows the base.
+-- `Math.round(Theme.animationDuration * 1.4)`. Notification travel uses it; colour transitions use
+-- `animation_ms`. Derive it rather than writing 206 so it follows the base.
 theme.notification_slide_ms     = math.floor(theme.animation_ms * 1.4 + 0.5)
 -- For a fill the user is scrubbing: a volume key on repeat, a brightness button held down. An
--- eased tween cannot do this. A target that moves mid-flight restarts the curve from a standstill
--- (ADR-0145's retarget), so under key repeat the fill re-launches every few frames and crawls
--- along behind the number beside it, never finishing a curve. A spring carries its velocity
--- across the retarget instead (ADR-0154), which is the one thing no easing can do.
+-- eased tween restarts from a standstill when its target moves (ADR-0145), so key repeat keeps the
+-- fill behind the number. A spring carries velocity across the retarget (ADR-0154).
 --
--- Critically damped, so a volume bar never overshoots and shows a level nobody set: `damping` is
--- just above the `2 * math.sqrt(stiffness)` that stops overshoot. Stiff enough that a single
--- press still lands in about a tenth of a second, which is what keeps it feeling like a keypress
--- rather than a wobble.
+-- The 400/42 spring is critically damped: `damping` is just above the
+-- `2 * math.sqrt(stiffness)` threshold. A single press still lands in about a tenth of a second.
 theme.spring_tracking           = { spring = { stiffness = 400, damping = 42 } }
--- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`: bar
+-- One width replaces `Theme.qml`'s `networkPanelWidth: 340` and `bluetoothPanelWidth: 360`. Bar
 -- panels share one card in `modules/shell/panel_host.lua`; ADR-0110 makes it as tall as the panel.
 -- Each list is capped at `Math.min(contentHeight, Theme.itemHeight * 7)`, then scrolls.
 theme.panel_width               = s(340, 280)
 theme.panel_list_height         = s(280, 210)
--- Where a closed panel card sits before its first layout has measured it (`geometry`,
--- ADR-0147): above the bar by the tallest card (history: its capped list plus chrome). After that
--- the card drops from exactly its own height, `PanelHost.qml`'s `-height`.
+-- Where a closed panel card sits before its first layout has measured it (`geometry`, ADR-0147):
+-- above the bar by the tallest card. After that it drops from its own height, `PanelHost.qml`'s
+-- `-height`.
 theme.panel_slide               = s(760, 570)
--- Notification history holds the popup's cards, not a dozen short rows. Its mirror width is
--- `notificationPanelWidth: 420`; `maxAvailableHeight` lets the list use most of the screen before
--- it scrolls.
+-- Notification history holds the popup's cards. Its mirror width is `notificationPanelWidth: 420`;
+-- `maxAvailableHeight` lets the list use most of the screen before it scrolls.
 theme.notification_panel_width  = s(420, 340)
 theme.notification_list_height  = s(640, 480)
 -- Update rows need a name and two versions: at 340px, `ca-certificates-mozilla` and
--- `3.128-1 -> 3.129-1` collide. Fixed version columns leave the name about 130px at 460px, which
--- still elided `gpu-screen-recorder-git`; use 520px.
+-- `3.128-1 -> 3.129-1` collide. At 460px the name still elided `gpu-screen-recorder-git`; use
+-- 520px for fixed version columns.
 theme.update_panel_width        = s(520, 400)
 
 -- `Theme.audioPanelWidth`: two named sliders and a mixer.

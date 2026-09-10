@@ -1,10 +1,9 @@
--- The list half of § 2.7: the popup shows the newest few for as long as the Supervisor keeps them;
--- this shows the whole feed.
+-- The list half of § 2.7: the popup shows the newest few; this shows the whole feed.
 --
 -- A feed needs scrolling; a fixed panel showed four and clipped the rest (ADR-0069).
 --
--- Rows use the popup's `components/notification_card.lua`, so actions, replies, and expanded bodies
--- work here too. This file owns the header, DND toggle, and sectioned list.
+-- Rows use `components/notification_card.lua`, so actions, replies, and expanded bodies work here.
+-- This file owns the header, DND toggle, and sectioned list.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -71,9 +70,8 @@ local function summary(n)
     return table.concat(parts, " · ")
 end
 
--- `criticalCount`, the number behind the header's urgent badge. Transients are excluded for the
--- same reason as `kept`: they never reach this list, so counting them would badge rows that are
--- not here.
+-- `criticalCount` drives the urgent badge; exclude transients like `kept` because they never reach
+-- this list.
 local function critical_count(n)
     local count = 0
     for _, notification in ipairs(feed(n)) do
@@ -94,8 +92,7 @@ local function ordinal(day)
     return ones == 1 and "st" or ones == 2 and "nd" or ones == 3 and "rd" or "th"
 end
 
--- "Tuesday 08th of September 2026 03:07 PM". The bar's clock is abbreviated to fit a pill; this has
--- a panel's width, so it spells the day and month out and there is no second place to look.
+-- The panel has room to spell out the day and month; the bar's clock is abbreviated to fit a pill.
 local function long_date(seconds)
     local day = tonumber(os.date("%d", seconds)) or 0
     return string.format("%s%s of %s", os.date("%A %d", seconds), ordinal(day),
@@ -103,9 +100,8 @@ local function long_date(seconds)
 end
 
 local body = {
-    -- Not the mirror's. `NotificationHistoryPanel.qml` opens straight into the weather, having no
-    -- greeting anywhere; this panel is wide enough to be read as a sidebar, and a sidebar that
-    -- never says whose session it is or what day it is was the gap.
+    -- `NotificationHistoryPanel.qml` opens into weather without a greeting; this sidebar identifies
+    -- the session and date before the feed.
     column {
         width = "Fill",
         children = {
@@ -117,12 +113,9 @@ local body = {
             end), theme.DIM, theme.font.xs, { width = "Fill" }),
         },
     },
-    -- `NotificationHistoryPanel.qml` opens with the weather, then the system readout, and only then
-    -- the notifications masthead: the panel is the shell's status sheet, and the feed is its
-    -- longest section rather than its subject. The weather half has no § 2.x capability behind it
-    -- and is absent; the system half is `SystemInfoWidget`.
+    -- `NotificationHistoryPanel.qml` orders weather, `SystemInfoWidget`, then the notifications
+    -- masthead. Weather has no § 2.x capability behind it and is absent.
     system_info("notifications"),
-    -- Shared masthead shape: bell, DND-dimmed when silenced, summary, and two trailing controls.
     panel_header {
         title = "notifications",
         icon = oblisk.notifications:map(function(n)
@@ -133,9 +126,8 @@ local body = {
         end),
         subtitle = util.label(oblisk.notifications, summary),
         trailing = {
-            -- `InfoBadge`, ahead of the two controls and shown only while something is critical.
-            -- Critical notifications bypass DND and never expire, so the count is what the panel
-            -- most needs to say before its list is read.
+            -- `InfoBadge` shows the urgent count before the two controls. Critical notifications
+            -- bypass DND and never expire.
             info_badge(oblisk.notifications:map(function(n)
                 return string.format("%d urgent", critical_count(n))
             end), theme.RED, {
@@ -157,9 +149,8 @@ local body = {
                 end),
                 slot = "notification-dnd",
             }),
-            -- One `dismiss` per entry; § 3.2 has no `dismiss_all`. No copy is needed: the feed
-            -- cannot
-            -- push until this callback returns, unlike `network_panel.lua`.
+            -- One `dismiss` per entry; § 3.2 has no `dismiss_all`. The feed cannot push until this
+            -- callback returns, unlike `network_panel.lua`.
             icon_button(icons.clear_all, function()
                 for _, notification in ipairs(feed(oblisk.notifications:get())) do
                     oblisk.notifications:invoke("dismiss", notification.id)

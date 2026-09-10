@@ -3,16 +3,15 @@
 -- ## Engine pieces (ADR-0112)
 --
 -- A plain `textfield` with `autofocus = true` gets the keyboard on map and opens empty. `on_change`
--- filters, `on_navigate` moves selection and calls the list scroll signal's `reveal`, `on_submit`
--- launches, and `on_cancel` closes. A compositor keybind toggles it through the shared `modal`
--- state (`oblisk toggle modal launcher`, `lib/ui_state.lua`), which is why that is a named
--- `state`, not a local.
+-- filters, `on_navigate` moves and reveals selection, `on_submit` launches, and `on_cancel` closes.
+-- A compositor keybind toggles the shared `modal` state (`oblisk toggle modal launcher`,
+-- `lib/ui_state.lua`), so it must be a named `state`.
 --
 -- ## Layer surface, not `window`
 --
 -- The old `xdg_toplevel` was tiled by niri beside other windows at the column's size. The mirror's
--- `OModal` is a screen scrim and centred card; a screen-sized `panel` bound to `launcher_open`
--- takes the keyboard on map, returns it on unmap, and closes through its outside catcher.
+-- `OModal` is a screen scrim and centred card, so a screen-sized `panel` bound to `launcher_open`
+-- takes and returns the keyboard on map/unmap and closes through its outside catcher.
 --
 -- ## Selection
 --
@@ -167,9 +166,8 @@ end)
 
 -- ## Selection
 --
--- Arrow-key order: visible web row first, then results. Read it when the key arrives, never inside
--- a
--- `computed`.
+-- Read arrow-key order when the key arrives, never inside a `computed`: the visible web row first,
+-- then results.
 local function rows_now()
     local text = trimmed:get()
     local found = results:get() or {}
@@ -203,7 +201,6 @@ local function move(delta)
     end
     local next_index = math.max(1, math.min(current + delta, #ids))
     selected_id:set(ids[next_index])
-    -- List index excludes the web row above it.
     local in_list = next_index - (ids[1] == WEB and 1 or 0)
     if in_list >= 1 then
         SCROLL:reveal(in_list)
@@ -300,8 +297,8 @@ local function app_row(app)
         lines[#lines + 1] = cell(app.comment, theme.DIM, theme.font.xs, { width = "Fill" })
     end
     return row_shell(app.id, "launcher-app-" .. app.id, {
-        -- `Utils.resolveIconSource(..., "application-x-executable")`: entries without `Icon=` still
-        -- get a generic picture.
+        -- `Utils.resolveIconSource(..., "application-x-executable")` gives entries without `Icon=`
+        -- a generic picture.
         -- `AppLauncher.qml`: the selected row's icon grows 1.3x in place (ADR-0149).
         icon {
             name = app.icon or "application-x-executable",
@@ -417,8 +414,8 @@ local no_apps = panel_empty_state("no applications found",
         return text == "" and #entries_of(apps) == 0
     end))
 
--- Centered below the bar, `OModal`'s `anchors.centerIn: parent`. The surface excludes the bar's
--- reservation, so center in its own height; `screens[1]` follows `panel_host.lua`'s clamp.
+-- Center below the bar in the surface that excludes the bar's reservation; `screens[1]` follows
+-- `panel_host.lua`'s clamp.
 local card_margin = oblisk.screens:map(function(screens)
     local screen = screens and screens[1]
     if not (screen and screen.width and screen.height) then

@@ -1,6 +1,6 @@
--- Mirrors `WorkspaceStrip.qml`: one collapsed circle for the active workspace, expanding under the
--- pointer to one circle per workspace, then narrowing `animationDuration + 200` after it leaves.
--- The pill itself is `components/expanding_pill.lua`, shared with the power menu.
+-- Mirrors `WorkspaceStrip.qml`: active workspace collapses to one circle; pointer expands it.
+-- It shows one circle per workspace and narrows `animationDuration + 200` after the pointer leaves.
+-- `components/expanding_pill.lua` supplies the shared pill, also used by the power menu.
 --
 -- Ground: accent when active, glass when populated, `DISABLED` at half opacity when empty
 -- (ADR-0117,
@@ -12,11 +12,9 @@
 -- active workspace but only one has focus, so another monitor would otherwise collapse to nothing.
 --
 -- Hyprland pads to ten slots (ADR-0119, `WorkspaceArrangement.qml`'s `fillEmptySlots`): it lists no
--- empty workspaces, creates a numbered one on focus, and gets dimmed padded numbers here. Each
--- padded slot is a dimmed number whose click focuses that number. Niri
--- keeps
--- a trailing empty workspace and needs no padding. The payload lists only existing workspaces;
--- padding is this strip's `compositor`-keyed policy.
+-- empty workspaces, creates a numbered one on focus, and dims padded numbers here. Each padded slot
+-- focuses that number. Niri keeps a trailing empty workspace and needs no padding.
+-- The payload lists only existing workspaces; padding is this strip's `compositor`-keyed policy.
 --
 -- The ground and border ease between states (ADR-0145); the expansion is the pill's.
 local theme = require("config.theme")
@@ -30,10 +28,9 @@ local function output_of(w)
     return w and (w.outputs or {})[1]
 end
 
--- The listed workspaces, padded with `{ id = n, idx = n, populated = false }` up to
--- `PADDED_SLOTS` or the highest number in use, on a compositor where `id` is the number and a
--- focus on a missing one creates it. The padded entry has the shape a real one has, so the button
--- below reads it the same way; its `id` is what `focus` sends.
+-- Pad listed workspaces with `{ id = n, idx = n, populated = false }` up to `PADDED_SLOTS` or the
+-- highest number in use. On a compositor where `id` is the number, focusing a missing one
+-- creates it. The padded entry matches a real one, and its `id` is sent to `focus`.
 local function workspaces_of(w)
     local out = output_of(w)
     local listed = out and (out.workspaces or {}) or {}
@@ -56,9 +53,8 @@ local pill = expanding_pill.new({ slot = "workspace-pill", collapse_ms = theme.a
 
 local function workspace_button(ws)
     local id = ws.id
-    -- Read the current snapshot, not the `ws` used to build the button. Key reconciliation keeps
-    -- the
-    -- button while its windows change.
+    -- Read the current snapshot, not the build-time `ws`. Key reconciliation keeps the button while
+    -- its windows change.
     local entry = oblisk.workspaces:map(function(w)
         for _, candidate in ipairs(workspaces_of(w)) do
             if candidate.id == id then

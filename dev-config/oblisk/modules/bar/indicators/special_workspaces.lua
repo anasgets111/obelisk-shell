@@ -1,8 +1,7 @@
 -- Mirrors `SpecialWorkspaces.qml`: one circle per Hyprland scratchpad, accented while `shown_on` is
 -- set and glass while hidden; a click invokes `toggle_special`. `oblisk.workspaces.special` is
--- `nil` without specials (ADR-0119), so the row
--- is absent there, as `LeftSide.qml` gates on `supportsSpecialWorkspaces`; it also hides when empty
--- to avoid a bar spacing gap.
+-- `nil` without specials (ADR-0119); `LeftSide.qml` gates on `supportsSpecialWorkspaces`, and
+-- hides the row when empty to avoid a bar spacing gap.
 --
 -- Use the standing window's icon when `oblisk.applications` knows its `app_id`; otherwise use the
 -- first two letters after `special:`. The mirror's keyword table (`term`, `slack`...) is omitted

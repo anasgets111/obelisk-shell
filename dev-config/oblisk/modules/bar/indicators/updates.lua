@@ -1,28 +1,24 @@
--- Mirrors ArchChecker.qml: the glyph says what the updater does; the ground says whether it wants
+-- Mirrors `ArchChecker.qml`: the glyph says what the updater does; the ground says whether it wants
 -- attention.
 --
--- Five overlapping states use the mirror's order: a check error beats a stale count, and an error
--- beats a later spinner. First match wins.
+-- Five overlapping states use the mirror's order: a check error beats a stale count and a later
+-- spinner. First match wins.
 --
--- ADR-0134 adds the "checking" state here. The panel header has been reading it all along;
--- `UpdatesState` always carried the in-flight flag, and only this indicator treated it as never
--- checked.
+-- ADR-0134 adds the "checking" state. `UpdatesState` always carried the in-flight flag; only this
+-- indicator treated it as never checked.
 --
 -- The mirror spins while installing. Here colour carries the state; rotation needs a per-frame
--- property, and ADR-0021's 5ms timer cap has no timer to drive it.
+-- property, and ADR-0021's 5ms timer cap provides no timer to drive it.
 --
--- Visible whenever a package manager exists. `LeftSide.qml` wraps it in a `Loader` whose `active`
--- is
+-- Visible when a package manager exists. `LeftSide.qml` wraps it in a `Loader` whose `active` is
 -- `UpdateService.ready`, matching `ArchChecker.qml`'s `MainService.isArchBased && command -v
--- checkupdates` gate. `oblisk.updates.package_manager` answers it at startup, before the first
--- check.
+-- checkupdates` gate. `oblisk.updates.package_manager` answers it before the first check.
 --
--- It used to disappear when up to date, making its idle click a no-op. The mirror re-checks on an
--- idle click, so this indicator stays visible and does the same.
+-- Keep it visible when up to date so its idle click can re-check, as the mirror does.
 --
--- The click never installs. A brief direct `install` test launched real `pkexec pacman -Syu` and
--- stopped at "Error creating textual authentication agent"; nothing was upgraded, but that was not
--- by design. `ArchChecker.qml` also installs only from the panel, where the package list makes that
+-- The click never installs. A direct `install` test launched real `pkexec pacman -Syu` and stopped
+-- at "Error creating textual authentication agent"; nothing was upgraded, but that was not by
+-- design. `ArchChecker.qml` installs only from the panel, where the package list makes that
 -- decision visible.
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -31,19 +27,17 @@ local ui_state = require("lib.ui_state")
 local update_panel = require("modules.bar.panels.update_panel")
 local store = require("lib.store")
 
--- Updates stay dormant until configured (ADR-0034); without this, `state_of` remains `idle` and
--- `visible` hides the indicator. Configure here, not in `shell.lua`, because this module wants the
+-- Updates stay dormant until configured (ADR-0034); otherwise `state_of` remains `idle` and
+-- `visible` hides the indicator. Configure here, not `shell.lua`, because this module needs the
 -- answer.
 --
--- Check hourly, the cadence a pending-updates badge is read, not the cadence Arch changes. Anything
--- much shorter spends bandwidth on a number that changes a few times a day. Each check is a real
--- `-Sy` against a mirror; reloads within the hour do not rerun it
--- (ADR-0113 amendment).
+-- Check hourly, the cadence a pending-updates badge is read rather than the cadence Arch changes.
+-- Shorter intervals spend bandwidth on a number that changes a few times a day. Each check runs a
+-- real `-Sy` against a mirror; reloads within the hour do not rerun it (ADR-0113 amendment).
 --
 -- Seed on `oblisk.storage`'s first push, which carries the file `lib/store.lua` declared
--- (ADR-0115, ADR-0136). Persisted `checked_at` prevents a restart within the hour from rerunning,
--- and the list it stamps rides along so the skipped check still has an answer to show;
--- `previous == nil` is the first push, so reloads still seed once per process.
+-- (ADR-0115, ADR-0136). Persisted `checked_at` and its package list let a restart within the hour
+-- skip the check and still show an answer; `previous == nil` seeds once per process.
 local UPDATE_INTERVAL = 3600
 oblisk.storage:on_change(function(_, previous)
     if previous == nil then
@@ -55,14 +49,14 @@ oblisk.storage:on_change(function(_, previous)
     end
 end)
 
--- On a completed check, remember when it ran and what it found, and announce what is new, as
+-- On a completed check, remember its time and packages, and announce what is new, as
 -- `UpdateService.qml` does.
 --
 -- "New" compares package names with the stored announced key, like `notifiedPackagesKey`: restarts
 -- do not repeat the same twelve packages, and upgraded packages drop out on the next check.
 oblisk.updates:on_change(function(u, previous)
-    -- Compare with the store, not the previous push: the first post-restart push carries the seeded
-    -- time, and writing it back would touch the store on every start.
+    -- Compare with the store, not the previous push: the first post-restart push carries seeded
+    -- time.
     if u.last_successful_check and u.last_successful_check ~= store.updates_checked_at:get() then
         store:set("updates_checked_at", u.last_successful_check)
         store:set("updates_packages", u.packages)
@@ -133,8 +127,8 @@ return icon_button(status:map(function(s)
 end), function(rect)
     -- Read at click time: this handler is registered once, while `status` changes.
     if state_of(oblisk.updates:get()) == "idle" then
-        -- The mirror's idle click. The Supervisor refuses `check` while one is running, so no
-        -- double-click guard is needed.
+        -- The mirror's idle click. The Supervisor refuses `check` while one is running, so no guard
+        -- is needed.
         oblisk.updates:invoke("check")
         return
     end
@@ -143,8 +137,8 @@ end, {
     slot = "updates",
     -- Accent while this indicator's panel is open.
     selected = ui_state.panel_showing(update_panel.kind),
-    -- Hide when the Supervisor has no supported package manager; `package_manager` stays nil and an
-    -- indicator that can only report its own failure is worse than none.
+    -- Hide when the Supervisor has no supported package manager; `package_manager` stays nil, and
+    -- an indicator that can only report its own failure is worse than none.
     visible = oblisk.updates:map(function(u)
         return u ~= nil and u.package_manager ~= nil
     end),

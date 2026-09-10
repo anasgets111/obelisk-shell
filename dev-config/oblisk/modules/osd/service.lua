@@ -1,6 +1,5 @@
 -- As `OSDService.qml`: system changes show a card for two seconds. Push-driven (ADR-0115), so a
--- volume key, terminal `wpctl`, and bar button use the same card; before `on_change`, only the bar
--- button could trigger it.
+-- volume key, terminal `wpctl`, and bar button use the same card.
 --
 -- `level` selects the shape: volume/brightness/keyboard backlight use glyph, track, percentage;
 -- toggles/devices/layout/charger use a glyph tile and text. `modules/osd/popup.lua` only draws.
@@ -44,7 +43,6 @@ function osd.show(kind, entry)
     end)
 end
 
--- `showToggle`: "<what> on" or "<what> off".
 local function toggle(kind, on, glyph_on, glyph_off, what)
     osd.show(kind, { glyph = on and glyph_on or glyph_off, text = what .. (on and " on" or " off") })
 end

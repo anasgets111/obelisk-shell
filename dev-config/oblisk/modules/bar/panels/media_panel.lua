@@ -1,18 +1,14 @@
 -- Mirrors `MediaPanel.qml`: artwork beside the track, a transport row, and a seek bar with elapsed
 -- and total either side.
 --
--- ## Position has to be extrapolated
---
 -- `position` is only valid at `position_updated_at`, and nothing polls it while a player runs, so a
 -- payload alone gives a bar that jumps once a track and sits still between. The mirror re-reads the
--- player on a 500ms timer; the equivalent here is to anchor the last push against a clock and add
--- the elapsed time.
+-- player on a 500ms timer; this anchors the last push against a clock and adds elapsed time.
 --
 -- `position_updated_at` is `CLOCK_MONOTONIC`, which no Lua global exposes, so the anchor is
 -- `os.time()` taken in `on_change` -- the one place a wall reading and a payload are known to be
--- simultaneous. `oblisk.system.time` then ticks the sum once a second. Wall seconds move when the
--- clock is set, and the elapsed term is wrong by the whole adjustment until the next real reading
--- anchors it again.
+-- simultaneous. `oblisk.system.time` ticks the sum once a second. Wall seconds move when the clock
+-- is set, so the elapsed term is wrong by the whole adjustment until the next real reading.
 --
 -- Writing the anchor in a handler rather than a `:map` is deliberate: ADR-0044 may rerun a map on
 -- the same inputs, so a map that recorded a time would record it repeatedly.
@@ -20,12 +16,10 @@
 -- A drag adopts its own target as the reading; without that the bar counted on from the pre-seek
 -- position for as long as the player stayed quiet, which for a browser is indefinitely. A step
 -- button estimates instead: `seek_relative` is relative at the player, so the config never learns
--- exactly where it landed and the next real reading corrects it.
---
--- ## Dropped
+-- exactly where it landed; the next real reading corrects it.
 --
 -- Stop: `control` takes `play`, `pause`, `play_pause`, `next` and `previous`, and nothing else
--- (`controller.rs`'s `VALID_COMMANDS`). Per-button enablement: the mirror greys each control from
+-- (`controller.rs`'s `VALID_COMMANDS`). The mirror greys controls from
 -- `canGoNext`/`canSeek`/`canControl`, which `PlayerState` does not carry. See ADR-0164.
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -42,15 +36,13 @@ local KIND = "media"
 local SEEK_STEP_US = 5 * 1000 * 1000
 
 -- Which player the panel drives, the mirror's `selectNextPlayer`. `players` is longest-running
--- first and stable across position updates, so an index keeps its meaning between pushes; it is
--- wrapped on read rather than clamped on write, since the list shrinks without telling us.
+-- first and stable across position updates; wrap the index on read, not clamp it on write, because
+-- the list shrinks without telling us.
 local chosen = state("media_player", 1)
 
--- The chosen player as a signal, `false` when there is none.
---
--- Every reader goes through this rather than picking the entry itself. Reading `chosen:get()`
--- inside a `:map` is a hidden dependency: the map's answer changes when the selection changes while
--- its declared inputs do not, so the switch button moved the index and nothing redrew.
+-- Reading `chosen:get()` inside a `:map` hides a dependency:
+-- selection changes while declared inputs stay fixed; switching players moved the index; nothing
+-- redrew.
 local selected = computed({ oblisk.mpris, chosen }, function(m, index)
     local players = (m and m.players) or {}
     if #players == 0 then
@@ -59,15 +51,12 @@ local selected = computed({ oblisk.mpris, chosen }, function(m, index)
     return players[(index - 1) % #players + 1]
 end)
 
--- Wall second at which the current `position` reading was taken.
---
 -- Keyed on the `position` value rather than on the push. A player that answers `Position` with the
 -- same number for the whole track -- which browsers publishing through the media session API do --
 -- otherwise reset the elapsed term on every push and pinned the bar to wherever playback began.
 --
--- A repeated number means "no news", so keep counting from the anchor already held; a changed one
--- is the evidence of a real reading. `position_updated_at` cannot stand in for this, because it is
--- the moment of the *read*, not of the value.
+-- A repeated number means "no news", so keep counting from the existing anchor; a changed one is
+-- a real reading. `position_updated_at` is the moment of the *read*, not of the value.
 local anchor = state("media_anchor", 0)
 local anchored_position = -1
 
@@ -75,8 +64,8 @@ local anchored_position = -1
 -- authoritative. `seek` returns before the move lands and the Supervisor then waits for a real
 -- `Seeked`/`PropertiesChanged` (`controller.rs`); a browser publishing MPRIS through the media
 -- session API often emits neither, so waiting for one means never re-anchoring -- the video jumps
--- and the bar carries on counting from where the track used to be. Adopting the requested position
--- immediately makes the bar agree with the video, and the first fresh reading takes it back.
+-- and the bar counts from the old position. Adopt the requested position immediately; the first
+-- fresh reading takes it back.
 local seek_base = state("media_seek_base", -1)
 
 oblisk.mpris.on_change(oblisk.mpris, function()
@@ -92,8 +81,6 @@ oblisk.mpris.on_change(oblisk.mpris, function()
     anchor:set(os.time())
 end)
 
--- Microseconds into the track, extrapolated to the last clock tick.
---
 -- No `os.time()` fallback: a `computed` must answer the same for the same inputs (ADR-0044), and a
 -- clock read makes it answer differently every run. Before `oblisk.system`'s first tick there is no
 -- "now", so the anchor is the only honest reading and the elapsed term is zero.
@@ -134,8 +121,7 @@ local has_player = selected:map(function(player)
     return player ~= false
 end)
 
--- `identity` is the non-nullable empty-string sentinel (§ 2.x), so every fallback here tests for
--- `""`; a plain `or` chain never reaches its next candidate.
+-- `identity` is the empty-string sentinel (§ 2.x), so fallbacks test `""`, not a plain `or` chain.
 local function first_nonempty(...)
     for _, candidate in ipairs({ ... }) do
         if candidate ~= nil and candidate ~= "" then
@@ -182,9 +168,9 @@ local artwork = rect {
     background = theme.GLASS_CONTROL,
     align_v = "Start",
     children = {
-        -- The note shows through until a cover lands. `album_art_path` is empty for a player that
-        -- publishes none and for a remote URL the Supervisor would not canonicalize, and `image`
-        -- with an empty `source` draws nothing, so the glyph needs no separate gate.
+        -- The note shows through until a cover lands. `album_art_path` is empty when none is
+        -- published or when the Supervisor cannot canonicalize a remote URL; an empty
+        -- `image.source` draws nothing, so the glyph needs no separate gate.
         glyph(icons.media, theme.DIM, theme.icon.xl, { align = "Center", align_v = "Center" }),
         image {
             source = selected:map(function(player)
@@ -192,7 +178,8 @@ local artwork = rect {
             end),
             fit = "cover",
             -- The pool downsizes a full-resolution cover while the panel is up, as the wallpaper
-            -- grid does (ADR-0122); an inline decode here would stall the frame that opens the card.
+            -- grid does (ADR-0122); an inline decode here would stall the frame that opens the
+            -- card.
             async = true,
             width = "Fill",
             height = "Fill",
@@ -202,9 +189,9 @@ local artwork = rect {
 
 local transport_row = row {
     width = "Fill",
-    -- `align_h` on a `row` is the main-axis distribution, the mirror's
-    -- `Layout.alignment: Qt.AlignHCenter`: six controls narrower than the column sit in its middle
-    -- rather than against the artwork.
+    -- `align_h` on a `row` is main-axis distribution, the mirror's
+    -- `Layout.alignment: Qt.AlignHCenter`: six controls narrower than the column sit in its middle,
+    -- not against the artwork.
     align_h = "Center",
     spacing = theme.spacing.sm,
     children = {
@@ -238,8 +225,8 @@ local seek_bar = slider {
         -- `clamp_seek_target` admits a zero length, so this clamps as it does; the two disagreeing
         -- meant a target the config allowed and the Supervisor then moved.
         local target = math.floor(math.min(math.max(0, fraction * length), length))
-        -- `MediaService.qml`'s `Math.abs(delta) <= 0.005`: a drag landing where the track already is
-        -- is not worth a `SetPosition`, which on this browser costs the length metadata for a moment.
+        -- `MediaService.qml`'s `Math.abs(delta) <= 0.005`: a drag landing where the track already
+        -- is is not worth a `SetPosition`, which on this browser costs the length metadata briefly.
         if math.abs(target - position_us:get()) < 5000 then
             return
         end
@@ -247,7 +234,6 @@ local seek_bar = slider {
         anchor:set(os.time())
         oblisk.mpris:invoke("seek", player.id, target)
     end,
-    -- Continuous: a seek bar that snapped to twentieths would refuse most of a long track.
     steps = 0,
     height = theme.spacing.md,
     radius = theme.radius.sm,
@@ -305,8 +291,8 @@ local body = {
                     end):map(function(shown)
                         return { { text = shown, bold = true } }
                     end), theme.FG, theme.font.lg, { width = "Fill" }),
-                    -- The mirror falls back through artist, album, identity. `PlayerState` has no
-                    -- album, so this is artist then identity (ADR-0164).
+                    -- Fallback is artist, album, identity; `PlayerState` has no album, so use
+                    -- artist then identity (ADR-0164).
                     cell(util.label(selected, function(player)
                         return first_nonempty(player and player.artist, player and player.identity, "unknown artist")
                     end), theme.DIM, theme.font.sm, { width = "Fill" }),

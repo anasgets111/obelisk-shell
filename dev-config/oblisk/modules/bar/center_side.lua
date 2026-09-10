@@ -2,9 +2,6 @@
 -- unconditionally and the media `Loader` fills the same box on top of it, so the spectrum plays
 -- over the window title instead of replacing it.
 --
--- This used to show one or the other, which meant the title vanished for as long as anything was
--- playing and the caption the centre zone exists for was the first thing lost.
---
 -- A `rect` is the stacking parent -- `modules/global/modal_host.lua` uses the same shape for its
 -- scrim and click catcher. The zone stays content-sized because invisible children contribute no
 -- size (`resolve_sizes` in scene.rs), so with nothing playing it is exactly the title's width, and

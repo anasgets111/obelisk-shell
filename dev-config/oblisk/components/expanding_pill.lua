@@ -1,17 +1,14 @@
--- `ExpandingPill.qml`: a row of circles showing one when collapsed and all of them under the
--- pointer, collapsing a moment after it leaves. Each cell tweens its width and opacity between
--- zero and a slot (ADR-0145, ADR-0146) and the row, content-sized, follows. The collapse delay is
--- `delay`, so a pointer that returns within `collapse_ms` cancels it; `hold_open` keeps the pill
--- open regardless, for a countdown in progress.
+-- `ExpandingPill.qml`: collapsed shows one circle; hover shows all, and collapse waits on `delay`.
+-- Each cell tweens width and opacity from zero to a slot (ADR-0145, ADR-0146); `collapse_ms` lets a
+-- returning pointer cancel it, and `hold_open` keeps the pill open for a countdown.
 --
--- Deliberately not mirrored: when the collapsed slot changes, the mirror slides the strip so the
--- new circle arrives from the side. Here the old cell shrinks as the new one grows in place, which
--- reads as a hand-off rather than a scroll and needs no offset arithmetic.
+-- Deliberately not mirrored: when the collapsed slot changes, the mirror slides the strip.
+-- The new circle arrives from the side. Here the old cell shrinks as the new one grows in place,
+-- a hand-off rather than a scroll. It needs no offset arithmetic.
 --
--- The gap between circles is each cell's own right padding rather than the row's `spacing`: a
--- zero-width cell still earns `spacing`, and a collapsed strip would be one circle plus every gap.
--- The last cell's gap trails the pill by one `spacing.sm` while expanded, which the mirror's
--- `expandedWidth` does not have; nothing sits close enough to notice.
+-- Each cell owns right padding instead of row `spacing`: a zero-width cell still earns `spacing`.
+-- A collapsed strip is one circle plus every gap. The last gap trails the expanded pill by one
+-- `spacing.sm`; the mirror's `expandedWidth` has none, but nothing sits close enough to notice.
 local theme = require("config.theme")
 local util = require("lib.util")
 

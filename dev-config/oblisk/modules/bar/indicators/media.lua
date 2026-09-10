@@ -1,17 +1,16 @@
--- Mirrors `MediaIndicator.qml`, which is a spectrum and nothing else: a `ShaderEffect` running
--- `Shaders/frag/cava_bars.frag` over `CavaService.values`, plus a pointer target that opens the
--- media panel. It carries no glyph and no track text -- `CenterSide.qml` draws the window title
--- underneath it, and the track itself belongs to the panel.
+-- Mirrors `MediaIndicator.qml`: `ShaderEffect` runs `Shaders/frag/cava_bars.frag` over
+-- `CavaService.values`; a pointer target opens the media panel. It has no glyph or track text;
+-- `CenterSide.qml` draws the window title underneath, and the track belongs to the panel.
 --
--- This drew a play glyph and "title -- artist" instead, which put the track caption where the
--- mirror puts the spectrum and hid the window title for as long as anything was playing.
+-- A play glyph and "title -- artist" put the track caption where the mirror puts the spectrum and
+-- hid the window title while anything was playing.
 --
 -- ## Why the bars are flat
 --
--- Levels need cava's 30fps frames, and the engine has no shader or canvas node: nine node types,
--- none of which draws a waveform. Bars are `rect`s, which can carry a level, but a per-frame push
--- driving them is the first per-frame path this config would have and the bar already logs
--- `exceeded the 5ms CPU budget` failures. Not attempted here; see the ADR.
+-- Cava needs 30fps frames. The engine has no shader or canvas node; its nine node types draw no
+-- waveform.
+-- `rect`s can carry levels, but per-frame pushes are the first such path here; the bar logs
+-- `exceeded the 5ms CPU budget` failures. Not attempted; see the ADR.
 --
 -- Flat is not a placeholder shape, though: `cava_bars.frag`'s `h = max(minHeightPx, level)` draws
 -- exactly this row when every level is zero, which is what the mirror shows while cava has no data.
@@ -19,9 +18,8 @@ local theme = require("config.theme")
 local ui_state = require("lib.ui_state")
 local media_panel = require("modules.bar.panels.media_panel")
 
--- `barCount` is cava's own configured 256. Fewer here because each is a real node rather than a
--- shader lane: at rest the row reads as the same fine rule either way, and 256 static children on
--- the bar buys nothing until they carry levels.
+-- `barCount` is cava's configured 256. Fewer here because each is a real node, not a shader lane.
+-- At rest it reads as the same fine rule; 256 static children buy nothing until they carry levels.
 local BARS = 48
 
 -- `gapPx: borderWidthThin` and `minHeightPx: borderWidthMedium`.
@@ -48,9 +46,10 @@ for index = 1, BARS do
     }
 end
 
--- The mirror opens the panel on hover and closes it on an `animationSlow` timer once the pointer
--- has left both the trigger and the card. Click instead: every other indicator here toggles its
--- panel on a click, and `Accessible.onPressAction` is the mirror's own keyboard equivalent of it.
+-- The mirror opens on hover and closes on `animationSlow` after the pointer leaves the trigger and
+-- card.
+-- Here click toggles the panel, matching every other indicator; `Accessible.onPressAction` is the
+-- mirror's keyboard equivalent.
 return button {
     width = theme.center_zone_width,
     height = "Fill",

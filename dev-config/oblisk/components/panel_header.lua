@@ -1,13 +1,14 @@
--- Panel masthead matching `Components/PanelHeader.qml`: glyph on a tinted plate, title over one
--- state line, and trailing controls such as a radio switch, rescan, or close button.
--- The plate and glyph turn accent when the panel's subject is on and dim when off, so "network" and
+-- `Components/PanelHeader.qml` masthead: tinted glyph plate, title/state line, trailing controls.
+--
+-- The plate and glyph turn accent when the subject is on and dim when off, so "network" and
 -- "bluetooth" read as switches before their labels. The caller supplies that fact as `opts.active`.
--- Replaced the title/close pair in `modules/bar/panels/settings.lua`. Network and bluetooth had a
--- `section_header` plus `panel_toggle_card`, making a grey heading and a "wi-fi" switch row where
--- the mirror uses one glyph line, so they looked like settings lists instead of their subject.
--- `width = "Fill"` leaves the title's remaining space and pins trailing controls to the far edge.
--- `scene.rs` sizes it from its siblings; `cell`'s `elide = "End"` keeps a long title from pushing
--- controls out.
+--
+-- `modules/bar/panels/settings.lua` replaced its title/close pair. Its network and bluetooth
+-- `section_header` plus `panel_toggle_card` made a grey heading and a "wi-fi" switch row; the
+-- mirror uses one glyph line, so these read like settings lists instead of their subjects.
+--
+-- `width = "Fill"` leaves title space for trailing controls. `scene.rs` sizes it from siblings;
+-- `cell`'s `elide = "End"` keeps a long title from pushing controls out.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local icons = require("config.icons")
@@ -38,8 +39,8 @@ return function(opts)
     local plate
     if opts.accent ~= nil then
         accent = opts.accent
-        -- `withOpacity(accent, opacitySubtle)`, the mirror's own plate, so a caller supplies one
-        -- colour rather than a matched pair it could get wrong.
+        -- `withOpacity(accent, opacitySubtle)` mirrors the plate; callers supply one colour, not a
+        -- pair.
         if type(accent) == "userdata" then
             ---@cast accent Signal
             plate = accent:map(function(colour)
@@ -77,8 +78,8 @@ return function(opts)
         }
     end
 
-    -- Bold like the mirror's `titleBold`; weight lives on the `TextRun` (`lua-meta/nodes.lua`), not
-    -- the plain title string's node.
+    -- Mirror `titleBold`: weight lives on `TextRun` (`lua-meta/nodes.lua`), not the title string's
+    -- node.
     local lines = { cell({ { text = opts.title, bold = true } }, theme.FG, title_size, { width = "Fill" }) }
     if opts.subtitle then
         lines[#lines + 1] = cell(opts.subtitle, opts.subtitle_color or theme.DIM,

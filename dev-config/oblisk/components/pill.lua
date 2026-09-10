@@ -1,15 +1,12 @@
--- A module's visual grouping, shared by eleven bar modules. Identical padding and radius are the
--- visual effect.
+-- Shared by eleven bar modules: identical padding and radius make one visual group.
 -- Glass, not solid: `surface2` at 0.42 alpha with a near-white 0.18 hairline, matching
--- `Components/IconButton.qml` and the mirror's pills. Opaque `SURFACE` made a filled rectangle on
--- the strip instead of a control floating over wallpaper.
--- `item_radius` is half `item_height`, giving semicircular ends that match adjacent icon buttons
--- without duplicating their number.
--- Fill missing child `align_v` because it defaults to `"Start"` and the pill is taller. Otherwise a
--- child sits at the top while neighbours centre; the volume pill's bare `icon` was a few pixels
--- above its readout while its `button` and `meter` were correct. The row's own alignment only
--- places
--- the pill in the bar, not its children. Explicit `"Start"` or `"Stretch"` still wins.
+-- `Components/IconButton.qml` and the mirror's pills; opaque `SURFACE` made a filled strip, not a
+-- control over wallpaper.
+-- `item_radius` is half `item_height`, giving semicircular ends that match adjacent icon buttons.
+-- Fill missing child `align_v`: it defaults to `"Start"`, leaving a taller pill's child at the top.
+-- The volume pill's bare `icon` sat a few pixels above its readout while its `button` and `meter`
+-- were correct. The row's alignment places the pill in the bar, not its children. Explicit
+-- `"Start"` or `"Stretch"` still wins.
 local theme = require("config.theme")
 
 return function(children, background, opts)

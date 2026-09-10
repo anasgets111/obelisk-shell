@@ -1,10 +1,9 @@
--- Glyphs the bar draws by name. An `icon` is a themed raster looked up by name (ADR-0054).
--- It paints in its theme artwork's colours. These private-use codepoints use `text`,
--- because `PaintStyle::Icon` has no tint and `layout::paint` applies none.
--- `text` accepts `foreground`, `font_size` and `opacity`, so a state can turn one glyph accent or
--- red. `shell.lua` puts "CaskaydiaCove Nerd Font Propo" first; fallback is per glyph (ADR-0043
--- decision 2), so codepoints choose Nerd Font and Latin text chooses Noto Sans. Without it, these
--- render as tofu.
+-- Glyphs the bar draws by name. An `icon` is a themed raster looked up by name (ADR-0054) that
+-- keeps its artwork colours. Private-use codepoints use `text`: `PaintStyle::Icon` has no tint, and
+-- `layout::paint` applies none. `text` accepts `foreground`, `font_size` and `opacity`.
+-- `shell.lua` puts "CaskaydiaCove Nerd Font Propo" first; fallback is per glyph (ADR-0043 decision
+-- 2), so codepoints choose Nerd Font and Latin text chooses Noto Sans. Without it, these render as
+-- tofu.
 --
 -- `\u{...}` keeps the source ASCII; the codepoint is lookupable at nerdfonts.com/cheat-sheet.
 -- Names are this config's; values match `~/.config/quickshell` for the same state.
@@ -91,9 +90,8 @@ icons.next            = "\u{F04AD}"
 icons.rewind          = "\u{F11F9}"
 icons.fast_forward    = "\u{F11F8}"
 icons.player_switch   = "\u{F0CB0}"
--- `SystemInfoWidget.qml`'s `MetricTile` icons, and its two are the way round they look: F035B is
--- the square processor with pins, F061A the DIMM stick. This file had them swapped, so the system
--- readout labelled a memory module "CPU".
+-- `SystemInfoWidget.qml`'s `MetricTile` uses F035B for CPU, the square processor with pins, and
+-- F061A for RAM, the DIMM stick. The old swap labelled a memory module "CPU".
 icons.cpu             = "\u{F035B}"
 icons.ram             = "\u{F061A}"
 icons.gpu             = "\u{F08AE}"
@@ -111,9 +109,9 @@ icons.device          = {
     generic    = "\u{F00AF}",
 }
 
--- Idle: `idle` means nothing holds the system awake, `awake` is the coffee cup, and the bar swaps
--- them when a manual hold starts. `display` is the monitor DPMS powers down; suspend reuses `sleep`
--- instead of adding the mirror's near-identical second power-sleep glyph.
+-- Idle: `idle` means nothing holds the system awake; `awake` is the coffee cup used during a manual
+-- hold. `display` is the monitor DPMS state; suspend reuses `sleep` instead of adding a near-
+-- duplicate power-sleep glyph.
 icons.idle            = "\u{F0FAA}"
 icons.awake           = "\u{F0176}"
 icons.display         = "\u{F0379}"

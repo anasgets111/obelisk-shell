@@ -1,11 +1,8 @@
 -- Radio tile matching `Components/PanelToggleCard.qml`: glyph over a word, whole tile a button,
--- accent-lit when on. Side-by-side tiles put wi-fi beside ethernet; here a filled ground means
--- "this is on" (`modules/bar/panels/power_menu.lua`), exactly matching radio state.
--- Replaced a label beside `components/toggle.lua`'s settings-row switch. The master switch now sits
--- in `components/panel_header.lua`, as in the mirror; this tile answers which radios are on.
--- Takes the raw signal plus `read`, like `components/toggle.lua` and `components/meter.lua`,
--- because
--- the capability pushes a table and only the caller knows which field is the switch.
+-- accent-lit when on. Side-by-side tiles put wi-fi beside ethernet; a filled ground means "this is
+-- on" (`modules/bar/panels/power_menu.lua`), matching radio state.
+-- Takes the raw signal plus `read`, like `components/toggle.lua` and `components/meter.lua`; the
+-- capability pushes a table and only the caller knows which field is the switch.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
@@ -88,7 +85,6 @@ return function(opts)
             end
             opts.on_change(not read_bool(opts.signal:get(), opts.read))
         end,
-        -- `button` stacks children; the column puts the word under the glyph and centres the stack.
         children = { column { align_h = "Center", align_v = "Center", spacing = theme.spacing.xs, children = lines } },
     }
 end

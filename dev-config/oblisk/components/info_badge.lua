@@ -1,9 +1,9 @@
 -- Mirrors `Components/InfoBadge.qml`: a short bold count on a filled capsule with the shell's
 -- hairline, sized by its text rather than a fixed width.
 --
--- Extraction rule: `modules/bar/panels/bluetooth_panel.lua` had written this shape as its own
--- `battery_badge`, and `modules/bar/panels/notification_history.lua` wanted the same capsule for
--- the urgent count. Two agreeing call sites is a component, and the mirror had already made it one.
+-- Extraction rule: `modules/bar/panels/bluetooth_panel.lua` and
+-- `modules/bar/panels/notification_history.lua` use the same capsule. Two agreeing call sites make
+-- a component, and `Components/InfoBadge.qml` already defines it.
 --
 -- The text takes `text_contrast(ground)`, not `FG`: these grounds are filled swatches -- accent,
 -- peach, red -- and white on peach is unreadable where the mirror's contrast rule puts dark ink.
@@ -16,10 +16,9 @@ local cell = require("components.cell")
 return function(label, ground, opts)
     opts = opts or {}
     ground = ground or theme.GLASS_CONTROL
-    -- A live ground maps the same contrast rule over itself, the way `components/icon_button.lua`
-    -- does. The recorder's elapsed badge is the call site that needs it: `badgeColor: paused ?
-    -- warning : critical` swaps peach for red under a running capture, and the ink has to follow or
-    -- one of the two is unreadable.
+    -- A live ground maps contrast over itself, as `components/icon_button.lua` does. The recorder's
+    -- elapsed badge uses `badgeColor: paused ? warning : critical`, swapping peach for red under
+    -- capture; ink must follow or one state is unreadable.
     ---@type Color|Signal
     local ink
     if type(ground) == "userdata" then

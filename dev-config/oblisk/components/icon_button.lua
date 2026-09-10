@@ -1,61 +1,51 @@
 -- One glyph in a circle, matching `Components/IconButton.qml`; twelve modules had duplicated its
 -- button, radius, left-button guard, and child.
--- ## Why the glyph is text
 -- It used an icon *theme name* and an `icon` node. The mirror needs state-coloured glyphs: themed
 -- artwork is name-looked-up (ADR-0054), and `PaintStyle::Icon` has no tint, so bluetooth cannot
--- turn
--- accent on connect or update turn red on failure. The old bar spelled states "bt", "apps", and
+-- turn accent on connect or make the update red on failure. The old bar spelled "bt", "apps", and
 -- "up to date"; a Nerd Font glyph is a `text` node whose `foreground` carries the state. Codepoints
 -- live in `config/icons.lua`.
--- Themed icons remain right for unchosen artwork, such as a tray item's or application's own icon;
--- those call sites still use `icon` nodes.
--- ## Colour
+-- Themed icons remain for unchosen artwork, such as tray or application icons; those callers use
+-- `icon` nodes.
 -- Derive foreground with `theme.text_contrast(background)`, which picks black or white by WCAG
--- luminance. A red alert background stays legible without a second caller setting;
--- `opts.foreground`
+-- luminance. Red alert backgrounds stay legible by default; `opts.foreground`
 -- overrides this for the mirror's special case, a state-tinted glyph on an unchanged ground.
 -- Left button only, matching `components/panel_row.lua`: a close or toggle one stray right-click
--- away is worse than a no-op. `opts.on_button` receives the raw button name for the three modules
--- that need their own right-click.
+-- away is worse than a no-op. `opts.on_button` gets the raw button for three right-click modules.
 -- Nil `on_activate` returns a `row`, matching `components/panel_row.lua`: a no-op button still
--- takes
--- the pointer and reads as clickable. Two indicators are mirror-clickable readouts whose capability
--- exposes no command here, so they must look like readouts.
+-- takes the pointer and reads clickable. Two mirror-clickable indicators expose no command, so they
+-- must look like readouts.
 local theme = require("config.theme")
 
 return function(glyph, on_activate, opts)
     opts = opts or {}
     local side = opts.size or theme.item_height
-    -- A circle by default, matching the mirror. Use half the side instead of a radius token: a
-    -- token
-    -- below half paints a rounded square.
+    -- A circle by default, matching the mirror. Use half the side instead of a radius token because
+    -- a token below half paints a rounded square.
     local radius = opts.radius or (opts.shape == "rounded" and theme.item_radius or side / 2)
-    -- Annotated because a theme token is a `Signal` on a scaled display and a string otherwise;
-    -- type inference then picks whichever `theme.lua` happened to build, leaving `---@cast` nothing
-    -- to narrow.
+    -- A theme token is a `Signal` on a scaled display and a string otherwise; inference cannot
+    -- narrow the union without these annotations and casts.
     ---@type Color|Signal
     local base = opts.background or theme.GLASS_CONTROL
     ---@type Color|Signal
     local base_hover = opts.background_hover or theme.GLASS_CONTROL_HOVER
 
-    -- Reuse one `hover(slot)` signal across four properties. The registry is name-keyed, so a
-    -- second call returns the same signal (ADR-0062 decision 2), but repeating the slot reads as
-    -- four regions.
+    -- Reuse one `hover(slot)` signal across four properties. The registry is name-keyed, so
+    -- repeated calls return the same signal (ADR-0062 decision 2), but repeating the slot reads
+    -- as four regions.
     local hovered = opts.slot and hover(opts.slot) or nil
 
-    -- Either ground may be a signal: the updates circle turns accent for waiting packages and the
-    -- keyboard circle peach under caps lock. Resolve it before deriving foreground, because
-    -- `text_contrast` needs a colour; passing the signal made `channels` fail on userdata in
-    -- `theme.lua`.
+    -- Either ground may be a signal: updates turn accent while packages wait; the keyboard turns
+    -- peach under caps lock. Resolve it before `text_contrast`; passing it to `channels` failed on
+    -- signal userdata in `theme.lua`.
     local function is_signal(value)
         return type(value) == "userdata"
     end
 
-    -- `---@type` and `---@cast` are needed because runtime `is_signal` distinguishes strings and
-    -- `Signal`, but the language server cannot follow `type(x) == "userdata"` without user-defined
-    -- type guards. Otherwise it narrows each local to the first branch and flags the others. This
-    -- is the only `dev-config` site needing them, so keep the annotations instead of disabling
-    -- diagnostics.
+    -- `---@type` and `---@cast` are needed because the language server cannot follow
+    -- `type(x) == "userdata"` as a type guard. Without them it narrows the union and flags it.
+    -- This is the only `dev-config` site needing them, so keep the annotations rather than
+    -- disable diagnostics.
     ---@type Color|Signal
     local ground
     if not hovered then
@@ -103,19 +93,17 @@ return function(glyph, on_activate, opts)
     end
     local background = ground
 
-    -- `selected` marks the open panel with an accent ring, identifying which of five indicators
-    -- owns
-    -- the popup. It replaces the hover border so selection remains legible under the pointer.
+    -- `selected` marks which of five indicators owns the open panel's popup. Its accent ring
+    -- replaces the hover border so selection remains legible under the pointer.
     if opts.selected ~= nil then
         border_color = opts.selected:map(function(is_selected)
             return is_selected and theme.ACCENT or theme.GLASS_BORDER
         end)
     end
 
-    -- `align_h` on the node is not redundant with the glyph's. `layout::scene` uses it to place a
-    -- stacking parent's child, but as a `row`'s main-axis alignment. A nil `on_activate` returns a
-    -- `row`, which ignores child `align_h`; that left keyboard "EN" against the edge while buttons
-    -- were centred. Set both so either returned shape centres its glyph.
+    -- `align_h` is needed on node and glyph. `layout::scene` uses it for stacking parents; a `row`
+    -- uses its main axis. A nil `on_activate` returns a `row` that ignores child `align_h`, leaving
+    -- keyboard "EN" against the edge. Set both to centre either.
     local node = {
         width = opts.width or side,
         height = side,
@@ -138,24 +126,21 @@ return function(glyph, on_activate, opts)
             foreground = foreground,
             -- The glyph's own size, not an icon box. A `text` node measures the string, so this is
             -- the face's rasterised em size.
-            --
-            -- `icon.md`, because `IconButton.qml` defaults `size: "md"` and no bar indicator
-            -- overrides it, so `iconSizeFor("md")` is `s(18, 14)`. This read `icon.lg` on a comment
-            -- claiming that was the same number; it is `s(24, 18)`, the mirror's `iconSizeLg`, so
-            -- every circle on the bar drew its glyph a third too large. Invisible on a wifi arc or
-            -- a bell, obvious the moment one of them was a filled square.
+            -- `icon.md`: `IconButton.qml` defaults `size: "md"` and no bar indicator overrides it,
+            -- so
+            -- `iconSizeFor("md")` is `s(18, 14)`. `icon.lg` is `s(24, 18)`, the mirror's
+            -- `iconSizeLg`, so every circle on the bar drew its glyph a third too large. A filled
+            -- square exposed it sooner than a wifi arc or bell.
             font_size = opts.icon_size or theme.icon.md,
-            -- The declared chain, *not* `theme.icon_font`. `Theme.qml` has both faces and
-            -- `IconButton.qml` picks the body one -- `font.family: Theme.fontFamily`,
-            -- CaskaydiaCove Nerd Font Propo -- while `iconFontFamily`, JetBrainsMono Nerd Font
-            -- Mono, is what the panel components use. `NetworkIndicator.qml` and
-            -- `DateTimeDisplay.qml` draw their glyphs the same way, so the split is bar versus
-            -- panel, not glyph versus text.
+            -- Use the declared chain, *not* `theme.icon_font`. `Theme.qml` has both faces, and
+            -- `IconButton.qml` picks `font.family: Theme.fontFamily`, CaskaydiaCove Nerd Font
+            -- Propo; panel components use `iconFontFamily`, JetBrainsMono Nerd Font Mono. The split
+            -- is bar versus panel, not glyph versus text; `NetworkIndicator.qml` and
+            -- `DateTimeDisplay.qml` draw their glyphs the same way.
             --
-            -- This passed `icon_font`, so every circle on the bar drew the mirror's codepoint in
-            -- the wrong face. The codepoints were already right, which is why it read as "all the
-            -- icons look off" rather than as any one wrong icon: JetBrainsMono's Material glyphs
-            -- are lighter and narrower than CaskaydiaCove's at the same pixel size.
+            -- Passing `icon_font` put every bar circle's correct codepoint in the wrong face. It
+            -- read as "all the icons look off" because JetBrainsMono's Material glyphs are lighter
+            -- and narrower than CaskaydiaCove's at the same pixel size.
             -- `components/glyph.lua` keeps `icon_font`, because its callers are the panel
             -- components that use `iconFontFamily` there.
             align_h = "Center",

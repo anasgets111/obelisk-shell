@@ -36,9 +36,8 @@ end), nil, {
     end,
 })
 
--- Two lines: what is holding it, and what happens next if nothing is. The mirror puts the reasons
--- in a tooltip too; the second line is this config's, and it is the one that makes the circle worth
--- hovering when nothing is held.
+-- Two lines say what holds it and what happens next if nothing does. The mirror puts reasons in a
+-- tooltip too; this config's second line makes the circle worth hovering when nothing is held.
 local idle_tooltip = tooltip({
     id = "idle_tooltip",
     slot = SLOT,

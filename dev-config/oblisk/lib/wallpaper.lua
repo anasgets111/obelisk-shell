@@ -1,25 +1,19 @@
 -- Wallpaper state matching `Services/Core/WallpaperService.qml`: file and fit per output, file
--- source, and two writes. No node here; drawing, picking, and the bar button live in
--- `modules/global/wallpaper.lua`, `modules/global/wallpaper_picker.lua`, and
--- `modules/bar/indicators/wallpaper_button.lua`.
--- ## Where the choice lives
+-- source, and two writes. Drawing, picking, and the bar button live in
+-- `modules/global/wallpaper.lua`,
+-- `modules/global/wallpaper_picker.lua`, and `modules/bar/indicators/wallpaper_button.lua`.
 -- One `wallpapers` key in `lib/store.lua`, a `{ path, fit }` table per output matching
--- `Settings.data.wallpapers`. It survives reload and reboot; ADR-0055 decision 2 replaced a
--- `state()` value that reloads forgot. ADR-0136 removed the two flattened key families after the
--- scalar-only store changed.
--- ## Where the files come from
--- `oblisk.files` (ADR-0120) watches `FOLDER` with inotify, so a dropped image reaches the picker
--- before it opens. Start watching here during evaluation because the folder is a setting, not
--- state;
--- the picker needs the list on open and the bar's right-click needs it before any picker open.
+-- `Settings.data.wallpapers`. It survives reload and reboot; ADR-0055 decision 2 replaced the
+-- reload-unsafe `state()` value, and ADR-0136 removed the two flattened key families.
+-- `oblisk.files` (ADR-0120) watches `FOLDER` with inotify. Start watching during evaluation because
+-- the folder is a setting, not state; picker and bar right-click need its list before opening.
 local store = require("lib.store")
 
 local wallpaper = {}
 
 -- `Settings.data.wallpaperFolder` default.
 wallpaper.FOLDER = "/mnt/Work/1Wallpapers/Main"
--- `FolderListModel.nameFilters`; exclude `gif` because the decoder supports none and folders often
--- contain one.
+-- `FolderListModel.nameFilters`; exclude `gif`: decoder supports none; folders often contain it.
 wallpaper.EXTENSIONS = { "jpg", "jpeg", "png", "webp" }
 -- `WallpaperService.availableModes` reduced to `image.fit` (ADR-0055 decision 3); omit `center` and
 -- `tile` because the engine draws neither.
@@ -29,25 +23,20 @@ wallpaper.FITS = {
     { value = "stretch", label = "Stretch" },
 }
 wallpaper.DEFAULT_FIT = "cover"
--- `WallpaperService.availableTransitions`, as the config's own shader files (ADR-0184). The engine
--- ships the cross-dissolve and the ability to run a fragment shader; which effects exist is this
--- config's to say, exactly as the mirror keeps its own `Shaders/frag` directory.
--- Where the effects live. `WallpaperService.qml` scans its own `Shaders/qsb` with a
--- `FolderListModel` and offers what it finds; this is that, through `oblisk.files` (ADR-0120), so a
--- `.frag` dropped in here appears in the picker without a reload. Point it anywhere: nothing in the
--- engine knows this directory exists.
+-- `WallpaperService.availableTransitions` comes from the config's shader files (ADR-0184).
+-- The engine supplies cross-dissolve and fragment-shader support; the config chooses effects in
+-- `Shaders/frag`; `WallpaperService.qml` scans `Shaders/qsb` with a `FolderListModel`;
+-- `oblisk.files` (ADR-0120) lists `.frag` files before the picker opens; engine does not know
+-- this directory exists.
 wallpaper.SHADER_FOLDER = oblisk.config_dir .. "/shaders"
 wallpaper.SHADER_EXTENSIONS = { "frag" }
--- The engine's own cross-dissolve, which is no file and always available.
 wallpaper.NO_SHADER = "fade"
--- `WallpaperService.qml`'s duration and curve.
 wallpaper.TRANSITION_MS = 1500
 wallpaper.TRANSITION_EASING = "InOutCubic"
 
--- `AnimatedWallpaper.qml`'s `transitionParams.randomize`, by effect name: a wipe picks a side, a
--- disc and a portal pick a centre, stripes pick a count and an angle. A shader with no row here --
--- anything dropped into the folder -- runs with every uniform at zero, which is what the engine
--- does with a parameter nothing supplies. Adding a row is how a config gives it knobs.
+-- `AnimatedWallpaper.qml`'s `transitionParams.randomize`: a wipe picks a side; a disc and portal
+-- a centre; stripes pick a count and angle. A shader with no row here -- anything dropped into the
+-- folder -- runs with every uniform at zero; adding a row gives it knobs.
 local RANDOM_PARAMS = {
     wipe = function()
         return { direction = math.floor(math.random() * 4), softness = 0.1 }
@@ -99,12 +88,10 @@ function wallpaper.effect_in(stored, available)
     return wallpaper.NO_SHADER
 end
 
----Every effect the folder offers right now.
 function wallpaper.effects()
     return oblisk.files:map(wallpaper.effects_in)
 end
 
----The chosen effect, as a name.
 function wallpaper.effect()
     return computed({ store.wallpaper_transition, oblisk.files }, function(stored, f)
         return wallpaper.effect_in(stored, wallpaper.effects_in(f))
@@ -120,7 +107,6 @@ function wallpaper.set_effect(name)
 end
 
 ---The `transition` table for the wallpaper `image`, as a signal.
----
 ---Depends on the stored wallpapers as well as the effect, so the parameters are drawn again on
 ---every wallpaper change the way `randomize` is called per change. A run already under way keeps
 ---the parameters it started with, because the engine copies the spec when it starts.
@@ -174,12 +160,10 @@ function wallpaper.fit_in(w, output)
     return wallpaper.DEFAULT_FIT
 end
 
----Stored table for callers building a `computed` over several outputs.
 function wallpaper.all()
     return store.wallpapers
 end
 
----`path_in` as a signal for one panel output's `image.source`.
 ---@param output string
 function wallpaper.path_of(output)
     return store.wallpapers:map(function(w)
@@ -268,7 +252,6 @@ function wallpaper.randomize_all()
 end
 
 oblisk.files:invoke("watch", wallpaper.FOLDER, wallpaper.EXTENSIONS)
--- The same call for the effects, for the same reason: the picker needs the list before it opens.
 oblisk.files:invoke("watch", wallpaper.SHADER_FOLDER, wallpaper.SHADER_EXTENSIONS)
 
 return wallpaper

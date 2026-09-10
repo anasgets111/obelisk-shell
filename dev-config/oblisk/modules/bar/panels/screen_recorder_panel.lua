@@ -1,10 +1,8 @@
--- Mirrors ScreenRecorderPanel.qml: the two captures as buttons, the four encoder choices behind one
--- expandable row, and a way to the folder.
+-- Mirrors ScreenRecorderPanel.qml: two capture buttons, four encoder choices in one expandable row,
+-- and a folder action.
 --
--- The panel is where the choices live. `ScreenRecorder.qml`'s three mouse buttons cover the two
--- common captures and nothing else, deliberately -- this is the surface that names them, shows what
--- a running capture is doing, and lets the encoder settings be changed without remembering a
--- keybind.
+-- `ScreenRecorder.qml`'s three mouse buttons cover only the two common captures. This panel names
+-- them, shows capture status, and exposes encoder settings without a keybind.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -21,9 +19,9 @@ local recorder = require("lib.screen_recording")
 
 local KIND = "screen_recorder"
 
--- `settingGroups`, in the mirror's order: what is captured, then how well, then how fast, then in
--- what. `fallback` repeats `lib/store.lua`'s default because a store key can be missing -- an older
--- `state.json` predating this block -- and a tile group with nothing lit reads as broken.
+-- `settingGroups` follows the mirror's order: capture, quality, frame rate, and format. `fallback`
+-- repeats `lib/store.lua`'s default because an older `state.json` can lack a key, leaving a group
+-- with no selected tile.
 local GROUPS = {
     {
         key = "audio",
@@ -77,10 +75,8 @@ local GROUPS = {
     },
 }
 
--- `ScreenRecorderPanel.qml` collapses this on close (`onIsOpenChanged`). Ours keeps it, matching
--- `modules/bar/indicators/system_info.lua`, which is the config's other expandable section: coming
--- back to a panel you left open on the settings is the answer people expect, and there is no
--- close edge to hang the reset on without `lib/ui_state.lua` requiring this file back.
+-- Unlike `ScreenRecorderPanel.qml`, this stays expanded across close, matching
+-- `modules/bar/indicators/system_info.lua`; `lib/ui_state.lua` has no close hook to reset it.
 local settings_expanded = state("recorder_settings_expanded", false)
 
 local function selected_option(group, settings)
@@ -93,8 +89,7 @@ local function selected_option(group, settings)
     return nil
 end
 
--- `settingsSummary`: the four chosen words on one line, so the row says what a capture will be
--- without opening.
+-- `settingsSummary` keeps the four choices visible in the row without opening it.
 local settings_summary = store.screen_recorder:map(function(settings)
     local words = {}
     for _, group in ipairs(GROUPS) do
@@ -120,9 +115,8 @@ local status_text = computed(
     end
 )
 
--- One group: its heading, its tiles side by side, and the chosen tile's explanation underneath.
--- The detail line follows the selection rather than sitting on each tile, as in the mirror: three
--- sentences at once is a paragraph, and only the current choice needs defending.
+-- The detail line follows the selected tile, not every tile, as in the mirror. Only the current
+-- choice needs an explanation.
 local function option_group(group)
     local tiles = {}
     for _, option in ipairs(group.options) do
@@ -136,8 +130,8 @@ local function option_group(group)
                 local option_of = selected_option(group, settings)
                 return option_of ~= nil and option_of.value == option.value
             end,
-            -- A radio, not a switch: the tile's own checked state is ignored, because clicking the
-            -- lit one must not turn every option off.
+            -- A radio, not a switch: ignore the tile's checked state so clicking the lit one cannot
+            -- turn every option off.
             on_change = function()
                 recorder.set_setting(group.key, option.value)
             end,
@@ -181,27 +175,27 @@ local body = {
         title = "screen recorder",
         icon = icons.record,
         subtitle = status_text,
-        -- `accent: recording ? Theme.critical : Theme.activeColor`. Red is not "off" here; it is
-        -- the alert that something is being captured right now.
+        -- `accent: recording ? Theme.critical : Theme.activeColor`: red marks an active capture,
+        -- not
+        -- "off".
         accent = recorder.recording:map(function(up)
             return up and theme.RED or theme.ACCENT
         end),
         trailing = {
             -- `badgeColor: root.paused ? Theme.warning : Theme.critical`: red while frames are
-            -- being written, peach while they are not.
+            -- written, peach while they are not.
             info_badge(recorder.elapsed_text, recorder.paused:map(function(held)
                 return held and theme.PEACH or theme.RED
             end), { visible = recorder.recording }),
         },
     },
 
-    -- Four buttons in two slots, not two buttons that change colour. `OButton` binds `bgColor` and
-    -- `variant` live -- `bgColor: recording ? critical : activeColor` on the left, `variant:
-    -- recording ? "secondary" : "primary"` on the right -- and `components/action_button.lua` picks
-    -- its three grounds from a static `tone` at build time. Making `tone` live would mean mapping
-    -- rest, hover, border and ink through one signal each, for one caller. An invisible node takes
-    -- no size and no spacing gap (`layout/scene.rs`), so a pair per state costs the same row and
-    -- each button keeps one label, one tone and one job.
+    -- Four buttons in two slots, not two colour-changing buttons. `OButton` binds `bgColor` and
+    -- `variant` live (`bgColor: recording ? critical : activeColor`; `variant: recording ?
+    -- "secondary" : "primary"`). `components/action_button.lua` fixes its three grounds from static
+    -- `tone`. Making `tone` live would map rest, hover, border, and ink through one signal each for
+    -- one caller. Invisible nodes take no size or spacing gap (`layout/scene.rs`), so a pair per
+    -- state costs the same row and each button keeps one label, one tone, and one job.
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -230,8 +224,8 @@ local body = {
                     return not up
                 end),
             }),
-            -- The one control in a panel that ends something already running, so it wears the
-            -- alert colour rather than the accent every other primary action uses.
+            -- This control ends a running capture, so it uses the alert colour instead of the
+            -- accent.
             action_button("stop", recorder.stop, "recorder-stop", {
                 tone = "danger",
                 width = "Fill",
@@ -253,8 +247,7 @@ local body = {
         },
     },
 
-    -- The mirror's hairline `Rectangle`: the two captures above are actions, everything below is
-    -- configuration, and the rule is what says so.
+    -- The mirror's hairline `Rectangle` separates capture actions from configuration.
     rect { width = "Fill", height = theme.border_width, background = theme.BORDER_SUBTLE },
 
     panel_row {
@@ -269,8 +262,8 @@ local body = {
             settings_expanded:set(not settings_expanded:get())
         end,
     },
-    -- Invisible children take no size and no spacing gap (`layout/scene.rs`), so the collapsed row
-    -- costs nothing and the card's measured height follows the reveal on its own.
+    -- Invisible children take no size or spacing gap (`layout/scene.rs`), so the collapsed row
+    -- costs nothing and the card's measured height follows the reveal.
     column {
         width = "Fill",
         spacing = theme.spacing.md,
@@ -281,8 +274,8 @@ local body = {
 
     panel_row {
         title = "open recordings folder",
-        -- `~`-collapsed like the mirror's `saveDirectory`: the home prefix is the same on every row
-        -- of a path and tells the reader nothing.
+        -- Collapse the home prefix to `~`, as with the mirror's `saveDirectory`; it tells the
+        -- reader nothing when repeated on every path.
         subtitle = recorder.directory:map(function(dir)
             local home = os.getenv("HOME") or ""
             if home ~= "" and dir:sub(1, #home) == home then

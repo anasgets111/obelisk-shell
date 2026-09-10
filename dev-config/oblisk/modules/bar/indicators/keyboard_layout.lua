@@ -25,9 +25,9 @@ local caps = oblisk.keyboard:map(function(k)
     return k ~= nil and k.caps_lock == true
 end)
 
--- No `on_activate`, so `icon_button` draws a `row` rather than a `button`: § 3.2's keyboard row is
--- a readout with no command. The mirror calls
--- `KeyboardLayoutService.nextLayout()`, but there is no corresponding capability action.
+-- No `on_activate`, so `icon_button` returns a readout `row`, not a `button`; § 3.2's keyboard row
+-- has no command. The mirror calls `KeyboardLayoutService.nextLayout()`, but no capability action
+-- exists.
 return icon_button(oblisk.keyboard:map(layout_short), nil, {
     icon_size = theme.font.md,
     foreground = caps:map(function(on)

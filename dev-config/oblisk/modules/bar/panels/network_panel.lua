@@ -1,14 +1,14 @@
 -- Mirrors NetworkPanel.qml: masthead, two radio tiles, and access points with the joined one first.
 --
--- The old header opened with a grey `network` word and a `wi-fi` switch. Its rows wrote "45% 5 GHz
--- lock -- connected". The mirror draws those facts as signal bars, a coloured "5G" band label, a
--- lock badge, and an accent ring; the row keeps only the SSID.
+-- The old header wrote "45% 5 GHz lock -- connected" beside a grey `network` word and `wi-fi`
+-- switch. The mirror draws those facts as signal bars, a coloured "5G" band label, lock badge, and
+-- accent ring, while rows keep only the SSID.
 --
--- "Hidden network..." is here now. It was dropped while this surface asked for the keyboard only for
--- a pending password: the name field could not be typed into, because the engine armed the panel
--- host's password field whether or not it was on screen and every key went into that invisible
--- buffer. `layout::secure_submit` counts only the fields a key can reach now, so an `autofocus` name
--- field beside it arms normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
+-- "Hidden network..." was dropped while this surface asked for the keyboard only for a pending
+-- password: the name field could not be typed into because the engine armed the panel host's
+-- password field whether or not it was on screen, sending every key to that invisible buffer.
+-- `layout::secure_submit` now counts only reachable fields, so an `autofocus` name field arms
+-- normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
 --
 -- Still dropped: the IP address (`NetworkState` lacks it) and Saved/Available sections (no `saved`
 -- flag). A connected network is saved by construction, so its forget action is offered there.
@@ -25,14 +25,12 @@ local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
 local panel_empty_state = require("components.panel_empty_state")
 local action_button = require("components.action_button")
--- One-way, like every panel's: `lib/ui_state.lua` requires only `lib/util`, never a panel back.
 local ui = require("lib.ui_state")
 
 local KIND = "network"
 local SCROLL = scroll("network_aps")
 
--- Payload order is connected-first, then descending signal (§ 2.5). The old copy-and-sort returned
--- to that same order on every rebuild; reading it straight is enough.
+-- Payload order is connected-first, then descending signal (§ 2.5); reading it straight is enough.
 local function access_points(n)
     return (n and n.available_networks) or {}
 end
@@ -41,7 +39,6 @@ local function radio_on(n)
     return n ~= nil and n.networking_enabled and n.wifi_enabled
 end
 
--- Four bars, which is what a strength percentage needs to say.
 local function strength_glyph(strength)
     local percent = strength or 0
     if percent >= 75 then
@@ -84,9 +81,8 @@ local function header_glyph(n)
     return n.wifi_enabled and icons.wifi[4] or icons.wifi_off
 end
 
--- Enrich each row with joined state and `blockedByOtherConnection`. Rebuilding per push costs no
--- more than the list already does: `parse_list_children` calls `itemfn` for every element each
--- pass.
+-- Enrich each row with joined state and `blockedByOtherConnection`; `parse_list_children` already
+-- calls `itemfn` for every element each pass.
 local rows = oblisk.network:map(function(n)
     local out = {}
     local connecting = n and n.connecting_ssid
@@ -124,8 +120,6 @@ local function access_point_row(entry)
         slot = "network-ap-" .. tostring(ap.ssid),
         leading = row { align_v = "Center", children = leading },
         title = ap.ssid or "?",
-        -- The only row subtitle, shown while true. Strength, band, security, and connection are
-        -- drawn instead of written.
         subtitle = entry.connecting and "connecting…" or nil,
         selected = ap.active,
         opacity = entry.blocked and theme.opacity.disabled or nil,
@@ -148,7 +142,6 @@ end
 -- surface can hold, because a form per row would put a `secure_submit` field in every one of them.
 local step = ui.credential_step
 
--- `visible` for a part of the sheet that belongs to some of the steps.
 local function during(...)
     local wanted = {}
     for _, name in ipairs({ ... }) do
@@ -210,9 +203,9 @@ local function submit_hidden_name()
     oblisk.network:invoke("connect", name, true)
 end
 
--- A failed attempt leaves nothing parked -- `finish_connect` clears the prompt and the intent both
--- -- so Retry is a fresh `connect`, not a resubmission. It is what takes the sheet from "failed"
--- back to "password" with the name it already knows.
+-- A failed attempt leaves no pending intent: `connect` consumes it and `begin_connect` clears the
+-- prompt before `finish_connect` records the verdict. Retry starts a fresh `connect`, not a
+-- resubmission; it takes the sheet from "failed" back to "password" with the name it already knows.
 local function retry_hidden()
     oblisk.network:invoke("connect", ui.hidden_ssid:get(), true)
 end
@@ -295,10 +288,9 @@ local body = {
         },
     },
     -- Mirror error card, red on a red-tinted ground. `connect_error` is sticky until the next
-    -- attempt (§ 2.5), with no clear command; the next row click dismisses it.
-    -- It yields to the sheet, as `visible: ... && !root.isHiddenTarget` does in the mirror: the
-    -- sheet carries the same error with the name it belongs to, and two copies of it read as two
-    -- failures.
+    -- attempt (§ 2.5), with no clear command; the next row click dismisses it. It yields to the
+    -- sheet, where `visible: ... && !root.isHiddenTarget` prevents two copies reading as two
+    -- two failures.
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -316,22 +308,18 @@ local body = {
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
         },
     },
-    -- The sheet itself. Its parts leave layout as the step moves, and `panel_host` tweens the
-    -- card's height to whatever the section now measures, so each step slides into the last one's
-    -- room rather than snapping (ADR-0147).
-    --
-    -- Typed passwords never reach this VM. `mask_character` plus `secure_submit` stores keystrokes
-    -- in a native buffer on the Renderer's Wayland thread and sends a `("network", "connect")`
-    -- envelope, as in `modules/global/lock.lua` (ADR-0005/ADR-0027); no `on_change` or `on_submit`
-    -- callback can reopen that hole, which is also why the password half has no Next button that
-    -- reads the field. `submit = true` is a button's one way to a password (ADR-0114).
-    --
-    -- The masked field is the only `secure_submit` field across `panel_host`'s nine panels. The
-    -- engine focuses a surface's *sole* such field on keyboard focus and refuses to guess between
-    -- two, so the name field beside it is a plain one -- an SSID is an ordinary `connect` argument,
-    -- which is the whole reason it can be typed at all. Only the shown ones are counted or armed
-    -- (`layout::secure_submit::typable_secure_submit_targets`), which is what lets each step take
-    -- the keyboard while the other step's field is down.
+    -- The sheet's parts leave layout as the step moves; `panel_host` tweens the card's height to
+    -- the section's measurement, so each step slides into the last one's room rather than snapping
+    -- (ADR-0147). Typed passwords never reach this VM. `mask_character` plus `secure_submit` stores
+    -- keystrokes in a native buffer on the Renderer's Wayland thread and sends a `("network",
+    -- "connect")` envelope, as in `modules/global/lock.lua` (ADR-0005/ADR-0027); no `on_change` or
+    -- `on_submit` callback can reopen that hole. `submit = true` is the only password-button path
+    -- (ADR-0114). The masked field is the only `secure_submit` field across `panel_host`'s nine
+    -- panels. The engine focuses a surface's *sole* such field and refuses to guess between two, so
+    -- the name field is plain -- an SSID is an ordinary `connect` argument, which is why it can be
+    -- typed. Only shown fields are counted or armed by
+    -- `layout::secure_submit::typable_secure_submit_targets`, letting each step take the keyboard
+    -- while the other field is down.
     column {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -340,10 +328,9 @@ local body = {
         end),
         children = {
             cell(sheet_title, theme.FG, theme.font.sm, { width = "Fill" }),
-            -- `autofocus` rather than a click into it: the row that raises this sheet is the last
-            -- thing the pointer touches, and `panel_host` turns the keyboard `Exclusive` on the
-            -- same edge. The draft is stored on every keystroke because Next has no other way to
-            -- read the field.
+            -- `autofocus` rather than a click: the row that raises this sheet is the last thing the
+            -- pointer touches, and `panel_host` turns keyboard `Exclusive` on the same edge. The
+            -- draft is stored on every keystroke because Next has no other way to read the field.
             field_box(during("name"), textfield {
                 width = "Fill",
                 height = "Fill",
@@ -368,8 +355,8 @@ local body = {
                 font_size = theme.font.sm,
             }),
             -- The mirror's `OSpinner` beside "Connecting…". There is no spinner node here, so the
-            -- word breathes instead, the same `loops = "Infinite"` pulse `power_menu.lua` puts on a
-            -- running countdown (ADR-0152). The entry's presence is the gate: no step, no sequence.
+            -- word breathes instead, using `loops = "Infinite"` as in `power_menu.lua` (ADR-0152).
+            -- Its presence gates the sequence: the pulse exists only while waiting.
             text {
                 content = "connecting…",
                 foreground = theme.DIM,
@@ -384,8 +371,8 @@ local body = {
                     },
                 },
             },
-            -- `⚠ errorMessage` under the field, where the mirror puts it, instead of the card at the
-            -- top of the panel: the error belongs to the network being asked about.
+            -- `⚠ errorMessage` under the field, not at the card's top, where the mirror puts it:
+            -- the error belongs to the network being asked about.
             row {
                 width = "Fill",
                 spacing = theme.spacing.xs,
@@ -405,8 +392,8 @@ local body = {
                 children = {
                     action_button("cancel", ui.clear_network_prompts, "network-sheet-cancel", { tone = "quiet" }),
                     -- Hidden rather than disabled while the name is empty: `action_button` has no
-                    -- disabled tone, and a button that cannot do anything is better absent than
-                    -- greyed. Enter does the same thing for anyone already typing.
+                    -- disabled tone, and a useless button is better absent than greyed.
+                    -- Enter does the same thing for anyone already typing.
                     action_button("next", submit_hidden_name, "network-sheet-next", {
                         tone = "solid",
                         visible = computed({ step, ui.hidden_draft }, function(current, draft)
@@ -430,10 +417,9 @@ local body = {
         },
     },
     -- Rows up to the cap, then a scrolling viewport (ADR-0110), matching
-    -- `Math.min(networkList.contentHeight, Theme.itemHeight * 7)`.
-    -- The sheet replaces it during a hidden join rather than sitting above it, which is the mirror's
-    -- `visible: !root.isHiddenTarget`: nothing in the list is what is being joined, and the card
-    -- tweens down to the sheet's height instead of growing to hold both.
+    -- `Math.min(networkList.contentHeight, Theme.itemHeight * 7)`. The sheet replaces it during a
+    -- hidden join rather than above it, matching the mirror's `visible: !root.isHiddenTarget`;
+    -- the card tweens down to the sheet's height instead of growing to hold both.
     list {
         width = "Fill",
         max_height = theme.panel_list_height,
@@ -450,8 +436,7 @@ local body = {
     },
     -- The one row nothing scanned put there, last as in the mirror. A network broadcasting no SSID
     -- is dropped from `available_networks`, so this stands in for it and asks for the name instead.
-    -- It leaves with the list it sits under: while the sheet is asking, the offer to open it again
-    -- is nothing the reader needs.
+    -- It leaves with the list while the sheet is asking.
     panel_row {
         slot = "network-hidden",
         icon = icons.wifi_hidden,

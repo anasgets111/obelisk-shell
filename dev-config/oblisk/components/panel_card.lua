@@ -1,13 +1,15 @@
 -- Shared background, padding, and radius for dropdowns and panel bodies.
--- `modules/shell/panel_host.lua`
--- and `modules/bar/panels/settings.lua` repeated the same six properties, meeting the two-call-site
--- rule also used by `components/pill.lua`.
--- `opts` overrides defaults. With no options, the common dropdown shape is 10px radius and 6px
--- spacing. The opaque settings toplevel passes `radius = 0` and its own padding because it has no
--- edge to round against.
+-- `modules/shell/panel_host.lua` and `modules/bar/panels/settings.lua` repeated the same six
+-- properties, meeting the two-call-site rule used by `components/pill.lua`.
+--
+-- `opts` overrides defaults. By default, dropdowns use `theme.radius.md` and `theme.spacing.sm`.
+-- The opaque settings toplevel passes `radius = 0` and its own padding because it has no edge to
+-- round against.
+--
 -- Pass through `margin`, `align_h`, `align_v`, and `visible`: they locate the card. The panel host
 -- positions it manually because a layer surface has no `anchor_rect`; its indicator offset is this
 -- node's outer `card_margin`. The content-sized polkit prompt centres with the two aligns.
+--
 -- `modules/bar/panels/update_panel.lua` hides whole package/log cards; hiding children alone leaves
 -- their ground and padding as a rounded empty rectangle.
 local theme = require("config.theme")

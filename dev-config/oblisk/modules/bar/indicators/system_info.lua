@@ -1,19 +1,16 @@
--- Mirrors `SystemInfoWidget.qml`: a full-width "System" button that carries the readouts on its own
--- line while collapsed, and opens into metric tiles.
+-- Mirrors `SystemInfoWidget.qml`: a full-width "System" button that collapses to readouts and opens
+-- into metric tiles.
 --
--- Despite living under `Indicators/`, the mirror never puts this on the bar -- `SystemInfoWidget` is
--- instantiated once, at the top of `NotificationHistoryPanel.qml`, under the weather. This file
--- keeps the mirror's path and is used from `modules/bar/panels/notification_history.lua` for the
--- same reason.
+-- Though this file lives under `Indicators/`, the mirror instantiates `SystemInfoWidget` once under
+-- the weather in `NotificationHistoryPanel.qml`; this module is used from
+-- `modules/bar/panels/notification_history.lua`.
 --
 -- ## What is missing, and why it is not a bug
 --
--- The mirror reads a `SystemInfoService` that shells out for GPU load, disk usage, uptime, and boot
--- time. § 2.12 is `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu` -- CPU,
--- memory and temperatures, as the capability table names it. So the GPU usage tile, the per-disk
--- rows, and the uptime/boot footer have no data behind them and are absent rather than faked. The
--- shape they left is spent on what § 2.12 does have: swap under memory, and the GPU's temperature
--- where the GPU tile stood.
+-- The mirror's `SystemInfoService` also reads GPU load, disk usage, uptime, and boot time. § 2.12
+-- exposes `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu`, so the GPU
+-- usage tile, per-disk rows, and uptime/boot footer are absent rather than faked. Their space holds
+-- swap under memory and the GPU's temperature where the GPU tile stood.
 --
 -- ## A factory, not a node
 --
@@ -28,17 +25,15 @@ local meter = require("components.meter")
 local panel_card = require("components.panel_card")
 
 -- `sysinfo`'s three pollers start dormant until configured (ADR-0035); without this, the readouts
--- stay at pre-first-sample `0%`. Configure here, not in `shell.lua`, because this is the only
--- module reading them.
+-- stay at pre-first-sample `0%`. Configure here because this is the only module reading them.
 --
 -- CPU every 2s and RAM every 5s, about as slow as a readout can tick before it reads as frozen,
 -- matching the mirror's cadence. Temperatures ride with RAM: they are a tile's second line, not a
 -- number anyone watches move, and the hwmon pass is one read of both `temp_cores` and `temp_gpu`.
 --
--- The mirror instead ref-counts `SystemInfoService.refCount` so the pollers only run while the
--- panel is open. § 2.12 has no such control -- `configure` sets an interval, and zero stops a
--- poller for everyone -- so the choice is polling always or polling never. Two file reads every
--- couple of seconds is the cheaper mistake.
+-- The mirror ref-counts `SystemInfoService.refCount`, but § 2.12 has no such control: `configure`
+-- sets an interval and zero stops a poller for everyone. The choice is polling always or never; two
+-- file reads every couple of seconds is the cheaper mistake.
 oblisk.sysinfo:invoke("configure", { cpu_interval = 2, ram_interval = 5, temp_interval = 5 })
 
 -- `SystemInfoWidget.qml`'s `statusColor(progress, fallback)`: red past 90%, peach past 75%, and the
@@ -57,7 +52,6 @@ local function percent_of(state_value, field)
     return (state_value and state_value[field]) or 0
 end
 
--- The tinted number, shared by the collapsed summary and each tile's value.
 local function tint(field, fallback)
     return oblisk.sysinfo:map(function(s)
         return status_color(percent_of(s, field), fallback)
@@ -99,8 +93,6 @@ local function tile(children, opts)
     })
 end
 
--- `MetricTile`: glyph, label, percentage on one line, a progress track under it, and one dim line
--- of detail.
 local function metric_tile(codepoint, label, field, accent, detail)
     return tile {
         row {

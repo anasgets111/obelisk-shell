@@ -8,9 +8,9 @@
 local theme = require("config.theme")
 local cell = require("components.cell")
 
--- `solid` mirrors `variant: "primary"` and is the only opaque ground. The other tints suit equal
--- notification choices, but at 15% alpha a panel's active control shows the glass behind "update".
--- It picks its foreground too, so callers cannot mismatch a chosen background and text.
+-- `solid` mirrors `variant: "primary"` and is the only opaque ground. At 15% alpha, other tints
+-- show panel glass behind "update". It also picks foreground, preventing background/text
+-- mismatches.
 local GROUND = {
     accent = { rest = theme.ACCENT_SUBTLE, hover = theme.ACCENT_LIGHT, border = theme.ACCENT_MEDIUM },
     quiet = { rest = theme.GLASS_CONTROL, hover = theme.GLASS_CONTROL_HOVER, border = theme.GLASS_BORDER },
@@ -38,10 +38,8 @@ return function(label, on_activate, slot, opts)
     opts = opts or {}
     local ground = GROUND[opts.tone or "accent"]
     local hovered = hover(slot)
-    -- `button` centres its one child with `align_h`; a `row` starts its children. This is fine on a
-    -- content-sized button, whose row is exactly as wide as the word, but wrong on a filling one:
-    -- it left "update" against the padding. Fill both row and label, then let `cell`'s `text_align`
-    -- centre the label in the filled box.
+    -- `button` centres one child with `align_h`; `row` starts its children. On a filling button
+    -- that leaves "update" against the padding, so fill the row and label for `cell` to centre.
     local fill = opts.width == "Fill" and "Fill" or nil
     local children = {}
     if opts.icon then
@@ -52,9 +50,9 @@ return function(label, on_activate, slot, opts)
             foreground = ground.text,
         }
     end
-    -- `opts.glyph` is the Nerd Font half of the same slot. A notification's action icon is a theme
-    -- name (ADR-0090) and has to stay an `icon` node; a panel's own control is a codepoint from
-    -- `config/icons.lua`, which is a `text` node and takes the button's ink like the label does.
+    -- `opts.glyph` is the Nerd Font half of the same slot. A notification action icon is a theme
+    -- name (ADR-0090) and stays an `icon` node; a panel control is a `config/icons.lua` codepoint,
+    -- a `text` node that takes the button's ink like the label.
     if opts.glyph then
         children[#children + 1] = text {
             content = opts.glyph,
@@ -94,7 +92,6 @@ return function(label, on_activate, slot, opts)
                 end
             end
         end,
-        -- The row is what puts a glyph beside a word, rather than on top of one.
         children = { row { width = fill, height = "Fill", align_v = "Center", spacing = theme.spacing.xs, children = children } },
     }
 end

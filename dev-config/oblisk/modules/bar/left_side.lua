@@ -4,10 +4,8 @@
 -- `rescue` has no counterpart and goes first so a config error cannot be pushed off the edge. It
 -- occupies no width unless configuration failed.
 --
--- `privacy` used to follow it here, on the argument that both are intermittent alerts. It is back
--- where `RightSide.qml` puts it, leading that row: a camera or microphone in use is a fact about
--- the session's hardware, which is what the right side is, and grouping it with `rescue` grouped it
--- with a config error instead.
+-- `privacy` used to sit beside `rescue`, grouping a camera or microphone alert with a config error.
+-- It now leads `RightSide.qml`'s row for session hardware.
 local theme = require("config.theme")
 local rescue_cell = require("modules.bar.indicators.rescue")
 local power_menu = require("modules.bar.panels.power_menu")

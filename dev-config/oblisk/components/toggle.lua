@@ -2,19 +2,16 @@
 -- `network:set_wifi_enabled`, and `audio:set_muted`. The next capability snapshot is the only
 -- readback.
 -- Takes the raw signal plus `read`, as `components/meter.lua` does, because `oblisk.bluetooth`
--- pushes a table, not a bool; only the caller knows the field. `on_change` receives the flipped
--- value so the
--- caller can route it through `capability:invoke(...)` or local `state()`.
+-- pushes a table, not a bool; caller knows the field. `on_change` passes the flipped value.
+-- The caller routes it through `capability:invoke(...)` or local `state()`.
 -- The thumb slides like `OToggle.qml`'s `Behavior on x`: the track is a `row` whose first child is
 -- a spacer with a signal-bound, eased `width` (ADR-0145). `align_h` would snap and `margin`'s edge
 -- table cannot carry a tween; a bare-number spacer width can.
 local theme = require("config.theme")
 
--- `OToggle.qml` derives the whole switch from one number: the track is
--- `controlHeightFor(size) * scaleSmall` tall, which `control.xs` now equals, and
--- `round(_trackHeight * 2.3)` wide, with `_thumbPadding: max(3, round(_trackHeight * 0.12))`.
--- Deriving the width keeps the thumb's travel proportional when the scale moves; the fixed 34 it
--- replaced left a 24px-tall track with almost no room for the thumb to slide in.
+-- `OToggle.qml` derives the switch from `controlHeightFor(size) * scaleSmall`, now `control.xs`.
+-- Width is `round(_trackHeight * 2.3)` with `_thumbPadding: max(3, round(_trackHeight * 0.12))`.
+-- Width scales proportionally; fixed 34 left a 24px-tall track with little thumb travel.
 local TRACK_HEIGHT = theme.control.xs
 local TRACK_WIDTH = math.floor(TRACK_HEIGHT * 2.3 + 0.5)
 local PAD = math.max(3, math.floor(TRACK_HEIGHT * 0.12 + 0.5))
@@ -53,7 +50,7 @@ return function(signal, read, on_change)
             background = on:map(function(v)
                 return v and theme.with_opacity(theme.ACCENT, theme.opacity.full) or theme.GLASS_CONTROL
             end),
-            -- `border.color: glassBorderColor`, the same hairline every other glass control carries.
+            -- `border.color: glassBorderColor`, the same hairline all other glass controls carry.
             border_width = theme.border_width,
             border_color = theme.GLASS_BORDER,
             animate = { background = { duration = theme.animation_ms, easing = "OutCubic" } },

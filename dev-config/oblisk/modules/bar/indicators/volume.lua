@@ -1,14 +1,12 @@
--- Mirrors Volume.qml: a glyph circle expands to a slider on hover. Drag sets volume, the wheel
--- steps,
+-- Mirrors Volume.qml: a glyph circle expands to a slider on hover. Drag and wheel set volume;
 -- middle-click mutes, and right-click opens the audio panel.
 --
--- `hover` is an engine signal (ADR-0062), read by `width` and the readout's `visible`. The width
--- and the ground ease over the mirror's 147ms through `animate` (ADR-0145); the percentage still
--- appears at once, since `visible` is not a property a tween carries.
+-- `hover` is an engine signal (ADR-0062); `width` and `visible` use it. Width and ground ease over
+-- the mirror's 147ms through `animate` (ADR-0145); percentage appears at once because `visible` is
+-- not a property a tween carries.
 --
--- The whole control is `components/slider.lua`, matching the mirror's `Slider`; its accent fill
--- runs
--- under the glyph and percentage and appears only while expanded.
+-- `components/slider.lua` matches `Slider`; its accent fill runs under glyph and percentage
+-- only while expanded.
 local theme = require("config.theme")
 local util = require("lib.util")
 local ui_state = require("lib.ui_state")

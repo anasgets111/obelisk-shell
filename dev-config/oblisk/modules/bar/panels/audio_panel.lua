@@ -1,12 +1,11 @@
--- Mirrors AudioPanel.qml: masthead, output/microphone cards with pickers, then one slider per
--- application stream.
+-- Mirrors AudioPanel.qml: masthead, output/microphone cards with pickers, and one slider per app
+-- stream.
 --
 -- Sliders use `components/slider.lua` and `button`'s `on_drag`/`on_wheel` (ADR-0116). Device
--- pickers and the mixer fold open on a click, using `PanelRow.expandable` backed by three
--- `state()` signals.
--- Unlike the mirror, closing the panel does not close a picker the user left open.
+-- pickers and the mixer expand on click through `PanelRow.expandable` and three `state()` signals.
+-- Unlike the mirror, closing the panel leaves an open picker open.
 --
--- Dropped: 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`, § 3.2). Stream
+-- Dropped 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`, § 3.2`). Stream
 -- icons use `oblisk.applications` and `app_id`, falling back to a note glyph.
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -42,8 +41,7 @@ local function active_device(devices)
     return nil
 end
 
--- `AudioService.deviceIconFor`: match words in PipeWire's `device.icon-name`; no hint gets the
--- picker's default.
+-- `AudioService.deviceIconFor`: match PipeWire's `device.icon-name`; no hint uses default glyph.
 local function device_glyph(device, default)
     local hint = (device and device.icon) or ""
     if hint:find("headset") or hint:find("hands%-free") then
@@ -70,8 +68,7 @@ local function device_name(device)
     return name ~= "" and name or device.name
 end
 
--- Mirror `AudioControl`: title/device row, percentage, mute button, slider, and caller-supplied
--- rows.
+-- Mirror `AudioControl`: title/device, percentage, mute button, slider, and caller-supplied rows.
 ---@class AudioControlOpts
 ---@field name string The slider's state name.
 ---@field title string

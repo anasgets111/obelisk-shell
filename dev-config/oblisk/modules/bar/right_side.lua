@@ -3,7 +3,7 @@
 -- No brightness module, matching the reference. Its level and controls live in
 -- `modules/bar/panels/power_menu.lua`, where there is room for labels.
 --
--- `privacy` leads this row, as in RightSide.qml. It had been on the left beside `rescue`.
+-- `privacy` leads this row, as in RightSide.qml.
 local theme = require("config.theme")
 local privacy_module = require("modules.bar.indicators.privacy")
 local volume_module = require("modules.bar.indicators.volume")
@@ -15,17 +15,15 @@ local bell = require("modules.bar.indicators.notification_bell")
 local date_time = require("modules.bar.indicators.date_time")
 local ui_state = require("lib.ui_state")
 
--- One control holds bell and clock, as in `DateTimeDisplay.qml`, and one `MouseArea` fills it: the
+-- One control holds bell and clock, as in `DateTimeDisplay.qml`, and one `MouseArea` fills it. The
 -- mirror's whole readout opens the notifications panel. Splitting it -- bell to history, date to a
--- calendar panel -- meant the bar's one always-visible control opened a month grid half the time,
--- and the calendar has gone back to the clock's hover tooltip where the mirror keeps it
--- (ADR-0174).
+-- calendar panel -- meant the always-visible control opened a month grid half the time; calendar
+-- has gone back to the clock's hover tooltip where the mirror keeps it (ADR-0174).
 local clock_slot = date_time.slot
 local hovered = hover(clock_slot)
 
--- `panelOpen` is the mirror's third state for this control, above hover: `border.color: panelOpen ?
--- activeColor : ...` rings it while its own panel is up, so the pill says which panel is showing
--- rather than leaving that to the panel's position.
+-- `panelOpen` is the third state above hover; `border.color: panelOpen ? activeColor : ...`
+-- Rings it while the panel is up; the pill says which panel is showing, not the panel's position.
 local panel_showing = computed({ ui_state.panel_open, ui_state.panel_kind }, function(open, kind)
     return open and kind == bell.kind
 end)
@@ -59,10 +57,9 @@ local clock_pill = button {
         height = "Fill",
         align_v = "Center",
         spacing = theme.spacing.xs,
-        -- `DateTimeDisplay.qml` insets its end children instead, `leftPadding` on the bell and
-        -- `rightPadding` on the clock, both `spacingSm`. One padding on the row is the same inset
-        -- and survives either child changing. Without it the bell and the minutes run under the
-        -- corner radius, which at half the item height is the whole end of the pill.
+        -- `DateTimeDisplay.qml` uses `leftPadding` on bell and `rightPadding` on clock.
+        -- Both use `spacingSm`; row padding is the same inset and survives either child changing.
+        -- Without it, bell and minutes run under its radius at half height; its end is exposed.
         padding = { left = theme.spacing.sm, right = theme.spacing.sm },
         children = { bell.bell, date_time.clock },
     } },

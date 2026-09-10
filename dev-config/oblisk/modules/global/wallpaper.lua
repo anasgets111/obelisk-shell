@@ -2,12 +2,10 @@
 -- `lib/wallpaper.lua`. `child` is keyed by output name (ADR-0121), so each screen gets its own file
 -- and fit, including monitors plugged in later without a reload.
 --
--- `async` with `transition` (ADR-0180, ADR-0181): the decode leaves the render thread, the picture
--- already up holds the screen until the replacement is ready, and then the two cross rather than
--- swapping in one frame. ADR-0122 kept `async`
--- off here because a pending image drew nothing and a change flashed the ground; ADR-0179 measured
--- what that bought -- 162.7ms of decode on the render thread at every change, 114ms in release --
--- and `retain` is what removes the flash the stall was paying for.
+-- `async` with `transition` (ADR-0180, ADR-0181) decodes off the render thread, holds the current
+-- image until replacement is ready, then cross-fades. ADR-0122 kept `async` off because a pending
+-- image drew nothing and changes flashed the ground. ADR-0179 measured 162.7ms of render-thread
+-- decode at every change and 114ms in release; `retain` removes the flash without that stall.
 local wallpaper = require("lib.wallpaper")
 
 -- Anchor all four edges so the compositor sizes both axes over the output.
@@ -27,16 +25,15 @@ return panel {
     background = "#11111bff",
     child = function(output)
         return image {
-            -- `retain` holds the last picture across a source change, so the node has to be the
-            -- same node across it: a stable `id`, with the path in `source` rather than in the
-            -- identity.
+            -- `retain` holds the last picture across a source change, so keep the node's `id`
+            -- stable and put the path in `source`, not its identity.
             id = "wallpaper_image",
             source = wallpaper.path_of(output),
             fit = wallpaper.fit_of(output),
             async = true,
-            -- `transition` implies `retain` (ADR-0181), so the hold and the cross are one
-            -- declaration. The effect is whichever `.frag` the picker last chose out of
-            -- `wallpaper.SHADER_FOLDER`, not a name the engine knows (ADR-0184).
+            -- `transition` implies `retain` (ADR-0181): one declaration holds the old picture and
+            -- crosses with the selected `.frag` from `wallpaper.SHADER_FOLDER`, not an engine-known
+            -- name (ADR-0184).
             transition = wallpaper.transition(),
             width = "Fill",
             height = "Fill",

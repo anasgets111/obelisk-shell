@@ -1,10 +1,9 @@
--- Mirrors BatteryIndicator.qml: a pill filled left to right, a five-level glyph, and a percentage.
--- It is the only pill on this bar because it carries a number.
+-- Mirrors BatteryIndicator.qml: a left-to-right fill, five-level glyph, and percentage. The only
+-- pill on this bar carries a number.
 --
--- The fill is a percentage-sized `rect` in a stacking parent, using `components/meter.lua`'s trick
--- spent on a whole control instead of a 6px bar. A `rect` has no main axis, so children stack at
--- its origin and `Fill` puts
--- the fill under the text without z-order or an overlay node.
+-- The percentage-sized `rect` applies `components/meter.lua`'s stacking trick to the whole control.
+-- It is not a 6px bar. A `rect` has no main axis, so children stack at its origin; `Fill` puts fill
+-- under the text without z-order or an overlay node.
 --
 -- `clip = "Rounded"` on the pill cuts the square-cornered fill to its arc. Putting the radius on
 -- the fill drew a lozenge inside the pill's left end at low charge because the engine clipped only
@@ -16,45 +15,41 @@ local tooltip = require("components.tooltip")
 
 local SLOT = "battery"
 
--- No per-state branch beyond the draining check. The glyph below already says what the cable is
--- doing, and a second signal for it here just meant that plugging in and standing at 90% painted
--- the same green.
+-- Only the draining check changes colour. The glyph shows cable state; a second signal made a
+-- plugged-in battery at 90% use the same green.
 local function battery_color(b)
     if b == nil or not b.present then
         return theme.DIM
     end
-    -- Warn only while running down. Red at 14% on the charger is wrong; the reference service's
-    -- `isLowAndNotCharging` gates its threshold on `isOnBattery` too.
+    -- Warn only while draining. Red at 14% on the charger is wrong; the reference service's
+    -- `isLowAndNotCharging` also gates its threshold on `isOnBattery`.
     if util.battery_at_most(b, util.battery_thresholds.critical) then
         return theme.RED
     end
     if util.battery_at_most(b, util.battery_thresholds.low) then
         return theme.PEACH
     end
-    -- `activeColor`, not green. `BatteryIndicator.qml` reads
-    -- `critical : warning : Theme.activeColor`, so a healthy battery is the same accent every other
-    -- "this is fine and on" thing on the bar wears; green is a fourth state the mirror does not
-    -- have. Side by side with the QML bar the green pill was the loudest difference between them.
+    -- `activeColor`, not green. `BatteryIndicator.qml` maps `critical : warning :
+    -- Theme.activeColor`.
+    -- Green would add a fourth state absent from the mirror.
     return theme.ACCENT
 end
 
--- `textColor: Theme.textContrast(percentage > 0.6 ? batteryColor : bgColor)`. The readout sits over
--- two grounds -- the fill on its left, the pill on its right -- and 60% is where the text's centre
--- crosses from one to the other, so that is which ground it contrasts against.
+-- `textColor: Theme.textContrast(percentage > 0.6 ? batteryColor : bgColor)`. The readout crosses
+-- from fill to pill at 60%, so it contrasts against the ground under its centre.
 --
--- This had been one colour against a fill tinted to 38%, on the argument that a solid `#a6e3a1` at
--- 89% was the bar's brightest object. That was true of green. The mirror's fill is opaque and
--- accent, which is the same weight as every other lit control here, so the tint and the single
--- colour both go with it.
+-- The old readout used one colour against a 38%-tinted fill because solid `#a6e3a1` at 89% was the
+-- bar's brightest object. The mirror uses an opaque accent fill, so remove both the tint and single
+-- colour.
 local READOUT = oblisk.battery:map(function(b)
     local over_fill = b ~= nil and b.present and (b.percent or 0) > 60
     return theme.text_contrast(over_fill and battery_color(b) or theme.GLASS_CONTROL)
 end)
 
--- `onIsPluggedInChanged: if (isPluggedIn) plugFlash.restart()`. `pulse` says a change just
--- happened; the `computed` beside it keeps only the rising edge, so unplugging does not flash.
--- The window has to outlast what it gates: the flash is two cycles of hold-dark, jump-lit,
--- hold-lit, so four `animation_fast_ms` in all.
+-- `onIsPluggedInChanged: if (isPluggedIn) plugFlash.restart()`. `pulse` marks a change and
+-- `computed`
+-- keeps only the rising edge, so unplugging does not flash. The two-cycle flash lasts four
+-- `animation_fast_ms` in all.
 local plugged = oblisk.battery:map(function(b)
     return b ~= nil and b.present and not util.battery_is_draining(b.state)
 end)
@@ -71,10 +66,10 @@ local fill = rect {
     end),
     height = "Fill",
     background = oblisk.battery:map(battery_color),
-    -- `BatteryIndicator.qml`: the level slides and the threshold colour fades (ADR-0145), and the
-    -- fill blinks twice when the cable goes in. The entry's presence is what runs the sequence
-    -- (ADR-0152), so the whole table is bound rather than a `running` flag inside it. `PropertyAction`
-    -- is a segment of no duration and `PauseAnimation` a segment between two equal values.
+    -- `BatteryIndicator.qml`: the level slides and threshold colour fades (ADR-0145), while the
+    -- fill blinks twice when the cable goes in. The entry's presence runs the sequence (ADR-0152),
+    -- so the table is bound rather than using a `running` flag. `PropertyAction` has no duration
+    -- and `PauseAnimation` sits between equal values.
     animate = plug_flash:map(function(flashing)
         local eases = {
             width = theme.animation_ms,
@@ -98,11 +93,11 @@ local readout = row {
     align_v = "Center",
     spacing = theme.spacing.xs,
     children = {
-        -- `cell`, not `glyph`: both lines here are `OText`, which is `Theme.fontFamily`, and the
-        -- pill is a bar control rather than a panel row. `components/glyph.lua` would force
-        -- `iconFontFamily` and put this one glyph in a different face from the circles beside it.
-        -- Both `OText`s are `bold: true`. On an accent fill at full opacity the weight is what
-        -- keeps the dark ink readable, which is the same reason the mirror sets it.
+        -- Use `cell`, not `glyph`: both lines are `OText`/`Theme.fontFamily`;
+        -- `components/glyph.lua`
+        -- would force `iconFontFamily` and mismatch the circles beside it. Both `OText`s are
+        -- `bold: true`, which keeps dark ink readable over the opaque accent fill, as in the
+        -- mirror.
         cell(oblisk.battery:map(function(b)
             return { { text = util.battery_glyph(b), bold = true } }
         end), READOUT, theme.icon.md, { align_v = "Center" }),

@@ -1,8 +1,7 @@
 -- Mirrors NotificationPopup.qml: newest cards stacked in one corner on one surface.
 --
--- One scrolling surface, enabled by ADR-0069. A `panel` is declared, not spawned, so one surface
--- per
--- card would mean N declarations and a fixed ceiling.
+-- One scrolling surface, enabled by ADR-0069. A declared `panel` avoids one surface per card and
+-- keeps a fixed ceiling.
 --
 -- `components/notification_card.lua` is shared with history. This file owns placement, height,
 -- keyboard mode, and expiry hold.
@@ -18,29 +17,25 @@ local MAX_CARDS = 4
 local SCROLL = scroll("notification_stack")
 local HOVER = hover("notification_stack_region")
 
--- Show the newest few live, unseen cards, and none while a bar panel is open.
+-- Show the newest unseen cards, except while a bar panel is open.
 --
--- One signal drives both properties. The old `visible` and list predicates disagreed, mapping an
--- empty column; sharing the answer keeps them consistent.
+-- One signal drives both properties. Sharing the answer prevents `visible` and the list predicate
+-- from mapping different results.
 local visible_groups = computed(
     { oblisk.notifications, ui.popup_seen, ui.panel_open, oblisk.lock, oblisk.applications },
     function(n, seen, panel_open, lock, applications)
-        -- Any panel suspends popups, as `PanelHost` does on `onOverlayOpen`, because both anchor
-        -- top-right. Standing down is not retiring: only history marks feed entries seen
-        -- (`ui.popup_seen` on open/close), so a card returns after panel close unless its
-        -- Supervisor
-        -- countdown expires (ADR-0100), which leaves it only in history.
+        -- Any panel suspends popups, as `PanelHost` does on `onOverlayOpen`; both anchor top-right.
+        -- Standing down is not retiring: only history marks entries seen (`ui.popup_seen`), so a
+        -- card returns after panel close unless its Supervisor countdown expires (ADR-0100).
         --
         -- Nothing while locked (`_popupsBlocked`): a popup over the lock screen is readable without
-        -- a password. Do not mark it seen, so it appears on unlock unless its Supervisor countdown
-        -- expires; a five-second chat ping may expire, while a critical alert can wait.
+        -- a password. Do not mark it seen, so it returns on unlock unless its Supervisor countdown
+        -- expires; a five-second chat ping may expire while a critical alert waits.
         if panel_open or (lock and lock.active) then
             return {}
         end
-        -- A card leaves the stack when it expires (`expired`, Supervisor, ADR-0100), history marks
-        -- it seen (`ui.popup_seen`, ADR-0098), or DND suppresses it unless critical. None removes
-        -- it
-        -- from history.
+        -- Expiry (`expired`, Supervisor, ADR-0100), history's seen set (`ui.popup_seen`, ADR-0098),
+        -- and DND remove a card from the stack; expiry, unlike the others, leaves it in history.
         local dnd = n and n.dnd
         local unseen = {}
         for _, notification in ipairs((n and n.feed) or {}) do
@@ -53,9 +48,8 @@ local visible_groups = computed(
         local shown = {}
         for index = 1, math.min(#all, MAX_CARDS) do
             local group = all[index]
-            -- Where this card sits in the stack, read by `components/notification_card.lua` to
-            -- stagger the entry. `all` is built fresh by `group_notifications` on every pass, so
-            -- this stamps a local table rather than anything the capability holds.
+            -- `components/notification_card.lua` reads this rank to stagger entry. `all` is fresh
+            -- on every pass, so this stamps a local table, not the capability's data.
             group.rank = index
             shown[index] = group
         end
@@ -69,34 +63,30 @@ return panel {
     anchor = { top = true, right = true },
     margin = { top = theme.bar_height + theme.spacing.md, right = theme.spacing.md },
     width = theme.notification_width,
-    -- No `height`: the surface is the stack. The cap that used to stand here was wrong in both
-    -- directions -- one card sat in 560px of surface, four expanded ones had nowhere to grow -- and
-    -- is now the list's `max_height`, which is what its "but no taller" always meant.
+    -- No `height`: the surface is the stack. The old cap put one card in 560px of surface and left
+    -- four expanded cards nowhere to grow; `max_height` now bounds the list instead.
     visible = visible_groups:map(function(shown)
         return #shown > 0
     end),
     -- On demand while the pointer is on the stack or a reply is pending (ADR-0109). Bind it because
-    -- niri focuses an `on_demand`/`exclusive` layer surface on map, and this maps per notification;
-    -- a constant would steal the keyboard on every notification.
+    -- niri focuses an `on_demand`/`exclusive` layer surface on map; a constant would steal the
+    -- keyboard on every notification.
     --
     -- `OnDemand`, not `Exclusive` (ADR-0108): a small surface has no outside click and must not
-    -- keep
-    -- the keyboard. Measured niri behavior focuses it on a *click* while already on demand, not on
-    -- the mode flip, so hover enters the binding before a reply-field click. A pending draft keeps
-    -- the request alive after the pointer leaves under click-to-focus; focus-follows-mouse returns
-    -- the keyboard with the pointer and preserves the field text.
+    -- keep the keyboard. Measured niri behavior focuses it on a *click* while already on demand,
+    -- not on the mode flip, so hover enters the binding before a reply-field click. A pending draft
+    -- keeps the request alive after the pointer leaves under click-to-focus; focus-follows-mouse
+    -- returns the keyboard and preserves the field text.
     keyboard_interactivity = computed({ HOVER, ui.reply_pending }, function(hovered, pending)
         return (hovered or pending) and "OnDemand" or "None"
     end),
     child = column {
         width = "Fill",
-        -- No `height` here or on the list: content all the way down, or the surface would ask a
-        -- child how tall to be while the child asked back.
+        -- No `height` here or on the list: content fills the surface without a parent-child sizing
+        -- loop.
         -- A pointer on any card stops countdowns; leaving releases the hold (ADR-0094, ADR-0095).
         -- The region follows drawn input (ADR-0109), so empty space below sends no events. One
-        -- region
-        -- for the stack avoids sibling enter/leave ordering: entering the first before leaving the
-        -- second would otherwise release the hold just acquired.
+        -- region avoids sibling enter/leave ordering that could release a newly acquired hold.
         hover = HOVER,
         on_hover = function(hovered)
             oblisk.notifications:invoke("hold_expiry", hovered and 300 or 0)

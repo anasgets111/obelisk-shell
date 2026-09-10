@@ -1,12 +1,11 @@
 -- Mirrors ActiveWindow.qml: the focused window's icon and title in the centre zone.
 --
--- Both halves read one push, `oblisk.workspaces.active_client`. The old title lived in a `state`
--- signal and showed `click for the focused window` until clicked. Its click ran
--- `process.run("niri", {"msg", "-j", "focused-window"})`, fed the result to `json.decode`
--- (ADR-0057),
--- and needed a request counter for out-of-order replies. That demo belonged elsewhere. ADR-0056
--- excludes window lists, not the focused `active_client` already in every snapshot; shelling out to
--- niri bought a subprocess per click while duplicating pushed data.
+-- Both halves read `oblisk.workspaces.active_client`; the old title used a `state` signal.
+-- It showed `click for the focused window` until clicked, then ran
+-- `process.run("niri", {"msg", "-j", "focused-window"})` fed its result to
+-- `json.decode` (ADR-0057); a request counter handled out-of-order replies.
+-- ADR-0056 excludes window lists; `active_client` is in every snapshot. The subprocess duplicated
+-- pushed data and cost one process per click.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -17,10 +16,9 @@ local function focused(workspaces)
     return workspaces and workspaces.active_client
 end
 
--- `text: hasActive ? baseLabel : "Desktop"`, lowercased for this shell's voice. The mirror captions
--- an empty desktop rather than leaving a hole, and `CenterSide.qml` anchors this node
--- unconditionally, so hiding the row on an empty workspace would move the bar's midpoint every time
--- the last window closed.
+-- `text: hasActive ? baseLabel : "Desktop"`, lowercased here. The mirror captions an empty desktop.
+-- `CenterSide.qml` anchors this node unconditionally; hiding it moves the midpoint when the last
+-- window closed.
 local EMPTY_LABEL = "desktop"
 
 -- `iconSource`'s fallback, `resolveIconSource("", "", "applications-system")`.
@@ -42,9 +40,9 @@ local function label(applications, workspaces)
     return (entry and entry.name) or client.class or EMPTY_LABEL
 end
 
--- The second `oblisk.applications` consumer (ADR-0061). `active_client.class` is the toplevel
--- `app_id` (ADR-0056 decision 5), which `util.app_entry` maps to a `.desktop` entry. ADR-0054
--- decision 5 reserved this caller before the capability existed.
+-- `active_client.class` is the toplevel `app_id` (ADR-0056 decision 5).
+-- `util.app_entry` maps it to a `.desktop` entry. This is the second `oblisk.applications` consumer
+-- (ADR-0061), reserved by ADR-0054 decision 5 before the capability existed.
 local focused_icon = icon {
     name = computed({ oblisk.applications, oblisk.workspaces }, function(applications, workspaces)
         local client = focused(workspaces)
@@ -60,9 +58,8 @@ local focused_icon = icon {
     align_v = "Center",
 }
 
--- No pill or button: `ActiveWindow.qml` puts the icon and title directly on the bar. No ground
--- behind them makes the centre read as a caption rather than one more control. The old button only
--- existed as the click target for the removed fetch.
+-- No pill or button: `ActiveWindow.qml` puts icon and title on bar. No ground makes it a caption.
+-- It is not another control; the old button served the removed fetch.
 return row {
     height = theme.item_height,
     align_v = "Center",

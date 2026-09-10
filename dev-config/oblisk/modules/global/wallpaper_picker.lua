@@ -3,11 +3,10 @@
 --
 -- ## Engine pieces
 --
--- `oblisk.files` follows the folder (ADR-0120), so the grid lists a `computed` and does no
--- scanning.
+-- `oblisk.files` follows the folder (ADR-0120), so the grid lists a `computed` without scanning.
 -- Each tile uses `image` with `async = true` (ADR-0122); the pool downsizes 4K files while the card
 -- is up, avoiding fifty inline decodes that held the shell for one second on open. Search reuses
--- launcher's autofocus/navigation/submit and two-stage Escape.
+-- the launcher's autofocus/navigation/submit and two-stage Escape.
 --
 -- ## Grid rows
 --
@@ -18,8 +17,8 @@
 -- ## Not carried over
 --
 -- Displays tab (`DisplaySettings.qml`), transition/theme/dark-mode rows (no animation model,
--- ADR-0055 decision 4, and this config has one theme), and `~/.cache/thumbnails`: pool downscale
--- makes tiles cheap and each generation decodes once.
+-- ADR-0055 decision 4, and this config has one theme), and `~/.cache/thumbnails` are not carried
+-- over. Pool downscale makes tiles cheap and each generation decodes once.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -58,7 +57,6 @@ local grid_inner = theme.wallpaper_picker_width
 local TILE_WIDTH = math.floor((grid_inner - (COLUMNS - 1) * tile_gap) / COLUMNS)
 local TILE_HEIGHT = math.floor(TILE_WIDTH * 9 / 16)
 
--- ## List
 
 local function entries_of(f)
     local folder = wallpaper.folder_in(f)
@@ -151,8 +149,7 @@ local current_fit = computed({ wallpaper.all(), oblisk.screens, effective_monito
 end)
 
 -- Ring `selected_path` if visible, else the applied file, else the first tile. One `computed`
--- serves
--- the grid; each tile asks it once.
+-- serves the grid; each tile asks it once.
 local effective_selected = computed({ selected_path, current_path, filtered }, function(chosen, applied, entries)
     local first = ""
     for _, entry in ipairs(entries or {}) do
@@ -277,7 +274,6 @@ local function tile(entry)
                     cell(entry.name, theme.FG, theme.font.xs, { width = "Fill", align = "Center", align_v = "Center" }),
                 },
             },
-            -- Applied badge, top left.
             rect {
                 width = theme.control.xs,
                 height = theme.control.xs,
@@ -317,9 +313,6 @@ local grid = list {
     end,
 }
 
--- ## Empty states
---
--- In order: folder unreadable, listing pending, folder empty, no match.
 local folder_state = computed({ oblisk.files, trimmed }, function(f, needle)
     local folder = wallpaper.folder_in(f)
     if folder == nil or not folder.ready then
@@ -480,9 +473,9 @@ for _, fit in ipairs(wallpaper.FITS) do
 end
 local fit_row = row { width = "Fill", spacing = theme.spacing.xs, children = fit_buttons }
 
--- The same segmented buttons as Monitor and Fill mode, wrapped into rows of three. Not the mirror's
--- combo popup: this sidebar has no dropdowns, and three across is the width Fill/Fit/Stretch
--- already sets, so the panel keeps one column rhythm however many effects the folder holds.
+-- Match Monitor and Fill mode's segmented buttons, but wrap effects into rows of three. This
+-- sidebar has no combo popup; three across matches Fill/Fit/Stretch and preserves one-column rhythm
+-- for any effect count.
 local EFFECTS_PER_ROW = 3
 local current_effect = wallpaper.effect()
 
@@ -518,7 +511,7 @@ local effect_grid = list {
                     "wallpaper-effect-" .. name
                 )
             else
-                -- An empty slot, holding its share of the row and drawing nothing.
+                -- Keep an empty slot's share of the row so a short last row does not stretch.
                 buttons[#buttons + 1] = rect { width = "Fill", height = theme.control.md }
             end
         end
@@ -584,7 +577,6 @@ local body = row {
     },
 }
 
--- Centered below the bar, like the launcher.
 local card_margin = oblisk.screens:map(function(screens)
     local screen = screens and screens[1]
     if not (screen and screen.width and screen.height) then

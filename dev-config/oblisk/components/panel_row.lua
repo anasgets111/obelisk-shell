@@ -1,24 +1,20 @@
--- Panel-list row matching `Components/PanelRow.qml`: leading icon, title, optional subtitle, and a
--- trailing action slot. Every bar-panel list uses it for access points, bluetooth devices,
--- and notifications.
--- The title column's `width = "Fill"` leaves the trailing slot at the right edge and elides the
--- title into the remaining space. `components/panel_header.lua` uses the same property and
--- `scene.rs` fix.
--- `selected` matches the mirror: accent ring, tinted ground, and accent title for the joined
--- network
--- or connected device. A coloured title alone looked like a different row, not the selected one.
+-- Panel-list row matching `Components/PanelRow.qml`: leading icon, title, optional subtitle, and
+-- trailing action slot. Every bar-panel list uses it for access points, bluetooth devices, and
+-- notifications.
+-- `width = "Fill"` leaves the trailing slot at the right edge and elides the title; it matches
+-- `components/panel_header.lua` and the `scene.rs` fix.
+-- `selected` matches the mirror's accent ring, tinted ground, and accent title. A coloured title
+-- alone looked like a different row, not the selected one.
 -- Without `on_activate`, return a `rect`, not a no-op `button` that takes the pointer and looks
--- clickable. Both shapes share the look, so an unclickable selected device row still wears its
--- ring;
--- its actions are the two trailing icons.
+-- clickable. Both shapes share the look, so an unclickable selected device row still wears its ring
+-- and trailing actions.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local glyph = require("components.glyph")
 
--- Annotated like `components/cell.lua`: payload fields become text here and `title`/`subtitle` go
--- straight to `cell`. Without these shapes, `list` `itemfn`'s `any` reached `text.content`
--- unchanged,
--- including a notification span array.
+-- Like `components/cell.lua`, payload fields become text here and `title`/`subtitle` go straight to
+-- `cell`. Without these shapes, `list` `itemfn`'s `any` reaches `text.content` unchanged, including
+-- a notification span array.
 ---@class PanelRowOpts
 ---@field title string|Bound
 ---@field subtitle? string|Bound
@@ -52,10 +48,8 @@ return function(opts)
     if opts.leading then
         children[#children + 1] = opts.leading
     elseif opts.icon then
-        -- A glyph, not a themed icon: `PanelRow.qml` tints it by state (connected accent, failed
-        -- red),
-        -- but `PaintStyle::Icon` has no tint. `opts.art` is for unchosen artwork such as an
-        -- application's icon.
+        -- A glyph, not a themed icon: `PanelRow.qml` tints it by state, but `PaintStyle::Icon` has
+        -- no tint. `opts.art` is for unchosen artwork such as an application's icon.
         children[#children + 1] = glyph(opts.icon, opts.icon_color or title_color, theme.icon.md, { align_v = "Center" })
     elseif opts.art then
         children[#children + 1] = icon { name = opts.art, size = theme.icon.md, align_v = "Center" }
@@ -91,7 +85,6 @@ return function(opts)
         end)
     end
 
-    -- One look for both shapes; only the handler chooses the constructor.
     local shell = {
         hover = hovered,
         width = "Fill",

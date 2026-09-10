@@ -1,24 +1,23 @@
--- Mirrors SysTray.qml: registered `StatusNotifierItem`s laid out horizontally as borderless buttons
--- carrying their applications' icons.
+-- Mirrors `SysTray.qml`: registered `StatusNotifierItem`s laid out horizontally as borderless
+-- buttons carrying their applications' icons.
 --
--- Use themed icons, not glyphs: tray items ship their own artwork and cannot be recoloured, as
--- `components/icon_button.lua` notes. The rest of this bar chooses its glyphs explicitly.
+-- Use themed icons, not glyphs: tray items ship artwork and cannot be recoloured, as
+-- `components/icon_button.lua` notes. The rest of this bar chooses glyphs explicitly.
 --
--- `icon.foreground` is CSS `color`, the value `currentColor` resolves to (ADR-0072). Symbolic icons
--- are defined to take the panel colour; Breeze bakes light-theme grey into the file for the toolkit
--- to rewrite. Telegram drew near-black until this was set. Full-colour icons have no `currentColor`
--- and ignore it, so apply it to every item.
+-- `icon.foreground` is CSS `color`, which resolves `currentColor` (ADR-0072). Symbolic icons take
+-- the panel colour; Breeze bakes light-theme grey for the toolkit to rewrite. Telegram drew
+-- near-black until this was set. Full-colour icons ignore `currentColor`, so apply it to every
+-- item.
 --
 -- The ground is the mirror's own: a `Rectangle` filling the tray, `glassControlColor` behind
--- `glassBorderColor` at `itemRadius`, with the row centred in it and no padding of its own -- the
--- gap around each icon is the button's width, not the pill's.
+-- `glassBorderColor` at `itemRadius`, with a centred row and no padding -- the gap around each icon
+-- is the button's width, not the pill's.
 --
--- An earlier pass here had no ground at all, because a *fixed* 135px pill looked like a failed
--- control with no items and a fixed 150px left two items sitting in 110px of empty bar: a `list`
--- without `width` sizes to content, so a fixed width is both floor and ceiling. Computing the width
--- from item count fixed that, and the ground could come back. The mirror's empty state is the same
--- answer -- the pill shrinks to `emptyLabel.implicitWidth` and says "No tray items" rather than
--- hiding or standing empty.
+-- An earlier pass had no ground: a *fixed* 135px pill looked like a failed control with no items,
+-- while a fixed 150px left two items in 110px of empty bar. A `list` without `width` sizes to
+-- content, so a fixed width is both floor and ceiling. Item-count sizing fixes that, and the ground
+-- can remain. The mirror's empty state matches it: shrink to `emptyLabel.implicitWidth` and say
+-- "No tray items" rather than hide or stand empty.
 local theme = require("config.theme")
 local util = require("lib.util")
 local cell = require("components.cell")
@@ -48,20 +47,16 @@ local function artwork(item)
 end
 
 -- The ceiling, not the width: a dozen items scroll instead of taking the zone (ADR-0069). The
--- mirror
--- has no cap because QML `RowLayout` shrinks children; this `row` does not.
+-- mirror has no cap because QML `RowLayout` shrinks children; this `row` does not.
 local TRAY_WIDTH = theme.s(150, 110)
 
 -- Content-sized up to the ceiling; § 5.1 has no `max_width`. `width` accepts a signal resolved
--- before
--- the property is parsed (ADR-0044), so item count supplies the width, like `components/meter.lua`
--- turns `"NN%"` into a progress bar.
+-- before the property is parsed (ADR-0044), so item count supplies the width, like
+-- `components/meter.lua` turns `"NN%"` into a progress bar.
 --
 -- One square per item, `IconButton`'s `implicitWidth: _size` at the `md` step the mirror's delegate
--- takes. The room around each icon is this square minus `icon.md`, which is where the pill's
--- breathing space comes from -- it has no padding of its own. Squares also make the row measurable
--- from the count alone: the no-artwork fallback draws letters of some other width, and an
--- icon-plus-gap item width was off by that difference.
+-- takes. The square minus `icon.md` is the pill's breathing space; it has no padding. Squares make
+-- width measurable from count alone because fallback letters and icon-plus-gap widths differ.
 local ITEM_WIDTH = theme.control.md
 
 local function tray_width(count)
@@ -87,9 +82,9 @@ local items = list {
         local art = artwork(item) or (entry and entry.icon)
         local face
         if art then
-            -- `anchors.centerIn: parent`. Without `align_h` the artwork sits against the left edge
-            -- of its square, which both lops the row's spacing onto one end and pushes the first
-            -- icon under the pill's corner radius (`components/icon_button.lua` hit this with "EN").
+            -- `anchors.centerIn: parent`. Without `align_h`, artwork sits at the square's left
+            -- edge, lops spacing onto one end and pushes the first icon under the pill's corner
+            -- radius (`components/icon_button.lua` hit this with "EN").
             face = icon {
                 name = art,
                 size = theme.icon.md,
@@ -99,8 +94,7 @@ local items = list {
             }
         else
             -- No artwork happens. Two 9px `DIM` letters beside 22px glyphs looked like a rendering
-            -- fault
-            -- between Bluetooth and the clock, so match the icon weight.
+            -- fault between Bluetooth and the clock, so match the icon weight.
             face = cell(
                 (item.name or item.id or "?"):sub(1, 2),
                 theme.FG,
@@ -108,9 +102,9 @@ local items = list {
                 { align = "Center", align_v = "Center" }
             )
         end
-        -- `SysTray.qml`'s `onClicked`: right opens the menu when there is one, left activates,
-        -- anything else is the secondary activation. An item whose `item_is_menu` is set has no
-        -- meaningful activation, so its left click opens the menu too rather than doing nothing.
+        -- `SysTray.qml`'s `onClicked`: right opens a menu, left activates, and anything else is
+        -- secondary activation. `item_is_menu` makes left click open the menu when one exists
+        -- instead of becoming a no-op.
         return button {
             width = ITEM_WIDTH,
             height = "Fill",
@@ -125,8 +119,8 @@ local items = list {
                     oblisk.tray:invoke("secondary_activate", item.id, 0, 0)
                 end
             end,
-            -- `onWheel`: the item decides what a notch means; ours is the vertical axis, which is
-            -- the only one `on_wheel` reports (ADR-0116).
+            -- `onWheel`: the item decides what a notch means; ours uses the vertical axis, the only
+            -- one `on_wheel` reports (ADR-0116).
             on_wheel = function(_, notches)
                 oblisk.tray:invoke("scroll", item.id, math.floor(notches), "vertical")
             end,
@@ -139,7 +133,7 @@ local items = list {
 }
 
 -- `opacity: Theme.opacityMuted` on a `DIM` line, folded into the colour: `cell` takes no opacity,
--- and an alpha is what the mirror's opacity resolves to on one run of text.
+-- so alpha supplies the mirror's opacity for one run of text.
 local empty_label = cell(
     "No tray items",
     theme.with_opacity(theme.DIM, theme.opacity.muted),
@@ -159,7 +153,7 @@ return row {
     background = theme.GLASS_CONTROL,
     border_width = theme.border_width,
     border_color = theme.GLASS_BORDER,
-    -- Both children are always here; an invisible one takes no width, no position and no gap, so
-    -- the pill measures whichever is showing.
+    -- Both children stay here; an invisible one takes no width, position or gap, so the pill
+    -- measures whichever is showing.
     children = { items, empty_label },
 }

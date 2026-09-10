@@ -1,7 +1,6 @@
 -- Mirrors DateTimeDisplay.qml: one control holds the notification state and clock.
 --
--- Date and time are one string, `%a %d %b  %I:%M %p`, rather than adjacent cells. A dim date cell next
--- to a large time cell read as two modules, which this drew before. The mirror uses
+-- Date and time share `%a %d %b  %I:%M %p`; separate cells read as two modules. The mirror uses
 -- `TimeService.format("datetime")`.
 --
 -- Seconds are omitted. A per-second clock re-resolves for a digit nobody reads; § 4.2's
@@ -26,16 +25,13 @@ end):map(function(shown)
     return { { text = shown, bold = true } }
 end), theme.text_contrast(theme.GLASS_CONTROL), theme.font.sm, { align_v = "Center" })
 
--- `DateTimeDisplay.qml` hangs `MinimalCalendar` off this tooltip, which is where the month grid
--- belongs: the clock's click opens the notifications panel, and a calendar nobody asked for should
--- not be what a click on the bar's one always-visible readout produces.
+-- `DateTimeDisplay.qml` hangs `MinimalCalendar` off this tooltip. The whole control opens
+-- notifications; a click on the always-visible readout should not open a calendar panel.
 --
--- The one tooltip that still declares its size. Every other one omits `width`/`height` and is
--- measured (`components/tooltip.lua`); this one's rows fill the card instead of sizing it -- the
--- two lines are `width = "Fill"` and the grid is a fixed cell -- so there is nothing for a
--- content-sized measurement to read. The height is the calendar's own plus the two lines above it
--- and `panel_card`'s spacing and padding, following the calendar's signal because a month is four
--- to six weeks tall.
+-- This is the only tooltip with explicit `width`/`height`; other tooltips are measured
+-- (`components/tooltip.lua`). Its `width = "Fill"` rows and fixed-cell grid leave no content-sized
+-- extent to measure. Height adds the calendar's signal, the two lines, `panel_card` spacing and
+-- padding; a month is four to six weeks tall.
 local DATE_LINE = math.ceil(theme.font.sm * 1.2)
 local TIME_LINE = math.ceil(theme.font.xs * 1.2)
 
@@ -43,9 +39,8 @@ local clock_tooltip = tooltip({
     id = "clock_tooltip",
     slot = SLOT,
     width = calendar.width + theme.spacing.sm * 2,
-    -- The month grid's bottom row is a `DAY_SIDE` cell around a much smaller glyph, so it carries
-    -- its own air; the date line at the top has none, and the shared `xs` under the border left it
-    -- against the edge. `md` is what the panel card uses for the same reason.
+    -- The grid's bottom row is a `DAY_SIDE` cell around a smaller glyph, so it carries its own air.
+    -- The date line has none; shared `xs` left it against the border, while `md` matches the card.
     padding_v = theme.spacing.md,
     height = calendar.height:map(function(grid)
         return grid + DATE_LINE + TIME_LINE + theme.spacing.md * 2 + theme.spacing.xs * 2
