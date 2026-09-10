@@ -50,27 +50,20 @@ end
 -- mirror has no cap because QML `RowLayout` shrinks children; this `row` does not.
 local TRAY_WIDTH = theme.s(150, 110)
 
--- Content-sized up to the ceiling; § 5.1 has no `max_width`. `width` accepts a signal resolved
--- before the property is parsed (ADR-0044), so item count supplies the width, like
--- `components/meter.lua` turns `"NN%"` into a progress bar.
---
 -- One square per item, `IconButton`'s `implicitWidth: _size` at the `md` step the mirror's delegate
--- takes. The square minus `icon.md` is the pill's breathing space; it has no padding. Squares make
--- width measurable from count alone because fallback letters and icon-plus-gap widths differ.
+-- takes. The square minus `icon.md` is the pill's breathing space; it has no padding. Equal squares
+-- keep the row even, where fallback letters and icon-plus-gap widths would not.
 local ITEM_WIDTH = theme.control.md
-
-local function tray_width(count)
-    return math.max(0, math.min(TRAY_WIDTH, count * ITEM_WIDTH))
-end
 
 local has_items = util.shown_when(oblisk.tray, function(t)
     return #items_of(t) > 0
 end)
 
+-- No `width`: the row measures its own children and stops at `max_width`, which is the same
+-- `min(count * ITEM_WIDTH, TRAY_WIDTH)` the config used to compute, with `spacing = 0` and every
+-- child a fixed `ITEM_WIDTH`.
 local items = list {
-    width = computed({ oblisk.tray }, function(t)
-        return tray_width(#items_of(t))
-    end),
+    max_width = TRAY_WIDTH,
     direction = "Horizontal",
     spacing = 0,
     align_v = "Center",

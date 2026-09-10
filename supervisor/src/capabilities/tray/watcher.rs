@@ -188,7 +188,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// Two worker threads because this one really does call the peer. `bind_item` builds the item
+    /// proxy with `CacheProperties::No`, so `register_item`'s ADR-0168 `Status` probe is a live
+    /// `Properties.Get` rather than a cached read, and the stub can only answer it while the
+    /// server side is parked on the reply -- which a current-thread runtime cannot do.
+    ///
+    /// It passed on one thread before that change, which is the tell: the probe was being served
+    /// from the property cache and this test never exercised the refusal it exists to pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_status_notifier_item_accepts_a_unique_name_matching_the_real_sender() {
         let (connection, peer) = p2p_pair().await;
         peer.object_server()

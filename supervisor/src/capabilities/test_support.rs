@@ -10,7 +10,9 @@ use tokio::net::UnixStream;
 /// `tray::registry::register_item` calls a peer with no handlers, and zbus's default timeout would
 /// let several sequential calls hang.
 ///
-/// Binding a proxy makes no call, so tests needing only a `Proxy` need no answering peer.
+/// Binding a proxy makes no call, so tests needing only a `Proxy` need no answering peer. A test
+/// that drives `register_item` is not one of those: its `Status` probe is a real call, and the
+/// peer answers it only on a multi-thread runtime.
 pub(super) async fn p2p_pair() -> (zbus::Connection, zbus::Connection) {
     let (a, b) = UnixStream::pair().expect("failed to create a unix socket pair");
     let guid = zbus::Guid::generate();

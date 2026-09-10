@@ -135,12 +135,27 @@ pub(super) trait StatusNotifierWatcherClient {
 
 /// Binds to `destination`, not the item's unique name: Chromium answers only its registered
 /// well-known name (ADR-0072).
+/// Uncached, like `battery::controller`'s UPower proxy and for a sharper reason: an item announces
+/// a changed icon with SNI's own `NewIcon`, never `PropertiesChanged`, which is the only thing
+/// zbus's default lazy cache invalidates on. `registry::spawn_item_signal_forwarder` re-reads
+/// `IconName` when `NewIcon` fires, and with a cache it would be handed the value from bind time
+/// every time.
+///
+/// libayatana-appindicator is why this is not merely stale but broken: it renumbers its icon file
+/// on every update (`tray-icon-<app>-0.png` to `-1.png` ...) and unlinks the old one, so a cached
+/// name is a path that no longer exists and the item paints an empty square. Seen with
+/// `yerd-gui`, which rotates within a second of launch.
 pub(super) async fn bind_item(
     connection: &zbus::Connection,
     destination: &OwnedBusName,
     path: &OwnedObjectPath,
 ) -> zbus::Result<StatusNotifierItemProxy<'static>> {
-    StatusNotifierItemProxy::builder(connection).destination(destination.clone())?.path(path.clone())?.build().await
+    StatusNotifierItemProxy::builder(connection)
+        .destination(destination.clone())?
+        .path(path.clone())?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
 }
 
 pub(super) async fn bind_dbusmenu(
