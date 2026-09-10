@@ -246,16 +246,13 @@ fn is_comparable_literal(value: &Value) -> bool {
 
 /// Whether the `state` literal changed. `None` means no edit per ADR-0044's amendment. This keeps
 /// `lib/ui_state.lua`'s table `popup_anchor` from looking edited on every reload and snapping a
-/// popup to the corner. Integer/number comparison follows Lua `==`, so `0` and `0.0` match; scalar
-/// types differing do not.
+/// popup to the corner. `Value`'s own `PartialEq` compares an `Integer` against a `Number` the way
+/// Lua `==` does, so `0` and `0.0` match; scalar types differing do not.
 fn literal_was_edited(current: &Value, seeded: &Value) -> Option<bool> {
     if !is_comparable_literal(current) || !is_comparable_literal(seeded) {
         return None;
     }
-    Some(match (current, seeded) {
-        (Value::Integer(i), Value::Number(n)) | (Value::Number(n), Value::Integer(i)) => (*i as f64) != *n,
-        _ => current != seeded,
-    })
+    Some(current != seeded)
 }
 
 /// Read-only reactive value: plain (`Direct`/Rust-pushed) or recomputed Lua closure (`Computed`).
