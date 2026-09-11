@@ -107,16 +107,6 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesCo
 /// 2,000-package run belongs in a file, not a state payload reserialized on every progress line.
 const LOG_TAIL_LINES: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PollMode {
-    Dormant,
-    Ticking(Duration),
-}
-
-fn poll_mode(interval: Duration) -> PollMode {
-    if interval.is_zero() { PollMode::Dormant } else { PollMode::Ticking(interval) }
-}
-
 /// Cloneable so `main.rs` can hand an `Arc`-backed copy to the spawned install task.
 #[derive(Clone)]
 pub struct UpdatesController {
@@ -239,15 +229,37 @@ async fn run_check_task(
 ) {
     loop {
         let interval = *interval_rx.borrow_and_update();
-        match poll_mode(interval) {
-            PollMode::Dormant => {
-                // Dormant mode still answers `check_now`; a config may use a button without a
-                // timer.
+        if interval.is_zero() {
+            // Dormant still answers `check_now`; a config may use a button without a timer.
+            tokio::select! {
+                changed = interval_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                asked = check_now_rx.recv() => {
+                    if asked.is_none() {
+                        return;
+                    }
+                    run_one_check(&backend, &state, &events).await;
+                }
+            }
+        } else {
+            let mut ticker = tokio::time::interval(interval);
+            // Checks can exceed a short interval. `Burst` would hammer mirrors with missed
+            // ticks; `Delay` resumes after the check.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` ticks immediately, so an hourly schedule checks now, not in an hour
+            // (ADR-0113 amendment). Skip only when this process has a fresh check; the
+            // controller outlives config generations; under the old unconditional consume,
+            // every save reset the hour and a day of editing never checked at all.
+            if !first_check_is_due(state.lock().unwrap().last_successful_check, now_unix(), interval) {
+                ticker.tick().await;
+            }
+            loop {
                 tokio::select! {
-                    changed = interval_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
+                    _ = ticker.tick() => {
+                        run_one_check(&backend, &state, &events).await;
                     }
                     asked = check_now_rx.recv() => {
                         if asked.is_none() {
@@ -255,37 +267,11 @@ async fn run_check_task(
                         }
                         run_one_check(&backend, &state, &events).await;
                     }
-                }
-            }
-            PollMode::Ticking(duration) => {
-                let mut ticker = tokio::time::interval(duration);
-                // Checks can exceed a short interval. `Burst` would hammer mirrors with missed
-                // ticks; `Delay` resumes after the check.
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // `interval` ticks immediately, so an hourly schedule checks now, not in an hour
-                // (ADR-0113 amendment). Skip only when this process has a fresh check; the
-                // controller outlives config generations; under the old unconditional consume,
-                // every save reset the hour and a day of editing never checked at all.
-                if !first_check_is_due(state.lock().unwrap().last_successful_check, now_unix(), duration) {
-                    ticker.tick().await;
-                }
-                loop {
-                    tokio::select! {
-                        _ = ticker.tick() => {
-                            run_one_check(&backend, &state, &events).await;
+                    changed = interval_rx.changed() => {
+                        if changed.is_err() {
+                            return;
                         }
-                        asked = check_now_rx.recv() => {
-                            if asked.is_none() {
-                                return;
-                            }
-                            run_one_check(&backend, &state, &events).await;
-                        }
-                        changed = interval_rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            break; // interval reconfigured; rebuild dormant/ticking outer loop
-                        }
+                        break; // interval reconfigured; rebuild the dormant/ticking outer loop
                     }
                 }
             }
@@ -566,12 +552,6 @@ mod tests {
             "this must never move the last-check time backwards"
         );
         assert_eq!(kept.count, 1);
-    }
-
-    #[test]
-    fn poll_mode_is_dormant_at_zero_and_ticking_otherwise() {
-        assert_eq!(poll_mode(Duration::ZERO), PollMode::Dormant);
-        assert_eq!(poll_mode(Duration::from_secs(1)), PollMode::Ticking(Duration::from_secs(1)));
     }
 
     /// A controller over [`StubBackend`], so every check fails without touching the network. What
