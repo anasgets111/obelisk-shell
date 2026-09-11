@@ -6,8 +6,8 @@
 -- "could not download; check the connection". Numbers are language-neutral; that sentence is not.
 --
 -- Not carried over: spinner (no per-frame property, ADR-0021) and copy-log button (no clipboard
--- primitive). Restart-safe check scheduling lives in `modules/bar/indicators/updates.lua` now that
--- config can act on success (ADR-0115).
+-- primitive). `modules/bar/indicators/updates.lua` schedules the checks (ADR-0115) on the cadence
+-- declared below and installs from the notification action through `install` here.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -20,6 +20,9 @@ local action_button = require("components.action_button")
 local meter = require("components.meter")
 
 local KIND = "updates"
+-- Check hourly: a badge is read on that scale, and each check is a real `-Sy` against a mirror. The
+-- indicator schedules on it and `last_check_line` calls twice this stale.
+local CHECK_INTERVAL = 3600
 local PACKAGE_SCROLL = scroll("update_packages")
 local LOG_SCROLL = scroll("update_log")
 
@@ -30,6 +33,22 @@ local dismissed = state("updates_result_dismissed", false)
 -- Stamp the install-start click: `install_finished_at` is published, and the click is the only
 -- known start. Config writes are allowed only in input callbacks (ADR-0044).
 local started_at = state("updates_install_started_at", 0)
+
+-- A failed run shows its log unasked; a successful one hides it behind a button, as the mirror's
+-- `showCompletedLog` does.
+local log_open = state("updates_log_open", false)
+
+-- Exported: the notification's action button in `indicators/updates.lua` is this same click.
+local function install()
+    local u = obelisk.updates:get()
+    if u == nil or (u.count or 0) == 0 or u.installing then
+        return
+    end
+    started_at:set(os.time())
+    dismissed:set(false)
+    log_open:set(false)
+    obelisk.updates:invoke("install")
+end
 
 local function packages(u)
     return (u and u.packages) or {}
@@ -58,14 +77,23 @@ local function download_total(u)
     return total
 end
 
--- True while a finished install's result remains on screen. `install_finished_at` supplies the
--- completion fact; the capability deliberately has no "completed" state, which ends when read.
+-- A run that ended. `install_finished_at` marks one the manager answered; a spawn failure publishes
+-- only `install_error` and never stamps it (`controller.rs` returns early), and reading just the
+-- stamp left that run invisible and reported as a success.
+local function install_ended(u)
+    return u ~= nil and (u.install_finished_at ~= nil or u.install_error ~= nil)
+end
+
+-- True while a finished install's result remains on screen. The capability deliberately has no
+-- "completed" state, which would end when read.
 local result_showing = computed({ obelisk.updates, dismissed }, function(u, is_dismissed)
-    return not is_dismissed and u ~= nil and not u.installing and u.install_finished_at ~= nil
+    return not is_dismissed and u ~= nil and not u.installing and install_ended(u)
 end)
 
+-- A manager killed by a signal publishes no exit code, so an absent one on a run the manager
+-- answered is a failure, not a success.
 local function install_failed(u)
-    return u ~= nil and ((u.install_exit_code ~= nil and u.install_exit_code ~= 0) or u.install_error ~= nil)
+    return install_ended(u) and (u.install_error ~= nil or u.install_exit_code ~= 0)
 end
 
 -- Replaces `_detectErrorMessage`: pacman's output supplies the reason, and this file turns it into
@@ -96,7 +124,22 @@ local function failure_reason(u)
     if u.install_error ~= nil then
         return "the updater could not be started"
     end
-    return string.format("pacman exited with %d", u.install_exit_code or -1)
+    if u.install_exit_code == nil then
+        return "pacman was killed before it finished"
+    end
+    return string.format("pacman exited with %d", u.install_exit_code)
+end
+
+-- ponytail: `install_log` is the last 200 lines, so a run longer than that undercounts. The
+-- Supervisor would have to keep the counter for an exact one.
+local function warning_count(u)
+    local count = 0
+    for _, line in ipairs(u.install_log or {}) do
+        if line:lower():find("warning", 1, true) then
+            count = count + 1
+        end
+    end
+    return count
 end
 
 local function status_line(u)
@@ -107,7 +150,7 @@ local function status_line(u)
         local package = u.install_current_package
         return (package ~= nil and package ~= "") and ("installing " .. package) or "starting the install"
     end
-    if not dismissed:get() and u.install_finished_at ~= nil then
+    if not dismissed:get() and install_ended(u) then
         return install_failed(u) and "update failed" or "update complete"
     end
     if u.checking then
@@ -133,15 +176,17 @@ local function detail_line(u)
         end
         return "pacman has not said how many yet"
     end
-    if not dismissed:get() and u.install_finished_at ~= nil then
+    if not dismissed:get() and install_ended(u) then
         if install_failed(u) then
             return failure_reason(u)
         end
+        local warnings = warning_count(u)
+        local noted = warnings > 0 and string.format(" · %d warning%s", warnings, warnings == 1 and "" or "s") or ""
         local seconds = u.install_finished_at - (started_at:get() or 0)
         if (started_at:get() or 0) > 0 and seconds >= 0 then
-            return string.format("took %d min %d sec", math.floor(seconds / 60), seconds % 60)
+            return string.format("took %d min %d sec%s", math.floor(seconds / 60), seconds % 60, noted)
         end
-        return "finished"
+        return "finished" .. noted
     end
     -- A failed check keeps the last good list (§ 2.14), so say which list is shown.
     if u.check_error ~= nil then
@@ -158,15 +203,17 @@ end
 
 -- Include the date when the check is not today. "checked 07:08" in a shell running since Tuesday
 -- falsely reads as this morning; the mirror prints the date unconditionally.
-local function last_check_line(u)
+--
+-- Past two intervals, say so: a suspended laptop otherwise shows an old count with nothing marking
+-- it old. The mirror's `isStale` without its error half, which `detail_line` already covers.
+local function last_check_line(u, now)
     if u == nil or u.last_successful_check == nil then
         return "never checked"
     end
     local at = u.last_successful_check
-    if os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d") then
-        return "checked " .. os.date("%H:%M", at)
-    end
-    return "checked " .. os.date("%b %d, %H:%M", at)
+    local when = os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d") and os.date("%H:%M", at)
+        or os.date("%b %d, %H:%M", at)
+    return "checked " .. when .. (now - at > CHECK_INTERVAL * 2 and " · stale" or "")
 end
 
 -- Sort by name; `alpm`'s installed-database order has no useful reading order.
@@ -210,8 +257,28 @@ local packages_showing = computed({ obelisk.updates, result_showing }, function(
     return not showing and u ~= nil and not u.installing and #packages(u) > 0
 end)
 
-local log_showing = computed({ obelisk.updates, result_showing }, function(u, showing)
-    return u ~= nil and (u.installing or (showing and install_failed(u)))
+local log_showing = computed({ obelisk.updates, result_showing, log_open }, function(u, showing, open)
+    return u ~= nil and (u.installing or (showing and (install_failed(u) or open)))
+end)
+
+-- Follow the newest line, as the mirror's `followOutput` does. Every push reveals, not only the
+-- lengthening ones: the log is a 200-line tail, so past that the content changes while the length
+-- does not.
+--
+-- Not gated on `installing`: the exit push carries the drained stderr, which is where a failure says
+-- why.
+--
+-- ponytail: unlike the mirror, scrolling back during an install does not stop the follow, so a user
+-- reading an earlier line is dragged to the end by the next one. The mirror pauses on
+-- `onMovementStarted`; the offset alone cannot stand in for that, because `reveal` lands in a later
+-- layout pass than the read (`lua-meta/signals.lua`), so a recorded offset always trails the real
+-- one by a reveal and a scroll back above it is indistinguishable from sitting at the end. Wants an
+-- engine-side "the wheel moved this viewport" signal.
+obelisk.updates:on_change(function(u)
+    local lines = u ~= nil and #(u.install_log or {}) or 0
+    if lines > 0 then
+        LOG_SCROLL:reveal(lines)
+    end
 end)
 
 local body = {
@@ -229,7 +296,9 @@ local body = {
         active = obelisk.updates:map(function(u)
             return ((u and u.count) or 0) > 0 or (u ~= nil and u.installing)
         end),
-        subtitle = util.label(obelisk.updates, last_check_line),
+        subtitle = computed({ obelisk.updates, obelisk.system }, function(u, clock)
+            return last_check_line(u, (clock and clock.time) or os.time())
+        end),
         trailing = {
             -- Show only when relevant; a reboot badge after no install warns about nothing.
             cell("reboot pending", theme.PEACH, theme.font.xs, {
@@ -328,7 +397,7 @@ local body = {
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", visible = log_showing }),
     panel_empty_state("nothing to update", util.shown_when(obelisk.updates, function(u)
-        return not u.installing and not u.checking and (u.count or 0) == 0 and u.install_finished_at == nil
+        return not u.installing and not u.checking and (u.count or 0) == 0 and not install_ended(u)
     end), { icon = icons.up_to_date }),
     row {
         width = "Fill",
@@ -338,15 +407,7 @@ local body = {
                 obelisk.updates:map(function(u)
                     return install_failed(u) and "retry" or "update"
                 end),
-                function()
-                    local u = obelisk.updates:get()
-                    if u == nil or (u.count or 0) == 0 or u.installing then
-                        return
-                    end
-                    started_at:set(os.time())
-                    dismissed:set(false)
-                    obelisk.updates:invoke("install")
-                end,
+                install,
                 "updates-install",
                 {
                     tone = "solid",
@@ -356,11 +417,28 @@ local body = {
                     end),
                 }
             ),
+            action_button("view log", function()
+                log_open:set(true)
+            end, "updates-log", {
+                tone = "quiet",
+                width = "Fill",
+                visible = computed({ result_showing, obelisk.updates, log_open }, function(showing, u, open)
+                    return showing and not open and not install_failed(u)
+                end),
+            }),
             action_button("close", function()
                 dismissed:set(true)
+                log_open:set(false)
             end, "updates-dismiss", { tone = "quiet", width = "Fill", visible = result_showing }),
         },
     },
 }
 
-return { kind = KIND, body = body }
+return {
+    kind = KIND,
+    body = body,
+    install = install,
+    install_failed = install_failed,
+    install_ended = install_ended,
+    CHECK_INTERVAL = CHECK_INTERVAL,
+}

@@ -59,6 +59,8 @@ local bluetooth_tooltip = require("modules.bar.indicators.bluetooth").tooltip
 local screen_recorder_tooltip = require("modules.bar.indicators.screen_recorder").tooltip
 -- The idle tooltip counts down to the next stage, which the bar has no room to show.
 local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
+-- One glyph carries five update states; the tooltip names the one it is in.
+local updates_tooltip = require("modules.bar.indicators.updates").tooltip
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
 -- Not a surface. Registers the battery's OSD, low-battery notification and suspend effects once;
@@ -85,6 +87,7 @@ return {
     bluetooth_tooltip,
     screen_recorder_tooltip,
     idle_tooltip,
+    updates_tooltip,
     modal_host,
     lock_screen,
     polkit_dialog,

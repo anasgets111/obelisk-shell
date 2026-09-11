@@ -29,7 +29,7 @@ return row {
     children = {
         rescue_cell,
         power_menu.button,
-        updates_module,
+        updates_module.indicator,
         idle_inhibitor.indicator,
         keyboard_module,
         battery.indicator,

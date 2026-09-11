@@ -1332,6 +1332,7 @@ mod tests {
                 ("bluetooth_tooltip", "popup"),
                 ("screen_recorder_tooltip", "popup"),
                 ("idle_tooltip", "popup"),
+                ("updates_tooltip", "popup"),
                 ("modal_host", "panel"),
                 ("lock_screen", "lock"),
                 ("polkit_dialog", "panel"),
