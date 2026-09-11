@@ -271,7 +271,7 @@ local function content(output)
                             -- the emoji beside them. Read against the code, not against a zero
                             -- temperature, which is a real winter reading in most of the world.
                             computed({ weather.code, weather.temperature }, function(code, celsius)
-                                return code >= 0 and string.format("%d°C", celsius or 0) or "--"
+                                return (code or -1) >= 0 and string.format("%d°C", celsius or 0) or "--"
                             end)
                         ),
                         status_item(
