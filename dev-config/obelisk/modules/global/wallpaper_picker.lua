@@ -38,9 +38,6 @@ local ALL = "all"
 local query = state("wallpaper_query", "")
 local selected_path = state("wallpaper_selected", "")
 local monitor = state("wallpaper_monitor", ALL)
--- Plain locals, not state: previous field text for Escape's two stages.
-local typed = ""
-local emptied_a_query = false
 
 -- ## Sizes
 --
@@ -368,18 +365,14 @@ local search = rect {
             font_size = theme.font.lg,
             foreground = theme.FG,
             on_change = function(text)
-                emptied_a_query = text == "" and typed ~= ""
-                typed = text
                 query:set(text)
                 select_first()
             end,
             on_submit = apply_selected,
-            on_cancel = function()
-                if emptied_a_query then
-                    emptied_a_query = false
-                    return
+            on_cancel = function(cleared)
+                if not cleared then
+                    close()
                 end
-                close()
             end,
             on_navigate = function(key)
                 if key == "backtab" then

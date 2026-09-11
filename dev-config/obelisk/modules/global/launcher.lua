@@ -61,9 +61,6 @@ local SPECIAL = " special"
 
 local query = state("launcher_query", "")
 local selected_id = state("launcher_selected", "")
--- Plain locals, not state: the previous field text for Escape's two stages.
-local typed = ""
-local emptied_a_query = false
 
 local function entries_of(applications)
     return (applications and applications.entries) or {}
@@ -451,22 +448,16 @@ local search = rect {
             font_size = theme.font.xl,
             foreground = theme.FG,
             on_change = function(text)
-                -- Escape empties the field before `on_cancel`; remember whether text existed here.
-                -- Opening with autofocus also sends `""`, resetting selection and scroll.
-                emptied_a_query = text == "" and typed ~= ""
-                typed = text
                 query:set(text)
                 select_first()
             end,
             on_submit = activate,
             -- `handleSearchKey`'s two-stage Escape: text clears and stays; empty closes. The engine
             -- already cleared the field and released the keyboard; autofocus takes it back.
-            on_cancel = function()
-                if emptied_a_query then
-                    emptied_a_query = false
-                    return
+            on_cancel = function(cleared)
+                if not cleared then
+                    close()
                 end
-                close()
             end,
             on_navigate = function(key)
                 if key == "up" or key == "backtab" then

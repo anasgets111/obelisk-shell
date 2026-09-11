@@ -1494,7 +1494,8 @@ struct PlainCallbacks {
     on_cancel: Option<Function>,
 }
 
-/// Delivers one plain-field edit's callbacks in the order a config can rely on (ADR-0189).
+/// Delivers one plain-field edit's callbacks in the order a config can rely on (ADR-0189), with
+/// `on_cancel` told whether the Escape it reports cleared any text.
 ///
 /// `on_submit` before `on_change`. A submit clears the buffer, and the `on_change` that reports the
 /// clearing carries the empty string; delivering it first hands a config the empty field before the
@@ -1519,9 +1520,11 @@ fn deliver_plain_edit(surface_id: &str, edit: PlainEdit, text: String, callbacks
     {
         eprintln!("[obelisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
     }
+    // `edit.changed` is the one thing a config cannot work out for itself: the autofocus arm fires
+    // `on_change("")` too, so counting empty changes cannot tell a cleared field from an opened one.
     if edit.cancelled
         && let Some(on_cancel) = on_cancel
-        && let Err(e) = on_cancel.call::<()>(())
+        && let Err(e) = on_cancel.call::<()>(edit.changed)
     {
         eprintln!("[obelisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
     }
