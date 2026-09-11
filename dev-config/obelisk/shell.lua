@@ -70,7 +70,8 @@ require("modules.global.power_events")
 require("modules.global.idle")
 
 return {
-    wallpaper,
+    wallpaper.desktop,
+    wallpaper.overview,
     bar,
     notifications,
     osd,

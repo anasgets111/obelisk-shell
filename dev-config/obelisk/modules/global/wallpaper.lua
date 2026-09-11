@@ -8,35 +8,52 @@
 -- decode at every change and 114ms in release; `retain` removes the flash without that stall.
 local wallpaper = require("lib.wallpaper")
 
--- Anchor all four edges so the compositor sizes both axes over the output.
---
--- Use `"Ignore"`, not `false`. Both reserve nothing, but `false` respects other reservations, so a
--- 39px bar shrank this to 1161px and placed it below. Layer-shell `-1` ignores them and covers the
--- output. `true` also reads as 0 for an all-edge surface with no single edge (ADR-0078).
-return panel {
-    id = "wallpaper",
-    layer = "Background",
-    anchor = { top = true, bottom = true, left = true, right = true },
-    exclusive = "Ignore",
-    width = "Fill",
-    height = "Fill",
-    -- Under the image: a failed decode leaves the desktop dark, not transparent, so the failure is
-    -- visible instead of looking like an unmapped surface.
-    background = "#11111bff",
-    child = function(output)
-        return image {
-            -- `retain` holds the last picture across a source change, so keep the node's `id`
-            -- stable and put the path in `source`, not its identity.
-            id = "wallpaper_image",
-            source = wallpaper.path_of(output),
-            fit = wallpaper.fit_of(output),
-            async = true,
-            -- `transition` implies `retain` (ADR-0181): one declaration holds the old picture and
-            -- crosses with the selected `.frag` from `wallpaper.SHADER_FOLDER`, not an engine-known
-            -- name (ADR-0184).
-            transition = wallpaper.transition(),
-            width = "Fill",
-            height = "Fill",
-        }
-    end,
+-- Built twice: `place-within-backdrop` moves a surface into Niri's backdrop rather than copying it,
+-- so the desktop needs its own. Unblurred, unlike `OverviewWallpaper.qml`: `blur` blurs what is
+-- behind a node, and an `image` takes no shader outside a `transition`.
+local function wallpaper_panel(id, visible)
+    -- Anchor all four edges so the compositor sizes both axes over the output.
+    --
+    -- Use `"Ignore"`, not `false`. Both reserve nothing, but `false` respects other reservations, so
+    -- a 39px bar shrank this to 1161px and placed it below. Layer-shell `-1` ignores them and covers
+    -- the output. `true` also reads as 0 for an all-edge surface with no single edge (ADR-0078).
+    return panel {
+        id = id,
+        visible = visible, -- `nil` on the desktop, which is never conditional.
+        layer = "Background",
+        anchor = { top = true, bottom = true, left = true, right = true },
+        exclusive = "Ignore",
+        width = "Fill",
+        height = "Fill",
+        -- Under the image: a failed decode leaves the desktop dark, not transparent, so the failure is
+        -- visible instead of looking like an unmapped surface.
+        background = "#11111bff",
+        child = function(output)
+            return image {
+                -- `retain` holds the last picture across a source change, so keep the node's `id`
+                -- stable and put the path in `source`, not its identity.
+                id = "wallpaper_image",
+                source = wallpaper.path_of(output),
+                fit = wallpaper.fit_of(output),
+                async = true,
+                -- `transition` implies `retain` (ADR-0181): one declaration holds the old picture and
+                -- crosses with the selected `.frag` from `wallpaper.SHADER_FOLDER`, not an engine-known
+                -- name (ADR-0184).
+                transition = wallpaper.transition(),
+                width = "Fill",
+                height = "Fill",
+            }
+        end,
+    }
+end
+
+-- Hyprland has no backdrop, so the second panel would decode a picture nothing draws. `false`
+-- destroys the surface rather than hiding it, and reads `nil` until the first answer (ADR-0044).
+local on_niri = obelisk.workspaces:map(function(w)
+    return w ~= nil and w.compositor == "niri"
+end)
+
+return {
+    desktop = wallpaper_panel("wallpaper"),
+    overview = wallpaper_panel("overview_wallpaper", on_niri),
 }
