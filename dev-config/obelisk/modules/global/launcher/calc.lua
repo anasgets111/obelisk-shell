@@ -6,11 +6,17 @@
 -- admits no letters and so no identifier, and the empty `_ENV` leaves nothing to reach if one ever
 -- got through.
 --
--- `--` is refused. It passes the allowlist and Lua reads it as a comment, so `2--3` would answer 2
--- where the mirror answers 5; a wrong number is worse than no row.
+-- `--` and `//` are refused. Both pass the allowlist, and Lua reads them as a comment and as
+-- floor division: `2--3` would answer 2 and `10//3` would answer 3, where the mirror raises a
+-- `SyntaxError` on each and shows no row. A wrong number is worse than no row.
 --
--- `^` needs no rewrite, being exponentiation already. The percent rewrite is kept verbatim, which
--- is why `%` means percent rather than Lua's modulo and `10%3` is refused by both configs.
+-- Three rewrites put JavaScript's arithmetic back. `**` becomes `^`, undoing the mirror's own
+-- `^`-to-`**`; a leading unary `+` goes, Lua having none; and every integer literal gains a `.0`,
+-- because Lua 5.4 integers wrap where JavaScript Numbers do not, and `4294967296*4294967296`
+-- otherwise answers 0 rather than 1.8e19.
+--
+-- The percent rewrite is kept verbatim, which is why `%` means percent rather than Lua's modulo
+-- and `10%3` is refused by both configs.
 local icons = require("config.icons")
 local util = require("lib.util")
 
@@ -27,10 +33,17 @@ function M.claims(query)
         return nil
     end
     -- `!/^\d+\.?\d*$/`: a bare number is not a calculation.
-    if input:match("^%d+%.?%d*$") or input:find("--", 1, true) then
+    if input:match("^%d+%.?%d*$") or input:find("--", 1, true) or input:find("//", 1, true) then
         return nil
     end
-    local expression = input:gsub(",", ""):gsub("(%d+%.?%d*)%%", "(%1/100)")
+    local expression = input
+        :gsub(",", "")
+        :gsub("%*%*", "^")
+        :gsub("^%s*%+", "")
+        :gsub("(%d+%.?%d*)%%", "(%1/100)")
+        :gsub("%d+%.?%d*", function(number)
+            return number:find(".", 1, true) and number or (number .. ".0")
+        end)
     local chunk = load("return " .. expression, "=calc", "t", {})
     if not chunk then
         return nil

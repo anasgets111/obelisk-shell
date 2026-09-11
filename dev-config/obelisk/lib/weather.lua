@@ -110,32 +110,40 @@ weather.location = store.weather_location
 -- launch would show "Weather Unavailable" over a forecast that is on screen.
 weather.failed = state("weather_failed", false)
 
-local in_flight = false
-local retries = 0
----@type integer|nil
-local next_attempt = nil
+-- `state`, not module locals: a local is rebuilt by every in-place reload, while the `process.run`
+-- child it is guarding is not. An unrelated config save would clear the guard under a live request
+-- and let the next tick start a second one. `state` has exactly the child's lifetime, surviving a
+-- reload with an unchanged seed (ADR-0044 decision 5) and dying with the generation that gets the
+-- child reaped anyway. `0` in `next_attempt` means nothing is scheduled yet.
+local in_flight = state("weather_fetching", false)
+local retries = state("weather_retries", 0)
+local next_attempt = state("weather_next_attempt", 0)
 
 local function schedule(seconds)
-    next_attempt = os.time() + seconds
+    next_attempt:set(os.time() + seconds)
 end
 
 local function failed()
     weather.failed:set(true)
-    retries = retries + 1
-    schedule(RETRY_SECONDS[retries] or REFRESH_SECONDS)
+    local attempt = retries:get() + 1
+    local backoff = RETRY_SECONDS[attempt]
+    -- Out of short retries: wait for the hour, and reset so that hour's cycle gets its own two,
+    -- which is what `_startRefreshCycle` does before every scheduled check.
+    retries:set(backoff and attempt or 0)
+    schedule(backoff or REFRESH_SECONDS)
 end
 
 ---@param url string
 ---@param apply fun(data: table)
 local function http_get(url, apply)
-    in_flight = true
+    in_flight:set(true)
     local body = {}
     process.run("curl", { "-fsS", "--max-time", "5", url }, function(line, stream)
         if stream == "stdout" then
             body[#body + 1] = line
         end
     end, function(code)
-        in_flight = false
+        in_flight:set(false)
         local data = code == 0 and json.decode(table.concat(body)) or nil
         -- `apply` raising is the mirror's `throw new Error("No weather data")`, caught into the same
         -- retry as a dead socket. A half-applied reading cannot result: both writers write last.
@@ -158,7 +166,7 @@ local function fetch_weather(latitude, longitude)
         store:set("weather_daily", data.daily)
         store:set("weather_updated_at", os.time())
         weather.failed:set(false)
-        retries = 0
+        retries:set(0)
         schedule(REFRESH_SECONDS)
     end)
 end
@@ -187,23 +195,27 @@ end
 
 ---`refresh()`: the widget's button. A reading younger than 30s is left alone, as the mirror does.
 function weather.refresh()
-    if in_flight then
+    if in_flight:get() then
         return
     end
     if os.time() - (store.weather_updated_at:get() or 0) < MANUAL_FLOOR_SECONDS then
         return
     end
-    retries = 0
+    retries:set(0)
     fetch(store.weather_location:get())
 end
 
 obelisk.system:on_change(function(system)
     local now = system and system.time
-    if not now or in_flight or obelisk.storage:get() == nil then
+    if not now or in_flight:get() or obelisk.storage:get() == nil then
         return
     end
-    -- Before this session has attempted anything, the deadline is the stored reading's own hour.
-    if now < (next_attempt or (store.weather_updated_at:get() or 0) + REFRESH_SECONDS) then
+    -- Before anything has been scheduled, the deadline is the stored reading's own hour.
+    local due = next_attempt:get()
+    if due == 0 then
+        due = (store.weather_updated_at:get() or 0) + REFRESH_SECONDS
+    end
+    if now < due then
         return
     end
     fetch(store.weather_location:get())

@@ -118,27 +118,33 @@ local function updated_text(at, now)
     return "Updated " .. os.date(same_day and "%I:%M %p" or "%b %d, %I:%M %p", at)
 end
 
--- `_requesting`: one request in flight, and a failure leaves the stored rates alone.
-local requesting = false
+-- `_requesting`: one request in flight, and a failure leaves the stored rates alone. Both live in
+-- `state`, not module locals: a local is rebuilt by every in-place reload while the `process.run`
+-- child it guards is not, so an unrelated config save would clear the guard under a live request.
+-- `state` has the child's own lifetime (ADR-0044 decision 5).
+local requesting = state("currency_fetching", false)
+-- A failure must move a deadline. Without one, `currency_updated_at` stays stale and the 1 Hz tick
+-- below starts a fresh curl every second for as long as the endpoint is down. The mirror cannot
+-- reach this: `refreshIfStale()` is called when the launcher opens, not once a second.
+local next_attempt = state("currency_next_attempt", 0)
+local RETRY_SECONDS = 3600
 
 local function fetch()
-    if requesting then
+    if requesting:get() then
         return
     end
-    requesting = true
+    requesting:set(true)
     local body = {}
     process.run("curl", { "-fsS", "--max-time", "5", URL }, function(line, stream)
         if stream == "stdout" then
             body[#body + 1] = line
         end
     end, function(code)
-        requesting = false
-        if code ~= 0 then
-            return
-        end
-        local decoded = json.decode(table.concat(body))
+        requesting:set(false)
+        local decoded = code == 0 and json.decode(table.concat(body)) or nil
         local rates = decoded and decoded.usd
         if type(rates) ~= "table" then
+            next_attempt:set(os.time() + RETRY_SECONDS)
             return
         end
         -- `data.usd["usd"] = 1.0`: the base is absent from its own table.
@@ -155,6 +161,9 @@ end
 obelisk.system:on_change(function(system)
     local now = system and system.time
     if not now or obelisk.storage:get() == nil then
+        return
+    end
+    if now < next_attempt:get() then
         return
     end
     if now - (store.currency_updated_at:get() or 0) >= REFRESH_SECONDS then
