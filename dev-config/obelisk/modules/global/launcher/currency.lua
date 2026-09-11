@@ -149,16 +149,12 @@ local function fetch()
 end
 
 -- Until storage pushes, `currency_updated_at` reads its `0` default, and fetching on that would
--- spend a request the stored rates were about to answer.
-local storage_ready = false
-
-obelisk.storage:on_change(function()
-    storage_ready = true
-end)
-
+-- spend a request the stored rates were about to answer. A level test on the signal, not a handler
+-- watching for its first push: an in-place reload installs the new handler after the capability has
+-- already pushed, so an edge gate would arm on a cold start and never again.
 obelisk.system:on_change(function(system)
     local now = system and system.time
-    if not (storage_ready and now) then
+    if not now or obelisk.storage:get() == nil then
         return
     end
     if now - (store.currency_updated_at:get() or 0) >= REFRESH_SECONDS then
