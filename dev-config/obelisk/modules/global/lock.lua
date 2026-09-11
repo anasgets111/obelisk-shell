@@ -2,7 +2,7 @@
 -- card centred on every output, and a password pill that says what PAM is doing.
 --
 -- The wallpaper's `MultiEffect` blur is absent because the engine has no effect node; the scrim
--- separates it instead. The weather status item is absent because no weather capability exists.
+-- separates it instead.
 local theme         = require("config.theme")
 local icons         = require("config.icons")
 local util          = require("lib.util")
@@ -11,6 +11,7 @@ local cell          = require("components.cell")
 local glyph         = require("components.glyph")
 local panel_card    = require("components.panel_card")
 local identity      = require("lib.identity")
+local weather       = require("lib.weather")
 
 local PAD           = theme.spacing.xl
 -- What the card's children have to share, for the nodes that need a number rather than "Fill".
@@ -264,6 +265,15 @@ local function content(output)
                     align_h = "Center",
                     spacing = theme.spacing.lg,
                     children = {
+                        status_item(
+                            weather.code:map(weather.glyph),
+                            -- `weatherLabel` is `currentTemp.split(" ")[0]`: the degrees without
+                            -- the emoji beside them. Read against the code, not against a zero
+                            -- temperature, which is a real winter reading in most of the world.
+                            computed({ weather.code, weather.temperature }, function(code, celsius)
+                                return code >= 0 and string.format("%d°C", celsius or 0) or "--"
+                            end)
+                        ),
                         status_item(
                             obelisk.battery:map(util.battery_glyph),
                             util.label(obelisk.battery, function(b)

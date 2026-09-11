@@ -27,6 +27,14 @@ return persistent_table {
         -- `lastSuccessfulCheck`, `packages`, and `notifiedPackagesKey`). The list travels with
         -- time: a restart inside the interval skips its check; without the list, it would say "up
         -- to date" for the rest of the hour.
+        -- `Settings.state.weather` and `Settings.data.weatherLocation`. The forecast is cached
+        -- whole so a restart inside the hour draws before any request; the mirror stringifies it
+        -- into the same file. `weather_location` is written once, from the IP lookup.
+        weather_code = -1,
+        weather_temperature = 0,
+        weather_daily = {},
+        weather_updated_at = 0,
+        weather_location = {},
         -- `Settings.state.currency`: the rates table keyed by lowercase code, and when it was
         -- fetched. Split into two keys rather than the mirror's one object, matching the
         -- `updates_*` trio above. A restart inside the day reuses them and spends no request.

@@ -17,6 +17,7 @@ local notification_card = require("components.notification_card")
 local info_badge = require("components.info_badge")
 local identity = require("lib.identity")
 local system_info = require("modules.bar.indicators.system_info")
+local weather_widget = require("modules.bar.indicators.weather")
 
 local KIND = "notifications"
 local SCROLL = scroll("notification_feed")
@@ -114,7 +115,8 @@ local body = {
         },
     },
     -- `NotificationHistoryPanel.qml` orders weather, `SystemInfoWidget`, then the notifications
-    -- masthead. Weather has no § 2.x capability behind it and is absent.
+    -- masthead.
+    weather_widget("notifications"),
     system_info("notifications"),
     panel_header {
         title = "notifications",

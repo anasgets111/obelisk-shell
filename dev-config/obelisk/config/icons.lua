@@ -117,6 +117,16 @@ icons.awake           = "\u{F0176}"
 icons.display         = "\u{F0379}"
 
 icons.refresh         = "\u{F0450}"
+
+-- `LockContent.qml`'s `weatherIcon` buckets the WMO code into six Nerd Font glyphs. The sidebar
+-- widget draws the emoji from `WeatherCodes.qml` instead: one is a status line beside the battery
+-- and keyboard layout, the other is the picture on a forecast card.
+icons.weather_sunny   = "\u{F0599}"
+icons.weather_fog     = "\u{F0591}"
+icons.weather_rain    = "\u{F0597}"
+icons.weather_snow    = "\u{F0598}"
+icons.weather_storm   = "\u{F0593}"
+icons.weather_cloud   = "\u{F0590}"
 icons.clear_all       = "\u{F0234}"
 
 -- List-row actions, matching `PanelActionIcon`: delete a saved network or paired device, or cut a
