@@ -29,7 +29,9 @@ return persistent_table {
         -- to date" for the rest of the hour.
         -- `Settings.state.weather` and `Settings.data.weatherLocation`. The forecast is cached
         -- whole so a restart inside the hour draws before any request; the mirror stringifies it
-        -- into the same file. `weather_location` is written once, from the IP lookup.
+        -- into the same file. `weather_location` carries the `timezone` it was resolved from, which
+        -- is what lets an hourly cycle tell "same place" from "this machine has moved". Write it by
+        -- hand to pin a place and no lookup runs at all.
         weather_code = -1,
         weather_temperature = 0,
         weather_daily = {},

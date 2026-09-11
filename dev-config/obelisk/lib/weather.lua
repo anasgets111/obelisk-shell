@@ -1,5 +1,8 @@
 -- Mirrors `Services/SystemInfo/WeatherService.qml` and `WeatherCodes.qml`: one hourly reading of
--- open-meteo, with the browser's geolocation standing in as an IP lookup.
+-- open-meteo.
+--
+-- Coordinates come from the timezone, not the mirror's `ipapi.co`, which answers 429 on its free
+-- tier. It is the timezone's city, not yours; write `weather_location` to pin one instead.
 --
 -- `process.run("curl", ...)` replaces `XMLHttpRequest`, decoded in `exit_cb` because only that
 -- callback knows the body is complete. `docs/roadmap.md` routes weather through an HTTP CLI rather
@@ -20,6 +23,7 @@
 -- edge gate would arm on a cold start and never again.
 local icons = require("config.icons")
 local store = require("lib.store")
+local util = require("lib.util")
 
 local weather = {}
 
@@ -29,7 +33,7 @@ local RETRY_SECONDS = { 2, 4 }
 -- `refresh()` ignores a click inside 30s of the last reading.
 local MANUAL_FLOOR_SECONDS = 30
 
-local GEOLOCATION_URL = "https://ipapi.co/json/"
+local GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search?count=5&name="
 
 -- `WeatherCodes.qml`, verbatim. WMO codes are sparse, so this is a lookup rather than a range test,
 -- and an unlisted one is the mirror's own "Unknown" rather than a nil a caller has to test for. The
@@ -171,25 +175,47 @@ local function fetch_weather(latitude, longitude)
     end)
 end
 
--- `_fetchGeoLocation`: the coordinates are cached with the place name, so this runs once per
--- machine rather than once per reading.
-local function fetch(location)
-    if location and location.latitude and location.longitude then
-        fetch_weather(location.latitude, location.longitude)
-        return
-    end
-    http_get(GEOLOCATION_URL, function(data)
-        assert(type(data.latitude) == "number" and type(data.longitude) == "number", "no coordinates")
-        local place = data.city or ""
-        if data.country_name and data.country_name ~= "" then
-            place = place ~= "" and (place .. ", " .. data.country_name) or data.country_name
+-- `_fetchGeoLocation`. The zone's last segment is its city.
+local function fetch_location(zone)
+    local city = zone:match("([^/]+)$"):gsub("_", "%%20")
+    http_get(GEOCODING_URL .. city, function(data)
+        for _, place in ipairs(data.results or {}) do
+            -- Load-bearing: unmatched, `Europe/Kiev` returns a Kiev in the Urals.
+            if place.timezone == zone then
+                store:set("weather_location", {
+                    latitude = place.latitude,
+                    longitude = place.longitude,
+                    place_name = place.country and (place.name .. ", " .. place.country) or place.name,
+                    timezone = zone,
+                })
+                fetch_weather(place.latitude, place.longitude)
+                return
+            end
         end
-        store:set("weather_location", {
-            latitude = data.latitude,
-            longitude = data.longitude,
-            place_name = place,
-        })
-        fetch_weather(data.latitude, data.longitude)
+        error("no place in " .. zone)
+    end)
+end
+
+-- Re-read each cycle so a machine that travels re-resolves; geocode only when the zone changed.
+local function fetch()
+    in_flight:set(true)
+    local zone = ""
+    process.run("timedatectl", { "show", "-p", "Timezone", "--value" }, function(line, stream)
+        if stream == "stdout" then
+            zone = util.trim(line)
+        end
+    end, function(code)
+        if code ~= 0 or zone == "" then
+            in_flight:set(false)
+            failed()
+            return
+        end
+        local known = store.weather_location:get()
+        if known and known.timezone == zone and known.latitude and known.longitude then
+            fetch_weather(known.latitude, known.longitude)
+        else
+            fetch_location(zone)
+        end
     end)
 end
 
@@ -202,7 +228,7 @@ function weather.refresh()
         return
     end
     retries:set(0)
-    fetch(store.weather_location:get())
+    fetch()
 end
 
 obelisk.system:on_change(function(system)
@@ -218,7 +244,7 @@ obelisk.system:on_change(function(system)
     if now < due then
         return
     end
-    fetch(store.weather_location:get())
+    fetch()
 end)
 
 ---`timeAgo`.
