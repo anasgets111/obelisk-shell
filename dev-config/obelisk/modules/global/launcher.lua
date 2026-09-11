@@ -27,9 +27,6 @@
 -- provider claimed: currency, then calculator, then the web fallback. Providers return plain tables
 -- rather than closures, because a `computed` value is marshalled and a function is not; `activate`
 -- switches on `kind`.
---
--- Calculator and currency were dropped from this file for want of a clipboard. `lib/util.lua`'s
--- `activate` hands the selection to `wl-copy`, which is where a Wayland selection has to live.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -172,7 +169,7 @@ local function web_claims(text, apps_weak)
         kind = "web",
         badge = is_url and "URL" or "WEB",
         hint = "Enter to open",
-        icon = icons.web,
+        icon = is_url and icons.web or icons.search,
         title = is_url and target or text,
         subtitle = is_url and "Open link" or "Web search",
         payload = target,
@@ -301,7 +298,7 @@ local function row_shell(id, slot, children, opts)
     return button {
         hover = hovered,
         width = "Fill",
-        height = theme.launcher_row_height,
+        height = (opts and opts.height) or theme.launcher_row_height,
         radius = theme.radius.md,
         visible = opts and opts.visible,
         background = computed({ selected, hovered }, function(on, hot)
@@ -332,7 +329,7 @@ local function row_shell(id, slot, children, opts)
         children = { row {
             width = "Fill",
             height = "Fill",
-            spacing = theme.spacing.md,
+            spacing = theme.spacing.sm,
             align_v = "Center",
             padding = { left = theme.spacing.sm, right = theme.spacing.sm },
             children = children,
@@ -394,7 +391,7 @@ local special_row = row_shell(SPECIAL, "launcher-special", {
     -- `rowIconIsText` picks between the body and icon families, and `cell` takes that choice as a
     -- signal, so the mirror's two `OText` cases are one node here. A currency row's flag needs it:
     -- under the icon family, regional indicators have no glyph to fall back from.
-    cell(special_field("icon"), theme.DIM, theme.launcher_icon, {
+    cell(special_field("icon"), theme.FG, theme.launcher_icon, {
         align_v = "Center",
         font = special:map(function(row)
             return (row and row.icon_is_text) and "Body" or "Icon"
@@ -413,9 +410,10 @@ local special_row = row_shell(SPECIAL, "launcher-special", {
     info_badge(special_field("badge")),
     cell(special_field("hint"), theme.DIM, theme.font.xs, { align_v = "Center" }),
 }, {
+    height = theme.launcher_special_height,
     visible = special:map(function(row)
         return row ~= nil
-    end)
+    end),
 })
 
 local app_list = list {
@@ -438,17 +436,19 @@ local search = rect {
     width = "Fill",
     height = theme.control.xl,
     radius = theme.radius.md,
-    background = theme.GLASS_CONTENT,
+    background = theme.GLASS_INPUT,
     border_width = theme.border_width,
-    border_color = theme.GLASS_BORDER,
-    padding = { left = theme.spacing.md, right = theme.spacing.md },
+    -- `OInput` rings `activeColor` while focused, which `autofocus` below makes this field for as
+    -- long as the modal is up.
+    border_color = theme.ACCENT,
+    padding = { left = theme.spacing.xl, right = theme.spacing.xl },
     children = {
         textfield {
             width = "Fill",
             height = "Fill",
             autofocus = true,
-            placeholder = "Search apps, or type a link",
-            font_size = theme.font.lg,
+            placeholder = "Search apps, calculate, convert currency…",
+            font_size = theme.font.xl,
             foreground = theme.FG,
             on_change = function(text)
                 -- Escape empties the field before `on_cancel`; remember whether text existed here.
@@ -488,7 +488,7 @@ local no_results = panel_empty_state("No results found",
         return text ~= "" and #found == 0 and row == nil
     end))
 
-local no_apps = panel_empty_state("no applications found",
+local no_apps = panel_empty_state("No applications found",
     computed({ obelisk.applications, trimmed }, function(apps, text)
         return text == "" and #entries_of(apps) == 0
     end))
@@ -516,6 +516,7 @@ return modal({
             width = "Fill",
             height = "Fill",
             background = theme.GLASS_CONTENT,
+            radius = theme.radius.lg,
             border_width = theme.border_width,
             border_color = theme.GLASS_BORDER,
             padding = {

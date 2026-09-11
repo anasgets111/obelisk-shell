@@ -183,6 +183,9 @@ theme.BORDER_SUBTLE             = theme.with_opacity(theme.SURFACE, 0.35)
 -- rectangle.
 theme.GLASS                     = theme.with_opacity("#181825", 0.88)
 theme.GLASS_CONTENT             = theme.with_opacity(theme.ELEVATED, 0.46)
+-- `glassInputColor`: a text field sits on the base tone, not the elevated one, so a search box reads
+-- as a well cut into the card it shares an edge with rather than a second card.
+theme.GLASS_INPUT               = theme.with_opacity(theme.BG, 0.62)
 theme.GLASS_HOVER               = theme.with_opacity(theme.ELEVATED_HOVER, 0.62)
 theme.ACCENT_SUBTLE             = theme.with_opacity(theme.ACCENT, theme.opacity.subtle)
 theme.ACCENT_LIGHT              = theme.with_opacity(theme.ACCENT, theme.opacity.light)
@@ -408,13 +411,17 @@ theme.media_artwork             = s(96, 80)
 
 -- ## The launcher (`modules/global/launcher.lua`)
 --
--- The mirror's `launcherWindowWidth/Height` are 860x680; its rows are 64px with 42px icons. This
--- is smaller because rows have a name and one-line comment, not a paragraph; 680px on a 1200px
--- screen reads as a window, not a prompt.
-theme.launcher_width            = s(720, 520)
-theme.launcher_height           = s(560, 420)
-theme.launcher_row_height       = s(56, 44)
-theme.launcher_icon             = s(36, 28)
+-- `launcherWindowWidth/Height`, `launcherRowHeight`, `launcherSpecialRowHeight` and
+-- `launcherIconSize` as the mirror sets them. The earlier 720x560 with 56px rows claimed rows here
+-- carry less than the mirror's; they carry the same name and one-line comment, so the smaller card
+-- only cost the list a row.
+theme.launcher_width            = s(860, 645)
+theme.launcher_height           = s(680, 510)
+theme.launcher_row_height       = s(64, 48)
+-- Taller than an app row because the provider row carries a badge and an "Enter to copy" hint
+-- beside the two text lines.
+theme.launcher_special_height   = s(86, 65)
+theme.launcher_icon             = s(42, 32)
 
 -- ## The wallpaper picker (`modules/global/wallpaper_picker.lua`)
 --
