@@ -15,28 +15,52 @@
 --
 -- ## Selection
 --
--- `selected_id` stores the last key/hover choice: app id, `WEB`, or empty. `effective_selected`
+-- `selected_id` stores the last key/hover choice: app id, `SPECIAL`, or empty. `effective_selected`
 -- keeps that row if visible, else the first row, computed once for the list so each row maps one
 -- signal. This keeps three hundred rows within the 5ms graph budget. Hover selection matches the
 -- mirror's `hoverSelectionArmed`, so mouse and arrows move the same ring.
 --
--- Dropped calculator and currency rows: both end in "Enter to copy", but the engine lacks a
--- clipboard.
--- Keep the web row because `applications:open_url` completes it.
+-- ## The special row
+--
+-- `LauncherService.qml` routes a query through its providers and keeps at most one, which
+-- `AppLauncher.qml` draws as a single row above the apps. One row here too, carrying whichever
+-- provider claimed: currency, then calculator, then the web fallback. Providers return plain tables
+-- rather than closures, because a `computed` value is marshalled and a function is not; `activate`
+-- switches on `kind`.
+--
+-- Calculator and currency were dropped from this file for want of a clipboard. `lib/util.lua`'s
+-- `activate` hands the selection to `wl-copy`, which is where a Wayland selection has to live.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
-local glyph = require("components.glyph")
+local util = require("lib.util")
+local store = require("lib.store")
 local ui_state = require("lib.ui_state")
 local modal = require("components.modal")
 local panel_card = require("components.panel_card")
 local panel_empty_state = require("components.panel_empty_state")
+local info_badge = require("components.info_badge")
+local calc = require("modules.global.launcher.calc")
+local currency = require("modules.global.launcher.currency")
+
+---What a provider returns when it claims a query, and the whole of what the special row draws.
+---The mirror spreads these across `rowBadge`/`rowHint`/`rowIcon`/`rowIconIsText`/`rowTitle`/
+---`rowSubtitle` on each singleton; one table carries them here because a `computed` can hold it.
+---@class LauncherRow
+---@field kind "currency"|"calc"|"web" What `activate` does with `payload`: copy it, or open it.
+---@field badge string
+---@field hint string
+---@field icon string
+---@field icon_is_text? boolean The glyph needs the body family, not the Nerd Font one.
+---@field title string
+---@field subtitle string
+---@field payload string
 
 local SCROLL = scroll("launcher_list")
 local MAX_RESULTS = 200
 local PAGE = 8
--- Web-row id in `selected_id`, not a desktop-file id; desktop-file ids never start with a space.
-local WEB = " web"
+-- Special-row id in `selected_id`, not a desktop-file id; desktop-file ids never start with a space.
+local SPECIAL = " special"
 
 local query = state("launcher_query", "")
 local selected_id = state("launcher_selected", "")
@@ -122,39 +146,65 @@ local results = computed({ obelisk.applications, query }, filter)
 -- ## Web row
 --
 -- `WebProvider.qml`: hostname-shaped input opens as a link; other input searches. Show for a URL
--- always, otherwise only when no application matches.
+-- always, otherwise only when no application matches. That is the mirror's `appsWeak`, which reads
+-- fzf scores this config does not keep.
 local function looks_like_url(text)
     return text:match("^https?://[^%s]+$") ~= nil or text:match("^[%w%-]+%.[%w%-%.]+[%w]/?[^%s]*$") ~= nil
 end
 
-local function web_target(text)
-    if looks_like_url(text) then
-        return text:match("^https?://") and text or ("https://" .. text), "Open link"
+---@param text string
+---@param apps_weak boolean
+---@return LauncherRow|nil
+local function web_claims(text, apps_weak)
+    local is_url = looks_like_url(text)
+    if not (is_url or apps_weak) then
+        return nil
     end
-    local encoded = text:gsub("[^%w%-_%.~]", function(c)
-        return string.format("%%%02X", c:byte())
-    end)
-    return "https://duckduckgo.com/?q=" .. encoded, "Web search"
+    local target
+    if is_url then
+        target = text:match("^https?://") and text or ("https://" .. text)
+    else
+        target = "https://duckduckgo.com/?q=" .. text:gsub("[^%w%-_%.~]", function(c)
+            return string.format("%%%02X", c:byte())
+        end)
+    end
+    return {
+        kind = "web",
+        badge = is_url and "URL" or "WEB",
+        hint = "Enter to open",
+        icon = icons.web,
+        title = is_url and target or text,
+        subtitle = is_url and "Open link" or "Web search",
+        payload = target,
+    }
 end
 
-local trimmed = query:map(function(text)
-    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
-end)
+local trimmed = query:map(util.trim)
 
-local web_shown = computed({ trimmed, results }, function(text, found)
-    return text ~= "" and (looks_like_url(text) or #found == 0)
-end)
+-- `LauncherService.route`: the first provider that claims wins, and the web row is only reached
+-- when neither does.
+local special = computed(
+    { trimmed, results, store.currency_rates, store.currency_updated_at },
+    function(text, found, rates, updated_at)
+        if text == "" then
+            return nil
+        end
+        return currency.claims(text, rates, updated_at)
+            or calc.claims(text)
+            or web_claims(text, #(found or {}) == 0)
+    end
+)
 
 -- Ring `selected_id` when its row shows, else the first row. That is the launch target before input
 -- and after filtering removes the hovered row. One `computed` serves the list; each row asks it
 -- once.
-local effective_selected = computed({ selected_id, results, web_shown }, function(id, found, web)
-    local first = web and WEB or (found and found[1] and found[1].id) or ""
+local effective_selected = computed({ selected_id, results, special }, function(id, found, row)
+    local first = row and SPECIAL or (found and found[1] and found[1].id) or ""
     if id == "" then
         return first
     end
-    if id == WEB then
-        return web and WEB or first
+    if id == SPECIAL then
+        return row and SPECIAL or first
     end
     for _, app in ipairs(found or {}) do
         if app.id == id then
@@ -166,14 +216,13 @@ end)
 
 -- ## Selection
 --
--- Read arrow-key order when the key arrives, never inside a `computed`: the visible web row first,
--- then results.
+-- Read arrow-key order when the key arrives, never inside a `computed`: the visible special row
+-- first, then results.
 local function rows_now()
-    local text = trimmed:get()
     local found = results:get() or {}
     local ids = {}
-    if text ~= "" and (looks_like_url(text) or #found == 0) then
-        ids[#ids + 1] = WEB
+    if special:get() then
+        ids[#ids + 1] = SPECIAL
     end
     for _, app in ipairs(found) do
         ids[#ids + 1] = app.id
@@ -201,7 +250,7 @@ local function move(delta)
     end
     local next_index = math.max(1, math.min(current + delta, #ids))
     selected_id:set(ids[next_index])
-    local in_list = next_index - (ids[1] == WEB and 1 or 0)
+    local in_list = next_index - (ids[1] == SPECIAL and 1 or 0)
     if in_list >= 1 then
         SCROLL:reveal(in_list)
     end
@@ -216,9 +265,22 @@ local function activate()
     if id == "" then
         return
     end
-    if id == WEB then
-        local url = web_target(trimmed:get())
-        obelisk.applications:invoke("open_url", url)
+    if id == SPECIAL then
+        -- `LauncherService.activateSpecial`. The calculator and currency rows copy, as the mirror's
+        -- "Enter to copy" hint promises; the web row opens.
+        local row = special:get()
+        if not row then
+            return
+        end
+        if row.kind == "web" then
+            obelisk.applications:invoke("open_url", row.payload)
+        else
+            -- `Utils.copyText`. A Wayland selection belongs to a process that stays alive to serve
+            -- it, which is what `process.detach` gives `wl-copy` and what a generation cannot
+            -- promise: a `process.run` child's group is reaped by the next generation swap, and the
+            -- selection goes with it.
+            process.detach("wl-copy", { row.payload })
+        end
     else
         obelisk.applications:invoke("launch", id)
     end
@@ -313,31 +375,46 @@ local function app_row(app)
     })
 end
 
-local web_selected = is_selected(WEB)
-local web_title = computed({ trimmed, web_selected }, function(text, selected)
+-- `AppLauncher.qml`'s `specialRow`: leading glyph, title over subtitle, then the badge and hint.
+local function special_field(key)
+    return special:map(function(row)
+        return row and row[key] or ""
+    end)
+end
+
+local special_selected = is_selected(SPECIAL)
+local special_title = computed({ special, special_selected }, function(row, selected)
+    local title = row and row.title or ""
     if selected then
-        return { { text = text, bold = true } }
-    else
-        return text
+        return { { text = title, bold = true } }
     end
+    return title
 end)
-local web_title_color = web_selected:map(function(on)
-    return on and theme.ACCENT or theme.FG
-end)
-local web_row = row_shell(WEB, "launcher-web", {
-    glyph(icons.web, theme.DIM, theme.launcher_icon, { align_v = "Center" }),
+local special_row = row_shell(SPECIAL, "launcher-special", {
+    -- `rowIconIsText` picks between the body and icon families, and `cell` takes that choice as a
+    -- signal, so the mirror's two `OText` cases are one node here. A currency row's flag needs it:
+    -- under the icon family, regional indicators have no glyph to fall back from.
+    cell(special_field("icon"), theme.DIM, theme.launcher_icon, {
+        align_v = "Center",
+        font = special:map(function(row)
+            return (row and row.icon_is_text) and "Body" or "Icon"
+        end),
+    }),
     column {
         width = "Fill",
         align_v = "Center",
         children = {
-            cell(web_title, web_title_color, theme.font.md, { width = "Fill" }),
-            cell(trimmed:map(function(text)
-                local _, what = web_target(text)
-                return what
-            end), theme.DIM, theme.font.xs, { width = "Fill" }),
+            cell(special_title, special_selected:map(function(on)
+                return on and theme.ACCENT or theme.FG
+            end), theme.font.md, { width = "Fill" }),
+            cell(special_field("subtitle"), theme.DIM, theme.font.xs, { width = "Fill" }),
         },
     },
-}, { visible = web_shown })
+    info_badge(special_field("badge")),
+    cell(special_field("hint"), theme.DIM, theme.font.xs, { align_v = "Center" }),
+}, { visible = special:map(function(row)
+    return row ~= nil
+end) })
 
 local app_list = list {
     width = "Fill",
@@ -405,8 +482,8 @@ local search = rect {
 }
 
 local no_results = panel_empty_state("No results found",
-    computed({ trimmed, results, web_shown }, function(text, found, web)
-        return text ~= "" and #found == 0 and not web
+    computed({ trimmed, results, special }, function(text, found, row)
+        return text ~= "" and #found == 0 and row == nil
     end))
 
 local no_apps = panel_empty_state("no applications found",
@@ -433,7 +510,7 @@ return modal({
     keyboard = true,
     card = panel_card({
         search,
-        panel_card({ web_row, app_list, no_results, no_apps }, {
+        panel_card({ special_row, app_list, no_results, no_apps }, {
             width = "Fill",
             height = "Fill",
             background = theme.GLASS_CONTENT,

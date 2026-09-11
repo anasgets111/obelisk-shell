@@ -461,4 +461,22 @@ function util.linger(signal, ms)
     end)
 end
 
+-- Whitespace off both ends. Parenthesised because `gsub` also returns its count, and a caller
+-- writing `return util.trim(x)` would otherwise return two values.
+function util.trim(text)
+    return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Thousands separators into an already-formatted number: the half of JS `toLocaleString` the
+-- launcher's calculator and currency rows need. Reverse, group, reverse, because grouping from the
+-- right is what makes "1234" read as "1,234" rather than "123,4".
+function util.thousands(formatted)
+    local sign, digits, rest = formatted:match("^(%-?)(%d+)(.*)$")
+    if not digits then
+        return formatted
+    end
+    local grouped = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    return sign .. grouped .. rest
+end
+
 return util

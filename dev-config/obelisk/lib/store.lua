@@ -27,6 +27,11 @@ return persistent_table {
         -- `lastSuccessfulCheck`, `packages`, and `notifiedPackagesKey`). The list travels with
         -- time: a restart inside the interval skips its check; without the list, it would say "up
         -- to date" for the rest of the hour.
+        -- `Settings.state.currency`: the rates table keyed by lowercase code, and when it was
+        -- fetched. Split into two keys rather than the mirror's one object, matching the
+        -- `updates_*` trio above. A restart inside the day reuses them and spends no request.
+        currency_rates = {},
+        currency_updated_at = 0,
         updates_checked_at = 0,
         updates_packages = {},
         updates_notified = "",

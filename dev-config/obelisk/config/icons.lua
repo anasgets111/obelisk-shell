@@ -18,6 +18,7 @@ icons.sleep           = "\u{F04B2}" -- nf-md-power_sleep
 icons.settings        = "\u{F0493}"
 icons.launcher        = "\u{F035C}"
 icons.web             = "\u{F059F}" -- nf-md-web, the launcher's open-link/search row
+icons.calc            = "\u{F00EC}" -- nf-md-calculator, its calculator row
 icons.wallpaper       = "\u{F02E9}"
 
 -- Updates, in `ArchChecker.qml` test order.
