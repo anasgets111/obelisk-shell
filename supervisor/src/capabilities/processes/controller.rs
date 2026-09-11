@@ -81,7 +81,8 @@ enum Request {
     /// One signal to the process itself, not its group: a pause or a reload is addressed to the
     /// program a config named, not to helpers it happened to spawn.
     Signal(Signal),
-    /// Stop the group with the declared signal, escalating to `SIGKILL` after [`STOP_GRACE`].
+    /// Stop the group with the signal the declaration names when this is handled, escalating to
+    /// `SIGKILL` after [`STOP_GRACE`].
     Stop,
 }
 
@@ -161,7 +162,6 @@ impl ProcessesController {
                 let task = tokio::spawn(supervise(
                     name.to_string(),
                     child,
-                    entry.stop_signal,
                     requests_rx,
                     Arc::clone(&self.entries),
                     self.signal_tx.clone(),
@@ -222,7 +222,6 @@ impl ProcessesController {
 async fn supervise(
     name: String,
     mut child: Child,
-    stop_signal: Signal,
     mut requests: UnboundedReceiver<Request>,
     entries: Entries,
     signal_tx: UnboundedSender<ProcessesSignal>,
@@ -246,7 +245,9 @@ async fn supervise(
                 }
                 // `None` means the controller is gone and nothing can ask again; leaving the
                 // program orphaned would be worse than stopping it.
-                Some(Request::Stop) | None => break stop_group(&name, &mut child, pid, stop_signal).await,
+                Some(Request::Stop) | None => {
+                    break stop_group(&name, &mut child, pid, declared_stop_signal(&entries, &name)).await;
+                }
             },
         }
     };
@@ -296,6 +297,15 @@ async fn stop_group(
         Ok(status) => status,
         Err(_elapsed) => Err(io::Error::other("still running after SIGKILL")),
     }
+}
+
+/// The signal `name`'s declaration names *now*, read here rather than captured when [`supervise`]
+/// started: a reload redeclares under a program already up, and `start` is long past. Names are
+/// only ever added to the map, so the fallback is unreachable and `SIGTERM` merely has to stop a
+/// program nothing can describe any more.
+fn declared_stop_signal(entries: &Entries, name: &str) -> Signal {
+    let guard = entries.lock().expect("processes entries mutex poisoned");
+    guard.get(name).map_or(Signal::SIGTERM, |entry| entry.stop_signal)
 }
 
 /// `ESRCH` is success here as in `process::signal_group_best_effort`: the target may die between
@@ -413,6 +423,40 @@ mod tests {
         controller.stop("t");
         until(&controller, "t", |s| !s.running).await;
         assert_eq!(session(&controller, "t").exit_code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn a_redeclared_stop_signal_reaches_a_program_that_was_already_running() {
+        let (controller, _rx) = controller();
+        let ready = tempfile::tempdir().expect("tempdir");
+        let marker = ready.path().join("armed");
+        controller.declare("t", Signal::SIGTERM);
+        // Two statuses so the signal that arrived is readable: 11 is the one `supervise` used to
+        // capture at `start` and keep.
+        let (cmd, args) = trapping_shell("trap 'exit 11' TERM; trap 'exit 22' INT", &marker);
+        controller.start("t", &cmd, &args);
+        until_ready(&marker).await;
+
+        // A reload re-sends every declaration. This one changed and the program did not restart.
+        controller.declare("t", Signal::SIGINT);
+        controller.stop("t");
+        until(&controller, "t", |s| !s.running).await;
+        assert_eq!(session(&controller, "t").exit_code, Some(22), "stop must use the declaration as it stands now");
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_reap_also_uses_the_current_declaration() {
+        let (controller, _rx) = controller();
+        let ready = tempfile::tempdir().expect("tempdir");
+        let marker = ready.path().join("armed");
+        controller.declare("t", Signal::SIGTERM);
+        let (cmd, args) = trapping_shell("trap 'exit 11' TERM; trap 'exit 22' INT", &marker);
+        controller.start("t", &cmd, &args);
+        until_ready(&marker).await;
+
+        controller.declare("t", Signal::SIGINT);
+        controller.reap_all().await;
+        assert_eq!(session(&controller, "t").exit_code, Some(22), "shutdown is the other path the stale signal took");
     }
 
     #[tokio::test]
