@@ -140,6 +140,7 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | :--- | :--- |
 | `obelisk.idle:register_threshold(seconds, on_idle, on_resume)` | Register inactivity callbacks; reset on re-evaluation |
 | `obelisk.idle:inhibit(reason)` / `release_inhibit()` | Acquire/release one generation-owned hold on logind idle inhibition |
+| `fuzzy(haystack, needle)` | fzf's score and match start for one candidate; `nil` for no match. Smart case. The caller sorts |
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |

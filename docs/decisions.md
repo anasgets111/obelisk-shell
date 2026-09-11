@@ -4406,3 +4406,28 @@ above is the check; `extract_route_target` already covers the parsing half.
 
 `bind_device_node` subscribes to `Props` the same way and is left alone, because a node is created
 with its `Props`. If a sink ever reads zero volume at login, suspect this first.
+
+## 0201. `fuzzy` is fzf's scorer in the engine, with the finder left in config
+
+1. One global, `fuzzy(haystack, needle) -> score?, start?`. Not a capability: it is read inside
+`computed`s, which must be pure and synchronous (ADR-0021).
+
+2. The scorer only. `createFinder`, `find` and `sortResults` are iterate/sort/tiebreak/cap, which
+`launcher.lua`'s `filter` already was. `start` is returned because the mirror tiebreaks on it; match
+positions for highlighting are not, because the mirror computes none either.
+
+3. Ported from the mirror's `Services/Utils/Fzf.qml` -- BSD-3-Clause, copyright 2021 Ajit -- with
+every constant unchanged, rather than taking a matcher crate. `LauncherService.route` decides the
+web row on `maxAppScore < Math.max(32, q.length * 25)`; a different score scale turns that copied
+threshold into a number to re-tune by feel.
+
+4. Rust rather than config Lua: O(needle x haystack) per candidate on every keystroke is ~30k inner
+steps over 300 entries, 1-3ms interpreted against tens of microseconds compiled, out of 5ms.
+
+5. Non-ASCII keeps the mirror's separate greedy scorer, ceiling and all. Its numbers do not line up
+with the DP's, so a list mixing alphabets orders the two groups by slightly different rules.
+
+Rejected: porting the 350-line JS into `dev-config`, which spends the graph budget to own more code
+than the engine version. Also rejected: keeping the five hand-rolled tiers, which agreed with fzf
+everywhere except initials -- "vsc" scored "Visual Studio Code" in the same bucket as every other
+name holding v, s and c in order, then preferred the shortest.

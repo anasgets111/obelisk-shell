@@ -68,82 +68,79 @@ end
 
 -- ## Matching
 --
--- Not fzf: name prefix beats word, substring, then comment; ordered letters are the fallback, with
--- shorter names breaking ties. "fi" therefore gives Firefox, Files, Profile Editor. Ten lines beat
--- a scoring library.
-local function subsequence(haystack, needle)
-    local position = 1
-    for i = 1, #needle do
-        position = haystack:find(needle:sub(i, i), position, true)
-        if not position then
-            return false
-        end
-        position = position + 1
+-- `Fzf.createFinder(allApps, { selector: entry => [name, comment].join(" ") })`: one string per
+-- entry, scored by `fuzzy` (ADR-0201), ordered by score and then by the mirror's tiebreakers, match
+-- start and then length. The name comparison after those is ours, because `table.sort` is unstable
+-- and two entries alike on all three keys would otherwise trade places between keystrokes.
+local function haystack_of(app)
+    if app.comment and app.comment ~= "" then
+        return app.name .. " " .. app.comment
     end
-    return true
-end
-
-local function score(app, needle)
-    local name = app.name:lower()
-    if name:sub(1, #needle) == needle then
-        return 5
-    end
-    if name:find(" " .. needle, 1, true) then
-        return 4
-    end
-    if name:find(needle, 1, true) then
-        return 3
-    end
-    if app.comment and app.comment:lower():find(needle, 1, true) then
-        return 2
-    end
-    if subsequence(name, needle) then
-        return 1
-    end
-    return nil
+    return app.name
 end
 
 ---@param applications ApplicationsState|nil
 ---@param text string
----@return AppSummary[]
+---@return { apps: AppSummary[], best: integer } `best` is the top score, the one thing the web row
+---needs that a sorted list does not carry.
 local function filter(applications, text)
     local entries = entries_of(applications)
-    local needle = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    -- No `lower()`: `fuzzy` is smart-case, so an uppercase letter in the query is the user asking
+    -- for an exact match.
+    local needle = util.trim(text)
     if needle == "" then
-        return { table.unpack(entries, 1, math.min(#entries, MAX_RESULTS)) }
+        return { apps = { table.unpack(entries, 1, math.min(#entries, MAX_RESULTS)) }, best = 0 }
     end
     local scored = {}
+    local best = 0
     for _, app in ipairs(entries) do
-        local s = score(app, needle)
-        if s then
-            scored[#scored + 1] = { app = app, score = s }
+        local haystack = haystack_of(app)
+        local value, start = fuzzy(haystack, needle)
+        if value then
+            scored[#scored + 1] = { app = app, score = value, start = start, length = #haystack }
+            if value > best then
+                best = value
+            end
         end
     end
     table.sort(scored, function(a, b)
         if a.score ~= b.score then
             return a.score > b.score
         end
-        if #a.app.name ~= #b.app.name then
-            return #a.app.name < #b.app.name
+        if a.start ~= b.start then
+            return a.start < b.start
+        end
+        if a.length ~= b.length then
+            return a.length < b.length
         end
         return a.app.name < b.app.name
     end)
-    local results = {}
+    local apps = {}
     for i = 1, math.min(#scored, MAX_RESULTS) do
-        results[i] = scored[i].app
+        apps[i] = scored[i].app
     end
-    return results
+    return { apps = apps, best = best }
 end
 
-local results = computed({ obelisk.applications, query }, filter)
+local matches = computed({ obelisk.applications, query }, filter)
+local results = matches:map(function(found)
+    return found.apps
+end)
 
 -- ## Web row
 --
 -- `WebProvider.qml`: hostname-shaped input opens as a link; other input searches. Show for a URL
--- always, otherwise only when no application matches. That is the mirror's `appsWeak`, which reads
--- fzf scores this config does not keep.
+-- always, otherwise only when the apps matched weakly.
 local function looks_like_url(text)
     return text:match("^https?://[^%s]+$") ~= nil or text:match("^[%w%-]+%.[%w%-%.]+[%w]/?[^%s]*$") ~= nil
+end
+
+-- `LauncherService.route`'s `appCount === 0 || maxAppScore < Math.max(32, q.length * 25)`, in fzf's
+-- own units.
+---@param text string
+---@param found { apps: AppSummary[], best: integer }
+local function apps_weak(text, found)
+    return #found.apps == 0 or found.best < math.max(32, #text * 25)
 end
 
 ---@param text string
@@ -178,14 +175,14 @@ local trimmed = query:map(util.trim)
 -- `LauncherService.route`: the first provider that claims wins, and the web row is only reached
 -- when neither does.
 local special = computed(
-    { trimmed, results, store.currency_rates, store.currency_updated_at },
+    { trimmed, matches, store.currency_rates, store.currency_updated_at },
     function(text, found, rates, updated_at)
         if text == "" then
             return nil
         end
         return currency.claims(text, rates, updated_at)
             or calc.claims(text)
-            or web_claims(text, #(found or {}) == 0)
+            or web_claims(text, apps_weak(text, found))
     end
 )
 

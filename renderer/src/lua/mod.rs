@@ -6,6 +6,7 @@
 pub mod action;
 pub mod capability;
 pub mod fonts;
+pub mod fuzzy;
 pub mod idle;
 pub mod json;
 pub mod marshal;
@@ -127,6 +128,7 @@ impl Loader {
         action::register(&lua)?;
         json::register(&lua)?;
         fonts::register(&lua)?;
+        fuzzy::register(&lua)?;
         signal::register(&lua, dirty)?;
         store::register(&lua)?;
         session_process::register(&lua)?;

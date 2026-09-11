@@ -22,6 +22,21 @@
 ---@param chain string[] Family names in fallback order, densest first. A dense array: a hole truncates it.
 function fonts(chain) end
 
+---fzf's score for `needle` against `haystack`, and where the match begins; `nil` for no match, so
+---`if value then` is the filter. A run, a word boundary, a camelCase hump and a digit each pay a
+---bonus, which is what ranks "Visual Studio Code" above every other name holding v, s and c.
+---
+---Smart case: an all-lowercase needle matches either case, one uppercase character makes the whole
+---comparison exact. Ordering is the caller's; this scores one pair (ADR-0201).
+---
+---Scores compare only between candidates scored against the same needle, and only within one
+---alphabet: a non-ASCII haystack takes a cruder greedy scorer whose numbers do not line up with the
+---ASCII path's. Both are on fzf's scale, so fzf's own thresholds carry over.
+---@param haystack string The text to search, such as an application's name and comment joined.
+---@param needle string What the user typed, already trimmed. Empty scores 0 rather than failing.
+---@return integer? score, integer? start `start` is a 0-based index into `haystack`.
+function fuzzy(haystack, needle) end
+
 json = {}
 
 ---Decodes JSON without raising. Errors return `nil` plus a message; JSON `null` also returns `nil`
