@@ -4375,3 +4375,34 @@ Three things the shape settles:
 
 quickshell keeps a second, structured `log.qslog` beside the plain one so `-r` can re-filter a
 finished run at read time. Not copied: there are no log levels here to filter by.
+
+## 0200. The active route index is re-read from `info`, because PipeWire never pushes one that appears late
+
+`obelisk` starts from `spawn-at-startup`, before the ALSA card has settled. `bind_device` bound
+device 43 and called `subscribe_params(&[Route])` while the card still had no `Route`, and PipeWire
+answered with nothing. The profile landing a moment later emits `info` with `PARAMS` changed and no
+`param` event, so `device_routes` stayed empty for the session and `write_device_route` dropped
+every hardware `set_volume`. Clicking the volume widget did nothing, bar and audio panel alike, on
+every login since the feature landed.
+
+Found in the log ADR-0199 added, on the first boot that had one:
+
+    audio: sink 50 routes through device 43 port 7, whose active Route index has not been seen
+
+Reproduced without rebooting, which is also the check:
+
+    pactl set-card-profile 43 off      # no routes exist
+    <start the shell>                  # binds, subscribes to nothing
+    pactl set-card-profile 43 output:analog-stereo+input:analog-stereo
+
+So `Route` is enumerated from the device's own `info` handler on every `PARAMS` change and
+`subscribe_params` is gone. A bind always answers with one `info`, so startup still enumerates
+once, and later ones cover what a subscription would not: a profile switch, a plugged headset, a
+card that settles after login. The proxy is an `Rc` for that handler to reach, held `Weak` there
+because a strong one is a cycle through the listener the device owns.
+
+No unit test: the behaviour is the daemon's, and tests here do not touch a shared daemon. The recipe
+above is the check; `extract_route_target` already covers the parsing half.
+
+`bind_device_node` subscribes to `Props` the same way and is left alone, because a node is created
+with its `Props`. If a sink ever reads zero volume at login, suspect this first.

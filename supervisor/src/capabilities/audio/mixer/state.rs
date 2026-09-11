@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use pipewire as pw;
 use pw::keys;
@@ -510,7 +511,7 @@ pub(super) struct MixerState {
     pub(super) source_nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     /// Bound ALSA `Device` proxies/listeners for writes. Hardware volume lives on `Route`, not
     /// the node; without these, `set_volume` is accepted and silently discarded.
-    pub(super) devices: HashMap<u32, (pw::device::Device, pw::device::DeviceListener)>,
+    pub(super) devices: HashMap<u32, (Rc<pw::device::Device>, pw::device::DeviceListener)>,
     /// `(device global id, card.profile.device)` -> active `Route` index from the device.
     pub(super) device_routes: HashMap<(u32, i32), i32>,
     /// `Stream/Output/Audio` id -> raw `Props`, using the sink's pod shape and parser.

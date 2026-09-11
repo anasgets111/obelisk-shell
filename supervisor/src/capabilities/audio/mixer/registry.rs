@@ -452,6 +452,10 @@ fn bind_default_metadata(
 
 /// Binds ALSA `Device` globals for their `Route` active index, solely for writes. Without this,
 /// hardware-sink `set_volume` is silently dropped. `v4l2`/`libcamera` devices have no audio routes.
+///
+/// Enumerated from `info`, not subscribed to: `subscribe_params` delivers only what exists when it
+/// is called, and a `Route` appearing later is pushed to nobody. A shell started before its card
+/// settles, which is every login, then dropped every write for the session (ADR-0200).
 fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
     if obj.props.and_then(|props| props.get_prop(*keys::DEVICE_API)) != Some("alsa") {
         return;
@@ -465,6 +469,10 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
         }
     };
 
+    // `Rc` so the `info` handler below can reach the proxy it is registered on; `Weak` there,
+    // because a strong one is a cycle through the listener the device owns.
+    let device = Rc::new(device);
+    let device_for_info = Rc::downgrade(&device);
     let state_for_param = Rc::clone(state);
     let listener = device
         .add_listener_local()
@@ -481,8 +489,17 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
             };
             state_for_param.borrow_mut().device_routes.insert((device_id, profile_device), index);
         })
+        // Re-asks on every param change, including the first `info` a bind always answers with.
+        // A profile switch or a plugged headset moves the active route.
+        .info(move |info| {
+            if !info.change_mask().contains(pw::device::DeviceChangeMask::PARAMS) {
+                return;
+            }
+            if let Some(device) = device_for_info.upgrade() {
+                device.enum_params(0, Some(pw::spa::param::ParamType::Route), 0, u32::MAX);
+            }
+        })
         .register();
 
-    device.subscribe_params(&[pw::spa::param::ParamType::Route]);
     state.borrow_mut().devices.insert(device_id, (device, listener));
 }
