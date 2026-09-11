@@ -455,13 +455,18 @@ impl Supervisor {
         let outcome =
             reload::run_pba(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS)
                 .await;
-        // Before the outcome, and on the failure path too: a handshake that fails still consumed
-        // the frames, and a `StartCapability` the Candidate sent while evaluating is owed to the
-        // main loop either way.
-        replay.extend(std::mem::take(&mut link.deferred));
 
         match outcome {
             Ok(outcome) => {
+                // The candidate is now authoritative, so its deferred capability commands are
+                // owed to the main loop. Frames from the other generation remain ordered behind
+                // them and are filtered as stale when the loop resumes.
+                reload::replay_deferred_frames(
+                    replay,
+                    std::mem::take(&mut link.deferred),
+                    candidate_generation_id,
+                    true,
+                );
                 // ADR-0043 decision 1: widest handoff point, Candidate presented while superseded
                 // still owns every buffer and both are resident. Sample before swap reaps one.
                 memory::log_sample(
@@ -491,6 +496,16 @@ impl Supervisor {
                 }
             }
             Err(failure) => {
+                // The candidate was reaped before this branch. Its deferred StartCapability and
+                // Command frames are no longer owed to the main loop because dispatching them
+                // would recreate resources owned by a dead generation. Frames consumed from the
+                // authoritative connection still need replay.
+                reload::replay_deferred_frames(
+                    replay,
+                    std::mem::take(&mut link.deferred),
+                    candidate_generation_id,
+                    false,
+                );
                 eprintln!("generation swap for sequence {sequence} failed: {failure}");
                 eprintln!("{} stays authoritative", self.authoritative.generation_id);
             }

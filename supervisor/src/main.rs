@@ -67,6 +67,22 @@ fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
     report_sequence == next_sequence
 }
 
+/// Only the authoritative Renderer and control clients may dispatch after a swap. A failed
+/// Candidate can still have frames in flight while its process is being reaped.
+fn is_live_inbound_generation(generation_id: u32, authoritative_generation_id: u32) -> bool {
+    generation_id == authoritative_generation_id || generation_id == shared::CONTROL_CLIENT_GENERATION
+}
+
+/// [`is_live_inbound_generation`] with `CallResult`'s exemption. An `obelisk call` dispatched before
+/// a swap is answered by the generation it was asked, which by then may be the superseded one, and
+/// that answer is correct. `CallRoutes::answer` applies the stricter test this cannot: it refuses
+/// any generation other than the one the call went to. Dropping the frame here instead would strand
+/// the caller until its deadline.
+fn frame_may_dispatch(frame: &RendererFrame, generation_id: u32, authoritative_generation_id: u32) -> bool {
+    matches!(frame, RendererFrame::CallResult(_))
+        || is_live_inbound_generation(generation_id, authoritative_generation_id)
+}
+
 /// Bumps and sends one `Reevaluate` sequence (ADR-0024, ADR-0041 decision 4). Debounced file
 /// changes and Renderer `RequestReload` after `wl_output` changes share this counter, so stale
 /// reports from either trigger fail `is_current_reload`.
@@ -326,16 +342,15 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),
             Some(()) = reload_events.recv() => supervisor.begin_reload(),
             Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
-            Some(inbound) = next_inbound(&mut replay, &mut inbound_frames) => match inbound.frame {
-                RendererFrame::LockReport(report) if inbound.generation_id != supervisor.authoritative.generation_id => {
-                    // A superseded, unreaped connection still sends frames. Either stale report
-                    // corrupts the swap gate: Unlocked/Finished reaps the live lock holder, while
-                    // Locked shuts the gate with no holder and no report reopens it.
+            Some(inbound) = next_inbound(&mut replay, &mut inbound_frames) => {
+                if !frame_may_dispatch(&inbound.frame, inbound.generation_id, supervisor.authoritative.generation_id) {
                     eprintln!(
-                        "generation {}'s lock report arrived from a non-authoritative generation (authoritative is {}); dropping: {report:?}",
+                        "dropping a frame from stale generation {} (authoritative is {})",
                         inbound.generation_id, supervisor.authoritative.generation_id
                     );
+                    continue;
                 }
+                match inbound.frame {
                 RendererFrame::LockReport(report) => supervisor.record_lock_report(report),
                 RendererFrame::Command(envelope) => match envelope.params.capability.as_str() {
                     // `process` is addressable but never started, so it is not a roster capability.
@@ -495,6 +510,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     );
                     submit.secret.zeroize();
                 }
+                }
             },
             else => break,
         }
@@ -561,6 +577,28 @@ mod tests {
     fn is_current_reload_matches_only_the_most_recently_sent_sequence() {
         assert!(is_current_reload(3, 3));
         assert!(!is_current_reload(3, 4), "a report for an older sequence than the last-sent one must be stale");
+    }
+
+    #[test]
+    fn only_the_authoritative_generation_and_control_clients_may_reach_dispatch() {
+        assert!(is_live_inbound_generation(0, 0));
+        assert!(is_live_inbound_generation(shared::CONTROL_CLIENT_GENERATION, 0));
+        assert!(!is_live_inbound_generation(1, 0));
+    }
+
+    #[test]
+    fn a_call_answer_from_a_superseded_generation_still_reaches_its_waiting_caller() {
+        // The call went to generation 0, which was superseded before it answered. `CallRoutes`
+        // pairs the answer with the generation asked; the stale-frame filter must not pre-empt it.
+        let answer = RendererFrame::CallResult(shared::CallResult {
+            id: 7,
+            outcome: shared::CallOutcome::Returned(serde_json::Value::Null),
+        });
+        assert!(frame_may_dispatch(&answer, 0, 1));
+
+        // Everything else from a superseded generation is still refused.
+        assert!(!frame_may_dispatch(&RendererFrame::RequestReload, 0, 1));
+        assert!(frame_may_dispatch(&RendererFrame::RequestReload, 1, 1));
     }
 
     #[test]

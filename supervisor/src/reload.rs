@@ -11,6 +11,7 @@
 //! aborts the Candidate and leaves Generation `N` untouched.
 //! `run_pba` never touches `N`; [`swap_and_reap`] does. All four link steps have deadlines.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::time::Duration;
@@ -230,6 +231,19 @@ fn swap_frames(
             ]
         })
         .collect()
+}
+
+/// Returns frames consumed by the handshake to the main loop. A failed Candidate is dead before
+/// its deferred frames can be dispatched, so replay only frames belonging to other generations.
+pub(crate) fn replay_deferred_frames(
+    replay: &mut VecDeque<crate::socket::InboundFrame>,
+    deferred: Vec<crate::socket::InboundFrame>,
+    candidate_generation_id: u32,
+    candidate_succeeded: bool,
+) {
+    replay.extend(
+        deferred.into_iter().filter(|frame| candidate_succeeded || frame.generation_id != candidate_generation_id),
+    );
 }
 
 /// Owns everything after [`run_pba`] verifies evidence, which previously lived in `main.rs`'s
@@ -885,5 +899,22 @@ mod tests {
         // Self-check the polling helper.
         let became_true = wait_until(Duration::from_millis(30), || false).await;
         assert!(!became_true);
+    }
+
+    #[test]
+    fn failed_candidate_frames_are_not_replayed_but_other_generations_are() {
+        let mut replay = VecDeque::new();
+        let deferred = vec![
+            crate::socket::InboundFrame { generation_id: 0, frame: shared::RendererFrame::RequestReload },
+            crate::socket::InboundFrame {
+                generation_id: 1,
+                frame: shared::RendererFrame::StartCapability { capability: "idle".to_string() },
+            },
+        ];
+
+        replay_deferred_frames(&mut replay, deferred, 1, false);
+
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay.front().expect("the authoritative frame survives").generation_id, 0);
     }
 }
