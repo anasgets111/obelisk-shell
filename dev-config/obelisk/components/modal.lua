@@ -19,6 +19,27 @@ local CLOSED_SCALE = 0.97
 ---@field keyboard boolean
 ---@field node table The screen-sized wrapper carrying the card and its motion.
 
+-- `modal_host`'s outside catcher is every card's ancestor, and a hit takes the innermost handled
+-- `button` (ADR-0050 decision 1), so a press on the card's own ground -- its padding, the gap
+-- between two rows, an empty list -- walked up to the catcher and closed the modal under the
+-- pointer. A handled button the size of the card ends that walk. It takes the card's placement
+-- rather than sitting under it: content-sized, it would reach back to the surface origin and eat
+-- the scrim's clicks along the top and left. `cursor` undoes the pointing hand it otherwise wears.
+local function swallow_presses(card)
+    local box = button {
+        on_click = function() end,
+        cursor = "default",
+        width = card.width,
+        height = card.height,
+        margin = card.margin,
+        align_h = card.align_h,
+        align_v = card.align_v,
+        children = { card },
+    }
+    card.margin, card.align_h, card.align_v = nil, nil, nil
+    return box
+end
+
 ---@param opts ModalOpts
 ---@return Modal
 return function(opts)
@@ -53,7 +74,7 @@ return function(opts)
                 return open and 1 or 0
             end),
             animate = animate,
-            children = { opts.card },
+            children = { swallow_presses(opts.card) },
         },
     }
 end
