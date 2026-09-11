@@ -399,11 +399,16 @@ impl Signal {
             | SignalKind::Scroll { cell, .. }
             | SignalKind::State { cell, .. }
             | SignalKind::Geometry(cell) => Ok(cell.borrow().clone()),
+            // Both recurse into their source, so both claim a nesting level for the reason
+            // `Computed` does. Unguarded, a long enough chain exhausted the Rust stack and
+            // aborted `obelisk check` before any cap could answer.
             SignalKind::Delayed { source, hold, cell } => {
+                let _budget = CpuBudget::enter(lua)?;
                 let fresh = source.get_value(lua)?;
                 Ok(cell.borrow_mut().follow(fresh, *hold, Instant::now(), |due| arm_wake(lua, due)))
             }
             SignalKind::Pulse { source, hold, cell } => {
+                let _budget = CpuBudget::enter(lua)?;
                 let fresh = source.get_value(lua)?;
                 Ok(Value::Boolean(cell.borrow_mut().fire(fresh, *hold, Instant::now(), |due| arm_wake(lua, due))))
             }
@@ -1918,6 +1923,32 @@ mod tests {
             err.to_string().contains("signal nesting exceeded"),
             "a 200-link map chain must trip the nesting cap: {err}"
         );
+    }
+
+    /// `delay(delay(...))` / `pulse(pulse(...))` `links` deep over Direct signal `a`.
+    fn hold_chain_source(builder: &str, links: usize) -> String {
+        format!(
+            r#"
+            local s = a
+            for _ = 1, {links} do s = {builder}(s, 1) end
+            return s:get()
+            "#
+        )
+    }
+
+    #[test]
+    fn a_long_delay_or_pulse_chain_is_rejected_by_the_nesting_cap_not_a_stack_overflow() {
+        // A delay or pulse chain nests `get_value` the way a map chain does. Unguarded, 10,000
+        // links ended `obelisk check` in `fatal runtime error: stack overflow`: SIGABRT, which no
+        // config author can read.
+        for builder in ["delay", "pulse"] {
+            let lua = lua_with_signal("a", Value::Integer(1));
+            let err = lua.load(hold_chain_source(builder, 200)).eval::<Value>().unwrap_err();
+            assert!(
+                err.to_string().contains("signal nesting exceeded"),
+                "a 200-link {builder} chain must trip the nesting cap: {err}"
+            );
+        }
     }
 
     #[test]
