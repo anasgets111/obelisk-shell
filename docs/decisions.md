@@ -4244,3 +4244,68 @@ preserve a typo and cost each reader a moment deciding whether "Oblisk" was some
 Rejected: keeping "Oblisk" as a stylized name. Nothing chose it.
 
 Rejected: an `oblisk` alias in the Lua namespace, to spare configs that do not exist.
+
+## 0197. `obelisk call` runs a config's own verbs, because a keybind could only write state
+
+`obelisk set`/`toggle` was the only frame a control client had. It reseeds a declared `state` and
+marks the scene dirty, and nothing hangs a config callback off that write; rendering may not have
+side effects. So a keybind could change what the shell *drew* and never what it *did*, and
+`lib/screen_recording.lua`'s `start`/`stop` were reachable from a mouse and nothing else.
+
+`action(name, fn)` declares a verb and `obelisk call <name> [args]` runs it, waits, and prints what
+it returned. `name` is one opaque string: `rec.toggle` groups for a reader the way a module path
+does, and nothing splits on the dot, so no delimiter rule can surprise a config. Arguments and the
+return value cross as JSON, marshalled by `capability::invoke`'s conversion in both directions.
+
+The shape is this codebase's own outbound verb, `obelisk.<cap>:invoke(action, ...)`, not the QML
+predecessor's `IpcHandler`. `CommandParams` itself is not reused: its `generation_id` and
+`expected_revision` describe the Renderer's view of a capability, and an external caller has neither.
+A target is a namespace in the key and nothing more -- no `rec` object is created, because config
+exports are not the Supervisor's capability roster.
+
+Four frame variants and two payloads. The Supervisor assigns the id, never the client: every control
+peer is `CONTROL_CLIENT_GENERATION`, so the id is the only thing that tells two waiting callers
+apart, and believing a client's own would let one collect another's answer. It records which
+generation was asked and refuses an answer from any other, which a swap mid-call can otherwise
+produce. Pending calls are capped and dropped with their connection.
+
+Registrations last one evaluation, cleared beside `on_change` handlers (ADR-0115) and for the same
+reason: they are closures over locals that the next evaluation replaces. A failed evaluation leaves
+them cleared rather than half-registered.
+
+Returning nothing and returning `nil` are one answer, because Lua cannot tell them apart. A raise or
+an unmarshallable return is a failure and the caller's non-zero exit; a returned `{ error = ... }`
+table is a table, or the two could never be distinguished. A handler runs under the same CPU budget
+as an `on_change` handler.
+
+Rejected: a callback on external `state` writes. Two files instead of eight, but its only use is
+side effects, and a side effect asked for from outside is a call -- a second way to do this, kept
+forever once configs adopted it.
+
+Rejected: a `state` holding a token a keybind flips to mean "do it". A command protocol inside a
+signal whose value means nothing, and scripts would come to depend on the flip.
+
+Rejected: a fifo read by a long-lived `process.run`, which worked already. A second control channel
+beside the socket built for this, untyped, with a shell loop reaped and respawned on every save.
+
+Not built: any boundary beyond the socket's. `$XDG_RUNTIME_DIR` is `0700`, so a caller is already
+this user, and a process of this user can run what it likes without asking the shell. An action is
+reachable by anything that can reach the socket, which is what `set`/`toggle` already were.
+
+What a synchronous answer can say is bounded: `rec.toggle` returns `starting` or `cancelled`, naming
+what the press did, not whether a capture later succeeded. It is read before the `slurp` exit
+callback runs, so the state itself would report `starting` for a press that just cancelled.
+
+An answer is capped well under the 16MiB frame limit. A frame that cannot be written is a dead
+socket to the writer, so an oversized return would cost the Renderer's whole connection rather than
+its own call.
+
+Known, and not fixed: a config reload while a region selection is open loses the `slurp` handle,
+because an in-place reload re-requires the module. The cancel survives, so the capture the user
+cancelled cannot start; the overlay stays up until Escape, and `starting` clears when its callback
+finally runs. Holding the handle somewhere an evaluation cannot reset means storing a userdata
+outside `state`, which is machinery for a window that needs a config save mid-selection to open.
+
+Verified against a live niri session: `obelisk call no.such.thing` exits 1 naming it, a first
+`rec.toggle` prints `starting` with `slurp` on screen, and a second prints `cancelled` with the
+child gone, repeatably in both directions.

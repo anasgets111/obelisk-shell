@@ -33,6 +33,26 @@ function json.decode(text) end
 
 process = {}
 
+---Declares what `obelisk call <name>` runs (ADR-0197).
+---
+---The outward twin of `obelisk.<cap>:invoke(...)`: a keybind writes a `state` when it wants the
+---shell to look different and calls an action when it wants it to *do* something, because rendering
+---may not have side effects and a `state` write reaches no config code.
+---
+---`name` is one opaque string. `"rec.toggle"` groups it for a reader the way a module path does and
+---nothing splits on the dot, so any character its config wrote is allowed.
+---
+---Registrations last one evaluation: declare at the top level, not inside a callback that fires
+---more than once. Two declarations of one name in the same evaluation are an error rather than the
+---last one winning, since which won would otherwise depend on `require` order.
+---
+---What the handler returns is converted to JSON and printed by the caller; returning nothing and
+---returning `nil` are the same answer. Raising inside it, or returning something that will not
+---convert, reaches the caller as a failure and its exit code.
+---@param name string
+---@param handler fun(...: any): any?
+function action(name, handler) end
+
 ---@class ProcessHandle
 local ProcessHandle = {}
 

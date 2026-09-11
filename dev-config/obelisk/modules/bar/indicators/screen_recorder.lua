@@ -47,11 +47,7 @@ end), nil, {
             return
         end
         if mouse_button == "left" then
-            if recorder.recording:get() then
-                recorder.stop()
-            else
-                recorder.start("selection")
-            end
+            recorder.toggle()
             return
         end
         if mouse_button == "middle" and not recorder.recording:get() then

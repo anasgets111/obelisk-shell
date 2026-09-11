@@ -269,12 +269,20 @@ impl RendererClient {
         Ok(())
     }
 
-    /// Before each `shell.lua` evaluation, clear old `on_change` handlers. Evaluation registers
-    /// them afresh; retaining them doubles side effects after a config save (ADR-0115).
+    /// Before each `shell.lua` evaluation, clear what the last one registered: `on_change` handlers
+    /// (ADR-0115) and `action` exports (ADR-0197). Evaluation registers both afresh; retaining them
+    /// doubles side effects after a config save, and both are closures over locals that evaluation
+    /// is about to replace.
+    ///
+    /// Run again when an evaluation *fails*, because clearing first is not enough: `shell.lua` may
+    /// register several before it raises, and those belong to a config that was rejected. Half a
+    /// config answering `obelisk call` is worse than none, and the scene still on screen is the
+    /// previous evaluation's, whose registrations this already dropped.
     fn clear_change_handlers(&self) {
         for handle in self.capabilities.borrow().values() {
             handle.clear_handlers();
         }
+        lua::action::clear(self.loader.lua());
     }
 
     /// Returns a handle, lazily adding `obelisk.<capability>` as `nil`, revision `0` (ADR-0029).
@@ -312,6 +320,8 @@ impl RendererClient {
             }
             Err(err) => {
                 eprintln!("control-socket client: startup shell.lua evaluation failed: {err}");
+                // Whatever it registered before raising goes with it.
+                self.clear_change_handlers();
                 self.set_rescue_state(true, &err.to_string());
                 None
             }
@@ -547,6 +557,19 @@ impl RendererClient {
                     );
                 }
             }
+            // ADR-0197: `obelisk call`. Runs outside layout, like an `on_change` handler, and
+            // always answers -- a caller is holding its socket open for this.
+            SupervisorFrame::Call(call) => {
+                let outcome = lua::action::dispatch(self.lua(), &call.name, &call.arguments);
+                let result = shared::CallResult { id: call.id, outcome };
+                if let Err(err) = self.commands.frames().send(RendererFrame::CallResult(result)) {
+                    eprintln!("control-socket client: failed to answer `obelisk call {}`: {err}", call.name);
+                }
+            }
+            // The Supervisor routes these to control clients; one arriving here is a wire fault.
+            SupervisorFrame::CallResult(result) => {
+                eprintln!("control-socket client: ignoring a CallResult for id {}; nothing here calls", result.id);
+            }
         }
         FrameOutcome::Handled
     }
@@ -572,6 +595,8 @@ impl RendererClient {
                 }
             }
             Err(err) => {
+                // Whatever it registered before raising goes with it.
+                self.clear_change_handlers();
                 self.set_rescue_state(true, &err.to_string());
                 ReevaluateReport::Failed { sequence: request.sequence, error: err.to_string() }
             }
@@ -803,8 +828,10 @@ fn frame_label(frame: &RendererFrame) -> &'static str {
         RendererFrame::LockReport(_) => "LockReport",
         RendererFrame::RequestReload => "RequestReload",
         RendererFrame::StartCapability { .. } => "StartCapability",
-        // Never sent here (ADR-0112), but a wildcard could hide a new unnamed variant.
+        RendererFrame::CallResult(_) => "CallResult",
+        // Never sent here (ADR-0112, ADR-0197), but a wildcard could hide a new unnamed variant.
         RendererFrame::SetState(_) => "SetState",
+        RendererFrame::Call(_) => "Call",
     }
 }
 

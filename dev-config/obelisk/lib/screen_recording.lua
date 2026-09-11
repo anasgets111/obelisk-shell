@@ -36,6 +36,20 @@ local output_path = state("recorder_path", "")
 -- user interaction, and the buttons must not offer a second start while it is up.
 local starting = state("recorder_starting", false)
 
+-- The `slurp` in flight, so `stop` has something to cancel. Not `state`: a handle is this
+-- generation's, and an in-place reload re-requires this module and loses it.
+local selecting = nil
+
+-- A stop asked for while `starting`, which is `state` because the press that asks and the moment it
+-- can be obeyed are not the same moment, and may not even be the same evaluation.
+--
+-- Three things outlast a press: `slurp` may have exited successfully before the kill landed, so its
+-- callback is pending with a good region; `launch` may already have asked the Supervisor to start,
+-- and there is nothing to signal until it reports `running`; and an in-place reload drops
+-- `selecting` while leaving both the child and its callback alive. Each is read here rather than
+-- inferred from `starting`, which cannot say which of them is true.
+local cancelled = state("recorder_cancelled", false)
+
 -- ## Pause arithmetic
 --
 -- `started_at` is the Supervisor's, so it survives reloads; the pause bookkeeping is this config's,
@@ -181,13 +195,20 @@ local function start(mode)
 
     starting:set(true)
     local region = ""
-    process.run("slurp", { "-f", "%wx%h+%x+%y" }, function(line, stream)
+    selecting = process.run("slurp", { "-f", "%wx%h+%x+%y" }, function(line, stream)
         if stream == "stdout" then
             region = region .. line
         end
     end, function(code)
+        selecting = nil
         starting:set(false)
         local selected = region:match("^%s*(.-)%s*$")
+        -- Checked before the exit status, not after: killing `slurp` does not guarantee a non-zero
+        -- exit, because it may have exited cleanly with a region while the kill was in flight.
+        if cancelled:get() then
+            cancelled:set(false)
+            return
+        end
         if code ~= 0 or selected == "" or recording:get() then
             return
         end
@@ -201,11 +222,46 @@ local function start(mode)
 end
 
 local function stop()
-    if not recording:get() then
+    if recording:get() then
+        recorder:signal("INT")
         return
     end
-    recorder:signal("INT")
+    -- Nothing is up yet, so record the refusal instead of dropping it: the selection callback and
+    -- the `running` edge below both look here before they let a capture through.
+    if starting:get() then
+        cancelled:set(true)
+        if selecting then
+            selecting:kill()
+        end
+    end
 end
+
+-- One press, whatever is in flight. Here and not in the indicator, which cannot see `starting`.
+--
+-- Returns what the press did, not the state after it: `stop` kills `slurp` and the exit callback
+-- that clears `starting` has not run yet, so reading the signal back would report "starting" for a
+-- press that just cancelled.
+local function toggle()
+    if recording:get() then
+        stop()
+        return "stopped"
+    end
+    if starting:get() then
+        stop()
+        return "cancelled"
+    end
+    -- A press with nothing in flight clears a cancel nothing consumed, so a stale flag cannot eat
+    -- the capture after it.
+    cancelled:set(false)
+    start("selection")
+    return "starting"
+end
+
+-- `obelisk call rec.toggle`, so a compositor keybind reaches the same decision the indicator makes.
+-- Returns what the press left behind, which is the only feedback a terminal caller gets.
+-- The word names the press, not the recording: a capture that dies a second later still started
+-- here, and nothing synchronous could have known.
+action("rec.toggle", toggle)
 
 -- `togglePause` is `SIGUSR2` either way; which edge it was is this config's bookkeeping, since the
 -- recorder reports only that it is still up.
@@ -290,10 +346,21 @@ obelisk.processes:on_change(function(current, previous)
     end
     if now.running then
         starting:set(false)
+        -- The press that asked arrived before there was a process to signal. This is the first
+        -- moment there is one.
+        if cancelled:get() then
+            cancelled:set(false)
+            recorder:signal("INT")
+        end
         return
     end
-    if now.start_error ~= "" then
+    -- The *edge*, not the field: `start_error` stays set until the next `start` clears it, and any
+    -- later push -- a reload republishing the declaration, most easily -- would otherwise read an
+    -- old failure as this attempt's and retire a cancel belonging to the selection now in flight.
+    if now.start_error ~= "" and now.start_error ~= ((was or {}).start_error or "") then
         starting:set(false)
+        -- It never came up, so there is nothing left for a pending cancel to stop.
+        cancelled:set(false)
     end
     if was ~= nil and was.running then
         announce_saved(os.time(), was.started_at, now.exit_code)
@@ -314,6 +381,7 @@ return {
     set_setting = set_setting,
     start = start,
     stop = stop,
+    toggle = toggle,
     toggle_pause = toggle_pause,
     open_directory = function()
         local dir = directory:get()

@@ -3,6 +3,7 @@
 //! re-evaluation on an in-place reload. `Loader::evaluate_file` reads `~/.config/obelisk/shell.lua`
 //! (`shared::shell_lua_path`) and is the `renderer/src/socket.rs` entry point on startup and every
 //! Supervisor-triggered `Reevaluate`.
+pub mod action;
 pub mod capability;
 pub mod fonts;
 pub mod idle;
@@ -123,6 +124,7 @@ impl Loader {
         restrict_os(&lua)?;
         point_package_path_at(&lua, config_dir)?;
         nodes::register_node_constructors(&lua)?;
+        action::register(&lua)?;
         json::register(&lua)?;
         fonts::register(&lua)?;
         signal::register(&lua, dirty)?;

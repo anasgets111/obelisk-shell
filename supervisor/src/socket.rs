@@ -255,13 +255,15 @@ fn bind(path: &Path) -> Result<UnixListener, io::Error> {
 /// instead of dropping a push during hydration.
 pub fn spawn_listener(
     path: &Path,
-) -> Result<(GenerationRegistry, mpsc::Receiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
+) -> Result<(GenerationRegistry, CallRoutes, mpsc::Receiver<InboundFrame>, mpsc::UnboundedReceiver<u32>), io::Error> {
     let listener = bind(path)?;
     let registry = GenerationRegistry::default();
+    let routes = CallRoutes::default();
     let (inbound_tx, inbound_rx) = mpsc::channel(MAX_INBOUND_FRAMES);
     let (connected_tx, connected_rx) = mpsc::unbounded_channel();
 
     let accept_registry = registry.clone();
+    let accept_routes = routes.clone();
     // Counts connections being handled, so the accept loop can refuse rather than spawn without
     // limit. `Arc` because each connection task decrements it on the way out, however it exits.
     let live_connections = Arc::new(AtomicUsize::new(0));
@@ -282,11 +284,12 @@ pub fn spawn_listener(
                         continue;
                     }
                     let registry = accept_registry.clone();
+                    let routes = accept_routes.clone();
                     let inbound_tx = inbound_tx.clone();
                     let connected_tx = connected_tx.clone();
                     let live = Arc::clone(&live_connections);
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(stream, registry, inbound_tx, connected_tx).await {
+                        if let Err(err) = handle_connection(stream, registry, routes, inbound_tx, connected_tx).await {
                             eprintln!("control-socket connection ended: {err}");
                         }
                         live.fetch_sub(1, Ordering::Relaxed);
@@ -303,7 +306,7 @@ pub fn spawn_listener(
         }
     });
 
-    Ok((registry, inbound_rx, connected_rx))
+    Ok((registry, routes, inbound_rx, connected_rx))
 }
 
 /// Reads the handshake, registers the connection, forwards decoded `RendererFrame`s, and lets a
@@ -311,6 +314,7 @@ pub fn spawn_listener(
 async fn handle_connection(
     stream: UnixStream,
     registry: GenerationRegistry,
+    routes: CallRoutes,
     inbound_tx: mpsc::Sender<InboundFrame>,
     connected_tx: UnboundedSender<u32>,
 ) -> Result<(), FramingError> {
@@ -358,6 +362,11 @@ async fn handle_connection(
             return Ok(());
         }
     }
+    // Ids this connection waits on, dropped with it. Shared: the read loop fills it, cleanup drains.
+    let opened: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    // Cloned before `register` takes the original: a control client is never registered, so this is
+    // the only handle on where its answer goes.
+    let reply_tx = outbound_tx.clone();
     let hangup = Arc::new(tokio::sync::Notify::new());
     let token = (!control_client).then(|| registry.register(generation_id, outbound_tx, Arc::clone(&hangup)));
     // Best effort; a dropped receiver during shutdown needs no replay.
@@ -376,10 +385,30 @@ async fn handle_connection(
     let read_loop = async {
         loop {
             match framing::read_json_frame::<_, RendererFrame>(&mut read_half).await {
-                Ok(frame) => {
+                Ok(mut frame) => {
                     if let Some(refusal) = refuse_frame(control_client, generation_id, &frame) {
                         eprintln!("control-socket: dropped a frame from generation {generation_id}: {refusal}");
                         continue;
+                    }
+                    // Stamped here because this is where the waiting peer's write half is; `main`
+                    // sees frames, not the connections they arrived on.
+                    if let RendererFrame::Call(call) = &mut frame {
+                        let Some(id) = routes.open(reply_tx.clone()) else {
+                            eprintln!(
+                                "control-socket: refusing `obelisk call {}`; {MAX_PENDING_CALLS} calls are already \
+                                 waiting",
+                                call.name
+                            );
+                            continue;
+                        };
+                        call.id = id;
+                        let mut outstanding = opened.lock().expect("opened calls mutex poisoned");
+                        // Answered ids are already gone from the routing table, so this list is
+                        // only the ones cleanup still has to drop. Pruning here bounds a long-lived
+                        // caller's sequential calls by what is actually pending, not by how many it
+                        // has ever made.
+                        outstanding.retain(|id| routes.is_pending(*id));
+                        outstanding.push(id);
                     }
                     // Awaited, not dropped: parking this peer is the backpressure
                     // `MAX_INBOUND_FRAMES` exists for. An error means `main` is gone.
@@ -405,11 +434,101 @@ async fn handle_connection(
         }
     }
 
+    routes.close(&opened.lock().expect("opened calls mutex poisoned"));
     if let Some(token) = token {
         registry.unregister(generation_id, token);
     }
     writer.abort();
     Ok(())
+}
+
+/// Most `obelisk call`s that may be in flight at once (ADR-0197). A keybind makes one at a time; a
+/// script could make more, and this bounds what a peer that never reads its answer can pin.
+const MAX_PENDING_CALLS: usize = 64;
+
+/// Control clients waiting on an `obelisk call` answer, keyed by the id this assigns.
+///
+/// Not the [`GenerationRegistry`]: that is keyed by generation, and every control client shares
+/// [`shared::CONTROL_CLIENT_GENERATION`], so it cannot tell one waiting peer from another. The id
+/// is assigned here rather than taken from the client for the same reason a generation id is not
+/// believed from a handshake body -- a client-chosen id would let one peer collect another's answer.
+#[derive(Clone, Default)]
+pub struct CallRoutes(Arc<Mutex<Pending>>);
+
+/// The waiting callers and the counter that names them. One lock covers both: every id is handed
+/// out while the map is already held to check the cap against it.
+#[derive(Default)]
+struct Pending {
+    waiting: HashMap<u64, Waiting>,
+    last_id: u64,
+}
+
+/// One waiting caller: where its answer goes, and which generation was asked.
+struct Waiting {
+    reply: mpsc::Sender<Vec<u8>>,
+    /// `None` until `main` forwards it. A result naming a different generation is stale, which a
+    /// swap mid-call can produce, and answering from it would report another config's outcome.
+    dispatched_to: Option<u32>,
+}
+
+impl CallRoutes {
+    /// Reserves an id for a caller, or `None` when too many are already pending.
+    pub fn open(&self, reply: mpsc::Sender<Vec<u8>>) -> Option<u64> {
+        let mut pending = self.0.lock().expect("call routes mutex poisoned");
+        if pending.waiting.len() >= MAX_PENDING_CALLS {
+            return None;
+        }
+        pending.last_id = pending.last_id.wrapping_add(1);
+        let id = pending.last_id;
+        pending.waiting.insert(id, Waiting { reply, dispatched_to: None });
+        Some(id)
+    }
+
+    /// Records which generation was asked, so a later result can be checked against it.
+    pub fn dispatched(&self, id: u64, generation_id: u32) {
+        if let Some(entry) = self.0.lock().expect("call routes mutex poisoned").waiting.get_mut(&id) {
+            entry.dispatched_to = Some(generation_id);
+        }
+    }
+
+    /// Answers the caller and forgets it. Refuses a result from a generation that was not asked.
+    pub fn answer(&self, from_generation: u32, result: &shared::CallResult) -> Result<(), String> {
+        let entry = {
+            let mut pending = self.0.lock().expect("call routes mutex poisoned");
+            match pending.waiting.get(&result.id).map(|entry| entry.dispatched_to) {
+                None => return Err(format!("no caller is waiting on call {}", result.id)),
+                // Not yet forwarded, so no generation can have been asked. Refused without removing
+                // the route: the call it belongs to has not been made, and consuming it here would
+                // strand the caller that is about to make it.
+                Some(None) => {
+                    return Err(format!("call {} has not been dispatched yet", result.id));
+                }
+                Some(Some(asked)) if asked != from_generation => {
+                    return Err(format!(
+                        "call {} was dispatched to generation {asked}, so generation {from_generation} cannot answer it",
+                        result.id
+                    ));
+                }
+                Some(Some(_)) => pending.waiting.remove(&result.id).expect("just looked it up"),
+            }
+        };
+        let payload = serde_json::to_vec(&shared::SupervisorFrame::CallResult(result.clone()))
+            .map_err(|err| format!("could not encode the answer to call {}: {err}", result.id))?;
+        entry.reply.try_send(payload).map_err(|err| format!("the caller of call {} is gone: {err}", result.id))
+    }
+
+    /// Whether this id still has a caller waiting, so a connection can forget the ones answered.
+    pub fn is_pending(&self, id: u64) -> bool {
+        self.0.lock().expect("call routes mutex poisoned").waiting.contains_key(&id)
+    }
+
+    /// Drops ids whose connection ended, so a caller that hung up before its answer leaves nothing.
+    pub fn close(&self, ids: &[u64]) {
+        let mut pending = self.0.lock().expect("call routes mutex poisoned");
+        for id in ids {
+            pending.waiting.remove(id);
+        }
+    }
 }
 
 /// Why a decoded frame must not be forwarded, or `None` to forward it.
@@ -428,10 +547,10 @@ async fn handle_connection(
 fn refuse_frame(control_client: bool, generation_id: u32, frame: &RendererFrame) -> Option<String> {
     if control_client {
         return match frame {
-            RendererFrame::SetState(_) => None,
+            RendererFrame::SetState(_) | RendererFrame::Call(_) => None,
             // `RendererFrame` derives `Debug` and `SecureSubmit` redacts its own secret, so this
             // cannot print a password.
-            other => Some(format!("a control client may only send SetState, not {other:?}")),
+            other => Some(format!("a control client may only send SetState or Call, not {other:?}")),
         };
     }
     let claimed = match frame {
@@ -491,6 +610,8 @@ mod tests {
             write: shared::StateWrite::Toggle,
         });
         assert!(refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &set_state).is_none());
+        let call = RendererFrame::Call(shared::Call { id: 0, name: "rec.toggle".into(), arguments: Vec::new() });
+        assert!(refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &call).is_none());
 
         let refusal = refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &command_frame(0))
             .expect("a control client must not be able to send Command");
@@ -609,7 +730,7 @@ mod tests {
     async fn spawn_listener_registers_two_simultaneous_connections_by_generation_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obelisk-shell.sock");
-        let (registry, _inbound, _connected) = spawn_listener(&path).unwrap();
+        let (registry, _routes, _inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[1, 2]);
 
         let mut client_a = UnixStream::connect(&path).await.unwrap();
@@ -631,7 +752,7 @@ mod tests {
     async fn spawn_listener_reports_a_generation_id_on_the_connected_channel_once_registered() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obelisk-shell.sock");
-        let (registry, _inbound, mut connected) = spawn_listener(&path).unwrap();
+        let (registry, _routes, _inbound, mut connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[7]);
 
         let mut client = UnixStream::connect(&path).await.unwrap();
@@ -644,7 +765,7 @@ mod tests {
     async fn spawn_listener_forwards_a_decoded_command_envelope_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obelisk-shell.sock");
-        let (registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
+        let (registry, _routes, mut inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[5]);
 
         let mut client = UnixStream::connect(&path).await.unwrap();
@@ -683,7 +804,7 @@ mod tests {
     async fn spawn_listener_forwards_a_decoded_reevaluate_report_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obelisk-shell.sock");
-        let (registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
+        let (registry, _routes, mut inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[5]);
 
         let mut client = UnixStream::connect(&path).await.unwrap();
@@ -699,5 +820,78 @@ mod tests {
 
         assert_eq!(received.generation_id, 5);
         assert_eq!(received.frame, RendererFrame::ReevaluateReport(report));
+    }
+
+    fn result(id: u64) -> shared::CallResult {
+        shared::CallResult { id, outcome: shared::CallOutcome::Returned(serde_json::json!("recording")) }
+    }
+
+    #[tokio::test]
+    async fn an_answer_reaches_the_caller_that_opened_the_call() {
+        let routes = CallRoutes::default();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let id = routes.open(tx).expect("the first call fits");
+        routes.dispatched(id, 7);
+
+        routes.answer(7, &result(id)).expect("the generation that was asked may answer");
+        let payload = rx.try_recv().expect("the caller is waiting on exactly this");
+        let frame: SupervisorFrame = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(frame, SupervisorFrame::CallResult(result(id)));
+    }
+
+    #[tokio::test]
+    async fn a_generation_that_was_not_asked_cannot_answer() {
+        let routes = CallRoutes::default();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let id = routes.open(tx).unwrap();
+        routes.dispatched(id, 7);
+
+        // A swap mid-call leaves the old generation able to reply.
+        let refusal = routes.answer(8, &result(id)).expect_err("a stale generation must be refused");
+        assert!(refusal.contains('7') && refusal.contains('8'), "the refusal names both: {refusal}");
+        assert!(rx.try_recv().is_err(), "nothing may reach the caller");
+    }
+
+    #[tokio::test]
+    async fn a_route_that_was_never_dispatched_is_refused_and_kept() {
+        let routes = CallRoutes::default();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let id = routes.open(tx).unwrap();
+
+        // The id exists but `main` has not forwarded it yet, so no generation was asked. Consuming
+        // it here would strand the caller whose call is still on its way.
+        assert!(routes.answer(7, &result(id)).is_err());
+        assert!(rx.try_recv().is_err());
+        routes.dispatched(id, 7);
+        routes.answer(7, &result(id)).expect("the route survived the refusal");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_id_nobody_waits_on_is_refused_rather_than_panicking() {
+        let routes = CallRoutes::default();
+        assert!(routes.answer(7, &result(404)).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_hung_up_leaves_nothing_behind() {
+        let routes = CallRoutes::default();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let id = routes.open(tx).unwrap();
+        routes.close(&[id]);
+        assert!(routes.answer(7, &result(id)).is_err(), "a closed route must not still accept an answer");
+    }
+
+    #[tokio::test]
+    async fn pending_calls_are_bounded_so_a_peer_that_never_reads_cannot_pin_the_table() {
+        let routes = CallRoutes::default();
+        let mut held = Vec::new();
+        for _ in 0..MAX_PENDING_CALLS {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+            held.push(rx);
+            assert!(routes.open(tx).is_some());
+        }
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        assert!(routes.open(tx).is_none(), "one past the cap is refused");
     }
 }

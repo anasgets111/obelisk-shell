@@ -18,6 +18,13 @@ pub enum Command {
     /// `set <name> <value>`, `toggle <name>` or `toggle <name> <value>` writes a running config's
     /// `state` signal from outside for a compositor keybind (ADR-0112).
     SetState(shared::SetState),
+    /// `call <name> [args...]` runs a config's `action(name, fn)` and prints what it returned
+    /// (ADR-0197). `name` is one opaque string: `rec.toggle` groups for a reader, and nothing
+    /// splits on the dot.
+    Call {
+        name: String,
+        arguments: Vec<serde_json::Value>,
+    },
     Version,
     Help,
 }
@@ -41,6 +48,8 @@ USAGE:
     obelisk toggle <NAME> <VALUE>
                                 set it to VALUE, or back to its declared
                                 initial when it already is VALUE
+    obelisk call <NAME> [ARGS]   run the config's action(NAME) and print what
+                                 it returned
 
 OPTIONS:
     -c, --config <DIR>   the config directory, holding shell.lua. Overrides
@@ -58,6 +67,13 @@ false)` flips; bind `obelisk toggle modal launcher` and `state(\"modal\", \"\")`
 becomes \"launcher\", or \"\" again when it already was. VALUE is read as JSON
 (true, 3, \"text\", [1,2]); anything that is not JSON is taken as a string, so
 quoting `notifications` is optional.
+
+`call` is for what a keybind wants the shell to *do* rather than look like:
+the config declares `action(\"rec.toggle\", function() ... end)` and the bind is
+`obelisk call rec.toggle`. NAME is one opaque string -- the dot groups it for a
+reader, nothing splits on it. Arguments are read as JSON like VALUE above. It
+waits for the answer, prints it, and exits non-zero when the action failed or
+does not exist.
 ";
 
 /// `-c` names a directory, but accepts a path to `shell.lua` because that is what someone reaches
@@ -94,11 +110,12 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "init" | "check" | "set" | "toggle" if command.is_none() => {
+            "init" | "check" | "set" | "toggle" | "call" if command.is_none() => {
                 command = Some(match arg.as_str() {
                     "init" => "init",
                     "check" => "check",
                     "set" => "set",
+                    "call" => "call",
                     _ => "toggle",
                 });
             }
@@ -107,6 +124,11 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             // `obelisk toggle open -c /dir` would store the flag as the value and then choke on the
             // directory.
             _ if matches!(command, Some("set" | "toggle")) && positional.len() < 2 && !is_option(&arg) => {
+                positional.push(arg);
+            }
+            // `call` takes a name and however many arguments the action declares, so no two-slot
+            // cap. A JSON argument beginning with a dash is still a value, as above.
+            _ if matches!(command, Some("call")) && !is_option(&arg) => {
                 positional.push(arg);
             }
             "-c" | "--config" => {
@@ -153,6 +175,16 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 None => shared::StateWrite::Toggle,
             };
             Command::SetState(shared::SetState { name, write })
+        }
+        Some("call") => {
+            let mut positional = positional.into_iter();
+            let name =
+                positional.next().ok_or_else(|| "call takes an action name: `obelisk call rec.toggle`".to_string())?;
+            // The same reading as `set`: JSON when it parses, a string otherwise, so a keybind
+            // passing a word needs no shell quoting.
+            let arguments =
+                positional.map(|arg| serde_json::from_str(&arg).unwrap_or(serde_json::Value::String(arg))).collect();
+            Command::Call { name, arguments }
         }
         _ => Command::Run,
     };
@@ -241,6 +273,20 @@ mod tests {
         assert_eq!(parse_args(&["init"]).unwrap().command, Command::Init { force: false });
         assert_eq!(parse_args(&["init", "--force"]).unwrap().command, Command::Init { force: true });
         assert_eq!(parse_args(&["check"]).unwrap().command, Command::Check);
+        assert_eq!(
+            parse_args(&["call", "rec.toggle"]).unwrap().command,
+            Command::Call { name: "rec.toggle".into(), arguments: Vec::new() }
+        );
+        // The dot is not split: one opaque name, so no delimiter rule can surprise a config.
+        assert_eq!(
+            parse_args(&["call", "a.b.c", "7", "hello"]).unwrap().command,
+            Command::Call {
+                name: "a.b.c".into(),
+                // JSON where it parses, a string otherwise, as `set` reads its value.
+                arguments: vec![serde_json::json!(7), serde_json::json!("hello")]
+            }
+        );
+        assert!(parse_args(&["call"]).is_err(), "call without a name has nothing to ask for");
     }
 
     /// ADR-0112: keybind verbs. Values parse as JSON when possible; bare words need no quotes.

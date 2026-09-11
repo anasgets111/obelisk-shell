@@ -157,6 +157,43 @@ pub enum StateWrite {
     ToggleTo(serde_json::Value),
 }
 
+/// `obelisk call <name> [json...]`: one call into a config-exported `action(name, fn)` (ADR-0197).
+///
+/// `name` is opaque and never split. `"rec.toggle"` is one key; the dot groups for a reader the way
+/// a Lua module path does, and nothing here parses it, so an action may contain any character its
+/// config wrote.
+///
+/// Distinct from [`CommandParams`], which is the config calling *out* to a capability and carries a
+/// `generation_id` and `expected_revision` describing the Renderer's view of that capability. An
+/// external caller has neither and needs neither.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Call {
+    /// Assigned by the Supervisor, not the client: it owns the pending table and the reply route,
+    /// and a client id would let one peer answer another's call.
+    pub id: u64,
+    pub name: String,
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// The answer to one [`Call`], carrying `id` back so the Supervisor can find the peer that waits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallResult {
+    pub id: u64,
+    pub outcome: CallOutcome,
+}
+
+/// What a [`Call`] produced. A handler returning nothing and one returning `nil` are both
+/// `Returned(null)`: Lua cannot tell them apart, and inventing a difference here would invent one
+/// in every config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CallOutcome {
+    /// The handler ran and returned this. `null` is a value, not an absence.
+    Returned(serde_json::Value),
+    /// No such action, a handler that raised, or a returned value that would not marshal. A
+    /// returned `{ error = ... }` table is **not** this: it is a config returning a table.
+    Failed(String),
+}
+
 /// Supervisor -> Renderer: re-evaluate `shell.lua`. Echo `sequence` in every response so a second
 /// file-change event before the first completes cannot be mistaken for the current round trip.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,6 +390,10 @@ pub enum SupervisorFrame {
     SetSessionLock(SetSessionLock),
     /// A control client's `state` write, forwarded to the authoritative generation (ADR-0112).
     SetState(SetState),
+    /// A control client's `obelisk call`, forwarded to the authoritative generation (ADR-0197).
+    Call(Call),
+    /// That call's answer, routed back to the waiting control client (ADR-0197).
+    CallResult(CallResult),
 }
 
 /// Renderer -> Supervisor frames, tagged like [`SupervisorFrame`]. `Command` is § 7's Lua-write
@@ -371,6 +412,11 @@ pub enum RendererFrame {
     /// [`CONTROL_CLIENT_GENERATION`] (ADR-0112). It stays in this enum because the listener has one
     /// decoder for every peer; a separate peer type would duplicate it.
     SetState(SetState),
+    /// Control-client frame like [`Self::SetState`]: `obelisk call` (ADR-0197). Its `id` is zero on
+    /// the way in; the Supervisor assigns the real one when it forwards.
+    Call(Call),
+    /// A generation answering a forwarded [`Call`] (ADR-0197).
+    CallResult(CallResult),
     /// Starts a reload cycle: the Supervisor bumps its sequence and sends the
     /// [`ReevaluateRequest`] (ADR-0041 decision 4). This carries no sequence; only the Supervisor
     /// owns `next_sequence`, and `is_current_reload` (`supervisor/src/main.rs`) drops reports that

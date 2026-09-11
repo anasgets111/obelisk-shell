@@ -172,6 +172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         cli::Command::Init { force } => setup::run(&shared::config_dir()?, force),
         cli::Command::SetState(set) => control_client::send(set),
+        cli::Command::Call { name, arguments } => control_client::call(name, arguments),
         cli::Command::Check => match setup::check(&shared::config_dir()?) {
             Ok(report) => {
                 print!("{report}");
@@ -219,7 +220,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     let (capabilities, mut signals) = Capabilities::new(connection.clone(), sound_tx, idle_signal_tx);
 
     let socket_path = shared::control_socket_path()?;
-    let (registry, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
+    let (registry, call_routes, mut inbound_frames, mut connected) = socket::spawn_listener(&socket_path)?;
 
     // Lock (ADR-0042, ADR-0052): the Renderer holds and paints `ext_session_lock_v1`; this side
     // decides whether to take it. The controller must not cache the authoritative generation id,
@@ -366,6 +367,21 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     supervisor.authoritative.generation_id,
                     &SupervisorFrame::SetState(set),
                 ),
+                // ADR-0197: `obelisk call`, to the same generation `SetState` goes to. The id was
+                // stamped by the connection that is holding its socket open for the answer.
+                RendererFrame::Call(call) => {
+                    let generation_id = supervisor.authoritative.generation_id;
+                    call_routes.dispatched(call.id, generation_id);
+                    send_frame_logged(&supervisor.registry, generation_id, &SupervisorFrame::Call(call));
+                }
+                // The answer, back to whichever peer is waiting on that id. A refusal here is the
+                // caller's deadline expiring rather than a wrong answer, which is the safe way
+                // round when a generation swapped mid-call.
+                RendererFrame::CallResult(result) => {
+                    if let Err(why) = call_routes.answer(inbound.generation_id, &result) {
+                        eprintln!("control-socket: dropped an `obelisk call` answer: {why}");
+                    }
+                }
                 // ADR-0041 decision 4: a `wl_output` appeared or disappeared.
                 RendererFrame::RequestReload => supervisor.begin_reload(),
                 RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
