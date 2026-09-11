@@ -35,9 +35,19 @@ local SYMBOLS = {
 -- `_getFlag`'s `specials`: three countries whose code is not their first two letters, and the
 -- cryptocurrencies that have a sign instead of a flag.
 local FLAGS = {
-    eur = "eu", gbp = "gb", usd = "us",
-    btc = "₿", eth = "Ξ", ltc = "Ł", doge = "Ð", xrp = "✕",
-    ada = "₳", sol = "₴", dot = "●", usdt = "₮", usdc = "₵",
+    eur = "eu",
+    gbp = "gb",
+    usd = "us",
+    btc = "₿",
+    eth = "Ξ",
+    ltc = "Ł",
+    doge = "Ð",
+    xrp = "✕",
+    ada = "₳",
+    sol = "₴",
+    dot = "●",
+    usdt = "₮",
+    usdc = "₵",
 }
 
 -- `(?:to|in|->|=>|=)`. Matched against a lowercased query, so the word forms need no case class.

@@ -44,7 +44,8 @@ local function day_card(daily, index, opts)
     return panel_card({
         cell({ { text = heading, bold = true } }, opts.today and theme.FG or theme.DIM, theme.font.sm, centred),
         cell(weather.info(code).icon, theme.FG, theme.font.xl, centred),
-        cell({ { text = degrees((daily.temperature_2m_max or {})[index]), bold = true } }, theme.FG, theme.font.lg, centred),
+        cell({ { text = degrees((daily.temperature_2m_max or {})[index]), bold = true } }, theme.FG, theme.font.lg,
+            centred),
         cell(degrees((daily.temperature_2m_min or {})[index]), theme.DIM, theme.font.sm, centred),
     }, {
         width = "Fill",

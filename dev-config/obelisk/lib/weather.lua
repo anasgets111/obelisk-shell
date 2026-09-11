@@ -274,7 +274,8 @@ function weather.weekday(iso)
         return ""
     end
     -- Noon, so a timezone shift cannot move the date across midnight and name the wrong weekday.
-    local named = os.date("%a", os.time({ year = tonumber(year), month = tonumber(month), day = tonumber(day), hour = 12 }))
+    local named = os.date("%a",
+        os.time({ year = tonumber(year), month = tonumber(month), day = tonumber(day), hour = 12 }))
     ---@cast named string
     return named
 end

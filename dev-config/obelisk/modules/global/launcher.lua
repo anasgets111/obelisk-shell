@@ -412,9 +412,11 @@ local special_row = row_shell(SPECIAL, "launcher-special", {
     },
     info_badge(special_field("badge")),
     cell(special_field("hint"), theme.DIM, theme.font.xs, { align_v = "Center" }),
-}, { visible = special:map(function(row)
-    return row ~= nil
-end) })
+}, {
+    visible = special:map(function(row)
+        return row ~= nil
+    end)
+})
 
 local app_list = list {
     width = "Fill",
