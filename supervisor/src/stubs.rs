@@ -13,7 +13,7 @@
 //!
 //! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting all
 //! 19 `parse_*_args` functions, only with an IDL change for named arguments
-//! (docs/oblisk-idl-api-specs.md § 7).
+//! (docs/lua-api.md § 7).
 
 use std::collections::BTreeMap;
 

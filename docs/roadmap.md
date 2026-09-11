@@ -2,7 +2,7 @@
 
 Source inspection compared the current implementation with the reference QML config and Quickshell C++ at
 `2d3b3e9`. This is a scope guide, not a commitment to full Qt/Quickshell parity or a live hardware validation.
-[API](oblisk-idl-api-specs.md) and [services](oblisk-supervisor-services-dbus.md) describe
+[API](lua-api.md) and [services](services.md) describe
 what exists; [decisions](decisions.md) holds history.
 
 Rust owns platform connections, validation, secret handling, resource lifetimes, input and

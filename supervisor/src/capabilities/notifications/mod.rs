@@ -1,5 +1,5 @@
-//! Notifications capability (`oblisk.notifications`, `docs/oblisk-supervisor-services-dbus.md` §1;
-//! `docs/oblisk-idl-api-specs.md` §2.7/§3.2, ADR-0033).
+//! Notifications capability (`oblisk.notifications`, `docs/services.md` §1;
+//! `docs/lua-api.md` §2.7/§3.2, ADR-0033).
 //! Hosts `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view,
 //! global DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a
 //! tier default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
@@ -146,7 +146,7 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "inline-reply",
 ];
 
-// Wire-facing types (docs/oblisk-idl-api-specs.md §2.7, ADR-0033).
+// Wire-facing types (docs/lua-api.md §2.7, ADR-0033).
 
 /// One allowlisted body-markup run (CONTEXT.md, ADR-0033). Text carries styling and link target;
 /// images carry only a spooled/validated path. `alt` is parsed but not carried.

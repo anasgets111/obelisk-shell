@@ -1,5 +1,5 @@
 //! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`; docs/oblisk-supervisor-
-//! services-dbus.md §5; docs/oblisk-idl-api-specs.md §2.6; ADR-0030).
+//! services-dbus.md §5; docs/lua-api.md §2.6; ADR-0030).
 //!
 //! Proxies follow BlueZ's D-Bus API docs; `org.freedesktop.DBus.ObjectManager` reuses
 //! `zbus::fdo::ObjectManagerProxy` (ADR-0030: no maintained BlueZ proxy crate).
@@ -30,7 +30,7 @@ pub mod registry;
 
 pub use controller::BluetoothController;
 
-// State shape pushed as `oblisk.bluetooth`'s StateSnapshot (docs/oblisk-idl-api-specs.md §2.6).
+// State shape pushed as `oblisk.bluetooth`'s StateSnapshot (docs/lua-api.md §2.6).
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]

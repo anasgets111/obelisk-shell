@@ -1,4 +1,4 @@
-//! `Signal` (`oblisk-idl-api-specs.md` § 1.2): `get`, `map`, `set`, `computed(dependencies, fn)`,
+//! `Signal` (`lua-api.md` § 1.2): `get`, `map`, `set`, `computed(dependencies, fn)`,
 //! and `state(name, initial)` (ADR-0044 decision 5). Rust owns the userdata; `computed` calls `fn`
 //! with dependency values, not handles, so its body does not call `:get()` on declared deps.
 //!

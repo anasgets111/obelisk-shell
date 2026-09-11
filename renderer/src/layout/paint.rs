@@ -618,7 +618,7 @@ fn draw_for(
     let dissolve = node.dissolve.as_ref();
     match node.paint.as_ref()? {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
-        // fill, then borders (`oblisk-idl-api-specs.md` § 5.2 item 1). `clip` is not read here: it
+        // fill, then borders (`lua-api.md` § 5.2 item 1). `clip` is not read here: it
         // decides what this node's *children* are cut to, `build_node`'s question, not this one's.
         PaintStyle::Box { background, radius, colors, widths, clip: _ } => Some(Draw::Box {
             background: background.map(|color| fade(color, opacity)),

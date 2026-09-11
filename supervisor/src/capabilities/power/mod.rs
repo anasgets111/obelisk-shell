@@ -1,5 +1,5 @@
 //! `oblisk.power` reports profiles and battery charge/discharge rate
-//! (`docs/oblisk-idl-api-specs.md` § 2.13) from two D-Bus services (ADR-0053 amendment).
+//! (`docs/lua-api.md` § 2.13) from two D-Bus services (ADR-0053 amendment).
 //!
 //! § 2.13 combines unrelated facts: power-profiles-daemon supplies `active_profile`/`profiles`,
 //! UPower supplies `on_battery`/`energy_rate`. Either half may be absent, so fields are optional

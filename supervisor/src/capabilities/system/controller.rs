@@ -1,4 +1,4 @@
-//! [`SystemController`] feeds `oblisk.system.time` (docs/oblisk-idl-api-specs.md §2.11) from one
+//! [`SystemController`] feeds `oblisk.system.time` (docs/lua-api.md §2.11) from one
 //! wall-clock-aligned task, refreshed every second.
 //!
 //! §2.11 has no interval argument, so it ticks unconditionally from construction to shutdown,
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11), with its
+/// `oblisk.system`'s one Lua-visible field (docs/lua-api.md §2.11), with its
 /// `StateSnapshot` JSON key unchanged.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {

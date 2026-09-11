@@ -1,5 +1,5 @@
-//! `process` global table and `ProcessHandle` userdata (`oblisk-idl-api-specs.md` § 3.3,
-//! `docs/oblisk-supervisor-services-dbus.md` § 10, ADR-0026).
+//! `process` global table and `ProcessHandle` userdata (`lua-api.md` § 3.3,
+//! `docs/services.md` § 10, ADR-0026).
 //!
 //! `process.run(cmd, args, out_cb, exit_cb)` runs on the Wayland dispatch thread during Lua
 //! evaluation, with no socket in scope. [`ProcessRegistry`] queues the outbound `"process"`/`"run"`

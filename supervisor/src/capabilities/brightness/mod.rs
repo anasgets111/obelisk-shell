@@ -1,4 +1,4 @@
-//! `oblisk.brightness` reports display backlight percent (docs/oblisk-idl-api-specs.md § 2.3),
+//! `oblisk.brightness` reports display backlight percent (docs/lua-api.md § 2.3),
 //! reads sysfs through a udev `backlight` watch, and writes through logind (ADR-0053). Its write
 //! action is `brightness:set(pct)` (§ 3.2), unlike read-only `battery`.
 //!

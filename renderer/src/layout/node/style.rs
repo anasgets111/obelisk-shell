@@ -396,7 +396,7 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
     }
 }
 
-/// `opacity` (`oblisk-idl-api-specs.md` § 5.1) belongs to every kind, including non-painting lists,
+/// `opacity` (`lua-api.md` § 5.1) belongs to every kind, including non-painting lists,
 /// and is inherited by multiplication on `ResolvedNode`. It does not replace `visible`: a fully
 /// transparent node still lays out, occupies space, and hit-tests. Values outside `[0, 1]` error
 /// rather than clamp (ADR-0068), matching the reference config's use of this property in 32 files.

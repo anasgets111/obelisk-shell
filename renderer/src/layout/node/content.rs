@@ -275,7 +275,7 @@ pub enum Elide {
     End,
 }
 
-/// `elide` (`oblisk-idl-api-specs.md` § 5.2 item 4). Only `"End"` is offered: the reference config
+/// `elide` (`lua-api.md` § 5.2 item 4). Only `"End"` is offered: the reference config
 /// uses neither head nor middle elision, and middle elision needs a grapheme budget across runs.
 pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutError> {
     let Some(value) = properties.get("elide") else {
@@ -303,7 +303,7 @@ pub enum Wrap {
     Word,
 }
 
-/// `wrap` (`oblisk-idl-api-specs.md` § 5.2 item 4) defaults to `None`. Before this, a fixed-width
+/// `wrap` (`lua-api.md` § 5.2 item 4) defaults to `None`. Before this, a fixed-width
 /// `text` measured its full wrapped height but painted one clipped line; making wrapping default
 /// would have drawn into that extra height everywhere. `None` now measures one line, keeping box
 /// and paint consistent.
@@ -321,7 +321,7 @@ pub fn parse_wrap(properties: &HashMap<String, Value>) -> Result<Wrap, LayoutErr
     }
 }
 
-/// `max_lines` (`oblisk-idl-api-specs.md` § 5.2 item 4) is uncapped when absent or `0`; zero lets
+/// `max_lines` (`lua-api.md` § 5.2 item 4) is uncapped when absent or `0`; zero lets
 /// signal-driven values spell "absent" because `Bound` cannot. Negatives error rather than being
 /// clamped, which would hide a sign mistake in config arithmetic. It is consulted
 /// only for [`parse_wrap`] = `Word`, so setting both unconditionally is safe.
@@ -337,7 +337,7 @@ pub fn parse_max_lines(properties: &HashMap<String, Value>) -> Result<Option<usi
     Ok((n >= 1.0).then_some(n as usize))
 }
 
-/// `text_align` (`oblisk-idl-api-specs.md` § 5.2 item 4) defaults to `Start` and uses the same
+/// `text_align` (`lua-api.md` § 5.2 item 4) defaults to `Start` and uses the same
 /// string boundary as `fit`, `layer`, `align_h`, and `on_click`. `Start`/`End` match `align_h`.
 pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign, LayoutError> {
     let Some(value) = properties.get("text_align") else {

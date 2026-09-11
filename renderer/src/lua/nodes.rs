@@ -1,4 +1,4 @@
-//! Node constructors (`oblisk-idl-api-specs.md` § 5.2/§ 6) and `VirtualNode`, the loader's shallow
+//! Node constructors (`lua-api.md` § 5.2/§ 6) and `VirtualNode`, the loader's shallow
 //! table-to-Rust conversion.
 //!
 //! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies other keys unchanged,

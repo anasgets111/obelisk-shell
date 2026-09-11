@@ -1,4 +1,4 @@
-//! NetworkManager D-Bus controller (`oblisk.network`; docs/oblisk-supervisor-services-dbus.md §4;
+//! NetworkManager D-Bus controller (`oblisk.network`; docs/services.md §4;
 //! ADR-0029). It holds `rusty_network_manager` proxies (ADR-0013) and merges their signal streams
 //! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
 //! thread like `audio::mixer`.
@@ -11,7 +11,7 @@
 //! later needs a restart. Upgrade path: watch `device_added`/`device_removed` and rescan.
 //!
 //! ponytail: only the first Wi-Fi device from `GetAllDevices` is tracked. Multiple adapters need a
-//! device selector in `available_networks`/`scan`/`connect`; `docs/oblisk-idl-api-specs.md §2.5`
+//! device selector in `available_networks`/`scan`/`connect`; `docs/lua-api.md §2.5`
 //! has none.
 
 use std::collections::{HashMap, HashSet};
@@ -36,7 +36,7 @@ use connection::{
 };
 pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 
-/// One scanned AP, resolved to `network.available_networks` (docs/oblisk-idl-api-specs.md §2.5)
+/// One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
 /// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {

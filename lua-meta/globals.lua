@@ -81,7 +81,7 @@ local SessionProcessHandle = {}
 ---
 ---A name already running is left alone rather than started twice; `running` says which case this
 ---was. Nothing is returned: the outcome arrives as state, like every other capability
----(docs/oblisk-idl-api-specs.md § 3).
+---(docs/lua-api.md § 3).
 ---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
 ---@param args? string[] One element per argument, already split. Omitted means a bare command.
 function SessionProcessHandle:start(cmd, args) end

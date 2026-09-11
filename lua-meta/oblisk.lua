@@ -43,7 +43,7 @@
 --- Payload types ------------------------------------------------------------------------------
 
 ---@class AccessPointInfo
----One scanned AP, resolved to `network.available_networks` (docs/oblisk-idl-api-specs.md §2.5)
+---One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
 ---and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
@@ -137,7 +137,7 @@
 ---@field why string Free-text `why`, e.g. `"Playing video"`, often empty.
 
 ---@class MenuItem
----One DBusMenu layout node, resolved to `tray.items[].menu` (docs/oblisk-idl-api-specs.md §2.14).
+---One DBusMenu layout node, resolved to `tray.items[].menu` (docs/lua-api.md §2.14).
 ---@field children MenuItem[] Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose children are dropped with an stderr line.
 ---@field enabled boolean `false` for a greyed-out entry. Activation is a no-op; keep it to preserve the application's layout instead of filtering it.
 ---@field icon_name? string Theme icon name, or `nil`; DBusMenu pixmaps are not carried.
@@ -233,7 +233,7 @@
 ---@field attention_icon_path? string File half of the attention artwork, matching `attention_icon_name`.
 ---@field icon_name? string Theme icon name for `icon { name = ... }`; exclusive with [`TrayItem::icon_path`].
 ---@field icon_path? string Decoded, bounds-checked PNG in the runtime directory for `image { source = ... }`; set when the item sent pixels instead of a theme name.
----@field id string docs/oblisk-idl-api-specs.md §2.14 id: sanitized D-Bus unique name with the item's object path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
+---@field id string docs/lua-api.md §2.14 id: sanitized D-Bus unique name with the item's object path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
 ---@field item_is_menu boolean `true` means left click opens the menu instead of activating the item.
 ---@field menu? MenuItem[] Top-level menu entries, or `nil` without `com.canonical.dbusmenu`. Fetched at registration and on layout updates.
 ---@field name string Display name: `Title`, falling back to `Id` when `Title` is empty.
@@ -380,7 +380,7 @@
 ---@field screencast_users PrivacyUser[] Apps producing PipeWire screen-capture streams (ADR-0137). Names may be the portal's identity for portal-created nodes. wlr-screencopy recorders (`wf-recorder`, `grim`) bypass PipeWire and never appear.
 
 ---@class SysinfoState
----`oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12), with field
+---`oblisk.sysinfo`'s five Lua-visible fields (docs/lua-api.md §2.12), with field
 ---names unchanged from the `StateSnapshot` JSON keys.
 ---@field cpu_percent integer Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.
 ---@field ram_percent integer Physical memory in use, `0` to `100`.
@@ -389,7 +389,7 @@
 ---@field temp_gpu integer GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as [`SysinfoState::temp_cores`], so neither is newer than the other.
 
 ---@class SystemState
----`oblisk.system`'s one Lua-visible field (docs/oblisk-idl-api-specs.md §2.11), with its
+---`oblisk.system`'s one Lua-visible field (docs/lua-api.md §2.11), with its
 ---`StateSnapshot` JSON key unchanged.
 ---@field time integer Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds; milliseconds would be wrong by 1000x.
 

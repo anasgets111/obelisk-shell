@@ -90,7 +90,7 @@ impl std::fmt::Display for Capability {
         f.write_str(self.as_str())
     }
 }
-/// Guarded JSON-RPC 2.0 envelope for a Lua write action (docs/oblisk-idl-api-specs.md § 7).
+/// Guarded JSON-RPC 2.0 envelope for a Lua write action (docs/lua-api.md § 7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommandEnvelope {
     pub jsonrpc: String,
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn command_envelope_matches_idl_wire_format() {
-        // Exact example from docs/oblisk-idl-api-specs.md § 7.
+        // Exact example from docs/lua-api.md § 7.
         let wire = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "ExecuteCommand",

@@ -1,4 +1,4 @@
-//! `animate` (`docs/oblisk-idl-api-specs.md` § 5.1): per-property tweens on a retained node, the
+//! `animate` (`docs/lua-api.md` § 5.1): per-property tweens on a retained node, the
 //! engine's answer to QML's `Behavior on x { NumberAnimation { ... } }` (ADR-0145). A node names
 //! the properties it wants eased and how long; when a pass resolves a different target for one of
 //! them, the node's [`Tween`] carries the displayed value from where it was to where it is going,

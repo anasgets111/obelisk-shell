@@ -108,8 +108,8 @@ VALUE is read as JSON, and anything that is not JSON is taken as a string.
 
 | | |
 | :--- | :--- |
-| [Lua API](docs/oblisk-idl-api-specs.md) | what a config can declare and call |
-| [Capabilities](docs/oblisk-supervisor-services-dbus.md) | payloads, actions and the D-Bus behind them |
+| [Lua API](docs/lua-api.md) | what a config can declare and call |
+| [Capabilities](docs/services.md) | payloads, actions and the backends behind them |
 | [Decisions](docs/decisions.md) | why it is built this way, including what was rejected |
 | [Roadmap](docs/roadmap.md) | known gaps, and what is deliberately out of scope |
 | [CONTEXT.md](CONTEXT.md) | the vocabulary these docs use |

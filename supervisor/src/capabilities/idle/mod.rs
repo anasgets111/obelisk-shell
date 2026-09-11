@@ -1,4 +1,4 @@
-//! Idle capability (`oblisk.idle`, docs/oblisk-supervisor-services-dbus.md §7; ADR-0032).
+//! Idle capability (`oblisk.idle`, docs/services.md §7; ADR-0032).
 //! Notify uses the Supervisor's dedicated `ext_idle_notifier_v1` Wayland connection; inhibit uses
 //! `org.freedesktop.login1.Manager.Inhibit` on the existing system bus. They share one controller
 //! and generation-scoped cleanup.

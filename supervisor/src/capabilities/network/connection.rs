@@ -11,7 +11,7 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use super::AccessPointInfo;
 
-/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/oblisk-supervisor-services-dbus.md
+/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/services.md
 /// §4.2: "serializes the top 20 access points").
 const MAX_AVAILABLE_NETWORKS: usize = 20;
 

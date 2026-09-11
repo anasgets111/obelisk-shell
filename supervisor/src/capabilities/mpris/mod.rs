@@ -1,5 +1,5 @@
-//! Media players (`oblisk.mpris`, docs/oblisk-supervisor-services-dbus.md §3;
-//! docs/oblisk-idl-api-specs.md §2.8; ADR-0036).
+//! Media players (`oblisk.mpris`, docs/services.md §3;
+//! docs/lua-api.md §2.8; ADR-0036).
 //!
 //! Supervisor-owned session-bus MPRIS discovery and zero-polling progress state, so `mpris.players`
 //! survives Renderer crash/reload like idle/lock authority (ADR-0010). Capture position once with

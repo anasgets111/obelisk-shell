@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-/// `oblisk.sysinfo`'s five Lua-visible fields (docs/oblisk-idl-api-specs.md §2.12), with field
+/// `oblisk.sysinfo`'s five Lua-visible fields (docs/lua-api.md §2.12), with field
 /// names unchanged from the `StateSnapshot` JSON keys.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct SysinfoState {

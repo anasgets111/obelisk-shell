@@ -1,4 +1,4 @@
-//! `oblisk.system` provides reactive wall-clock time (docs/oblisk-idl-api-specs.md §2.11).
+//! `oblisk.system` provides reactive wall-clock time (docs/lua-api.md §2.11).
 //!
 //! Read-only. ADR-0136 moved the former persisted `state.json` and `system:write_state` to
 //! `oblisk.storage`, where config names the file.

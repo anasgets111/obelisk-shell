@@ -1,5 +1,5 @@
 //! Presentation-Before-Authority (PBA) hot-reload orchestration
-//! (`docs/oblisk-supervisor-services-dbus.md` § 14).
+//! (`docs/services.md` § 14).
 //!
 //! Ordering/gating only for six steps: spawn, hydrate, null-buffer stage, activate draw, verify
 //! evidence, swap/reap. [`process`] owns spawn/reap; [`CandidateLink`] is the control-socket trait

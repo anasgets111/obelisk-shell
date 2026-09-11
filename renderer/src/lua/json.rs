@@ -1,4 +1,4 @@
-//! `json` global table (`oblisk-idl-api-specs.md` § 3.3, ADR-0057), the config's only reader for
+//! `json` global table (`lua-api.md` § 3.3, ADR-0057), the config's only reader for
 //! structured subprocess output.
 //!
 //! `process.run`'s `out_cb` fires once per newline-stripped line, so a config polling

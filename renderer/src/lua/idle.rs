@@ -1,5 +1,5 @@
 //! `oblisk.idle`: idle-notify thresholds and the logind inhibit pair (ADR-0032,
-//! docs/oblisk-supervisor-services-dbus.md § 7).
+//! docs/services.md § 7).
 //!
 //! **A roster capability with three extra methods.** Until ADR-0141 it exposed only methods: a
 //! threshold crossing was treated as an event with no idle state. That missed whether anything

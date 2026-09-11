@@ -1,5 +1,5 @@
 //! `oblisk.workspaces`: per-output workspace state and focused window
-//! (`docs/oblisk-idl-api-specs.md` § 2.9), from niri's IPC stream (ADR-0056) or Hyprland's event
+//! (`docs/lua-api.md` § 2.9), from niri's IPC stream (ADR-0056) or Hyprland's event
 //! and command sockets (ADR-0118).
 //!
 //! Top-level because this is a compositor Unix socket, not a device or D-Bus interface.

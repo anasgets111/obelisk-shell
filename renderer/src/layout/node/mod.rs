@@ -1,4 +1,4 @@
-//! Typed, validated properties for `VirtualNode` (`docs/oblisk-idl-api-specs.md` § 5.1).
+//! Typed, validated properties for `VirtualNode` (`docs/lua-api.md` § 5.1).
 //! `resolve_properties` reads each ordinary `Signal` once per node/pass (ADR-0044 decision 1);
 //! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals. A
 //! `panel`'s other § 6 properties are live fields, not exceptions. Plain tables remain

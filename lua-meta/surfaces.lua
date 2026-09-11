@@ -1,5 +1,5 @@
 ---@meta
--- The four surface roles (`oblisk-idl-api-specs.md` § 6, ADR-0040); a `wl_surface` stays inert.
+-- The four surface roles (`lua-api.md` § 6, ADR-0040); a `wl_surface` stays inert.
 -- Protocol assigns its role. This shell has one constructor per role. `shell.lua` returns the set,
 -- freshly evaluated on every reload (ADR-0038).
 --

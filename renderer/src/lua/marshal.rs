@@ -1,4 +1,4 @@
-//! Rust-Lua marshalling boundary (`oblisk-idl-api-specs.md` § 1.1), enforcing its strict,
+//! Rust-Lua marshalling boundary (`lua-api.md` § 1.1), enforcing its strict,
 //! non-coercive rules for `f64`, `i64`/`u64`, and `String`. `mlua` maps shape but does not reject
 //! NaN, unsafe integers, or oversized strings. First caller: `signal::Signal::try_new_direct`
 //! (§ 1.2's `Box<Signal<T>>` line).

@@ -3,7 +3,7 @@ name: implement
 description: "Implement an Oblisk slice."
 ---
 
-Implement the requested Oblisk slice against `docs/oblisk-idl-api-specs.md`, the
+Implement the requested Oblisk slice against `docs/lua-api.md`, the
 relevant entries in `docs/decisions.md`, and the user's request. `docs/roadmap.md`
 lists what is not built. Use the canonical terms in `CONTEXT.md`.
 

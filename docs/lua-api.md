@@ -1,6 +1,6 @@
 # Lua API
 
-This is the config-author reference. [Services](oblisk-supervisor-services-dbus.md) owns backend
+This is the config-author reference. [Services](services.md) owns backend
 behavior and reload lifetimes; [roadmap](roadmap.md) owns gaps and proposed work;
 [CONTEXT](../CONTEXT.md) owns terminology; [decisions](decisions.md) owns history.
 
@@ -154,14 +154,14 @@ generation swap; a session process is held by the Supervisor, survives every rel
 reaped only at shutdown. In exchange a session process has no output callbacks -- its stdio is
 inherited -- because the evaluation that started it is gone by the time most of its output
 arrives.
-Persistence debounce and process group reaping belong to [services](oblisk-supervisor-services-dbus.md).
+Persistence debounce and process group reaping belong to [services](services.md).
 
 ## 4. Surface lifecycle
 
 A config returns a surface declaration or an array of them. An empty return is valid.
 The declared set is fixed for a generation; `visible` toggles mapping without destroying surfaces.
 Topology changes, output hotplug and failure handling belong to
-[services](oblisk-supervisor-services-dbus.md#14-reload-lifecycle).
+[services](services.md#14-reload-lifecycle).
 
 ## 5. UI nodes
 
@@ -318,7 +318,7 @@ focus. Navigation callbacks receive up/down/page_up/page_down/tab/backtab.
 The default mask is a bullet; an empty glyph hides length.
 Supported targets are lock/authenticate, polkit/authenticate and network/connect.
 Secrets never reach Lua callbacks. See [secure target parsing](../renderer/src/layout/node/spec.rs)
-and [authentication ownership](oblisk-supervisor-services-dbus.md#7-idle-lock-and-polkit).
+and [authentication ownership](services.md#7-idle-lock-and-polkit).
 
 ## 6. Surface declarations
 
@@ -358,7 +358,7 @@ See [surface parsing](../renderer/src/lua/surfaces.rs),
 ## 7. Wire format envelope
 
 Lua capability invocations serialize to a JSON-RPC 2.0 envelope over the control socket.
-See [wire format and dispatch limits](oblisk-supervisor-services-dbus.md#13-control-socket-and-wire-format).
+See [wire format and dispatch limits](services.md#13-control-socket-and-wire-format).
 
 ## 8. Tooling
 

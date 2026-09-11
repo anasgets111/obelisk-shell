@@ -1,8 +1,8 @@
 # Decisions
 
 Historical decisions, not current API documentation. Entries may describe proposals, deferred work
-or behavior superseded later. Current contracts live in [API](oblisk-idl-api-specs.md) and
-[services](oblisk-supervisor-services-dbus.md); open work lives in [roadmap](roadmap.md).
+or behavior superseded later. Current contracts live in [API](lua-api.md) and
+[services](services.md); open work lives in [roadmap](roadmap.md).
 
 Entry and internal decision numbers are permanent because code cites both. Keep the choice,
 constraints, rejected alternatives and amendments when shortening an entry. Add new decisions
@@ -53,7 +53,7 @@ capability call; references above mean config writing to the `state()` signal bo
 
 ## 0003. Authority transfers per output, not per process
 
-`oblisk-supervisor-services-dbus.md` § 15.4's all-display presentation barrier is replaced by
+`services.md` § 15.4's all-display presentation barrier is replaced by
 per-(`generation`, output) authority. Each output moves to the candidate when its own presentation
 evidence arrives, without waiting for siblings. The Supervisor reaps a generation at zero owned
 outputs, immediately or minutes later if one output sleeps.
@@ -174,7 +174,7 @@ types through `delegate_*!` macros. Hand-written `Dispatch<ZwpTextInputV3, D>` f
 `TextInputService` uses the same struct and queue, and
 `zwp_text_input_manager_v3::get_text_input(seat)` uses SCTK's `wl_seat`.
 
-`oblisk-idl-api-specs.md` § 5.2 is corrected accordingly.
+`lua-api.md` § 5.2 is corrected accordingly.
 
 ## 0010. Supervisor owns idle-notify and lock authority, with its own Wayland connection
 
@@ -362,7 +362,7 @@ Since built: `process.run`'s Lua binding and a process registry in ADR-0026. ADR
 ## 0019. PBA control-socket transport and Lua AST evaluation are deferred, not built
 
 Phase 8 ships PBA ordering and gating only, not the surrounding
-`oblisk-supervisor-services-dbus.md` § 15.1-15.4 system. These items are deferred for the same
+`services.md` § 15.1-15.4 system. These items are deferred for the same
 reason as ADR-0015/0017/0018: no consumer or transport exists yet to build against. They are the
 Unix control-socket wire,
 Lua AST evaluation, Renderer null-buffer commit and `wp_presentation_feedback`, NetworkManager/BlueZ
@@ -376,7 +376,7 @@ state hydration, true per-(`generation`, output) evidence fan-out (ADR-0003), `�
    `push_state_snapshot` (state hydration), `recv_ready_signal` (null-buffer staging),
    `send_activate_draw` (activate draw), and `recv_presentation_evidence` (evidence verification).
    It reuses `shared::StateSnapshot` for hydration, but not
-   `shared::CommandEnvelope` for `ActivateDraw`: `oblisk-idl-api-specs.md` § 7.2 defines that
+   `shared::CommandEnvelope` for `ActivateDraw`: `lua-api.md` § 7.2 defines that
    envelope as a generation-guarded Renderer-to-Supervisor Lua write, while activation is a
    Supervisor-issued nonce, so it carries a plain `u64`.
 3. **Failure semantics.** Any failure before presentation evidence is verified, including a
@@ -395,7 +395,7 @@ evaluation from ADR-0023; and a production caller through ADR-0024's Watcher.
 ## 0020. Control-socket transport ships without dispatch, PBA wiring, or `process.run` streaming
 
 Phase 9 builds Unix control-socket framing and connection identity, but defers everything after a
-frame arrives: the `oblisk-idl-api-specs.md` § 3.2 command table of ~30 writes, still forwarded to an
+frame arrives: the `lua-api.md` § 3.2 command table of ~30 writes, still forwarded to an
 aggregated `eprintln!` channel; ADR-0019's production `CandidateLink`; `process.run` line streaming,
 which is a separate transport concern; handshake deadlines, so an idle client blocks only its own
 connection task, not the accept loop; real generation IDs (`renderer/src/socket.rs` reads

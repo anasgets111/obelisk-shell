@@ -8,7 +8,7 @@ use super::proxies::{DBusMenuProxy, raw_menu_layout_to_value};
 use super::{MAX_MENU_NODES, MAX_TRAY_TEXT_BYTES};
 use crate::capabilities::truncate_utf8_bytes;
 
-/// One DBusMenu layout node, resolved to `tray.items[].menu` (docs/oblisk-idl-api-specs.md §2.14).
+/// One DBusMenu layout node, resolved to `tray.items[].menu` (docs/lua-api.md §2.14).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MenuItem {
     /// DBusMenu item id used by `tray:activate_menu_item` and `tray:menu_will_show`.

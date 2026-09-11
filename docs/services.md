@@ -1,7 +1,7 @@
 # Supervisor services
 
 Current ownership and backend behavior. Lua call syntax and schemas are in the
-[API specification](oblisk-idl-api-specs.md); proposed work is in the [roadmap](roadmap.md).
+[API specification](lua-api.md); proposed work is in the [roadmap](roadmap.md).
 [Decisions](decisions.md) records rationale and history.
 
 The Supervisor owns durable platform connections and validates commands. Capabilities start on

@@ -50,7 +50,7 @@ pub(crate) fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<
     }
 }
 
-/// The 100ms § 10 grace window from `docs/oblisk-supervisor-services-dbus.md`. Parameterized so
+/// The 100ms § 10 grace window from `docs/services.md`. Parameterized so
 /// tests can reap faster.
 pub const DEFAULT_REAP_GRACE: Duration = Duration::from_millis(100);
 

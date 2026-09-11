@@ -130,7 +130,7 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     })
 }
 
-/// Validates `docs/oblisk-supervisor-services-dbus.md §1.1`'s image-data bounds and its "ARGB icon
+/// Validates `docs/services.md §1.1`'s image-data bounds and its "ARGB icon
 /// rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit samples only, channels
 /// matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length. ponytail: no 16-bit/float
 /// support until a real sender needs it.

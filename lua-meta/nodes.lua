@@ -1,5 +1,5 @@
 ---@meta
--- The eight geometric nodes (`oblisk-idl-api-specs.md` § 5.2) and their shared properties (§ 5.1).
+-- The eight geometric nodes (`lua-api.md` § 5.2) and their shared properties (§ 5.1).
 --
 -- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `oblisk.lua` is
 -- generated: capability payloads are `Serialize` structs, while a node's schema is 29 scattered

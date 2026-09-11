@@ -325,7 +325,7 @@ pub fn run(
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // Candidate order from `oblisk-supervisor-services-dbus.md` § 14.2: evaluate shell.lua, bind
+    // Candidate order from `services.md` § 14.2: evaluate shell.lua, bind
     // declared layer surfaces (ADR-0038 decision 1), commit null buffers (`bind_and_clear`'s
     // candidate branch), and signal ready (`maybe_send_ready_signal`).
     //

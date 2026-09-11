@@ -1,5 +1,5 @@
-//! System tray host (`oblisk.tray`, docs/oblisk-supervisor-services-dbus.md §2;
-//! docs/oblisk-idl-api-specs.md §2.14; ADR-0031).
+//! System tray host (`oblisk.tray`, docs/services.md §2;
+//! docs/lua-api.md §2.14; ADR-0031).
 //!
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and handles registered
 //! `org.kde.StatusNotifierItem`s and optional `com.canonical.dbusmenu` menus. Hand-written proxies

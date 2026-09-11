@@ -4,7 +4,7 @@
 //! secure textfield submissions (ADR-0005). Accepts simultaneous connections during a swap, with
 //! Generation `N` and Candidate `N+1` registered by `generation_id`.
 //!
-//! Command-dispatch routing remains deferred (ADR-0020), including `oblisk-idl-api-specs.md`
+//! Command-dispatch routing remains deferred (ADR-0020), including `lua-api.md`
 //! § 3.2's ~30 write commands.
 //! Decode inbound frames as `shared::RendererFrame` (ADR-0024) and forward them unchanged.
 //!
