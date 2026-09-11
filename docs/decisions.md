@@ -4309,3 +4309,27 @@ outside `state`, which is machinery for a window that needs a config save mid-se
 Verified against a live niri session: `obelisk call no.such.thing` exits 1 naming it, a first
 `rec.toggle` prints `starting` with `slurp` on screen, and a second prints `cancelled` with the
 child gone, repeatably in both directions.
+
+## 0198. The instruction hook is installed for the life of the VM, not around each budget
+
+Installing a Lua hook does not retrofit coroutines that already exist: a new thread inherits its
+creator's hook, and a creator running while nothing was budgeted has none to pass on. `shell.lua`'s
+own top level is exactly that moment, so
+
+    spin = coroutine.wrap(function() while true do end end)
+
+stored there and resumed from any getter ran with nothing to stop it. Reproduced: the call never
+returned. That is the render thread, so it is Wayland. `StdLib::COROUTINE` is granted to configs.
+
+The refcount that decided when to remove the hook is what opened those windows, so it is gone and
+`install_hook` runs once in `signal::register`, before any config code. `HookHolders`,
+`acquire_hook` and `release_hook` go with it, and `CpuBudget`/`LayoutPassBudget` now only push and
+pop deadlines. This reverses the "install on 0->1, remove on 1->0" half of ADR-0022 decision 2,
+which was right about reentrancy and wrong about coverage.
+
+The cost is the callback every 1000 instructions with no budget live, where `expired_budget` finds
+no deadline stack and returns on its first lookup.
+
+Not fixed, and now precise: a config that catches the hook's error and keeps spinning still has no
+bound, because the gates are cooperative. `obelisk call` (ADR-0197) made that reachable from any
+process of this user rather than only from a click, which is what prompted looking.

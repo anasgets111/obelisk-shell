@@ -771,47 +771,27 @@ pub(crate) struct CpuBudget<'lua> {
     lua: &'lua Lua,
 }
 
-/// Number of live [`CpuBudget`] or [`LayoutPassBudget`] holders. Count, not signal-stack depth:
-/// finishing a signal inside a pass must not remove the hook the pass still needs, or later
-/// `__index` calls become unbounded.
-#[derive(Default)]
-struct HookHolders(usize);
-
-/// Installs the instruction hook for the first holder; [`release_hook`] balances it.
-fn acquire_hook(lua: &Lua) -> mlua::Result<()> {
-    if lua.app_data_ref::<HookHolders>().is_none() {
-        lua.set_app_data(HookHolders::default());
-    }
-    let first = lua.app_data_ref::<HookHolders>().expect("just ensured the counter exists").0 == 0;
-    if first {
-        // `set_global_hook`, not per-thread `set_hook`: coroutines otherwise ran unhooked, measured
-        // 5.75s of Lua in `coroutine.create`/`resume` returning `Ok`. The global callback covers
-        // whichever Lua thread fires.
-        lua.set_global_hook(
-            mlua::HookTriggers { every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS), ..mlua::HookTriggers::new() },
-            |lua, _| match expired_budget(lua) {
-                Some(message) => Err(mlua::Error::runtime(message)),
-                None => Ok(mlua::VmState::Continue),
-            },
-        )?;
-    }
-    lua.app_data_mut::<HookHolders>().expect("just ensured the counter exists").0 += 1;
-    Ok(())
-}
-
-/// Drops one hook claim, removing the hook when the last holder lets go.
-fn release_hook(lua: &Lua) {
-    let remaining = {
-        let mut holders = lua.app_data_mut::<HookHolders>().expect("acquire_hook always runs before its release");
-        holders.0 = holders.0.saturating_sub(1);
-        holders.0
-    };
-    if remaining == 0 {
-        // Both: global removal stops inheriting coroutines; thread removal clears this thread's
-        // mask.
-        lua.remove_global_hook();
-        lua.remove_hook();
-    }
+/// Installs the instruction hook for the life of the VM, once, before any config code runs.
+///
+/// `set_global_hook`, not per-thread `set_hook`: coroutines otherwise ran unhooked, measured 5.75s
+/// of Lua in `coroutine.create`/`resume` returning `Ok`.
+///
+/// Installed permanently rather than around each budget, because installing a hook does not
+/// retrofit coroutines that already exist -- a new Lua thread inherits its creator's hook, and a
+/// creator running while nothing was budgeted had none to pass on. `shell.lua`'s own top level is
+/// exactly that moment, so a `coroutine.wrap` stored there and resumed from a getter spun with
+/// nothing to stop it. Refcounting when to remove it was what left those windows open.
+///
+/// The cost is the callback itself, every [`CHECK_EVERY_N_INSTRUCTIONS`]: with no budget live
+/// [`expired_budget`] finds no deadline stack and returns on the first lookup.
+pub(crate) fn install_hook(lua: &Lua) -> mlua::Result<()> {
+    lua.set_global_hook(
+        mlua::HookTriggers { every_nth_instruction: Some(CHECK_EVERY_N_INSTRUCTIONS), ..mlua::HookTriggers::new() },
+        |lua, _| match expired_budget(lua) {
+            Some(message) => Err(mlua::Error::runtime(message)),
+            None => Ok(mlua::VmState::Continue),
+        },
+    )
 }
 
 /// Whole-`Scene::apply` deadline, when a pass is in flight.
@@ -835,8 +815,6 @@ impl<'lua> LayoutPassBudget<'lua> {
         if lua.app_data_ref::<PassDeadline>().is_none() {
             lua.set_app_data(PassDeadline::default());
         }
-        // Store deadline after hook installation so failed install leaves nothing for `Drop`.
-        acquire_hook(lua)?;
         lua.app_data_mut::<PassDeadline>().expect("just ensured the slot exists").0 =
             Some(Deadline::lasting(LAYOUT_PASS_CAP));
         // Unconditional, like the deadline above it: only a `Computed` installs a memo and none is
@@ -859,7 +837,6 @@ impl Drop for LayoutPassBudget<'_> {
     fn drop(&mut self) {
         self.lua.app_data_mut::<PassDeadline>().expect("enter always runs before its Drop").0 = None;
         self.lua.remove_app_data::<MemoTable>();
-        release_hook(self.lua);
     }
 }
 
@@ -877,7 +854,6 @@ impl<'lua> CpuBudget<'lua> {
                 "signal nesting exceeded its maximum depth of {MAX_SIGNAL_NESTING_DEPTH} levels -- a computed/map chain recursing into itself, or a dependency chain that long?"
             )));
         }
-        acquire_hook(lua)?;
         lua.app_data_mut::<Vec<Deadline>>()
             .expect("just ensured the deadline stack exists")
             .push(Deadline::lasting(CPU_CAP));
@@ -899,7 +875,6 @@ impl<'lua> CpuBudget<'lua> {
 impl Drop for CpuBudget<'_> {
     fn drop(&mut self) {
         self.lua.app_data_mut::<Vec<Deadline>>().expect("CpuBudget::enter always runs before its Drop").pop();
-        release_hook(self.lua);
     }
 }
 
@@ -960,6 +935,8 @@ fn parse_hold(what: &str, millis: f64) -> Result<Duration, mlua::Error> {
 
 /// `RendererClient` drains.
 pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
+    // Before any config code runs, so every coroutine it ever creates inherits the hook.
+    install_hook(lua)?;
     let hover_dirty = dirty.clone();
     let rect_dirty = dirty.clone();
     let scroll_dirty = dirty.clone();
@@ -2052,6 +2029,34 @@ mod tests {
             result.is_err(),
             "a body that swallows the hook error must not yield a partially computed value: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_coroutine_made_before_any_budget_is_still_covered_by_the_cpu_cap() {
+        // The sibling below creates its coroutine inside a budgeted body, so it inherits the hook
+        // that body installed. One made while nothing is budgeted -- at the top level of
+        // `shell.lua`, before any getter runs -- inherited no hook, because installing one does not
+        // retrofit threads that already exist. Resuming it later from inside a budget then spun
+        // with nothing to stop it, and `obelisk call` made that reachable from outside the process.
+        let lua = lua_with_signal("a", Value::Integer(1));
+        lua.load(
+            r#"
+            spin = coroutine.wrap(function()
+                local n = 0
+                for _ = 1, 500000000 do n = n + 1 end
+                return n
+            end)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let start = Instant::now();
+        let result: mlua::Result<i64> = lua.load("return computed({a}, function(x) return spin() end):get()").eval();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a coroutine made before the budget must still hit the cap: {result:?}");
+        assert!(elapsed < Duration::from_secs(1), "the hook must reach it, took {elapsed:?}");
     }
 
     #[test]
