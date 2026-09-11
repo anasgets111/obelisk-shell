@@ -101,10 +101,15 @@ fn fuzzy_match_v2(case_sensitive: bool, input: &[u8], pattern: &[u8]) -> Option<
         bonuses[input_index] = bonus_for(previous_class, current_class) as i16;
         previous_class = current_class;
 
-        if byte == current_pattern_byte && pattern_index < pattern.len() {
-            first_match_by_pattern[pattern_index] = input_index;
-            pattern_index += 1;
-            current_pattern_byte = pattern[pattern_index.min(pattern.len() - 1)];
+        if byte == current_pattern_byte {
+            if pattern_index < pattern.len() {
+                first_match_by_pattern[pattern_index] = input_index;
+                pattern_index += 1;
+                current_pattern_byte = pattern[pattern_index.min(pattern.len() - 1)];
+            }
+            // Keeps advancing past a complete subsequence: the DP's window ends at the last
+            // occurrence of the needle's final character, not the earliest one that finishes it.
+            // Stopping early hides a better run further along, which is most of a long haystack.
             last_match_index = input_index;
         }
 
@@ -191,15 +196,22 @@ fn score_multi_byte_match(
                 consecutive = consecutive_matches[previous_cell] + 1;
 
                 let mut bonus = i32::from(bonuses[input_index]);
-                if bonus == BONUS_BOUNDARY {
-                    consecutive = 1;
-                } else if consecutive > 1 {
-                    let run_start = input_index + 1 - consecutive as usize;
-                    bonus = bonus.max(BONUS_CONSECUTIVE.max(i32::from(bonuses[run_start])));
+                if consecutive > 1 {
+                    let run_bonus = i32::from(bonuses[input_index + 1 - consecutive as usize]);
+                    if bonus >= BONUS_BOUNDARY && bonus > run_bonus {
+                        consecutive = 1; // a boundary starts a better run than the one in progress.
+                    } else {
+                        bonus = bonus.max(BONUS_CONSECUTIVE.max(run_bonus));
+                    }
                 }
                 // A run's bonus is kept only when it beats stepping sideways; otherwise the plain
-                // one applies, so a long run cannot claim credit the path did not take.
-                diagonal += if diagonal + bonus < left { i32::from(bonuses[input_index]) } else { bonus };
+                // one applies and the run ends, so it cannot claim credit the path did not take.
+                if diagonal + bonus < left {
+                    diagonal += i32::from(bonuses[input_index]);
+                    consecutive = 0;
+                } else {
+                    diagonal += bonus;
+                }
             }
 
             consecutive_matches[cell] = consecutive;
@@ -321,6 +333,16 @@ mod tests {
     #[test]
     fn a_prefix_beats_the_same_run_found_later_in_the_name() {
         assert!(scored("Files", "fil") > scored("Profile Editor", "fil"));
+    }
+
+    /// The DP window once ended at the earliest complete subsequence, so a literal run past it was
+    /// never scored: LibreOffice Calc, whose keywords end in `xlsx`, lost "xlsx" to two text
+    /// editors holding no x at all beyond `text`.
+    #[test]
+    fn a_run_late_in_a_long_haystack_is_still_found_past_an_earlier_scattered_subsequence() {
+        let decoyed = "Excel Works analyze lists in spreadsheets ods xls xlsx";
+        assert_eq!(scored(decoyed, "xlsx"), scored("ods xls xlsx", "xlsx"));
+        assert!(scored(decoyed, "xlsx") > scored("Neovim Edit text files Text Editor", "xlsx"));
     }
 
     #[test]
