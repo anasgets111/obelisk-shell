@@ -1946,6 +1946,17 @@ Same-day amendment:
 9. Every autofocus arm emits an empty change callback, allowing selection/scroll reset when empty.
 10. Two-stage Escape is config policy: clear first, close when empty.
 
+Later amendment, reversing half of decision 4:
+
+11. Carry `GenericName` and `Keywords` as well, unlocalized like `Name`. They are the only place an
+    entry says what it is in the user's words: "text editor" is Zed's `GenericName`, "image" one of
+    GIMP's `Keywords`, and neither word is in those entries' name or comment. `Keywords` arrives
+    split on `;` rather than raw.
+
+`Categories` still stays out. It is a menu taxonomy (`TextEditor;Development;IDE`), so searching it
+makes "ide" hit every IDE-adjacent entry. That is noise, not recall. Localization stays out as
+decision 4 left it.
+
 ## 0113. What a code review is worth: four fixes out of two hundred findings, and the two that were the review's own doc drift
 
 Verify review claims against behavior, not finding counts.

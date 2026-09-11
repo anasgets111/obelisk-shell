@@ -72,11 +72,15 @@ end
 -- entry, scored by `fuzzy` (ADR-0201), ordered by score and then by the mirror's tiebreakers, match
 -- start and then length. The name comparison after those is ours, because `table.sort` is unstable
 -- and two entries alike on all three keys would otherwise trade places between keystrokes.
+--
+-- The haystack is wider than the mirror's two fields. "text editor" is Zed's `GenericName` and
+-- "image" is one of GIMP's `Keywords`; neither word is anywhere in those entries' name or comment.
 local function haystack_of(app)
-    if app.comment and app.comment ~= "" then
-        return app.name .. " " .. app.comment
-    end
-    return app.name
+    local parts = { app.name }
+    if app.comment and app.comment ~= "" then parts[#parts + 1] = app.comment end
+    if app.generic_name and app.generic_name ~= "" then parts[#parts + 1] = app.generic_name end
+    for _, word in ipairs(app.keywords) do parts[#parts + 1] = word end
+    return table.concat(parts, " ")
 end
 
 ---@param applications ApplicationsState|nil

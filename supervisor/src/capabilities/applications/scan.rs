@@ -27,6 +27,12 @@ pub struct AppSummary {
     /// `"Web Browser"` under `Firefox` (ADR-0112). `None` means no key, so config can hide it;
     /// unlike `name`, this field is localized.
     pub comment: Option<String>,
+    /// Unlocalized `GenericName=`, what the application is rather than what it is called:
+    /// `"Text Editor"` under `Zed`, which no other field of that entry says. Search text.
+    pub generic_name: Option<String>,
+    /// `Keywords=` split on `;`: the synonyms an entry ships for search, such as GIMP's `GNU` and
+    /// `Image Manipulation Program`. Empty when the key is absent. Search text, not a label.
+    pub keywords: Vec<String>,
 }
 
 /// What `launch` needs but Lua never sees.
@@ -113,6 +119,15 @@ pub fn scan(dirs: &[PathBuf]) -> ScanResult {
                 name: name.clone(),
                 icon: group.get("Icon").cloned(),
                 comment: group.get("Comment").cloned(),
+                generic_name: group.get("GenericName").cloned(),
+                // The specification's trailing `;` leaves an empty last field. `\;` is not
+                // unescaped: no shipped entry uses it, and a stray backslash costs one keyword.
+                keywords: group
+                    .get("Keywords")
+                    .map(|value| {
+                        value.split(';').map(str::trim).filter(|word| !word.is_empty()).map(String::from).collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -276,6 +291,22 @@ mod tests {
         let names: Vec<String> = scan(&[dir.path().to_path_buf()]).entries.into_iter().map(|e| e.name).collect();
 
         assert_eq!(names, vec!["Apple", "Banana", "Cherry"]);
+    }
+
+    /// "text editor" finds Zed through `GenericName` and "image" finds GIMP through `Keywords`;
+    /// neither word is in those entries' `Name` or `Comment`.
+    #[test]
+    fn scan_carries_the_two_search_fields_an_entry_holds_beyond_its_name_and_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), "zed.desktop", &application("Zed", "GenericName=Text Editor\n"));
+        write_entry(dir.path(), "gimp.desktop", &application("GIMP", "Keywords=GNU;Image Manipulation Program;\n"));
+
+        let entries = scan(&[dir.path().to_path_buf()]).entries;
+
+        assert_eq!(entries[0].name, "GIMP");
+        assert_eq!(entries[0].keywords, vec!["GNU".to_string(), "Image Manipulation Program".to_string()]);
+        assert_eq!(entries[1].generic_name.as_deref(), Some("Text Editor"));
+        assert!(entries[1].keywords.is_empty(), "a missing Keywords is no keywords, not one empty one");
     }
 
     #[test]

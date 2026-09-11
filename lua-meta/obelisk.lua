@@ -74,8 +74,10 @@
 ---One application as config sees it (ADR-0061). Display data only: argv stays private because
 ---`applications:launch(id)` runs it, and exposing it would let config rewrite the command.
 ---@field comment? string Unlocalized `Comment=`, the one-line description/search text under the name, e.g. `"Web Browser"` under `Firefox` (ADR-0112). `None` means no key, so config can hide it; unlike `name`, this field is localized.
+---@field generic_name? string Unlocalized `GenericName=`, what the application is rather than what it is called: `"Text Editor"` under `Zed`, which no other field of that entry says. Search text.
 ---@field icon? string `Icon=` as written, either a theme name or absolute path; `icon { name = ... }` accepts both (ADR-0054 decision 2). `None` means no `Icon=` key, distinct from failed resolution.
 ---@field id string Desktop file id (`org.telegram.desktop`), and `launch`'s argument.
+---@field keywords string[] `Keywords=` split on `;`: the synonyms an entry ships for search, such as GIMP's `GNU` and `Image Manipulation Program`. Empty when the key is absent. Search text, not a label.
 ---@field name string Unlocalized `Name=`. `Name[xx]` is not read (ADR-0061), so this is English on a localized system.
 
 ---@class AudioDevice
