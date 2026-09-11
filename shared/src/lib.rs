@@ -5,7 +5,7 @@ pub mod framing;
 mod paths;
 mod secure_buffer;
 pub use paths::{
-    CHECK_ENV, CONFIG_DIR_ENV, EXIT_COMPOSITOR_GONE, GENERATION_ID_ENV, config_dir, control_socket_path,
+    CHECK_ENV, CONFIG_DIR_ENV, EXIT_COMPOSITOR_GONE, GENERATION_ID_ENV, config_dir, control_socket_path, log_path,
     session_locked_flag_path, shell_lua_path,
 };
 pub use secure_buffer::SecureBuffer;

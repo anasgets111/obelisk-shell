@@ -23,6 +23,15 @@ pub fn session_locked_flag_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(runtime_dir).join("obelisk-session-locked"))
 }
 
+/// Where `Command::Run` parks stdout and stderr when no terminal is reading them, and where
+/// `obelisk log` reads them back (ADR-0199). Beside the control socket, and per-login like it: the
+/// only run worth reading is the current one.
+pub fn log_path() -> io::Result<PathBuf> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    Ok(PathBuf::from(runtime_dir).join("obelisk-shell.log"))
+}
+
 /// The tracked dev config, baked in so it resolves from any working directory. The workspace root
 /// is one level above this crate's `CARGO_MANIFEST_DIR`.
 #[cfg(debug_assertions)]

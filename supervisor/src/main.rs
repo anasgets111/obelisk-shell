@@ -3,6 +3,7 @@ mod cli;
 mod compositor;
 mod control_client;
 mod generation;
+mod log;
 mod memory;
 mod pam_worker;
 mod polkit;
@@ -173,6 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli::Command::Init { force } => setup::run(&shared::config_dir()?, force),
         cli::Command::SetState(set) => control_client::send(set),
         cli::Command::Call { name, arguments } => control_client::call(name, arguments),
+        cli::Command::Log { follow } => log::print(follow),
         cli::Command::Check => match setup::check(&shared::config_dir()?) {
             Ok(report) => {
                 print!("{report}");
@@ -184,6 +186,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         cli::Command::Run => {
+            // Before anything writes a diagnostic, and before any Renderer inherits the
+            // descriptors (ADR-0199).
+            log::capture()?;
             // Exit explicitly: `Shutdown`'s code matters, while `main`'s `Result` only yields 0 or
             // 1 (ADR-0059 decision 3). `run_supervisor` has finished its teardown. Two workers,
             // not one per core (ADR-0124), cover socket/D-Bus/inotify/timer waits; the blocking

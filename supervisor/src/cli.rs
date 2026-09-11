@@ -1,7 +1,8 @@
 //! Argument parsing for the `obelisk` binary.
 //!
-//! Hand-rolled: four flags, two subcommands, and one non-obvious rule (`-c` may name a file).
-//! `clap` would be the workspace's largest dependency; the rule needs custom code either way.
+//! Hand-rolled: a handful of flags, a handful of subcommands, and one non-obvious rule (`-c` may
+//! name a file). `clap` would be the workspace's largest dependency; the rule needs custom code
+//! either way.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,11 @@ pub enum Command {
     Call {
         name: String,
         arguments: Vec<serde_json::Value>,
+    },
+    /// `log [-f]` prints what this run wrote to stdout and stderr, which a shell with no terminal
+    /// parks in a file (ADR-0199).
+    Log {
+        follow: bool,
     },
     Version,
     Help,
@@ -50,11 +56,13 @@ USAGE:
                                 initial when it already is VALUE
     obelisk call <NAME> [ARGS]   run the config's action(NAME) and print what
                                  it returned
+    obelisk log [-f]             print this run's stdout and stderr
 
 OPTIONS:
     -c, --config <DIR>   the config directory, holding shell.lua. Overrides
                          $OBELISK_CONFIG_DIR and $XDG_CONFIG_HOME.
         --force          init only: overwrite files that already exist
+    -f, --follow         log only: keep printing until the shell exits
     -V, --version
     -h, --help
 
@@ -67,6 +75,11 @@ false)` flips; bind `obelisk toggle modal launcher` and `state(\"modal\", \"\")`
 becomes \"launcher\", or \"\" again when it already was. VALUE is read as JSON
 (true, 3, \"text\", [1,2]); anything that is not JSON is taken as a string, so
 quoting `notifications` is optional.
+
+`log` is for a shell the compositor started, whose output would otherwise go to
+/dev/null: when it does, stdout and stderr go to $XDG_RUNTIME_DIR/obelisk-shell.log
+instead, truncated each run, and `-f` keeps reading until the shell exits. A
+terminal, a redirect or a pipe is left alone and there is no file to read.
 
 `call` is for what a keybind wants the shell to *do* rather than look like:
 the config declares `action(\"rec.toggle\", function() ... end)` and the bind is
@@ -98,7 +111,8 @@ fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
 /// Whether `arg` is one of the options this parser knows, rather than a value that merely begins
 /// with a dash. `-1` is a `set` value; `-c` is an option even where a value is expected.
 fn is_option(arg: &str) -> bool {
-    matches!(arg, "-c" | "--config" | "--force" | "-V" | "--version" | "-h" | "--help") || arg.starts_with("--config=")
+    matches!(arg, "-c" | "--config" | "--force" | "-f" | "--follow" | "-V" | "--version" | "-h" | "--help")
+        || arg.starts_with("--config=")
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
@@ -106,16 +120,18 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let mut command = None;
     let mut config_dir = None;
     let mut force = false;
+    let mut follow = false;
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "init" | "check" | "set" | "toggle" | "call" if command.is_none() => {
+            "init" | "check" | "set" | "toggle" | "call" | "log" if command.is_none() => {
                 command = Some(match arg.as_str() {
                     "init" => "init",
                     "check" => "check",
                     "set" => "set",
                     "call" => "call",
+                    "log" => "log",
                     _ => "toggle",
                 });
             }
@@ -136,6 +152,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 config_dir = Some(config_dir_from(&value)?);
             }
             "--force" => force = true,
+            "-f" | "--follow" => follow = true,
             "-V" | "--version" => {
                 return Ok(Args { command: Command::Version, config_dir });
             }
@@ -186,10 +203,14 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 positional.map(|arg| serde_json::from_str(&arg).unwrap_or(serde_json::Value::String(arg))).collect();
             Command::Call { name, arguments }
         }
+        Some("log") => Command::Log { follow },
         _ => Command::Run,
     };
     if force && !matches!(command, Command::Init { .. }) {
         return Err("--force is only meaningful with `init`".to_string());
+    }
+    if follow && !matches!(command, Command::Log { .. }) {
+        return Err("--follow is only meaningful with `log`".to_string());
     }
     Ok(Args { command, config_dir })
 }
@@ -287,6 +308,8 @@ mod tests {
             }
         );
         assert!(parse_args(&["call"]).is_err(), "call without a name has nothing to ask for");
+        assert_eq!(parse_args(&["log"]).unwrap().command, Command::Log { follow: false });
+        assert_eq!(parse_args(&["log", "-f"]).unwrap().command, Command::Log { follow: true });
     }
 
     /// ADR-0112: keybind verbs. Values parse as JSON when possible; bare words need no quotes.
@@ -331,6 +354,7 @@ mod tests {
     #[test]
     fn force_without_init_is_refused_rather_than_ignored() {
         assert!(parse_args(&["--force"]).is_err(), "a flag that does nothing is worse than an error");
+        assert!(parse_args(&["-f"]).is_err(), "--follow has nothing to follow without `log`");
     }
 
     #[test]

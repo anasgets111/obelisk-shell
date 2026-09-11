@@ -4333,3 +4333,36 @@ no deadline stack and returns on its first lookup.
 Not fixed, and now precise: a config that catches the hook's error and keeps spinning still has no
 bound, because the gates are cooperative. `obelisk call` (ADR-0197) made that reachable from any
 process of this user rather than only from a click, which is what prompted looking.
+
+## 0199. A shell with no terminal writes its log to a file, because the compositor that started it kept nothing
+
+`spawn-at-startup "obelisk"` gives the shell `/dev/null` for stdout and stderr, so a session's
+diagnostics were gone before anyone could ask for them. Checked on the running shell: both
+`/proc/<pid>/fd/1` and `fd/2` pointed there. The repo's `packaging/obelisk-shell.service` would
+have handed them to the journal, but it is not installed and the shell is started from the
+compositor's config on purpose (`justfile`'s `install` recipe says so).
+
+Every diagnostic in both binaries is an `eprintln!`. So `log::capture` is two `dup2` calls onto
+`$XDG_RUNTIME_DIR/obelisk-shell.log` rather than a logging crate, a level filter or a second
+format: the Renderer inherits the descriptors through `spawn_group_leader`, and a panic message
+lands in the file because nothing of ours sits between the process and the write. `obelisk log`
+prints the file and `-f` follows it, after `quickshell log -f`.
+
+Three things the shape settles:
+
+- **Only `/dev/null` is taken over.** `capture` reads `/proc/self/fd/2` and returns early unless it
+  says `/dev/null`, so a terminal, a redirect or a pipe keeps the output and `obelisk >mine.log`
+  still fills `mine.log`. An `is_terminal` test was the first version and was wrong about both of
+  the latter. Teeing to both would need a pipe and a pump thread, and that thread dies with an
+  aborting process still holding the panic message it was about to write, so the file gets the
+  descriptors directly instead.
+- **Truncated per run, and no rotation.** It is per-login state beside the control socket, and the
+  run worth reading is the current one. `ponytail:` an `eprintln!` loop can still fill a tmpfs;
+  the ceiling is a size check in `capture`, which needs a writer in the path to enforce it and so
+  costs the paragraph above.
+- **`flock` says who is writing.** `--follow` stops when the shell does, and the kernel releases
+  that lock on a crash as readily as on an exit. It also stops a second shell blanking a running
+  one's log, which is why the open does not truncate and `set_len(0)` comes after the lock.
+
+quickshell keeps a second, structured `log.qslog` beside the plain one so `-r` can re-filter a
+finished run at read time. Not copied: there are no log levels here to filter by.
