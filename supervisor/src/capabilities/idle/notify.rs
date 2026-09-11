@@ -1,4 +1,4 @@
-//! Notify half of `oblisk.idle` (ADR-0032): `ext_idle_notifier_v1` on the Supervisor's dedicated
+//! Notify half of `obelisk.idle` (ADR-0032): `ext_idle_notifier_v1` on the Supervisor's dedicated
 //! Wayland connection, with one listener per distinct threshold and a dispatch thread.
 //! Split from `dbus::idle` -- see `hardware/idle/mod.rs` for the module-level doc.
 

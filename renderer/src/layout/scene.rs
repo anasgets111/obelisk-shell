@@ -438,7 +438,7 @@ impl Scene {
         let budget = match crate::lua::signal::LayoutPassBudget::enter(lua) {
             Ok(budget) => budget,
             Err(err) => {
-                eprintln!("[oblisk-renderer] tick: no pass budget, skipping the frame: {err}");
+                eprintln!("[obelisk-renderer] tick: no pass budget, skipping the frame: {err}");
                 return Vec::new();
             }
         };
@@ -454,7 +454,7 @@ impl Scene {
                 let advanced = advance_paint_only(retained, now, lua)
                     .and_then(|()| if budget.exceeded() { Err(LayoutError::PassBudgetExceeded) } else { Ok(()) });
                 if let Err(err) = advanced {
-                    eprintln!("[oblisk-renderer] {key}: advancing a paint-only tween failed, stopping it: {err}");
+                    eprintln!("[obelisk-renderer] {key}: advancing a paint-only tween failed, stopping it: {err}");
                     strip_tweens(retained);
                 }
                 continue;
@@ -467,12 +467,12 @@ impl Scene {
                 Ok(tree) => {
                     // Quiet: a tick never schedules a pass (ADR-0131).
                     if let Err(err) = publish_geometry(&tree, 0.0, 0.0, lua, true) {
-                        eprintln!("[oblisk-renderer] {key}: writing a geometry signal failed: {err}");
+                        eprintln!("[obelisk-renderer] {key}: writing a geometry signal failed: {err}");
                     }
                     *retained = tree;
                 }
                 Err(err) => {
-                    eprintln!("[oblisk-renderer] {key}: relaying out a tween failed, snapping it: {err}");
+                    eprintln!("[obelisk-renderer] {key}: relaying out a tween failed, snapping it: {err}");
                     strip_tweens(retained);
                 }
             }
@@ -4003,7 +4003,7 @@ pub(super) mod tests {
     fn text_content_size_comes_from_a_real_shaping_round_trip() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
-        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = text { content = "Oblisk" } }"#);
+        let (_lua, surface) = surface_from(r#"panel { id = "bar", child = text { content = "Obelisk" } }"#);
         apply_at(&mut scene, &[surface], full(), &shaping, &_lua).unwrap();
         let text = &scene.surface("bar@TEST").unwrap().children[0];
         assert!(text.rect.width > 0.0);
@@ -6076,7 +6076,7 @@ pub(super) mod tests {
     /// Its height has to be the wrapped body's, whatever the margin.
     #[test]
     fn a_containers_own_margin_does_not_widen_what_its_children_are_measured_at() {
-        let long = "have a look at this: https://github.com/anasgets111/oblisk-shell/pull/12 and tell me what you think about it all";
+        let long = "have a look at this: https://github.com/anasgets111/obelisk-shell/pull/12 and tell me what you think about it all";
         let heights = |margin: u32| {
             let src = format!(
                 r#"panel {{ id = "bar", child = column {{ width = "Fill", height = "Fill", children = {{

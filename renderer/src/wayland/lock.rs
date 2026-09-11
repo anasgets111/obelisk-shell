@@ -26,8 +26,8 @@ const LOCK_NEVER_GRANTED: &str = "the session lock was given up before the compo
 /// client holds the session; the wire cannot say more.
 const LOCK_DENIED: &str = "the compositor denied the session lock; another lock client most likely holds it already (`ext_session_lock_v1::finished` arrived in place \
      of `locked`)";
-/// `oblisk.rescue` after the compositor tears down a live lock. ADR-0052 decision 4 uses rescue,
-/// not `oblisk.lock.error`, because no lock screen remains to display it.
+/// `obelisk.rescue` after the compositor tears down a live lock. ADR-0052 decision 4 uses rescue,
+/// not `obelisk.lock.error`, because no lock screen remains to display it.
 const LOCK_TORN_DOWN: &str = "the compositor ended the session lock through its own mechanism; the session is unlocked and the lock screen is gone \
      (`ext_session_lock_v1::finished` after `locked`)";
 /// Exit code for a gone Supervisor socket (ADR-0059 decision 1), for journals or `$status`; it is
@@ -98,7 +98,7 @@ impl App {
     pub(super) fn create_lock(&mut self, instance: &SurfaceInstance, outputs: &HashMap<String, wl_output::WlOutput>) {
         let Some(output) = outputs.get(&instance.output) else {
             eprintln!(
-                "[oblisk-renderer] instance {:?} names an output that has since gone; skipping",
+                "[obelisk-renderer] instance {:?} names an output that has since gone; skipping",
                 instance.instance_id
             );
             return;
@@ -142,7 +142,7 @@ impl App {
             }
             self.surfaces[index].map_state = MapState::AwaitingConfigure;
             eprintln!(
-                "[oblisk-renderer] {}: lock surface created, awaiting its configure",
+                "[obelisk-renderer] {}: lock surface created, awaiting its configure",
                 self.surfaces[index].surface_id
             );
         }
@@ -164,7 +164,7 @@ impl App {
                 *surface = None;
             }
             self.surfaces[index].map_state = MapState::Unmapped;
-            eprintln!("[oblisk-renderer] {}: lock surface destroyed", self.surfaces[index].surface_id);
+            eprintln!("[obelisk-renderer] {}: lock surface destroyed", self.surfaces[index].surface_id);
         }
     }
 
@@ -193,7 +193,7 @@ impl App {
                     self.client.set_session_locked(true);
                     self.ensure_lock_surfaces(qh);
                     eprintln!(
-                        "[oblisk-renderer] session lock requested; waiting for the compositor's `locked` or `finished`"
+                        "[obelisk-renderer] session lock requested; waiting for the compositor's `locked` or `finished`"
                     );
                 }
                 // Preserve `GlobalError`'s own missing-global diagnosis.
@@ -229,19 +229,19 @@ impl App {
         self.client.set_session_locked(false);
         let outcome = release_outcome(was_locked);
         match &outcome {
-            LockOutcome::Unlocked => eprintln!("[oblisk-renderer] the session lock was released"),
-            _ => eprintln!("[oblisk-renderer] {LOCK_NEVER_GRANTED}"),
+            LockOutcome::Unlocked => eprintln!("[obelisk-renderer] the session lock was released"),
+            _ => eprintln!("[obelisk-renderer] {LOCK_NEVER_GRANTED}"),
         }
         self.report_lock(outcome);
     }
 
     /// Logs, rescues, and reports a refused lock (ADR-0052 decision 4). Refusal leaves the normal
-    /// scene visible, so `rescue` can display the message; wrong passwords reach `oblisk.lock`
+    /// scene visible, so `rescue` can display the message; wrong passwords reach `obelisk.lock`
     /// while lock surfaces are mapped and everything else is hidden. A later successful
     /// `RendererClient::handle_reevaluate`
     /// clears rescue.
     fn refuse_lock(&mut self, reason: &str) {
-        eprintln!("[oblisk-renderer] the session lock was refused: {reason}");
+        eprintln!("[obelisk-renderer] the session lock was refused: {reason}");
         self.client.set_rescue_state(true, reason);
         self.report_lock(LockOutcome::Refused(reason.to_string()));
     }
@@ -250,7 +250,7 @@ impl App {
     /// `active` only from these reports.
     fn report_lock(&mut self, outcome: LockOutcome) {
         if let Err(e) = self.outbound_tx.send(RendererFrame::LockReport(LockReport { outcome })) {
-            eprintln!("[oblisk-renderer] failed to queue a LockReport for the socket thread: {e}");
+            eprintln!("[obelisk-renderer] failed to queue a LockReport for the socket thread: {e}");
         }
     }
 }
@@ -272,7 +272,7 @@ impl SessionLockHandler for App {
             .iter()
             .filter(|tracked| matches!(tracked.role, TrackedRole::Lock { surface: Some(_), .. }))
             .count();
-        eprintln!("[oblisk-renderer] the session is locked; {surfaces} lock surface(s) up");
+        eprintln!("[obelisk-renderer] the session is locked; {surfaces} lock surface(s) up");
         self.report_lock(LockOutcome::Locked);
     }
 
@@ -304,7 +304,7 @@ impl SessionLockHandler for App {
             LockOutcome::Finished => LOCK_TORN_DOWN,
             _ => LOCK_DENIED,
         };
-        eprintln!("[oblisk-renderer] the session lock ended: {reason}");
+        eprintln!("[obelisk-renderer] the session lock ended: {reason}");
         self.client.set_rescue_state(true, reason);
         self.report_lock(outcome);
     }

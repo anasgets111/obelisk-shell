@@ -3,7 +3,7 @@
 ## Structure
 
 ```md
-# Oblisk shell
+# Obelisk shell
 
 Shared language for renderer generations, reloads, retained scenes, and capability state.
 
@@ -59,4 +59,4 @@ The skill infers which structure applies:
 - If only a root `CONTEXT.md` exists, single context
 - If neither exists, create a root `CONTEXT.md` lazily when the first term is resolved
 
-Oblisk currently has one context. Do not split it into renderer and capability contexts until their terms or ownership rules genuinely diverge.
+Obelisk currently has one context. Do not split it into renderer and capability contexts until their terms or ownership rules genuinely diverge.

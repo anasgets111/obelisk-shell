@@ -1,13 +1,13 @@
 ---
 name: grill-with-docs
-description: Relentless interview for sharpening an Oblisk plan and recording ADRs or glossary terms.
+description: Relentless interview for sharpening an Obelisk plan and recording ADRs or glossary terms.
 ---
 
 # Grill with docs
 
 Call the Skill tool twice, once for `grill` and once for `domain-modeling`.
 
-Use the exact Oblisk terms from `CONTEXT.md`: renderer generation, candidate,
+Use the exact Obelisk terms from `CONTEXT.md`: renderer generation, candidate,
 authoritative generation, presentation evidence, builder, retained scene,
 dependency snapshot, capability, and revision.
 

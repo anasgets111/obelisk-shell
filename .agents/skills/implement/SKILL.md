@@ -1,9 +1,9 @@
 ---
 name: implement
-description: "Implement an Oblisk slice."
+description: "Implement an Obelisk slice."
 ---
 
-Implement the requested Oblisk slice against `docs/lua-api.md`, the
+Implement the requested Obelisk slice against `docs/lua-api.md`, the
 relevant entries in `docs/decisions.md`, and the user's request. `docs/roadmap.md`
 lists what is not built. Use the canonical terms in `CONTEXT.md`.
 
@@ -26,6 +26,6 @@ a plain backtick path with the module prefix, never by widening an item's
 visibility to satisfy rustdoc. The counts to beat are 29 in the supervisor and
 3 in the renderer, all predating this note.
 
-Once done, use `/oblisk-review` to review the work against the requested slice.
+Once done, use `/obelisk-review` to review the work against the requested slice.
 
 Do not commit unless the user asks for a commit.

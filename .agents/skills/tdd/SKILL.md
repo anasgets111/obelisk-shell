@@ -17,11 +17,11 @@ See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for mocking g
 
 ## Seams: where tests go
 
-A **seam** is the module interface where you observe behavior without reaching inside. Tests live at seams, never against internals. In Oblisk, likely seams include the reload transaction, dependency snapshot, retained-scene transaction, and capability authority.
+A **seam** is the module interface where you observe behavior without reaching inside. Tests live at seams, never against internals. In Obelisk, likely seams include the reload transaction, dependency snapshot, retained-scene transaction, and capability authority.
 
 **Test only at pre-agreed seams.** Before writing any test, write down the seams under test and confirm them with the user. No test is written at an unconfirmed seam. You can't test everything, so agreeing the seams up front is how testing effort lands on the critical paths and complex logic instead of every edge case.
 
-Ask: "What is the public interface, and which Oblisk seams should we test?"
+Ask: "What is the public interface, and which Obelisk seams should we test?"
 
 When the shape of that interface is itself in question (how deep the module is, where the seam belongs, what the interface should expose), call the Skill tool with "codebase-design" for the vocabulary. It is the shared source of the module, interface, depth, seam, adapter, leverage and locality terms, and it is a reference to consult, not a session to run.
 
@@ -35,4 +35,4 @@ When the shape of that interface is itself in question (how deep the module is, 
 
 - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 - **One slice at a time.** One seam, one test, one minimal implementation per cycle.
-- **Refactoring is not part of the loop.** It belongs to the review stage (see the `oblisk-review` skill), not the red → green implementation cycle.
+- **Refactoring is not part of the loop.** It belongs to the review stage (see the `obelisk-review` skill), not the red → green implementation cycle.

@@ -1,4 +1,4 @@
-//! [`PowerController`] owns `oblisk.power` and its write action.
+//! [`PowerController`] owns `obelisk.power` and its write action.
 //! See `power/mod.rs` for why the payload has four optional fields.
 
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedValue;
 
-/// `oblisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
+/// `obelisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
 /// host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
@@ -22,7 +22,7 @@ pub struct PowerState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiles: Option<Vec<String>>,
     /// Running on battery rather than mains, from UPower; `nil` without UPower. This is the mains
-    /// question; charge direction is `oblisk.battery.state`.
+    /// question; charge direction is `obelisk.battery.state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_battery: Option<bool>,
     /// UPower's `EnergyRate` in watts, unchanged. It is positive in both directions, so
@@ -50,7 +50,7 @@ trait UPower {
 
 /// The composite `DisplayDevice`, not `battery_BAT0`: UPower sums every battery there.
 /// `EnergyRate` is a positive watt magnitude while charging or discharging; § 2.13 wants no
-/// direction, so configs needing it read `oblisk.battery.state`.
+/// direction, so configs needing it read `obelisk.battery.state`.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.Device",
     default_service = "org.freedesktop.UPower",
@@ -193,7 +193,7 @@ async fn next_change<S: Stream + Unpin>(stream: &mut Option<S>) -> Option<S::Ite
 /// Reads once, pushes, then follows all three property streams. Every wake re-reads the payload
 /// instead of patching one field.
 ///
-/// With neither service, no signal is sent, `oblisk.power` stays `nil` (ADR-0037), and the task
+/// With neither service, no signal is sent, `obelisk.power` stays `nil` (ADR-0037), and the task
 /// exits instead of parking on a dead stream.
 async fn run_power_task(
     system_bus: zbus::Connection,

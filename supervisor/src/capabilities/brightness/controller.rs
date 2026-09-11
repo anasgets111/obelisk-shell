@@ -1,4 +1,4 @@
-//! [`BrightnessController`] owns `oblisk.brightness` and its write action.
+//! [`BrightnessController`] owns `obelisk.brightness` and its write action.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use udev::MonitorSocket;
 use super::super::read_attr;
 use super::super::scale::{percent_from_raw, raw_from_percent};
 
-/// `oblisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
+/// `obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
 /// key. `Default` (`0`) precedes the first read, but no-device construction emits no signal, so
 /// Lua never observes the placeholder (see `brightness/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]

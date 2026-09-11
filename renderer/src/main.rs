@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
     }
-    // `oblisk check` re-execs this binary because the Supervisor has no `mlua`, before any Wayland
+    // `obelisk check` re-execs this binary because the Supervisor has no `mlua`, before any Wayland
     // connection because checking needs none.
     if std::env::var_os(shared::CHECK_ENV).is_some() {
         let config_dir = shared::config_dir()?;
@@ -47,11 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reaper; this would map a bar that never updates or exits. Refuse with one visible line.
     //
     // Check the env var before connecting. `process::spawn_group_leader` sets
-    // `OBLISK_GENERATION_ID` on every Renderer, at boot and generation swap.
+    // `OBELISK_GENERATION_ID` on every Renderer, at boot and generation swap.
     if std::env::var_os(shared::GENERATION_ID_ENV).is_none() {
         eprintln!(
-            "oblisk-renderer is not a command. The Supervisor starts it, one process per renderer \
-             generation, and reaps it.\n\nRun `oblisk` instead. `oblisk --help` lists what it takes."
+            "obelisk-renderer is not a command. The Supervisor starts it, one process per renderer \
+             generation, and reaps it.\n\nRun `obelisk` instead. `obelisk --help` lists what it takes."
         );
         std::process::exit(2);
     }

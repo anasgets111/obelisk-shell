@@ -5,8 +5,8 @@
 //! because this state stays on that thread.
 //!
 //! One userdata owns both halves. § 3.2 makes commands methods on the capability, and ADR-0052
-//! decision 4 reads lock state through the name it locks, so `oblisk.lock:get().attempts` and
-//! `oblisk.lock:invoke("lock")` use the same object; [`Capability`] delegates `get`/`map` to its
+//! decision 4 reads lock state through the name it locks, so `obelisk.lock:get().attempts` and
+//! `obelisk.lock:invoke("lock")` use the same object; [`Capability`] delegates `get`/`map` to its
 //! [`Signal`].
 //!
 //! ponytail: the API is `capability:invoke("action", ...)`, not § 3.2's
@@ -24,7 +24,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::lua::signal::{CpuBudget, DirtyFlag, LiveSignalHandle, Signal};
 
 /// Builds § 7's generation-guarded envelope and queues it for the socket thread. One sender per
-/// generation is cloned into every [`Capability`] on `oblisk`.
+/// generation is cloned into every [`Capability`] on `obelisk`.
 #[derive(Clone)]
 pub struct CommandSender {
     generation_id: u32,
@@ -33,7 +33,7 @@ pub struct CommandSender {
     next_id: Rc<Cell<u64>>,
     /// Capabilities this generation already asked the Supervisor to start. Shared across clones;
     /// `lua::namespace` and `secure_submit`'s sweep both use it (ADR-0070 decisions 1, 5), so a
-    /// second `oblisk.audio` reader costs nothing.
+    /// second `obelisk.audio` reader costs nothing.
     started: Rc<RefCell<HashSet<String>>>,
     outbound_tx: UnboundedSender<RendererFrame>,
 }
@@ -52,14 +52,14 @@ impl CommandSender {
 
     /// Asks the Supervisor to construct `capability`'s controller once per generation. The
     /// Supervisor drops repeats (ADR-0070 decision 3); the local set also stops a `map` over
-    /// `oblisk.audio` from writing a frame on every layout pass.
+    /// `obelisk.audio` from writing a frame on every layout pass.
     pub(crate) fn start_capability(&self, capability: &str) {
         if !self.started.borrow_mut().insert(capability.to_string()) {
             return;
         }
         let frame = RendererFrame::StartCapability { capability: capability.to_string() };
         if self.outbound_tx.send(frame).is_err() {
-            eprintln!("oblisk.{capability}: failed to queue the start request, the control-socket writer is gone");
+            eprintln!("obelisk.{capability}: failed to queue the start request, the control-socket writer is gone");
         }
     }
 
@@ -96,16 +96,16 @@ impl CommandSender {
         };
         if self.outbound_tx.send(RendererFrame::Command(envelope)).is_err() {
             eprintln!(
-                "oblisk.{capability}:invoke(\"{action}\"): failed to queue the command, the control-socket writer is gone"
+                "obelisk.{capability}:invoke(\"{action}\"): failed to queue the command, the control-socket writer is gone"
             );
         }
     }
 }
 
-/// One `oblisk` member: its live signal and write path. `name` is the
+/// One `obelisk` member: its live signal and write path. `name` is the
 /// `shared::Capability::ALL` roster name, the Lua field and every envelope's `capability` value.
 ///
-/// Only `lua::idle` clones it, wrapping `oblisk.idle` so three threshold methods share userdata
+/// Only `lua::idle` clones it, wrapping `obelisk.idle` so three threshold methods share userdata
 /// with `get`/`map`/`on_change` (ADR-0141). The signal and handler list remain shared.
 #[derive(Clone)]
 pub struct Capability {
@@ -120,7 +120,7 @@ pub struct Capability {
 }
 
 impl Capability {
-    /// Builds an `oblisk.<name>` member and the handle `socket::RendererClient` hydrates. Return
+    /// Builds an `obelisk.<name>` member and the handle `socket::RendererClient` hydrates. Return
     /// them together: value and revision must move as one, because ordinary dispatch does not
     /// enforce envelope revision claims (Supervisor services § 13). Pairing them here is the only
     /// guard against a `set` that stamps a stale read onto the current write.
@@ -147,7 +147,7 @@ impl Capability {
     }
 
     /// Roster name for a wrapper that must send the `start_capability` request hidden by
-    /// `oblisk`'s `__index` path.
+    /// `obelisk`'s `__index` path.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -158,14 +158,14 @@ impl Capability {
     }
 
     /// Wrapped read signal for `signal::from_userdata`, allowing § 1.2's live forms
-    /// (`content = oblisk.mpris`, `computed({oblisk.audio}, f)`) through a wrapper the engine
+    /// (`content = obelisk.mpris`, `computed({obelisk.audio}, f)`) through a wrapper the engine
     /// otherwise cannot see past.
     pub fn signal(&self) -> Signal {
         self.signal.clone()
     }
 }
 
-/// Rust-side half of an `oblisk.<name>` member, where `StateSnapshot` writes. One handle carries
+/// Rust-side half of an `obelisk.<name>` member, where `StateSnapshot` writes. One handle carries
 /// the `LiveSignalHandle` and revision because `socket::RendererClient` holds one per capability.
 #[derive(Clone)]
 pub struct CapabilityHandle {
@@ -202,7 +202,7 @@ impl CapabilityHandle {
                 budget.check_not_exceeded()
             });
             if let Err(err) = outcome {
-                eprintln!("oblisk.{}:on_change handler raised, ignoring it: {err}", self.name);
+                eprintln!("obelisk.{}:on_change handler raised, ignoring it: {err}", self.name);
             }
         }
     }
@@ -234,7 +234,7 @@ impl UserData for Capability {
                 // easier to debug than a malformed command at the Supervisor.
                 let json = lua.from_value::<serde_json::Value>(value).map_err(|err| {
                     mlua::Error::runtime(format!(
-                        "oblisk.{}:invoke(\"{action}\") could not marshal argument {}: {err}",
+                        "obelisk.{}:invoke(\"{action}\") could not marshal argument {}: {err}",
                         this.name,
                         index + 1
                     ))
@@ -254,14 +254,14 @@ mod tests {
 
     use super::*;
 
-    /// Test VM with an unowned `oblisk.probe`; the roster name is irrelevant to the write path.
+    /// Test VM with an unowned `obelisk.probe`; the roster name is irrelevant to the write path.
     fn lua_with_capability(generation_id: u32) -> (Lua, CapabilityHandle, mpsc::UnboundedReceiver<RendererFrame>) {
         let lua = Lua::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let (capability, handle) = Capability::new("probe", DirtyFlag::new(), CommandSender::new(generation_id, tx));
         let table = lua.create_table().unwrap();
         table.set("probe", capability).unwrap();
-        lua.globals().set("oblisk", table).unwrap();
+        lua.globals().set("obelisk", table).unwrap();
         (lua, handle, rx)
     }
 
@@ -276,7 +276,7 @@ mod tests {
     fn invoke_queues_the_generation_guarded_envelope_section_7_2_specifies() {
         let (lua, _handle, mut rx) = lua_with_capability(4);
 
-        lua.load(r#"oblisk.probe:invoke("set_volume", 0.75)"#).exec().unwrap();
+        lua.load(r#"obelisk.probe:invoke("set_volume", 0.75)"#).exec().unwrap();
 
         let envelope = queued_command(&mut rx).expect("invoke must queue a command");
         assert_eq!(envelope.jsonrpc, "2.0");
@@ -294,11 +294,11 @@ mod tests {
         let (lua, handle, mut rx) = lua_with_capability(0);
 
         handle.hydrate(Value::Nil, 7);
-        lua.load(r#"oblisk.probe:invoke("set_volume", 0.5)"#).exec().unwrap();
+        lua.load(r#"obelisk.probe:invoke("set_volume", 0.5)"#).exec().unwrap();
         assert_eq!(queued_command(&mut rx).unwrap().params.expected_revision, 7);
 
         handle.hydrate(Value::Nil, 8);
-        lua.load(r#"oblisk.probe:invoke("set_volume", 0.6)"#).exec().unwrap();
+        lua.load(r#"obelisk.probe:invoke("set_volume", 0.6)"#).exec().unwrap();
         assert_eq!(queued_command(&mut rx).unwrap().params.expected_revision, 8);
     }
 
@@ -307,7 +307,7 @@ mod tests {
         // `null` would not deserialize into `Vec<serde_json::Value>`.
         let (lua, _handle, mut rx) = lua_with_capability(0);
 
-        lua.load(r#"oblisk.probe:invoke("lock")"#).exec().unwrap();
+        lua.load(r#"obelisk.probe:invoke("lock")"#).exec().unwrap();
 
         assert_eq!(queued_command(&mut rx).unwrap().params.arguments, Vec::<serde_json::Value>::new());
     }
@@ -316,7 +316,7 @@ mod tests {
     fn each_invoke_gets_a_distinct_json_rpc_id() {
         let (lua, _handle, mut rx) = lua_with_capability(0);
 
-        lua.load(r#"oblisk.probe:invoke("a"); oblisk.probe:invoke("b")"#).exec().unwrap();
+        lua.load(r#"obelisk.probe:invoke("a"); obelisk.probe:invoke("b")"#).exec().unwrap();
 
         assert_eq!(queued_command(&mut rx).unwrap().id, 0);
         assert_eq!(queued_command(&mut rx).unwrap().id, 1);
@@ -326,7 +326,7 @@ mod tests {
     fn an_unmarshallable_argument_is_a_config_error_naming_its_slot_and_queues_nothing() {
         let (lua, _handle, mut rx) = lua_with_capability(0);
 
-        let err = lua.load(r#"oblisk.probe:invoke("connect", "ssid", function() end)"#).exec().unwrap_err();
+        let err = lua.load(r#"obelisk.probe:invoke("connect", "ssid", function() end)"#).exec().unwrap_err();
 
         assert!(err.to_string().contains("argument 2"), "the error must name the offending slot: {err}");
         assert!(rx.try_recv().is_err(), "a refused argument must not queue a half-built command");
@@ -338,7 +338,7 @@ mod tests {
         lua.load(
             r#"
             seen = {}
-            oblisk.probe:on_change(function(current, previous)
+            obelisk.probe:on_change(function(current, previous)
                 seen[#seen + 1] = { current = current, previous = previous }
             end)
         "#,
@@ -367,8 +367,8 @@ mod tests {
         lua.load(
             r#"
             ran = false
-            oblisk.probe:on_change(function() error("first handler broke") end)
-            oblisk.probe:on_change(function() ran = true end)
+            obelisk.probe:on_change(function() error("first handler broke") end)
+            obelisk.probe:on_change(function() ran = true end)
         "#,
         )
         .exec()
@@ -378,14 +378,14 @@ mod tests {
         handle.notify_change(&lua, previous);
 
         assert!(lua.globals().get::<bool>("ran").unwrap());
-        let read: i64 = lua.load("return oblisk.probe:get()").eval().unwrap();
+        let read: i64 = lua.load("return obelisk.probe:get()").eval().unwrap();
         assert_eq!(read, 5);
     }
 
     #[test]
     fn clear_handlers_forgets_what_the_last_evaluation_registered() {
         let (lua, handle, _rx) = lua_with_capability(1);
-        lua.load("count = 0; oblisk.probe:on_change(function() count = count + 1 end)").exec().unwrap();
+        lua.load("count = 0; obelisk.probe:on_change(function() count = count + 1 end)").exec().unwrap();
         handle.clear_handlers();
         let previous = handle.hydrate(Value::Integer(1), 1);
         handle.notify_change(&lua, previous);
@@ -396,14 +396,14 @@ mod tests {
     fn get_reads_the_same_live_value_a_bare_capability_global_would() {
         let (lua, handle, _rx) = lua_with_capability(0);
 
-        let before: bool = lua.load("return oblisk.probe:get() == nil").eval().unwrap();
+        let before: bool = lua.load("return obelisk.probe:get() == nil").eval().unwrap();
         assert!(before, "a capability reads nil until its first snapshot (ADR-0037)");
 
         let pushed = lua.create_table().unwrap();
         pushed.set("attempts", 2).unwrap();
         handle.hydrate(Value::Table(pushed), 1);
 
-        let attempts: i64 = lua.load("return oblisk.probe:get().attempts").eval().unwrap();
+        let attempts: i64 = lua.load("return obelisk.probe:get().attempts").eval().unwrap();
         assert_eq!(attempts, 2);
     }
 
@@ -412,7 +412,7 @@ mod tests {
         // The lock screen's failure text maps this handle; freezing the map at registration would
         // paint the first snapshot forever.
         let (lua, handle, _rx) = lua_with_capability(0);
-        lua.load(r#"mapped = oblisk.probe:map(function(s) return (s and s.error) or "" end)"#).exec().unwrap();
+        lua.load(r#"mapped = obelisk.probe:map(function(s) return (s and s.error) or "" end)"#).exec().unwrap();
 
         let first: String = lua.load("return mapped:get()").eval().unwrap();
         assert_eq!(first, "");

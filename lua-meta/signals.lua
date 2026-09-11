@@ -5,7 +5,7 @@
 -- `renderer/src/lua/signal.rs` appears only when `just types` reports a false `dev-config` error.
 --
 -- These stubs serve lua-language-server only; the engine never loads this directory. They stay
--- outside `dev-config/oblisk/` because `supervisor/src/watcher.rs` reloads on any config-tree
+-- outside `dev-config/obelisk/` because `supervisor/src/watcher.rs` reloads on any config-tree
 -- `.lua`
 -- save, so a stub there would restyle the bar on every edit.
 
@@ -22,7 +22,7 @@
 ---Properties use [`Bound`], not this class, so `string|Signal` remains permissive even with
 ---`: userdata`.
 ---
----`<T>` types the callback: `oblisk.network:map(function(n) ... end)` gives `n` the
+---`<T>` types the callback: `obelisk.network:map(function(n) ... end)` gives `n` the
 ---`NetworkState` type, making a misspelled field an edit-time `undefined-field`, not runtime `nil`.
 ---
 ---Methods must be `---@field`s. With `function Signal:map(fn)` and `---@param fn fun(value: T)`,
@@ -48,8 +48,8 @@
 ---5 and amendment); a table `initial` is never an edit because tables compare by identity and each
 ---evaluation creates a new one.
 ---
----The name is also the target of `oblisk set <name> <value>`, `oblisk toggle <name>` and
----`oblisk toggle <name> <value>` (to the value, or back to `initial` when it already holds it), a
+---The name is also the target of `obelisk set <name> <value>`, `obelisk toggle <name>` and
+---`obelisk toggle <name> <value>` (to the value, or back to `initial` when it already holds it), a
 ---compositor keybind's way in (ADR-0112). The write behaves like `:set()` and is refused if
 ---undeclared.
 ---@generic T
@@ -66,7 +66,7 @@ function state(name, initial) end
 
 ---A persisted table: a named JSON file read as signals.
 ---
----The framework owns no location (ADR-0136). Build `path` from `oblisk.config_dir`,
+---The framework owns no location (ADR-0136). Build `path` from `obelisk.config_dir`,
 ---`os.getenv("XDG_STATE_HOME")`, or anything else; use two stores for separate settings and cache
 ---files. The file appears on first save.
 ---

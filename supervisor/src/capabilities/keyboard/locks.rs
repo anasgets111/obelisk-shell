@@ -1,4 +1,4 @@
-//! Lock-state monitoring for `oblisk.keyboard` (ADR-0034). Sysfs LED `brightness` files do not
+//! Lock-state monitoring for `obelisk.keyboard` (ADR-0034). Sysfs LED `brightness` files do not
 //! emit inotify `MODIFY` when `input_leds` changes them; evdev `EV_LED` is primary and sysfs is a
 //! read-once fallback.
 

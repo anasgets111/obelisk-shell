@@ -1,4 +1,4 @@
-# Oblisk
+# Obelisk
 
 A Wayland desktop shell you write in Lua. You declare the bars, popups, launcher and lock screen as
 a tree of nodes; Rust owns the platform connections, input, layout and painting.
@@ -8,7 +8,7 @@ Status: pre-release. Nothing is published, and the Lua API changes without notic
 ## Why processes
 
 A shell reloads on every config save, and the reloaded UI has to release what the old one held.
-Most shells use a garbage collector for that. Oblisk uses the kernel.
+Most shells use a garbage collector for that. Obelisk uses the kernel.
 
 A **generation** is one Renderer process and its Lua state. An edit that changes the surface
 topology starts a second Renderer, waits for it to prove it has painted, transfers authority per
@@ -37,13 +37,13 @@ just build                              # both binaries into target/debug
 just check                              # fmt, tests, clippy, doc links, Lua parse and types
 just install PREFIX=/usr DESTDIR="$pkgdir"
 
-oblisk init     # writes shell.lua, plus a .luarc.json pointing the LSP at the stubs
-oblisk          # run it
-oblisk check    # evaluate the config and exit, taking no surface
+obelisk init     # writes shell.lua, plus a .luarc.json pointing the LSP at the stubs
+obelisk          # run it
+obelisk check    # evaluate the config and exit, taking no surface
 ```
 
 The config is a directory, not a file: `require` resolves inside it, and any `.lua` file changing
-triggers a reload. `-c DIR` beats `$OBLISK_CONFIG_DIR`, which beats `$XDG_CONFIG_HOME/oblisk`.
+triggers a reload. `-c DIR` beats `$OBELISK_CONFIG_DIR`, which beats `$XDG_CONFIG_HOME/obelisk`.
 
 ## A config
 
@@ -57,7 +57,7 @@ return {
         height = 34,
         background = "#1e1e2e80",
         child = text {
-            content = oblisk.system:map(function(s)
+            content = obelisk.system:map(function(s)
                 return os.date("%H:%M", s and s.time)
             end),
             foreground = "#cdd6f4ff",
@@ -72,7 +72,7 @@ signal, so the `:map` above re-resolves that clock without re-running the config
 
 ## Capabilities
 
-`oblisk.<name>` exposes platform state as a signal and takes actions. A backend starts on first use
+`obelisk.<name>` exposes platform state as a signal and takes actions. A backend starts on first use
 and stays for the session.
 
 applications, audio, battery, bluetooth, brightness, files, idle, keyboard, lock, mpris, network,
@@ -84,8 +84,8 @@ notifications, power, privacy, processes, storage, sysinfo, system, tray, update
 keybind reaches it. VALUE is read as JSON, and anything that is not JSON is taken as a string.
 
 ```sh
-oblisk toggle launcher_open     # flips state("launcher_open", false)
-oblisk toggle modal launcher    # sets state("modal", ""), or clears it if already "launcher"
+obelisk toggle launcher_open     # flips state("launcher_open", false)
+obelisk toggle modal launcher    # sets state("modal", ""), or clears it if already "launcher"
 ```
 
 ## Docs

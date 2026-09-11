@@ -160,7 +160,7 @@ pub(super) fn encode_image_data_to_png(image: &RawImageData) -> Result<Vec<u8>, 
     Ok(buffer)
 }
 
-/// Our icon spool root, `$XDG_RUNTIME_DIR/oblisk/notifications` (ADR-0033's `$UID` fix from
+/// Our icon spool root, `$XDG_RUNTIME_DIR/obelisk/notifications` (ADR-0033's `$UID` fix from
 /// ADR-0031); [`delete_icon_file`] may delete only here (finding 1).
 fn notifications_icon_dir() -> PathBuf {
     shm_icons::icon_dir("notifications")

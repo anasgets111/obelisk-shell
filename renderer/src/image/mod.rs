@@ -105,7 +105,7 @@ struct CacheKey {
 }
 
 /// File revision at a stable path (ADR-0031 deferred item): tray updates reuse
-/// `$XDG_RUNTIME_DIR/oblisk/tray/{name}.png`, with no revision suffix. Use mtime and length, not a
+/// `$XDG_RUNTIME_DIR/obelisk/tray/{name}.png`, with no revision suffix. Use mtime and length, not a
 /// content hash: tmpfs mtime is nanosecond-precise, length is free, and hashing reads the file to
 /// decide whether to read it. Unstatable files use the default, so *missing* files retry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -336,7 +336,7 @@ impl Pool {
             let wanted = Arc::clone(&wanted);
             let budget = Arc::clone(&budget);
             std::thread::Builder::new()
-                .name(format!("oblisk-image-decode-{index}"))
+                .name(format!("obelisk-image-decode-{index}"))
                 .spawn(move || {
                     loop {
                         // Hold the lock only to take a job; workers drain while another decodes.
@@ -372,7 +372,7 @@ impl Pool {
                         }
                     }
                 })
-                .expect("failed to spawn an oblisk-image-decode thread");
+                .expect("failed to spawn an obelisk-image-decode thread");
         }
         Pool { jobs, results, wanted, budget }
     }
@@ -493,7 +493,7 @@ impl ImageCache {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    eprintln!("[oblisk-renderer] image: every decode worker is gone; background images will not load");
+                    eprintln!("[obelisk-renderer] image: every decode worker is gone; background images will not load");
                     break;
                 }
             }
@@ -611,7 +611,7 @@ impl ImageCache {
                         self.deferred = true;
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        eprintln!("[oblisk-renderer] image: {}: no decode worker left to take it", key.path.display());
+                        eprintln!("[obelisk-renderer] image: {}: no decode worker left to take it", key.path.display());
                         self.unwant(&key);
                         self.insert(key, Slot::Failed);
                     }
@@ -759,7 +759,7 @@ fn upload_or_log(canvas: &mut Canvas<OpenGl>, path: &Path, decoded: Result<Decod
     match result {
         Ok((id, bytes)) => Slot::Ready(id, bytes),
         Err(err) => {
-            eprintln!("[oblisk-renderer] image: {}: {err}", path.display());
+            eprintln!("[obelisk-renderer] image: {}: {err}", path.display());
             Slot::Failed
         }
     }
@@ -894,7 +894,7 @@ fn decode_raster(
         let thumb = decoded.thumbnail(slot.px, slot.px).into_rgba8();
         let (thumb_width, thumb_height) = thumb.dimensions();
         if let Err(err) = slot.write(thumb.as_raw(), thumb_width, thumb_height) {
-            eprintln!("[oblisk-renderer] image: {}: thumbnail not written: {err}", path.display());
+            eprintln!("[obelisk-renderer] image: {}: thumbnail not written: {err}", path.display());
         }
         // Both axes, because `stored_size` fills the box while `thumbnail` fits inside it: a wide
         // source thumbnails to 128x72 and stores at 228x128, and rescaling from that would be an
@@ -1232,7 +1232,7 @@ mod tests {
     fn only_svg_is_rasterized_by_size() {
         assert!(is_vector(Path::new("/usr/share/icons/Adwaita/symbolic/x.svg")));
         assert!(is_vector(Path::new("/tmp/X.SVG")));
-        assert!(!is_vector(Path::new("/dev/shm/oblisk-1000/tray/telegram.png")));
+        assert!(!is_vector(Path::new("/dev/shm/obelisk-1000/tray/telegram.png")));
         assert!(!is_vector(Path::new("/tmp/no-extension")));
         // `.svgz` is unsupported (see `rasterize_svg`'s ponytail): vector treatment would feed gzip
         // bytes to XML, so it takes the raster path and fails there.
@@ -1711,7 +1711,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_and_a_real_one_read_different_versions() {
-        assert_eq!(FileVersion::read(Path::new("/nonexistent/oblisk-x.png")), FileVersion::default());
+        assert_eq!(FileVersion::read(Path::new("/nonexistent/obelisk-x.png")), FileVersion::default());
         // Any file with bytes in it; the rule is about read versus missing, not about the contents.
         let dir = tempfile::tempdir().unwrap();
         let present = dir.path().join("present.svg");

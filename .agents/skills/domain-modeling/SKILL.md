@@ -5,7 +5,7 @@ description: Build and sharpen a project's domain model. Use when discussing cod
 
 # Domain Modeling
 
-Build and sharpen Oblisk's domain model while designing. Challenge terms, test them against edge cases, and record resolved language and decisions immediately. Reading `CONTEXT.md` is not enough. Use this skill when the model changes.
+Build and sharpen Obelisk's domain model while designing. Challenge terms, test them against edge cases, and record resolved language and decisions immediately. Reading `CONTEXT.md` is not enough. Use this skill when the model changes.
 
 ## File structure
 

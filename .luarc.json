@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
   "runtime.version": "Lua 5.4",
-  "runtime.path": ["dev-config/oblisk/?.lua", "dev-config/oblisk/?/init.lua"],
+  "runtime.path": ["dev-config/obelisk/?.lua", "dev-config/obelisk/?/init.lua"],
   "runtime.pathStrict": true,
   "runtime.builtin": {
     "io": "disable",

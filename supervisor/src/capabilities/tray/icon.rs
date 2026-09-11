@@ -6,7 +6,7 @@ use crate::capabilities::shm_icons;
 
 use super::MAX_PIXMAP_DIMENSION;
 
-/// `/dev/shm/oblisk-$UID` subdirectory for tray pixmaps, shared by writes, per-item deletion, and
+/// `/dev/shm/obelisk-$UID` subdirectory for tray pixmaps, shared by writes, per-item deletion, and
 /// startup sweep.
 pub(super) const SPOOL_SUBDIR: &str = "tray";
 
@@ -109,7 +109,7 @@ fn encode_argb32_to_png(width: u32, height: u32, argb: &[u8]) -> Result<Vec<u8>,
     Ok(buffer)
 }
 
-/// Writes a validated pixmap to `/dev/shm/oblisk-$UID/tray/{filename_stem}.png`
+/// Writes a validated pixmap to `/dev/shm/obelisk-$UID/tray/{filename_stem}.png`
 /// ([`shm_icons::write_png`]), creating the tree and overwriting the same path (no cache-busting,
 /// ADR-0031). Base, attention, and overlay stems differ so their files do not collide (ADR-0074).
 /// An item id as a flat filename stem: [`super::registration::item_id`] ends in an object path and

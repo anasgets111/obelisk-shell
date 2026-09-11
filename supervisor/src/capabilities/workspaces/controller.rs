@@ -1,4 +1,4 @@
-//! [`WorkspacesController`]: `oblisk.workspaces` state owner, write action, and compositor-neutral
+//! [`WorkspacesController`]: `obelisk.workspaces` state owner, write action, and compositor-neutral
 //! reduction. See `workspaces/mod.rs`.
 //!
 //! [`derive_state`] knows no compositor type. It consumes [`WorkspaceRow`]s and a
@@ -14,7 +14,7 @@ use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_r
 
 use super::{hyprland, niri};
 
-/// `oblisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
+/// `obelisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
 /// omitted, not `null` (§ 2.9 says `nil` when unfocused).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
@@ -54,7 +54,7 @@ pub struct SpecialWorkspace {
 /// One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
-    /// Connector name, e.g. `"eDP-1"`; matches `oblisk.screens.name` and a surface's `monitor`.
+    /// Connector name, e.g. `"eDP-1"`; matches `obelisk.screens.name` and a surface's `monitor`.
     pub name: String,
     /// [`WorkspaceEntry::id`] visible on this output; every output has one.
     pub active_workspace: u64,

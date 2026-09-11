@@ -1,7 +1,7 @@
 ---@meta
 -- The eight geometric nodes (`lua-api.md` § 5.2) and their shared properties (§ 5.1).
 --
--- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `oblisk.lua` is
+-- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `obelisk.lua` is
 -- generated: capability payloads are `Serialize` structs, while a node's schema is 29 scattered
 -- `properties.get("...")` calls in `renderer/src/layout/node/`, so it is not derivable data.
 --
@@ -128,19 +128,19 @@
 ---@class Transition
 ---@field duration integer How long the cross runs, in ms. Required: a cross with no length is a snap, which `retain` alone already does.
 ---@field easing? Easing Default `"InOutQuad"`. The curve `u_progress` follows.
----@field shader? string Absolute path to a GLSL ES fragment shader to cross with, instead of the built-in dissolve (ADR-0184). Name one shipped beside `shell.lua` with `oblisk.config_dir .. "/shaders/wipe.frag"`. Recompiled when the file's bytes change, so editing an effect takes a reload and not a restart.
+---@field shader? string Absolute path to a GLSL ES fragment shader to cross with, instead of the built-in dissolve (ADR-0184). Name one shipped beside `shell.lua` with `obelisk.config_dir .. "/shaders/wipe.frag"`. Recompiled when the file's bytes change, so editing an effect takes a reload and not a restart.
 ---
 --- The engine prepends `#version 300 es`, `highp` precision for floats and samplers, its own declarations and `#line 1`, so the file is a `void main()` and its compile errors carry its own line numbers. What it gets:
 ---
 --- - `v_uv` -- this node's box, `0..1`, origin top-left, x right and y down.
 --- - `u_progress` -- the eased progress, clamped to `0..1`.
 --- - `u_size` -- the node's logical size in pixels, for aspect correction.
---- - `oblisk_from(uv)` and `oblisk_to(uv)` -- the outgoing and incoming pictures, premultiplied RGBA, each already placed by its `fit`, and `u_fill` (transparent) outside it. Sampling outside `0..1` is defined and returns that fill.
+--- - `obelisk_from(uv)` and `obelisk_to(uv)` -- the outgoing and incoming pictures, premultiplied RGBA, each already placed by its `fit`, and `u_fill` (transparent) outside it. Sampling outside `0..1` is defined and returns that fill.
 --- - `u_from_rect` and `u_to_rect` -- where each picture sits, as node-space `(x, y, width, height)` fractions. Under `"cover"` the origin is negative and the extent above one, because the picture is larger than the box that crops it.
 ---
 --- Write premultiplied RGBA to `fragColor` in the encoded colour space the images arrive in; no linear-light conversion happens either side. The node's inherited `opacity` is applied by the engine after your `main` returns, so it cannot be got wrong, and the result is composited source-over under the node's clip and transform like any other draw.
 ---
---- Identifiers beginning `u_` or `oblisk_` are the engine's. A shader that will not compile, will not link, or declares a non-`float` parameter is reported once and that transition falls back to the built-in cross-dissolve, so a mistake costs an effect and not a frame. A shader that compiles and loops forever hangs the GPU and with it the session: this is the config's own code at the same trust level as `process.run`, and nothing sandboxes it.
+--- Identifiers beginning `u_` or `obelisk_` are the engine's. A shader that will not compile, will not link, or declares a non-`float` parameter is reported once and that transition falls back to the built-in cross-dissolve, so a mistake costs an effect and not a frame. A shader that compiles and loops forever hangs the GPU and with it the session: this is the config's own code at the same trust level as `process.run`, and nothing sandboxes it.
 ---@field params? table<string, number> Values for the `uniform float`s the shader declares, by name. Finite numbers only, which is every type a config needs to parametrise an effect. Every parameter the compiled shader has is set on every draw, so one omitted here is `0` rather than whatever another node using the same shader last set. A name the shader has no uniform for is ignored, since a shader may declare one and never use it. Refused without a `shader` to reach.
 
 ---@class ImageProps: NodeBase

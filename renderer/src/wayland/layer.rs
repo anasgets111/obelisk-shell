@@ -204,7 +204,7 @@ fn spec_update(
 /// Parameters for [`App::spawn_layer`], bundled for clippy's argument-count limit.
 pub(super) struct LayerSpec<'a> {
     layer_type: Layer,
-    /// Compositor-visible namespace (§ 6, default `"oblisk-{id}"`), matched by `layerrule`.
+    /// Compositor-visible namespace (§ 6, default `"obelisk-{id}"`), matched by `layerrule`.
     namespace: &'a str,
     /// Always `Some` (ADR-0038 decision 3): one surface per `(surface, output)` pair.
     output: &'a wl_output::WlOutput,
@@ -252,7 +252,7 @@ impl App {
     ) {
         let Some(output) = outputs.get(&instance.output) else {
             eprintln!(
-                "[oblisk-renderer] instance {:?} names an output that has since gone; skipping",
+                "[obelisk-renderer] instance {:?} names an output that has since gone; skipping",
                 instance.instance_id
             );
             return;
@@ -274,7 +274,7 @@ impl App {
         let deferred = !visible && measured_axes(spec) != (false, false);
         if !deferred && let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
-                "[oblisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
+                "[obelisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
                  which layer-shell rejects as a protocol error; no surface created. Give it an explicit {axis}, or anchor both edges.",
                 instance.instance_id
             );
@@ -340,7 +340,7 @@ impl App {
         };
         if layer.is_some() {
             self.surfaces[index].map_state = map_state_for_kept_layer(self.surfaces[index].configured_size);
-            eprintln!("[oblisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
+            eprintln!("[obelisk-renderer] {} mapping: visible = true", self.surfaces[index].surface_id);
             return;
         }
         // `measured` is this pass's: [`App::apply_resolved_state`] writes it from the solved root
@@ -349,7 +349,7 @@ impl App {
         let size = layer_size_for(spec, *output_size, *measured);
         if let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
-                "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
+                "[obelisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
                  which layer-shell rejects as a protocol error; it stays hidden. Give it an explicit {axis}, or anchor both edges.",
                 self.surfaces[index].surface_id
             );
@@ -383,7 +383,7 @@ impl App {
             *requested = size;
         }
         self.surfaces[index].map_state = MapState::AwaitingConfigure;
-        eprintln!("[oblisk-renderer] {} created: visible = true", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} created: visible = true", self.surfaces[index].surface_id);
     }
 
     /// Stages `Reserve`'s configured-size zone, explicit `0` for `Respect`, or `-1` for `Ignore`.
@@ -439,7 +439,7 @@ impl App {
             // Log every change: it takes the keyboard from whatever the user was typing in, and a
             // dead password prompt otherwise cannot distinguish a missing request from compositor
             // inaction.
-            eprintln!("[oblisk-renderer] {}: keyboard_interactivity -> {mode:?}", self.surfaces[index].surface_id);
+            eprintln!("[obelisk-renderer] {}: keyboard_interactivity -> {mode:?}", self.surfaces[index].surface_id);
             layer.set_keyboard_interactivity(keyboard_interactivity_for(mode));
         }
         let mut sent = None;
@@ -448,7 +448,7 @@ impl App {
             // axis kills the connection, so repeat [`ambiguous_zero_axis`].
             if let Some(axis) = ambiguous_zero_axis(size, fresh.topology.anchor) {
                 eprintln!(
-                    "[oblisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
+                    "[obelisk-renderer] surface {:?} resolved to a {axis} of 0 without anchoring both {axis} edges, \
                      which layer-shell rejects as a protocol error; keeping its previous size. Give it an explicit {axis}, or anchor both edges.",
                     self.surfaces[index].surface_id
                 );
@@ -688,7 +688,7 @@ mod tests {
                 layer: LayerKind::Top,
                 anchor: node::Anchor { top: true, right: true, bottom: false, left: true },
                 monitor: "All".to_string(),
-                namespace: format!("oblisk-{id}"),
+                namespace: format!("obelisk-{id}"),
             },
             keyboard_interactivity: node::KeyboardInteractivity::None,
             exclusive: node::Exclusive::Reserve,

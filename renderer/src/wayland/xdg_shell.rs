@@ -339,7 +339,7 @@ impl App {
     pub(super) fn show_window(&mut self, qh: &QueueHandle<App>, index: usize) {
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
             eprintln!(
-                "[oblisk-renderer] {}: this compositor advertises no xdg_wm_base, so no window can be created for it",
+                "[obelisk-renderer] {}: this compositor advertises no xdg_wm_base, so no window can be created for it",
                 self.surfaces[index].surface_id
             );
             return;
@@ -366,7 +366,7 @@ impl App {
             *slot = Some(window);
         }
         self.surfaces[index].map_state = MapState::AwaitingConfigure;
-        eprintln!("[oblisk-renderer] {} creating: visible = true", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} creating: visible = true", self.surfaces[index].surface_id);
     }
 
     /// Destroys the toplevel but keeps tracking so a later `visible = true` rebuilds it
@@ -382,7 +382,7 @@ impl App {
         }
         self.surfaces[index].map_state = MapState::Unmapped;
         self.surfaces[index].null_buffered = false;
-        eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
     /// Creates positioner and popup in protocol order (§ 6, ADR-0040 decision 2, ADR-0049
@@ -400,7 +400,7 @@ impl App {
         let surface_id = self.surfaces[index].surface_id.clone();
         let Some(xdg_shell) = self.xdg_shell.as_ref() else {
             eprintln!(
-                "[oblisk-renderer] {surface_id}: this compositor advertises no xdg_wm_base, so no popup can be created for it"
+                "[obelisk-renderer] {surface_id}: this compositor advertises no xdg_wm_base, so no popup can be created for it"
             );
             return;
         };
@@ -418,7 +418,7 @@ impl App {
         if !placement.is_measured() {
             if self.refusal_is_new(index, PopupRefusal::Unmeasured) {
                 eprintln!(
-                    "[oblisk-renderer] {surface_id}: sized {:?}, so it is not opened yet. An omitted `width`/`height` \
+                    "[obelisk-renderer] {surface_id}: sized {:?}, so it is not opened yet. An omitted `width`/`height` \
                      is measured off the resolved tree, and this one has measured nothing on that axis. \
                      Logged once until it opens or `visible` resolves false.",
                     placement.size
@@ -432,7 +432,7 @@ impl App {
             let Some(armed) = self.input_serial.clone() else {
                 if self.refusal_is_new(index, PopupRefusal::Unarmed) {
                     eprintln!(
-                        "[oblisk-renderer] {surface_id}: `grab = true` and no input event armed a serial this turn, so it is not opened. \
+                        "[obelisk-renderer] {surface_id}: `grab = true` and no input event armed a serial this turn, so it is not opened. \
                          A popup may only be opened in response to real user input (§ 6.3); open it from an `on_click`, or declare `grab = false`. \
                          Logged once until it opens or `visible` resolves false."
                     );
@@ -442,7 +442,7 @@ impl App {
             let Some(seat) = self.seat_state.seats().next() else {
                 if self.refusal_is_new(index, PopupRefusal::Seatless) {
                     eprintln!(
-                        "[oblisk-renderer] {surface_id}: `grab = true` and this compositor advertises no seat, so it is not opened"
+                        "[obelisk-renderer] {surface_id}: `grab = true` and this compositor advertises no seat, so it is not opened"
                     );
                 }
                 return;
@@ -462,7 +462,7 @@ impl App {
         let Some(parent) = parent_index.and_then(|parent| self.surfaces[parent].role.as_popup_parent()) else {
             if self.refusal_is_new(index, PopupRefusal::HiddenParent) {
                 eprintln!(
-                    "[oblisk-renderer] {surface_id}: its `parent` {:?} names no surface that is currently shown, so it is not opened",
+                    "[obelisk-renderer] {surface_id}: its `parent` {:?} names no surface that is currently shown, so it is not opened",
                     spec.parent
                 );
             }
@@ -513,7 +513,7 @@ impl App {
             *positioned = Some(placement);
         }
         eprintln!(
-            "[oblisk-renderer] {surface_id} creating: visible = true, anchored to {parent_id}, grab {}",
+            "[obelisk-renderer] {surface_id} creating: visible = true, anchored to {parent_id}, grab {}",
             if grab.is_some() { "taken" } else { "not requested" }
         );
     }
@@ -540,7 +540,7 @@ impl App {
         if version < REPOSITION_SINCE {
             if self.refusal_is_new(index, PopupRefusal::Unrepositionable) {
                 eprintln!(
-                    "[oblisk-renderer] {surface_id}: this compositor bound xdg_popup v{version}, and `reposition` needs \
+                    "[obelisk-renderer] {surface_id}: this compositor bound xdg_popup v{version}, and `reposition` needs \
                      v{REPOSITION_SINCE}, so it keeps the size and place it opened at until it closes. \
                      Logged once until it opens again or `visible` resolves false."
                 );
@@ -569,7 +569,7 @@ impl App {
         // Rare enough to say every time: a popup only repositions when its content or its anchor
         // actually moved, and if that starts happening on every pass this line is the evidence.
         eprintln!(
-            "[oblisk-renderer] {surface_id} repositioned to {:?} from {:?} (token {token})",
+            "[obelisk-renderer] {surface_id} repositioned to {:?} from {:?} (token {token})",
             placement.size,
             was.map(|placement| placement.size)
         );
@@ -612,7 +612,7 @@ impl App {
         }
         self.surfaces[index].map_state = MapState::Unmapped;
         self.surfaces[index].null_buffered = false;
-        eprintln!("[oblisk-renderer] {} destroyed", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} destroyed", self.surfaces[index].surface_id);
     }
 
     /// Whether this is a new refusal for the popup (ADR-0049 amendment). Different reasons each
@@ -668,12 +668,12 @@ impl WindowHandler for App {
             });
         let Some(on_close) = on_close else {
             eprintln!(
-                "[oblisk-renderer] {surface_id}: the compositor asked it to close and no `on_close` declined or accepted; staying open"
+                "[obelisk-renderer] {surface_id}: the compositor asked it to close and no `on_close` declined or accepted; staying open"
             );
             return;
         };
         if let Err(e) = on_close.call::<()>(()) {
-            eprintln!("[oblisk-renderer] {surface_id}: on_close raised, ignoring it: {e}");
+            eprintln!("[obelisk-renderer] {surface_id}: on_close raised, ignoring it: {e}");
         }
     }
 
@@ -696,7 +696,7 @@ impl WindowHandler for App {
             && self.surfaces[index].map_state == MapState::AwaitingConfigure
         {
             eprintln!(
-                "[oblisk-renderer] {surface_id}: the compositor granted client-side decorations; carrying on undecorated, since this shell draws no titlebar of its own"
+                "[obelisk-renderer] {surface_id}: the compositor granted client-side decorations; carrying on undecorated, since this shell draws no titlebar of its own"
             );
         }
         let TrackedRole::Window { spec, .. } = &self.surfaces[index].role else {
@@ -734,7 +734,7 @@ impl PopupHandler for App {
             return;
         };
         let surface_id = self.surfaces[index].surface_id.clone();
-        eprintln!("[oblisk-renderer] {surface_id}: dismissed by the compositor");
+        eprintln!("[obelisk-renderer] {surface_id}: dismissed by the compositor");
         self.hide_popup(index);
         self.latch_popup(index);
 
@@ -749,7 +749,7 @@ impl PopupHandler for App {
             return;
         };
         if let Err(e) = on_dismiss.call::<()>(()) {
-            eprintln!("[oblisk-renderer] {surface_id}: on_dismiss raised, ignoring it: {e}");
+            eprintln!("[obelisk-renderer] {surface_id}: on_dismiss raised, ignoring it: {e}");
         }
     }
 }
@@ -761,8 +761,8 @@ mod tests {
     fn settings_window() -> WindowSpec {
         WindowSpec {
             id: "settings".to_string(),
-            title: "Oblisk settings".to_string(),
-            app_id: "oblisk.settings".to_string(),
+            title: "Obelisk settings".to_string(),
+            app_id: "obelisk.settings".to_string(),
             min_size: None,
             max_size: None,
         }
@@ -836,10 +836,10 @@ mod tests {
         );
 
         let mut rematched = applied.clone();
-        rematched.app_id = "oblisk.prefs".to_string();
+        rematched.app_id = "obelisk.prefs".to_string();
         assert_eq!(
             window_update(&applied, &rematched),
-            WindowUpdate { app_id: Some("oblisk.prefs".to_string()), ..WindowUpdate::default() }
+            WindowUpdate { app_id: Some("obelisk.prefs".to_string()), ..WindowUpdate::default() }
         );
 
         let mut bounded = applied.clone();

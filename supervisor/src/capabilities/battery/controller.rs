@@ -1,4 +1,4 @@
-//! [`BatteryController`] owns read-only `oblisk.battery` telemetry (§ 2.2).
+//! [`BatteryController`] owns read-only `obelisk.battery` telemetry (§ 2.2).
 //! Module-level behavior is documented in `battery/mod.rs`.
 
 use std::sync::{Arc, Mutex};
@@ -64,7 +64,7 @@ impl BatteryStatus {
     }
 }
 
-/// `oblisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys verbatim
+/// `obelisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys verbatim
 /// and may not be renamed. `Default` is the correct desktop answer when no battery exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 pub struct BatteryState {

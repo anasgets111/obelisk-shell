@@ -1,4 +1,4 @@
-//! `oblisk check`: evaluate config, report declared surfaces, and exit through the Renderer's Lua
+//! `obelisk check`: evaluate config, report declared surfaces, and exit through the Renderer's Lua
 //! loader. The Supervisor has no `mlua` runtime, so it re-execs this binary with
 //! `shared::CHECK_ENV` and forwards the exit code.
 //!
@@ -28,7 +28,7 @@ pub fn run(config_dir: &Path) -> Result<String, String> {
     let shell_lua = config_dir.join("shell.lua");
     if !shell_lua.is_file() {
         return Err(format!(
-            "{}: no shell.lua. `oblisk init -c {}` writes one.",
+            "{}: no shell.lua. `obelisk init -c {}` writes one.",
             shell_lua.display(),
             config_dir.display()
         ));
@@ -37,8 +37,8 @@ pub fn run(config_dir: &Path) -> Result<String, String> {
     let dirty = DirtyFlag::new();
     let loader = Loader::new(dirty.clone(), config_dir).map_err(|err| format!("{}: {err}", shell_lua.display()))?;
 
-    // Register `oblisk` and `process.run`: configs reach for both during evaluation, and a bare
-    // `Loader` dies on the first `oblisk.` access. Capabilities read `nil`, as at real boot before
+    // Register `obelisk` and `process.run`: configs reach for both during evaluation, and a bare
+    // `Loader` dies on the first `obelisk.` access. Capabilities read `nil`, as at real boot before
     // the first snapshot.
     //
     // Frames go into an undrained channel: without a Supervisor, `process.run` has nowhere to run.
@@ -63,10 +63,10 @@ mod tests {
     use std::path::Path;
 
     /// The shipped dev config spans thirty-odd files joined by `require`, so this checks that
-    /// `oblisk check` sees what a real boot sees.
+    /// `obelisk check` sees what a real boot sees.
     #[test]
     fn checking_the_shipped_dev_config_reports_its_surfaces() {
-        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");
+        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/obelisk");
         let report = super::run(&config).expect("the shipped dev config must evaluate");
         assert!(report.contains("ok,"), "{report}");
         assert!(report.contains("panel   bar"), "the bar must be in the report:\n{report}");
@@ -77,7 +77,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = super::run(dir.path()).unwrap_err();
         assert!(err.contains("no shell.lua"), "{err}");
-        assert!(err.contains("oblisk init"), "an error a new user hits should name the way out: {err}");
+        assert!(err.contains("obelisk init"), "an error a new user hits should name the way out: {err}");
     }
 
     #[test]

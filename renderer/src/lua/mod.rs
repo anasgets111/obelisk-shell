@@ -1,6 +1,6 @@
 //! Lua VM bootstrap and loader (`CONTEXT.md`, Loader): evaluates `shell.lua` into top-level `panel`
 //! nodes and topology for a candidate's first evaluation and the authoritative generation's
-//! re-evaluation on an in-place reload. `Loader::evaluate_file` reads `~/.config/oblisk/shell.lua`
+//! re-evaluation on an in-place reload. `Loader::evaluate_file` reads `~/.config/obelisk/shell.lua`
 //! (`shared::shell_lua_path`) and is the `renderer/src/socket.rs` entry point on startup and every
 //! Supervisor-triggered `Reevaluate`.
 pub mod capability;
@@ -62,7 +62,7 @@ fn restrict_os(lua: &Lua) -> mlua::Result<()> {
 /// `package.loadlib` raise, so stale `cpath` loads nothing.
 ///
 /// `package.path` has no escape syntax: non-UTF-8 paths substitute lossily, `;` splits an entry,
-/// and `?` is replaced along with the real marker. No startup check for `$XDG_CONFIG_HOME/oblisk`.
+/// and `?` is replaced along with the real marker. No startup check for `$XDG_CONFIG_HOME/obelisk`.
 fn point_package_path_at(lua: &Lua, config_dir: &std::path::Path) -> mlua::Result<()> {
     let dir = config_dir.display();
     lua.globals().get::<Table>("package")?.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))
@@ -72,7 +72,7 @@ fn point_package_path_at(lua: &Lua, config_dir: &std::path::Path) -> mlua::Resul
 /// incremental.
 pub struct Loader {
     lua: Lua,
-    /// `oblisk.idle` thresholds, cleared before every evaluation. `Option` covers `Loader::new`
+    /// `obelisk.idle` thresholds, cleared before every evaluation. `Option` covers `Loader::new`
     /// running before `lua::namespace::build` creates the registry (`None` in tests); `RefCell`
     /// permits the one post-construction registration.
     idle: RefCell<Option<idle::IdleRegistry>>,
@@ -181,7 +181,7 @@ impl Loader {
         process::register(&self.lua, registry)
     }
 
-    /// Gives the loader the `oblisk.idle` registry from `lua::namespace::build`, so
+    /// Gives the loader the `obelisk.idle` registry from `lua::namespace::build`, so
     /// [`Self::evaluate_file`] clears thresholds before re-running `shell.lua`. The member is a
     /// namespace field; `process` is a global.
     pub(crate) fn register_idle(&self, registry: idle::IdleRegistry) {
@@ -408,11 +408,11 @@ mod tests {
         output.surfaces[0].properties.get("background").unwrap().as_string().unwrap().to_string_lossy().to_string()
     }
 
-    /// Uses shipped `dev-config/oblisk/shell.lua`, split across directories. Dotted `config.theme`
+    /// Uses shipped `dev-config/obelisk/shell.lua`, split across directories. Dotted `config.theme`
     /// requires `?` substitution with a directory component, unlike a flat fixture.
     #[test]
     fn require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/oblisk");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/obelisk");
         let loader = Loader::new(signal::DirtyFlag::new(), &dir).unwrap();
 
         let accent: String = loader.lua().load(r#"return require("config.theme").ACCENT"#).eval().unwrap();
@@ -478,7 +478,7 @@ mod tests {
         let loader = test_loader();
         let err = loader
             .evaluate(
-                r#"return { panel { id = "bar", layer = "Top" }, "/home/me/.config/oblisk/modules/global/lock.lua" }"#,
+                r#"return { panel { id = "bar", layer = "Top" }, "/home/me/.config/obelisk/modules/global/lock.lua" }"#,
             )
             .unwrap_err();
 
@@ -714,7 +714,7 @@ mod tests {
 
     /// Trade-off: null-to-nil leaves an array hole; `ipairs` stops there, while `#` and direct
     /// indexing see past it. No capability payload has a null element today, only optional fields,
-    /// but `dev-config/oblisk/shell.lua` iterates capability lists with `ipairs`.
+    /// but `dev-config/obelisk/shell.lua` iterates capability lists with `ipairs`.
     #[test]
     fn to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at() {
         let loader = test_loader();

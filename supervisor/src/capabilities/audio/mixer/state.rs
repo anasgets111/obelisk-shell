@@ -1,4 +1,4 @@
-//! Tracked `oblisk.audio` state and pure parsing helpers, testable against recorded `pw-dump`
+//! Tracked `obelisk.audio` state and pure parsing helpers, testable against recorded `pw-dump`
 //! properties without a live PipeWire proxy.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use crate::capabilities::audio::master;
 const STREAM_OUTPUT_AUDIO: &str = "Stream/Output/Audio";
 
 /// `media.class` for camera capture (ADR-0034). PipeWire sees only portal-routed cameras, so this
-/// supplements `oblisk.privacy`'s kernel detection with a name-enrichment source.
+/// supplements `obelisk.privacy`'s kernel detection with a name-enrichment source.
 const VIDEO_SOURCE: &str = "Video/Source";
 
 /// `media.class` for app audio capture (ADR-0137), distinct from `source_volume`, a device
@@ -184,7 +184,7 @@ impl AudioApps {
     }
 }
 
-/// Full `oblisk.audio` payload (§ 2.4, ADR-0053 decision 3).
+/// Full `obelisk.audio` payload (§ 2.4, ADR-0053 decision 3).
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
@@ -295,7 +295,7 @@ pub(super) fn device_names(props: &impl PropsLookup) -> Option<DeviceNames> {
     })
 }
 
-/// `Video/Source` data for `oblisk.privacy` name enrichment (ADR-0034): `pid` matches a
+/// `Video/Source` data for `obelisk.privacy` name enrichment (ADR-0034): `pid` matches a
 /// kernel-detected `/dev/videoN` opener and `app_name` supplies its nicer PipeWire name. No
 /// `process_name`: privacy already falls back to `/proc/{pid}/comm`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -453,7 +453,7 @@ impl CaptureApps {
     }
 }
 
-/// All PipeWire inputs to `oblisk.privacy` in one snapshot (ADR-0137). One channel keeps the three
+/// All PipeWire inputs to `obelisk.privacy` in one snapshot (ADR-0137). One channel keeps the three
 /// lists from arriving out of order when a config draws them together. All three lists change on
 /// the same registry events; separate senders would add orderings where one list is a push behind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

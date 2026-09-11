@@ -1,4 +1,4 @@
-//! Pure connection-intent helpers for `oblisk.network`: band/security classification, AP dedup,
+//! Pure connection-intent helpers for `obelisk.network`: band/security classification, AP dedup,
 //! link-name resolution, NetworkManager dict construction, and write-command arg parsers; see
 //! `network/mod.rs` for the module-level contract.
 

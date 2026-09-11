@@ -1,4 +1,4 @@
-//! Keyboard backlight proxy for `oblisk.keyboard` (ADR-0034); raw-to-percent scaling is in
+//! Keyboard backlight proxy for `obelisk.keyboard` (ADR-0034); raw-to-percent scaling is in
 //! `crate::capabilities::scale` (ADR-0053).
 
 #[zbus::proxy(
@@ -47,7 +47,7 @@ mod tests {
 
     async fn build_proxy(caller_side: &zbus::Connection) -> KbdBacklightProxy<'_> {
         zbus::proxy::Builder::new(caller_side)
-            .destination("org.oblisk.test")
+            .destination("org.obelisk.test")
             .expect("valid destination bus name")
             .path("/org/freedesktop/UPower/KbdBacklight")
             .expect("valid object path")

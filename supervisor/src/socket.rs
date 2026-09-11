@@ -1,6 +1,6 @@
 //! Supervisor-side Unix control-socket listener.
 //!
-//! Binds at `$XDG_RUNTIME_DIR/oblisk-shell.sock`, not world-writable `/tmp`, because it carries
+//! Binds at `$XDG_RUNTIME_DIR/obelisk-shell.sock`, not world-writable `/tmp`, because it carries
 //! secure textfield submissions (ADR-0005). Accepts simultaneous connections during a swap, with
 //! Generation `N` and Candidate `N+1` registered by `generation_id`.
 //!
@@ -44,7 +44,7 @@ const CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Connections handled at once, across Renderers and control clients.
 ///
-/// A swap has two Renderers live (§ 14.2) and `oblisk set` is one short-lived client at a time, so
+/// A swap has two Renderers live (§ 14.2) and `obelisk set` is one short-lived client at a time, so
 /// the working set is single digits. This is sized to leave that room untouched while refusing the
 /// unbounded accept loop that preceded it: past this, `accept` still runs -- the listener must not
 /// wedge -- but the new connection is closed immediately.
@@ -76,7 +76,7 @@ pub struct InboundFrame {
 }
 
 /// Registry entry plus monotonic token identifying its connection. Two connections may claim one
-/// `generation_id` in sequence (reconnect or duplicate `OBLISK_GENERATION_ID=0`, ADR-0020); the
+/// `generation_id` in sequence (reconnect or duplicate `OBELISK_GENERATION_ID=0`, ADR-0020); the
 /// token stops old cleanup from unregistering the newer entry.
 struct Entry {
     token: u64,
@@ -416,7 +416,7 @@ async fn handle_connection(
 ///
 /// Two rules, both about a peer describing itself rather than being described:
 ///
-/// 1. A control client (`oblisk set`/`oblisk toggle`, ADR-0112) is any process of this user and is
+/// 1. A control client (`obelisk set`/`obelisk toggle`, ADR-0112) is any process of this user and is
 ///    never a Renderer. It sends exactly one frame kind, so it may send exactly that one. Without
 ///    this it could submit a `SecureSubmit` to PAM or drive `Command`s as though it were the shell.
 /// 2. A frame that names a generation must name its own. The pid check at handshake stops a peer
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn a_control_client_may_send_only_the_frame_the_cli_actually_sends() {
-        // Otherwise `oblisk set`'s socket is also a way to submit to PAM or drive capability
+        // Otherwise `obelisk set`'s socket is also a way to submit to PAM or drive capability
         // commands as though it were the shell.
         let set_state = RendererFrame::SetState(shared::SetState {
             name: "launcher_open".to_string(),
@@ -559,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn bind_removes_a_stale_socket_file_left_by_a_prior_run() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-shell.sock");
+        let path = dir.path().join("obelisk-shell.sock");
 
         let first = UnixListener::bind(&path).unwrap();
         drop(first); // Simulate an unclean shutdown: the socket file is left on disk.
@@ -608,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_listener_registers_two_simultaneous_connections_by_generation_id() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-shell.sock");
+        let path = dir.path().join("obelisk-shell.sock");
         let (registry, _inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[1, 2]);
 
@@ -630,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_listener_reports_a_generation_id_on_the_connected_channel_once_registered() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-shell.sock");
+        let path = dir.path().join("obelisk-shell.sock");
         let (registry, _inbound, mut connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[7]);
 
@@ -643,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_listener_forwards_a_decoded_command_envelope_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-shell.sock");
+        let path = dir.path().join("obelisk-shell.sock");
         let (registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[5]);
 
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_listener_forwards_a_decoded_reevaluate_report_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-shell.sock");
+        let path = dir.path().join("obelisk-shell.sock");
         let (registry, mut inbound, _connected) = spawn_listener(&path).unwrap();
         expect_this_process(&registry, &[5]);
 

@@ -1,4 +1,4 @@
-//! logind bridge for `oblisk.lock` (ADR-0138): `loginctl lock-session` in, `LockedHint` out.
+//! logind bridge for `obelisk.lock` (ADR-0138): `loginctl lock-session` in, `LockedHint` out.
 //!
 //! `loginctl lock-session` calls `org.freedesktop.login1.Manager.LockSession`, making logind emit
 //! `Lock` on this session's object. Ignoring it breaks `systemd-lock-handler`,

@@ -72,7 +72,7 @@ pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
 fn temp_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!(".oblisk-{}-{}.png.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+    format!(".obelisk-{}-{}.png.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// A `0600` temp file in `dir` that this call owns, so the caller's cleanup can only ever unlink
@@ -168,7 +168,7 @@ impl Slot {
             encoder
                 .add_text_chunk("Thumb::MTime".to_string(), self.mtime_secs.to_string())
                 .map_err(io::Error::other)?;
-            encoder.add_text_chunk("Software".to_string(), "Oblisk".to_string()).map_err(io::Error::other)?;
+            encoder.add_text_chunk("Software".to_string(), "Obelisk".to_string()).map_err(io::Error::other)?;
             let mut writer = encoder.write_header().map_err(io::Error::other)?;
             writer.write_image_data(rgba).map_err(io::Error::other)?;
             writer.finish().map_err(io::Error::other)?;

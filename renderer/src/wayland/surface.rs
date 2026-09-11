@@ -16,7 +16,7 @@ pub(super) struct BoundSurface {
 }
 /// Logs a bind-time failure; `surface_id` is `"{id}@{output}"` (ADR-0038).
 pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
-    eprintln!("[oblisk-renderer] {surface_id}: {stage} failed: {err}");
+    eprintln!("[obelisk-renderer] {surface_id}: {stage} failed: {err}");
 }
 /// § 6's `visible` state. Three states are required because showing commits without a buffer and
 /// waits for configure before drawing.
@@ -452,7 +452,7 @@ impl App {
         for instance in instances {
             let Some(roster) = specs.iter().find(|spec| spec.declared_id() == instance.declared_id) else {
                 eprintln!(
-                    "[oblisk-renderer] instance {:?} has no matching declaration; skipping",
+                    "[obelisk-renderer] instance {:?} has no matching declaration; skipping",
                     instance.instance_id
                 );
                 continue;
@@ -467,7 +467,7 @@ impl App {
                 Some((_, Ok(fresh))) => fresh,
                 Some((role, Err(err))) => {
                     eprintln!(
-                        "[oblisk-renderer] {}: re-resolved {role} properties are invalid, keeping the last applied ones: {err}",
+                        "[obelisk-renderer] {}: re-resolved {role} properties are invalid, keeping the last applied ones: {err}",
                         instance.instance_id
                     );
                     roster.clone()
@@ -538,7 +538,7 @@ impl App {
         // `App::surfaces` and `Scene::surfaces` are different maps; dropping the tracked surface
         // leaves the retained tree behind unless it is dropped here too.
         self.client.forget_surface(&surface_id);
-        eprintln!("[oblisk-renderer] {surface_id} destroyed: its output is gone");
+        eprintln!("[obelisk-renderer] {surface_id} destroyed: its output is gone");
     }
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds
@@ -696,14 +696,14 @@ impl App {
                 self.apply_spec_change(index, fresh);
             }
             Some(Err(err)) => eprintln!(
-                "[oblisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
+                "[obelisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"
             ),
             None => {}
         }
         match window {
             Some(Ok(fresh)) => self.apply_window_change(index, fresh),
             Some(Err(err)) => eprintln!(
-                "[oblisk-renderer] {surface_id}: re-resolved window properties are invalid, keeping the last applied ones: {err}"
+                "[obelisk-renderer] {surface_id}: re-resolved window properties are invalid, keeping the last applied ones: {err}"
             ),
             None => {}
         }
@@ -719,7 +719,7 @@ impl App {
                 }
             }
             Some(Err(err)) => eprintln!(
-                "[oblisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
+                "[obelisk-renderer] {surface_id}: re-resolved popup properties are invalid, keeping the last applied ones: {err}"
             ),
             None => {}
         }
@@ -907,7 +907,7 @@ impl App {
             self.keyboard_focus = None;
             self.focus_secure_submit(None);
         }
-        eprintln!("[oblisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
     /// Lazily builds the process-wide EGL state on the first drawable surface (ADR-0071). Failure
@@ -991,7 +991,7 @@ impl App {
         // Failure is non-fatal and leaves EGL's current blocking default.
         if let Err(e) = egl.instance.swap_interval(egl.display, 0) {
             eprintln!(
-                "[oblisk-renderer] {surface_id}: eglSwapInterval(0) failed ({e}); swaps on this surface keep EGL's blocking default"
+                "[obelisk-renderer] {surface_id}: eglSwapInterval(0) failed ({e}); swaps on this surface keep EGL's blocking default"
             );
         }
 
@@ -1003,7 +1003,7 @@ impl App {
             })
         });
 
-        eprintln!("[oblisk-renderer] {surface_id} up: {width}x{height}, EGL context current");
+        eprintln!("[obelisk-renderer] {surface_id} up: {width}x{height}, EGL context current");
         self.surfaces[index].bound = Some(BoundSurface { egl_surface, native_window });
         // A new EGL surface has empty buffers, so the next paint is unconditional.
         self.surfaces[index].last_painted = None;
@@ -1252,7 +1252,7 @@ impl App {
         self.ready_signal_sent = true;
         let surfaces = presenting_surface_ids(self.surfaces.iter().map(|s| (s.surface_id.as_str(), s.map_state)));
         if let Err(e) = self.outbound_tx.send(RendererFrame::ReadySignal(ReadySignal { surfaces })) {
-            eprintln!("[oblisk-renderer] failed to queue ReadySignal for the socket thread: {e}");
+            eprintln!("[obelisk-renderer] failed to queue ReadySignal for the socket thread: {e}");
         }
     }
 
@@ -1300,7 +1300,7 @@ impl App {
 
         let (width, height) = self.surfaces[index].configured_size;
         eprintln!(
-            "[oblisk-renderer] {} activated: {width}x{height}, presentation feedback requested (nonce={nonce})",
+            "[obelisk-renderer] {} activated: {width}x{height}, presentation feedback requested (nonce={nonce})",
             self.surfaces[index].surface_id
         );
     }
@@ -1464,7 +1464,7 @@ mod tests {
                 layer: LayerKind::Top,
                 anchor: node::Anchor { top: true, right: true, bottom: false, left: true },
                 monitor: "All".to_string(),
-                namespace: format!("oblisk-{id}"),
+                namespace: format!("obelisk-{id}"),
             },
             keyboard_interactivity: node::KeyboardInteractivity::None,
             exclusive: node::Exclusive::Reserve,
@@ -1573,7 +1573,7 @@ mod tests {
         WindowSpec {
             id: id.to_string(),
             title: String::new(),
-            app_id: format!("oblisk-{id}"),
+            app_id: format!("obelisk-{id}"),
             min_size: None,
             max_size: None,
         }

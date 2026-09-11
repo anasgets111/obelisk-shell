@@ -1,4 +1,4 @@
-//! [`FilesController`] owns `oblisk.files`, with one listing task per watched folder (ADR-0120).
+//! [`FilesController`] owns `obelisk.files`, with one listing task per watched folder (ADR-0120).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -14,8 +14,8 @@ use tokio::task::JoinHandle;
 /// one listing after the burst is the point.
 const RELIST_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// `oblisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
-/// `oblisk.files.folders[folder]` reads back with the string the config wrote.
+/// `obelisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
+/// `obelisk.files.folders[folder]` reads back with the string the config wrote.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct FilesState {
     /// One entry per active `files:watch(path)`, keyed by `path` with trailing slashes stripped.
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn a_missing_folder_lists_as_an_error_not_a_panic() {
-        assert!(list_folder(Path::new("/nonexistent/oblisk-files-test"), &[]).is_err());
+        assert!(list_folder(Path::new("/nonexistent/obelisk-files-test"), &[]).is_err());
     }
 
     #[tokio::test]
@@ -366,10 +366,10 @@ mod tests {
     async fn a_missing_folder_reads_ready_with_an_error() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let controller = FilesController::new(tx);
-        controller.watch("/nonexistent/oblisk-files-test", vec![]);
+        controller.watch("/nonexistent/obelisk-files-test", vec![]);
         rx.recv().await.unwrap();
         rx.recv().await.unwrap();
-        let folder = &controller.snapshot().folders["/nonexistent/oblisk-files-test"];
+        let folder = &controller.snapshot().folders["/nonexistent/obelisk-files-test"];
         assert!(folder.ready);
         assert!(folder.entries.is_empty());
         assert!(folder.error.is_some());

@@ -606,12 +606,12 @@ impl NotificationsController {
 
     #[zbus(name = "GetServerInformation")]
     async fn get_server_information(&self) -> (String, String, String, String) {
-        ("oblisk".to_string(), "oblisk".to_string(), "0.1.0".to_string(), "1.2".to_string())
+        ("obelisk".to_string(), "obelisk".to_string(), "0.1.0".to_string(), "1.2".to_string())
     }
 
     /// `reason` is [`CloseReason`] as its raw wire `u32` (the signal's D-Bus signature is fixed by
     /// the base spec): 1 = expired, 2 = dismissed via `dismiss()`, 3 = `CloseNotification`,
-    /// 4 = FIFO eviction -- a base-spec "undefined/reserved" value repurposed for Oblisk's hard
+    /// 4 = FIFO eviction -- a base-spec "undefined/reserved" value repurposed for Obelisk's hard
     /// 100-cap (ADR-0033).
     #[zbus(signal, name = "NotificationClosed")]
     async fn notification_closed(

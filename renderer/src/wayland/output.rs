@@ -105,7 +105,7 @@ impl App {
                 continue;
             }
             let Some(info) = self.output_state.info(&output) else {
-                eprintln!("[oblisk-renderer] output {index} advertised no info yet; no surface created on it");
+                eprintln!("[obelisk-renderer] output {index} advertised no info yet; no surface created on it");
                 continue;
             };
             let facts = OutputFacts {
@@ -121,7 +121,7 @@ impl App {
             match screen_entry(index, &facts) {
                 Some(screen) => screens.push(screen),
                 None => eprintln!(
-                    "[oblisk-renderer] output {:?} reports neither a logical size nor a current mode; no surface created on it",
+                    "[obelisk-renderer] output {:?} reports neither a logical size nor a current mode; no surface created on it",
                     info.name.as_deref().unwrap_or("<unnamed>")
                 ),
             }
@@ -151,7 +151,7 @@ impl App {
             return;
         }
         eprintln!(
-            "[oblisk-renderer] outputs changed: {:?}",
+            "[obelisk-renderer] outputs changed: {:?}",
             screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
         );
 
@@ -198,17 +198,17 @@ impl PresentationTimeHandler for App {
         _flags: WEnum<wp_presentation_feedback::Kind>,
     ) {
         let Some(nonce) = self.active_nonce else {
-            eprintln!("[oblisk-renderer] presented event arrived with no active ActivateDraw nonce; dropping");
+            eprintln!("[obelisk-renderer] presented event arrived with no active ActivateDraw nonce; dropping");
             return;
         };
         let Some(surface_id) = self.surface_id_for(surface).map(str::to_string) else {
-            eprintln!("[oblisk-renderer] presented event for an untracked surface; dropping");
+            eprintln!("[obelisk-renderer] presented event for an untracked surface; dropping");
             return;
         };
         if let Err(e) =
             self.outbound_tx.send(RendererFrame::PresentationEvidence(PresentationEvidence { nonce, surface_id }))
         {
-            eprintln!("[oblisk-renderer] failed to queue PresentationEvidence for the socket thread: {e}");
+            eprintln!("[obelisk-renderer] failed to queue PresentationEvidence for the socket thread: {e}");
         }
     }
 
@@ -222,7 +222,7 @@ impl PresentationTimeHandler for App {
         surface: &wl_surface::WlSurface,
     ) {
         let label = self.surface_id_for(surface).unwrap_or("<untracked surface>");
-        eprintln!("[oblisk-renderer] presentation feedback discarded for {label}");
+        eprintln!("[obelisk-renderer] presentation feedback discarded for {label}");
     }
 }
 

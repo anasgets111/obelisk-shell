@@ -92,12 +92,12 @@ pub(crate) fn log_unknown_action(params: &shared::CommandParams) {
 }
 
 /// Logs a command for a controller never built (ADR-0070). A config cannot reach this: reading
-/// `oblisk.<name>` sends the start before its `invoke` on the same socket. This is a buggy Renderer
+/// `obelisk.<name>` sends the start before its `invoke` on the same socket. This is a buggy Renderer
 /// or hand-written frame, so name the capability instead of staying silent.
 pub(crate) fn log_unstarted(envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     eprintln!(
-        "generation {}'s oblisk.{}:invoke({:?}) arrived before anything started {}; dropping",
+        "generation {}'s obelisk.{}:invoke({:?}) arrived before anything started {}; dropping",
         params.generation_id, params.capability, params.action, params.capability
     );
 }
@@ -142,14 +142,14 @@ impl Shutdown {
 /// Enters the PAM worker's tokio-free path (ADR-0028) before any D-Bus, runtime, or audio-thread
 /// setup. The worker must not construct a tokio runtime.
 fn main() -> Result<(), Box<dyn Error>> {
-    if std::env::var_os("OBLISK_PAM_WORKER").is_some() {
+    if std::env::var_os("OBELISK_PAM_WORKER").is_some() {
         return pam_worker::run_worker();
     }
 
     let args = match cli::parse(std::env::args()) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("oblisk: {message}\n\n{}", cli::HELP);
+            eprintln!("obelisk: {message}\n\n{}", cli::HELP);
             std::process::exit(2);
         }
     };
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         cli::Command::Version => {
-            println!("oblisk {}", env!("CARGO_PKG_VERSION"));
+            println!("obelisk {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         cli::Command::Init { force } => setup::run(&shared::config_dir()?, force),
@@ -208,7 +208,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
 
     // Idle (ADR-0032): notify uses its own Wayland connection so idle authority survives Renderer
     // crash/reload (ADR-0010); inhibit uses the shared one. It starts on the first
-    // `oblisk.idle` method call (ADR-0070), off the roster, so methods send start rather than
+    // `obelisk.idle` method call (ADR-0070), off the roster, so methods send start rather than
     // `__index` (`renderer/src/lua/idle.rs`). Events are not snapshots, so this receiver stays
     // separate from `Signals`.
     let (idle_signal_tx, mut idle_signals) = tokio::sync::mpsc::unbounded_channel::<shared::IdleEvent>();
@@ -345,7 +345,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     eprintln!("generation {}'s handshake frame arrived outside any in-flight PBA handshake; dropping: {:?}", inbound.generation_id, inbound.frame);
                 }
                 RendererFrame::StartCapability { capability } => {
-                    // ADR-0070: config read `oblisk.<capability>` or named it in `secure_submit`.
+                    // ADR-0070: config read `obelisk.<capability>` or named it in `secure_submit`.
                     // Await inline (decision 4). Re-entrant because decision 3 makes each
                     // generation resend every name; each arm is a no-op after controller creation.
                     match Capability::from_name(&capability) {
@@ -359,7 +359,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         ),
                     }
                 }
-                // ADR-0112: send `oblisk set`/`toggle` to the onscreen generation. The Renderer
+                // ADR-0112: send `obelisk set`/`toggle` to the onscreen generation. The Renderer
                 // applies or refuses it by name; only this process knows that generation.
                 RendererFrame::SetState(set) => send_frame_logged(
                     &supervisor.registry,

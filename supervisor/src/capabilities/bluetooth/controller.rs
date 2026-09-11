@@ -1,4 +1,4 @@
-//! [`BluetoothController`]: the `oblisk.bluetooth` write-action dispatcher and state owner.
+//! [`BluetoothController`]: the `obelisk.bluetooth` write-action dispatcher and state owner.
 //! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category,
 };
 
-/// Proxies needed by `oblisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
+/// Proxies needed by `obelisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
 /// proxy or `Arc`, so a clone can move into a `tokio::spawn` task.
 #[derive(Clone)]
 pub struct BluetoothController {

@@ -1,4 +1,4 @@
-//! [`PrivacyController`] owns read-only `oblisk.privacy` telemetry (ADR-0034).
+//! [`PrivacyController`] owns read-only `obelisk.privacy` telemetry (ADR-0034).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ pub struct PrivacyState {
     /// Apps PipeWire reports reading a microphone now (ADR-0137). Open-but-idle streams are absent:
     /// this means "something is listening", not "something could".
     ///
-    /// Distinct from `oblisk.audio.source_muted`, a device setting; a muted active capture appears
+    /// Distinct from `obelisk.audio.source_muted`, a device setting; a muted active capture appears
     /// in both.
     pub microphone_users: Vec<PrivacyUser>,
     /// Apps producing PipeWire screen-capture streams (ADR-0137). Names may be the portal's
@@ -109,7 +109,7 @@ pub struct PrivacyController {
 impl PrivacyController {
     /// `proc_root`/`video4linux_root` (defaults `/proc`/`/sys/class/video4linux`) are injected per
     /// the sysfs/procfs test convention. `sources` is the PipeWire connection shared with
-    /// `oblisk.audio` (ADR-0034). Returns immediately.
+    /// `obelisk.audio` (ADR-0034). Returns immediately.
     pub fn new(
         proc_root: PathBuf,
         video4linux_root: &Path,

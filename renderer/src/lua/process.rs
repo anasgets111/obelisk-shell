@@ -54,7 +54,7 @@ fn process_command(generation_id: u32, action: &str, arguments: Vec<serde_json::
 }
 
 impl ProcessRegistry {
-    /// `OBLISK_GENERATION_ID`, stamped into every envelope; `outbound_tx` is the frame channel
+    /// `OBELISK_GENERATION_ID`, stamped into every envelope; `outbound_tx` is the frame channel
     /// drained by the socket thread's `pump`.
     pub fn new(generation_id: u32, outbound_tx: UnboundedSender<RendererFrame>) -> Self {
         ProcessRegistry(Rc::new(RefCell::new(Inner {

@@ -1,4 +1,4 @@
-//! System tray host (`oblisk.tray`, docs/services.md §2;
+//! System tray host (`obelisk.tray`, docs/services.md §2;
 //! docs/lua-api.md §2.14; ADR-0031).
 //!
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and handles registered
@@ -125,7 +125,7 @@ pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<
     Some((id, menu_item_id))
 }
 
-/// Actions accepted by `oblisk.tray:invoke(...)`; `dispatch` keeps the table compiler-checked.
+/// Actions accepted by `obelisk.tray:invoke(...)`; `dispatch` keeps the table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
@@ -136,7 +136,7 @@ pub enum TrayAction {
     MenuWillShow,
 }
 
-/// `oblisk.tray` dispatch (ADR-0037): matches, parses, and spawns every write action
+/// `obelisk.tray` dispatch (ADR-0037): matches, parses, and spawns every write action
 /// (ADR-0031).
 pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

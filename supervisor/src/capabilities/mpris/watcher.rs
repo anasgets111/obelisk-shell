@@ -1,4 +1,4 @@
-//! Discovery: which session-bus names `oblisk.mpris` tracks. Split from `dbus::mpris`; see
+//! Discovery: which session-bus names `obelisk.mpris` tracks. Split from `dbus::mpris`; see
 //! `dbus/mpris/mod.rs`.
 //!
 //! Players never register; scan `ListNames` once, then watch `NameOwnerChanged` for arrivals and

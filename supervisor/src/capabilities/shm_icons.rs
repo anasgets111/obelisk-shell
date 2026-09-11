@@ -1,12 +1,12 @@
 //! Shared PNG spooling for `dbus::tray` and `dbus::notifications`: both spool bounds-checked PNG
-//! bytes to `$XDG_RUNTIME_DIR/oblisk/{subdir}/...`; the error type and directory/write mechanics
+//! bytes to `$XDG_RUNTIME_DIR/obelisk/{subdir}/...`; the error type and directory/write mechanics
 //! are identical, while subdirectory and pixel encoding stay local.
 
 use std::path::PathBuf;
 
-/// `$XDG_RUNTIME_DIR/oblisk/{subdir}` (ADR-0142; previously `/dev/shm/oblisk-$UID` under ADR-0031).
+/// `$XDG_RUNTIME_DIR/obelisk/{subdir}` (ADR-0142; previously `/dev/shm/obelisk-$UID` under ADR-0031).
 ///
-/// Not `/dev/shm`: mode 1777 lets another user create `oblisk-$UID` first, redirecting [`sweep`]'s
+/// Not `/dev/shm`: mode 1777 lets another user create `obelisk-$UID` first, redirecting [`sweep`]'s
 /// delete and [`write_png`] through a symlink. The owned 0700 runtime directory provides the
 /// intended isolation on the same tmpfs.
 ///
@@ -20,7 +20,7 @@ pub fn icon_dir(subdir: &str) -> PathBuf {
 fn spool_dir(runtime: Option<&std::ffi::OsStr>, subdir: &str) -> PathBuf {
     let runtime =
         runtime.map_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::Uid::current())), PathBuf::from);
-    runtime.join("oblisk").join(subdir)
+    runtime.join("obelisk").join(subdir)
 }
 
 /// Best-effort deletion of one spooled PNG.
@@ -54,7 +54,7 @@ pub fn sweep(subdir: &str) {
     }
 }
 
-/// Writes encoded `png_bytes` to `$XDG_RUNTIME_DIR/oblisk/{subdir}/{filename}`, creating missing
+/// Writes encoded `png_bytes` to `$XDG_RUNTIME_DIR/obelisk/{subdir}/{filename}`, creating missing
 /// directories. Overwrites the same path without cache-busting (ADR-0031, ADR-0033).
 pub fn write_png(subdir: &str, filename: &str, png_bytes: &[u8]) -> std::io::Result<String> {
     let dir = icon_dir(subdir);
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn the_spool_directory_is_the_private_runtime_one_and_never_a_shared_one() {
-        assert_eq!(spool_dir(Some(OsStr::new("/run/user/4242")), "tray"), PathBuf::from("/run/user/4242/oblisk/tray"));
+        assert_eq!(spool_dir(Some(OsStr::new("/run/user/4242")), "tray"), PathBuf::from("/run/user/4242/obelisk/tray"));
 
         let fallback = spool_dir(None, "notifications");
         assert!(

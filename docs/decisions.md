@@ -82,7 +82,7 @@ write such as `audio:toggle_mute()` may have no `:get()` in its callback, making
 an unrelated read elsewhere in the frame.
 
 Quickshell and Noctalia have no comparable optimistic write concurrency because each has one active
-writer per capability. Oblisk needs it while generations N and N+1 both retain write paths during a
+writer per capability. Obelisk needs it while generations N and N+1 both retain write paths during a
 swap.
 
 ## 0005. Secure textfield submit targets a capability action, never Lua
@@ -97,7 +97,7 @@ password. This follows Noctalia.
 The reference lock screen needs `on_submit = function(text) ... end`, and Wi-Fi password entry needs
 the same secret-input primitive. Quickshell's PAM binding `PamContext::respond(const QString&)` passes
 the password to QML as a plain string. Noctalia avoids a scriptable callback by using a fixed native
-lock widget. Making the primitive non-scriptable does not fit Oblisk, where Lua must author the
+lock widget. Making the primitive non-scriptable does not fit Obelisk, where Lua must author the
 Wi-Fi password field.
 
 Amendment (ADR-0009): the original decision protected only the Lua boundary and never told the
@@ -399,7 +399,7 @@ frame arrives: the `lua-api.md` § 3.2 command table of ~30 writes, still forwar
 aggregated `eprintln!` channel; ADR-0019's production `CandidateLink`; `process.run` line streaming,
 which is a separate transport concern; handshake deadlines, so an idle client blocks only its own
 connection task, not the accept loop; real generation IDs (`renderer/src/socket.rs` reads
-`OBLISK_GENERATION_ID`, defaulting to `0`, since nothing yet spawns a Renderer with a real one);
+`OBELISK_GENERATION_ID`, defaulting to `0`, since nothing yet spawns a Renderer with a real one);
 reconnection, backoff, and auth, unnecessary for the local `AF_UNIX` socket restricted by filesystem
 permissions.
 
@@ -408,7 +408,7 @@ permissions.
    path. `MAX_FRAME_LEN` rejects lengths over 16 MiB before allocation, closing the DoS exposed by a
    `u32` prefix on the socket ADR-0005 uses for secure submissions. `shared::ConnectionHandshake`
    (`{ generation_id: u32 }`) is sent first on every connection.
-2. **`supervisor/src/socket.rs`.** Binds `$XDG_RUNTIME_DIR/oblisk-shell.sock`, never `/tmp`
+2. **`supervisor/src/socket.rs`.** Binds `$XDG_RUNTIME_DIR/obelisk-shell.sock`, never `/tmp`
    (world-writable). It removes a stale socket left by an unclean shutdown before binding, otherwise
    `bind` fails with `AddrInUse` on every restart after a crash. It accepts unbounded concurrent
    connections for N and Candidate N+1, and registers each `generation_id` in
@@ -429,7 +429,7 @@ Phase 10 builds an `mlua` VM and loader for `shell.lua` node trees and surface t
 retained-scene reconciliation (`deserialize_lua_table` makes one shallow `VirtualNode`, never
 recursing into `children` or matching by identity), socket write dispatch, `textfield`'s
 `secure_submit`/`SecureBuffer`, computed-signal memoization/invalidation, property validation,
-`oblisk.*` signals, `list` repeaters, `button` input, and a production `Loader` call in `main.rs`.
+`obelisk.*` signals, `list` repeaters, `button` input, and a production `Loader` call in `main.rs`.
 
 1. **The type-marshalling boundary** (`marshal.rs`). `check_number`/`check_integer`/`check_string`
    enforce finite `f64` (rejecting NaN/Inf), `i64`/`u64` in `[-2^53+1, 2^53-1]`, and a 64KB
@@ -451,7 +451,7 @@ recursing into `children` or matching by identity), socket write dispatch, `text
 ADR-0023's layout engine built retained-scene reconciliation; ADR-0022 gives `Loader` a production
 call site. ADR-0044 decision 3 rejects memoization: every signal re-resolves on every read.
 
-## 0022. Minimal end-to-end slice ships one ad hoc signal, not the `oblisk.*` tree
+## 0022. Minimal end-to-end slice ships one ad hoc signal, not the `obelisk.*` tree
 
 Phase 11 wires Phase 9's socket to Phase 10's loader with audio-mixer payloads. It adds
 `Signal::new_live` and `SignalKind::Live(Rc<RefCell<Value>>)` beside `Direct`/`Computed`; only
@@ -465,7 +465,7 @@ push it into global `audio`, and re-evaluate hardcoded `PROOF_OF_WIRING_SHELL` t
 `Loader::evaluate`. Decode failure ends this one-sender loop; the Supervisor's inbound
 `CommandEnvelope` loop tolerates bad frames.
 
-Not built: full `oblisk.*` namespacing (only `audio`); `expected_revision`/staleness rejection
+Not built: full `obelisk.*` namespacing (only `audio`); `expected_revision`/staleness rejection
 (ADR-0004), safe on one ordered Unix-socket connection; generation-ID assignment (both sides
 hardcode `0` from shared defaults, no handshake); reconnection (a dropped socket ends the thread,
 per ADR-0020); real `shell.lua`; work past `LoadOutput`; capabilities besides `audio::mixer`; or
@@ -502,7 +502,7 @@ ADR-0143 supersedes the retained-subtree lease bag and child-first teardown cont
 
 ## 0024. In-place reload: the Renderer self-diffs topology, the Supervisor only dispatches
 
-Phase 13 adds a Supervisor-side `inotify` watcher on `~/.config/oblisk/`. After fixed 200ms
+Phase 13 adds a Supervisor-side `inotify` watcher on `~/.config/obelisk/`. After fixed 200ms
 (`RELOAD_DEBOUNCE`) debounce, the loader re-evaluates. Renderer returns `Unchanged`,
 `TopologyChanged` or `Failed`; Supervisor dispatches.
 
@@ -531,7 +531,7 @@ useful `reset_registrations` (called but empty; ADR-0006 requires reset before f
 but this round trip cannot honor that ordering because the reset decision depends on the evaluation's
 verdict; it needs the same pending/apply staging the Scene already has once a real registration
 capability exists to stage against);
-full `oblisk.*` tree (only `rescue`, as in ADR-0022's `audio`); startup fallback;
+full `obelisk.*` tree (only `rescue`, as in ADR-0022's `audio`); startup fallback;
 multi-generation bookkeeping (generation `0`, per ADR-0020); or real `layer`/`anchor`/`monitor`.
 
 ## 0025. PBA orchestrator wired with atomic per-candidate promotion, not true per-output streaming
@@ -613,7 +613,7 @@ PAM runs in a re-executed worker with one password captured before spawning.
    and zeroize the source. The machine lacked `polkit-1` PAM config; fallback: `login`.
 2. **Isolation: re-exec, not fork or a third binary.** PAM modules cannot reliably be cancelled
    without terminating their process. Forking the multithreaded Supervisor risks inheriting locked
-   mutexes. Re-exec the Supervisor with `OBLISK_PAM_WORKER=1` before D-Bus/tokio/audio setup; reuse
+   mutexes. Re-exec the Supervisor with `OBELISK_PAM_WORKER=1` before D-Bus/tokio/audio setup; reuse
    process-group spawn/reap helpers.
 3. **Protocol: one-shot, not interactive.** Write the captured password once to stdin and close
    the pipe; every PAM prompt receives it. A worker stdout frame distinguishes Success, StartFailed,
@@ -686,7 +686,7 @@ missing inbound-channel prerequisite with app volume/mute controls.
 3. **Registry identity.** Resolve the caller's service to a D-Bus unique name before using it as key
    or spool filename. Raw service strings permit filename injection/path traversal. Historical
    spool:
-   `/dev/shm/oblisk-$UID/tray/{sanitized_unique_name}.png`.
+   `/dev/shm/obelisk-$UID/tray/{sanitized_unique_name}.png`.
 4. **Icon preference.** Pass IconName to the Renderer; decode only as fallback. Choose the largest
    pixmap up to 128 px, with no minimum; Lua owns display size.
 5. **Menus.** Fetch full layout at registration and LayoutUpdated. Refresh lazy submenus through
@@ -709,7 +709,7 @@ listener per duration fans out registrations; reload cleanup uses generation res
 get_idle_notification; no presence-sensor exclusion. Deliver idled/resumed through IdleEvent,
 because these are edges, not revisioned state.
 
-Use logind `Inhibit(what="idle", who="oblisk", why=reason, mode="block")` on the system bus. The
+Use logind `Inhibit(what="idle", who="obelisk", why=reason, mode="block")` on the system bus. The
 fd releases the hold after a crash. It covers automatic idle actions, not explicit sleep, shutdown
 or lid-switch. Refcount generation holds; reset clears the count.
 
@@ -746,7 +746,7 @@ expiry; Lua owns popup policy.
 Use snapshots because each mutation changes feed or DND state. A 20-entry feed views a 100-entry
 FIFO so actions resolve outside the feed. Replacement without a fresh image deletes the old spool;
 eviction deletes the evicted image. Historical spool:
-`/dev/shm/oblisk-$UID/notifications/notif-{id}.png`.
+`/dev/shm/obelisk-$UID/notifications/notif-{id}.png`.
 
 Add reply, per-urgency sound and DND writes alongside dismiss; expose urgency, reply availability,
 and structured body spans.
@@ -949,7 +949,7 @@ Lock-client process ownership is deferred to the ADR-0010 reconsideration. Conte
 paint pass and declared-surface manager; popups also need input routing. Adding/removing any role
 still requires a topology swap, with instancing following ADR-0038.
 
-## 0041. `oblisk.screens` is Renderer-sourced; variants are a Lua loop
+## 0041. `obelisk.screens` is Renderer-sourced; variants are a Lua loop
 
 1. Lua loops already provide per-screen iteration; no variants/repeater constructor.
 
@@ -1042,7 +1042,7 @@ ADR-0143 supersedes decision 2's child-first retirement requirement; identity ma
 
 ## 0046. Rescue renders out of band when no scene survives
 
-1. Reload failure retains the working scene and reports through oblisk.rescue. Startup failure has no
+1. Reload failure retains the working scene and reports through obelisk.rescue. Startup failure has no
 scene and needs an independent display path.
 
 2. The Supervisor re-execs a rescue process with hardcoded Rust drawing, no Lua, capabilities,
@@ -1265,7 +1265,7 @@ persistent lock marker was not built yet.
 
 ## 0060. A restarted Supervisor learns the session was locked from a file in the runtime directory
 
-1. Keep the lock fact in $XDG_RUNTIME_DIR/oblisk-session-locked so it survives SIGKILL but not the
+1. Keep the lock fact in $XDG_RUNTIME_DIR/obelisk-session-locked so it survives SIGKILL but not the
 login session. Do not serialize transient attempts or acquisition state.
 
 2. Drive it from Renderer outcomes: Locked sets; Unlocked/Finished clear; Refused leaves it. Renderer
@@ -1338,7 +1338,7 @@ Unfocused fields show placeholders; focus changes clear the buffer.
 
 3. A keystroke requests paint without scene resolution; display-list equality narrows GPU work.
 
-4. Probe the installed Oblisk PAM service per authentication, falling back to login when absent.
+4. Probe the installed Obelisk PAM service per authentication, falling back to login when absent.
 Naming a missing service would hit pam_deny on the observed system.
 
 Leave the machine's PAM failure delay and lockout policy intact. No caret, placeholder styling or
@@ -1575,7 +1575,7 @@ cannot be suppressed; use LuaCATS prose markers on return annotations.
 Reject generating types from the current parser layer: it relocates hand-written claims rather than
 deriving them. Language-server checking is optional when absent, but the skip is explicit.
 
-## 0082. `oblisk.network` is subscribed to the association, not just to the scan
+## 0082. `obelisk.network` is subscribed to the association, not just to the scan
 
 1. Connectivity comes from PrimaryConnection, not AP identity; AP lists cannot describe wired routes,
    radio power or DHCP progress.
@@ -1925,7 +1925,7 @@ omissions stayed config scope, not proof of framework gaps.
 The card was measured at its 1521 px left margin rather than 378 px content width, underestimating
 wrapped height by 13.2 px.
 
-## 0112. A launcher's four missing primitives: `autofocus`, `on_navigate`, `scroll:reveal`, and `oblisk set`
+## 0112. A launcher's four missing primitives: `autofocus`, `on_navigate`, `scroll:reveal`, and `obelisk set`
 
 1. Autofocus arms an ordinary field on a live focused surface when nothing owns typing. It opens empty;
    multiple candidates choose document order, unlike secure-target refusal.
@@ -2055,7 +2055,7 @@ Deferred: padding, specials, fullscreen and compositor metadata.
 No overview or urgency without a consumer. Synthetic slots stay out of backend facts. Hyprland is
 documented-IPC-only, not live-tested.
 
-## 0120. A watched folder is a capability, `oblisk.files`
+## 0120. A watched folder is a capability, `obelisk.files`
 
 1. Watch requested folders in Supervisor, not blocking Lua reads or parsed ls output.
 2. Key by requested path with trailing slashes removed; readiness/errors are per folder.
@@ -2162,10 +2162,10 @@ Idle never scanned continuously; this reduces redundant startup/event scans, not
 
 Historical comparison on the same 1920×1200 machine, with both shells running during a 35.5-second
 idle window: Quickshell/reference used 169.0 MB PSS plus 9.8 MB helpers, 214.2 MB GPU, 4.65% CPU
-and 1.30% cava. Oblisk used 47.5 MB PSS, 51.5 MB GPU and 0.34% CPU. Not feature-identical: the
+and 1.30% cava. Obelisk used 47.5 MB PSS, 51.5 MB GPU and 0.34% CPU. Not feature-identical: the
 reference also ran a visualizer and animations.
 
-The native Noctalia renderer supplied comparison ideas, not a rewrite. Oblisk shared one context and
+The native Noctalia renderer supplied comparison ideas, not a rewrite. Obelisk shared one context and
 used a byte-budgeted image cache. Dedicated shaders and in-process context recovery did not justify
 replacing femtovg/process recovery without evidence.
 
@@ -2181,7 +2181,7 @@ Adopt animation's elapsed-time and idle-frame-loop rules, not an implementation 
    slow animation.
 3. Arm compositor callbacks only while active; keep the chain alive without drawing when unchanged.
 4. The declarative plugin layer cannot request arbitrary animations; native widgets own them, but
-   Oblisk's config authors its UI.
+   Obelisk's config authors its UI.
 5. Retained node identity and leases provide the lifetime basis; interpolation must survive
    reconciliation under that identity.
 
@@ -2226,7 +2226,7 @@ hints; retain fallback behavior. The profiler touches no clock when disabled.
 Live idle windows showed about 17 resolves per ten seconds from clock/CPU/RAM schedules, not
 spinning, at roughly 0.24–0.25% CPU. Nonblocking swap alone had no measured idle speed gain.
 
-## 0133. `oblisk.battery` reads UPower uncached, because its wake-up races zbus's cache
+## 0133. `obelisk.battery` reads UPower uncached, because its wake-up races zbus's cache
 
 1. Disable caching on DisplayDevice reads while keeping one whole-object subscription. A pre-refresh
    read compared equal, dropped the push and left state one event behind for minutes.
@@ -2236,7 +2236,7 @@ spinning, at roughly 0.24–0.25% CPU. Nonblocking swap alone had no measured id
 Live unplug/replug confirmed the fix; hardware latency was not the cause. A similar tray
 custom-signal/cache risk remained unconfirmed and unfixed.
 
-## 0134. `oblisk.updates` is a schedule with a package manager behind a trait, and says which one
+## 0134. `obelisk.updates` is a schedule with a package manager behind a trait, and says which one
 
 1. Put manager-specific name, check, install, progress parsing and reboot detection behind a backend
    trait; the scheduler must not know pacman.
@@ -2298,7 +2298,7 @@ running capture stream are distinct facts.
 Reject optional Lua lock-session compliance. Lock-before-suspend delay inhibition is separate work
 requiring its own fd/window/subscription.
 
-## 0139. A held logind idle inhibitor stops idle events, because Oblisk is the idle daemon
+## 0139. A held logind idle inhibitor stops idle events, because Obelisk is the idle daemon
 
 Amends ADR-0032: a session running its own idle daemon honors logind inhibitors.
 
@@ -2331,7 +2331,7 @@ Config-side idle policy over ADR-0139.
 Reject ignoring foreign inhibitors and leaking replacement registrations. Fullscreen inhibition on
 niri remains unavailable without a backend fullscreen fact.
 
-## 0141. `oblisk.idle` joins the roster, because there is idle state worth reading after all
+## 0141. `obelisk.idle` joins the roster, because there is idle state worth reading after all
 
 Amends ADR-0032 and ADR-0139: the bar needs foreign-inhibitor state.
 
@@ -2351,7 +2351,7 @@ Supervisor-owned state.
 Amends ADR-0031/0033: a UID-named directory under world-writable /dev/shm does not establish
 ownership; precreated symlinks could redirect sweeping or PNG writes.
 
-1. Move spools to the user's private runtime directory under oblisk/{subdir}.
+1. Move spools to the user's private runtime directory under obelisk/{subdir}.
 2. Fall back only to /run/user/$UID, never /dev/shm. Missing storage degrades to no icon.
 3. Keep removal's prefix check based on the same directory helper.
 
@@ -2486,11 +2486,11 @@ ms of open and gone within two close frames. Lua needed the measured height.
 Not built: `width`/`height` bound to an ancestor's geometry signal is a QML-style binding loop; only
 the one-pass lag prevents further protection.
 
-## 0148. `oblisk toggle <name> <value>` sets a state or restores its declared initial, so one keybind opens and closes a modal named by a string
+## 0148. `obelisk toggle <name> <value>` sets a state or restores its declared initial, so one keybind opens and closes a modal named by a string
 
 The three modals became one `state("modal", "")` holding the name, like `activeModal`, so two cannot
 stack. `toggle <name> <value>` stores the value or restores the registry's initial on a match. It is
-a `set` with one comparison, the scalar `literal_was_edited` makes, so `oblisk toggle modal launcher`
+a `set` with one comparison, the scalar `literal_was_edited` makes, so `obelisk toggle modal launcher`
 works for any scalar state. Not built: toggling between two non-initial values; use two bindings or
 a boolean.
 ## 0149. `scale`, `rotate`, `translate` and `origin` are one paint-only affine on every node, because the solver must never see a transform
@@ -2709,13 +2709,13 @@ that the code is separable. The roadmap gate still governs the next addition to 
 
 ## 0155. The engine's test suite guards no `dev-config` component, because nineteen files nothing ships are sample usage and not product
 
-Six tests in `renderer/src/lua/mod.rs` loaded `dev-config/oblisk` to test what
+Six tests in `renderer/src/lua/mod.rs` loaded `dev-config/obelisk` to test what
 `components/panel_card.lua`, `panel_header.lua`, `toggle.lua` and `panel_toggle_card.lua` build and
 how `on_click` filters a button. ADR-0154 moved four engine tests off that load; these remained
 because replacing them seemed to require a Lua runner.
 
 1. **`share/starter` ships one file, `shell.lua`.** The nineteen files under
-   `dev-config/oblisk/components/` are not installed, referenced by the starter, or delivered to
+   `dev-config/obelisk/components/` are not installed, referenced by the starter, or delivered to
    engine users. They are one config's implementation, so tests that fail on a sample restyle test
    the sample.
 2. **The six engine contracts are already fixtures.** The non-pure-Lua contract is `on_click`'s
@@ -2725,7 +2725,7 @@ because replacing them seemed to require a Lua runner.
    mapping. The six tests called handlers directly from Rust and only tested each component's
    `if button == "left"`.
 3. **Delete, do not move.** These components need `panel`, `text`, `state` and node builders from
-   the engine VM, so a Lua spec runner would require a new engine subcommand beside `oblisk check`
+   the engine VM, so a Lua spec runner would require a new engine subcommand beside `obelisk check`
    for a sample-only consumer. `just check` already parses every Lua file and type-checks
    `dev-config` against `lua-meta`; runtime behaviour belongs to running the sample shell.
 4. **Keep `require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out`.** It
@@ -2742,7 +2742,7 @@ keystrokes but could not authenticate under `ext-session-lock-v1`, a lockout rat
 unlock; recovery used ADR-0060's takeover marker.
 
 The Renderer evaluates `shell.lua` before `ReadySignal` (`wayland/mod.rs` § 14.2: evaluate, bind,
-clear, signal). ADR-0070 decision 1 makes reading `oblisk.<capability>` queue a `StartCapability`,
+clear, signal). ADR-0070 decision 1 makes reading `obelisk.<capability>` queue a `StartCapability`,
 so Candidate starts precede the signal awaited by the swap. `SocketCandidateLink::recv_matching`
 logged and threw away everything that was not the frame it wanted, on every swap, not only a rushed
 one. Idempotent `Capabilities::start` hid it because the prior generation usually had the same
@@ -2887,7 +2887,7 @@ The method lesson is to instrument the layer that distinguishes "not being told"
 dropped": the Wayland event handler, first and last layer reached. Three diagnoses were previously
 treated as settled from correlation after changes whose symptoms moved independently.
 
-## 0160. `oblisk.idle` reports that the compositor is withholding idle notifications, because nothing else can see a surface inhibitor
+## 0160. `obelisk.idle` reports that the compositor is withholding idle notifications, because nothing else can see a surface inhibitor
 
 ADR-0141 put foreign logind inhibitors in `IdleState`, but `zwp_idle_inhibitor_v1` is surface-scoped.
 A browser can hold it during a video call, and the compositor then withholds `idled` from every
@@ -2947,17 +2947,17 @@ start authentication" and cannot unlock the session. This occurred twice on 2026
 with the session locked and the user on a TTY:
 
 ```
-/proc/3342256/exe -> /mnt/Work/0Coding/1Rust/oblisk-shell/target/debug/oblisk (deleted)
+/proc/3342256/exe -> /mnt/Work/0Coding/1Rust/obelisk-shell/target/debug/obelisk (deleted)
 ```
 
-A `cargo build` triggers it here. `pacman -Syu` does the same to an installed `oblisk` during a
+A `cargo build` triggers it here. `pacman -Syu` does the same to an installed `obelisk` during a
 locked session, which is the ordinary upgrade path rather than an exotic deployment.
 
 1. **Execute the link, do not read it.** `SELF_EXE` is the literal `/proc/self/exe`. The kernel
    follows it to the inode already pinned by this process, including after unlinking, so the worker
    starts from the same code as the running Supervisor. One line.
 2. **`renderer_binary_path` is not affected and is unchanged.** `with_file_name` replaces the whole " (deleted)"
-   filename with `oblisk-renderer` and produces a real sibling path.
+   filename with `obelisk-renderer` and produces a real sibling path.
 3. **Rejected: an `O_PATH` fd pinned at startup, exec'd with `execveat`.** It works and is needed
    only if procfs becomes unreachable; for an ordinary upgrade it adds machinery at the exec
    boundary
@@ -2985,7 +2985,7 @@ no exec strategy survives that.
 
 ## 0162. The network panel's missing facts are capability gaps, not config workarounds
 
-`NetworkPanel.qml` draws six facts that `oblisk.network` cannot answer. Config fakes two and drops
+`NetworkPanel.qml` draws six facts that `obelisk.network` cannot answer. Config fakes two and drops
 four. This list lets us remove the fakes when the capability grows instead of hardening them into
 config idiom. `NetworkState` carries `available_networks`, `connect_error`, `connected`, `connecting_ssid`,
 `ethernet_enabled`, `networking_enabled`, `password_ssid`, `scanning`, `ssid`, `strength` and
@@ -3023,7 +3023,7 @@ separately visible, so the fields can land one at a time.
 
 ## 0163. `PolkitState` cannot describe polkitd's prompt, so the dialog hardcodes it
 
-`PolkitDialog.qml` draws three properties of the authentication request that `oblisk.polkit` cannot
+`PolkitDialog.qml` draws three properties of the authentication request that `obelisk.polkit` cannot
 answer. `PolkitState` carries `action_id`, `active`, `authenticating`, `error`, `icon_name` and
 `message`; `invoke` accepts `cancel`, and authenticating is a `secure_submit` target.
 
@@ -3047,7 +3047,7 @@ polkitd sends both, and collapsing them loses the field's label.
 ## 0164. `PlayerState` describes the track but not what the player will accept
 
 `MediaPanel.qml` greys each transport control from a capability flag and offers a stop button.
-`oblisk.mpris` answers neither, so `modules/bar/panels/media_panel.lua` draws every control live and
+`obelisk.mpris` answers neither, so `modules/bar/panels/media_panel.lua` draws every control live and
 omits stop. Record these capabilities rather than faking them from `play_state`; they are facts only
 the player knows.
 
@@ -3067,7 +3067,7 @@ the player knows.
 4. **A monotonic clock, or a pushed position while playing.** `position` is valid only at
    `position_updated_at`, which is `CLOCK_MONOTONIC`, but no Lua global reads that clock. The panel
    anchors each push with `os.time()` in an `on_change` handler and adds elapsed seconds; a clock
-   adjustment skews the bar until the next push. A monotonic reading beside `oblisk.system.time`, or
+   adjustment skews the bar until the next push. A monotonic reading beside `obelisk.system.time`, or
    a cadence while `Playing`, removes the workaround. The clock is smaller and can time other
    durations.
 
@@ -3138,14 +3138,14 @@ recheck fires on a transition, not a cadence.
 therefore changed the value maps would return without changing a declared dependency, so the panel
 kept drawing the previous player until unrelated data moved.
 
-One `computed({ oblisk.mpris, chosen }, ...)` now resolves the player, and every reader uses that
+One `computed({ obelisk.mpris, chosen }, ...)` now resolves the player, and every reader uses that
 signal. `false` is the no-player value because a `computed` yielding `nil` has no value to hold.
 
 The rule generalises: `:get()` inside a `:map` or `computed` callback reads an undeclared graph input
 and is correct only for a value that cannot change while the map lives. `on_click`, `on_commit` and
 `on_change` callbacks may read freely because they are not re-evaluated.
 
-`just types`, `luac -p` and `oblisk check` cannot detect this. The code is valid and the scene
+`just types`, `luac -p` and `obelisk check` cannot detect this. The code is valid and the scene
 resolves; only a control that does nothing exposes it.
 
 ## 0168. Chromium's tray object lives on one of its several connections
@@ -3388,8 +3388,8 @@ is enough to escape our `killpg`, where Quickshell needed nothing, but the Super
 on config edits. It
 already holds a `Child` for every `process.run`; no orphan liveness probe is needed.
 
-1. **`oblisk.processes` is a roster capability, declared as `session_process { name, stop_signal }`.**
-   It matches the `oblisk.storage`/`persistent_table` shape: config names the thing, the Supervisor
+1. **`obelisk.processes` is a roster capability, declared as `session_process { name, stop_signal }`.**
+   It matches the `obelisk.storage`/`persistent_table` shape: config names the thing, the Supervisor
    owns it, and state returns by name. Unlike `storage`, which keeps a file config could read, this
    keeps a handle config cannot hold.
 
@@ -3484,9 +3484,9 @@ Pause arithmetic is `state`: it survives an in-place reload and resets on a gene
 which paused seconds count as recorded. The mirror has the same hole across a Quickshell restart; a
 debounced disk write per pause is not worth closing it.
 
-`IPC.qml`'s `rec toggle` has no equivalent. `oblisk set` writes a value and a reader re-renders,
+`IPC.qml`'s `rec toggle` has no equivalent. `obelisk set` writes a value and a reader re-renders,
 but starting a recording is a call. The only config hook that runs code is a capability's `on_change`;
-on `oblisk.system` a keybind answers up to a second late. This remains a roadmap item.
+on `obelisk.system` a keybind answers up to a second late. This remains a roadmap item.
 
 A live capture paused at `1:47` for seven seconds, resumed, then read `1:51` four seconds later.
 The stopped file was 9.3 MB and `ffprobe` reported `duration=112.905512`; `SIGINT` closed the
@@ -3795,11 +3795,11 @@ ships `ShaderEffect`, and the shaders are user code. ADR-0055 already rejected a
 capability and wallpaper-specific Rust code, so a `Wipe` arm repeats that mistake.
 
 1. `transition = { duration, easing, shader, params }`. `shader` is an absolute path named through
-   `oblisk.config_dir`, as the default wallpaper is. Omit it for cross-dissolve. The engine ships no
+   `obelisk.config_dir`, as the default wallpaper is. Omit it for cross-dissolve. The engine ships no
    effects; `dev-config` ships five samples.
 2. The engine owns the vertex stage, prelude, and epilogue. The prelude declares the contract and
    sampling helpers, then `#line 1` makes compile errors point into the config. It `#define`s the
-   config's `main` to `oblisk_effect`; the engine's `main` calls it and multiplies the result by the
+   config's `main` to `obelisk_effect`; the engine's `main` calls it and multiplies the result by the
    node's `opacity`. A config shader cannot be trusted to preserve the node's inherited `opacity`.
    Documenting that rule and trusting the config would be a promise without a mechanism.
 3. The CPU fits each endpoint and hands over a rect, not a normalised plane. The shader does not
@@ -3996,7 +3996,7 @@ The running config showed the ordering bug; the config itself was correct.
 `LockScreen.qml` animates in and out. Its exit is two 147ms stages, ending with
 `LockService.finalizeUnlock()`; QML holds and releases the lock.
 
-That shape cannot be copied. ADR-0042 deliberately gives `oblisk.lock` no `unlock` action: a Lua
+That shape cannot be copied. ADR-0042 deliberately gives `obelisk.lock` no `unlock` action: a Lua
 callback or `finalize_unlock` would create a one-click path past PAM. It would also let a config
 exception or unfinished animation leave the lock up after the correct password.
 
@@ -4121,7 +4121,7 @@ open that this user-writable directory can change between them. The slot size is
 `decode_within_limits` as the decoder's edge limit, using the same mechanism as `MAX_DECODE_EDGE`.
 The header check remains as the cheaper early refusal; the decoder limit makes `Charge::Free` safe.
 
-The writer also trusted `.oblisk-{pid}-{mtime_secs}.png.tmp` to be unique. The four workers share a
+The writer also trusted `.obelisk-{pid}-{mtime_secs}.png.tmp` to be unique. The four workers share a
 process, so two sources with the same mtime second chose it. The loser failed `create_new`, then its
 cleanup unlinked the winner's file, making both renames fail and forcing full-size re-decodes. A
 process-wide counter now names temps, and creation is outside the cleanup closure, so cleanup cannot
@@ -4149,7 +4149,7 @@ upscale it. Square-ish sources take the shortcut; wide ones keep full-source sca
 
 `ext-background-effect-v1` has three requests -- `get_background_effect(wl_surface)`,
 `set_blur_region(wl_region)`, `destroy` -- and niri implements it. The no-client alternative is a
-niri `layer-rule` matching our `oblisk-{id}` namespace.
+niri `layer-rule` matching our `obelisk-{id}` namespace.
 
 The rule was measured and rejected. With a full-screen click-catcher and one 620x260 card over a
 striped backdrop, luma spread far from the card went from 224 off to 5 on. It blurs the surface
@@ -4221,3 +4221,26 @@ Verified on the wire against niri: `capabilities(1)`, one `get_background_effect
 `set_blur_region`, and 27 `wl_region.add` calls, with the middle band first
 (`add(200, 280, 620, 220)`) and corner strips inset symmetrically. The lifetime fault was pinned by
 27 tooltip cycles with no protocol error; 14 had killed the previous build.
+
+## 0196. The name is Obelisk, in the record as well as the code
+
+"Oblisk" was a misspelling of the object this is named after, carried from the first commit through
+1,303 occurrences in 200 files. All of them moved together: the Lua namespace is `obelisk.*`, the
+binaries are `obelisk` and `obelisk-renderer`, config is `~/.config/obelisk`, the socket is
+`$XDG_RUNTIME_DIR/obelisk-shell.sock`, the bus name `org.obelisk.Supervisor`, the environment prefix
+`OBELISK_`, and the shader entry points `obelisk_effect`, `obelisk_opacity`, `obelisk_from` and
+`obelisk_to`. A three-case replacement was enough and could not overreach, because "oblisk" is not a
+substring of any other word: every occurrence in the tree was this project's own name.
+
+Now, because the Lua namespace and the shader uniforms are config-facing contracts with nobody yet on
+the other side: nothing is pushed to origin, no machine has an installed copy, and 0.1.0 does not
+move, since versioning starts at the first push.
+
+The 195 earlier entries were swept too, against this file's rule that an entry is dated evidence and
+is not edited to match what shipped later. That rule protects the substance of a decision, and no
+entry here decided how to spell the project; leaving them citing a name that no longer exists would
+preserve a typo and cost each reader a moment deciding whether "Oblisk" was something else.
+
+Rejected: keeping "Oblisk" as a stylized name. Nothing chose it.
+
+Rejected: an `oblisk` alias in the Lua namespace, to spare configs that do not exist.

@@ -259,7 +259,7 @@ mod tests {
         assert!(!extracted.mute);
     }
 
-    /// Regression test: `wpctl get-volume` said 0.45, but the next `oblisk.audio` push reported
+    /// Regression test: `wpctl get-volume` said 0.45, but the next `obelisk.audio` push reported
     /// `0.0` with no real change in between. Root cause, found with a live probe: a sink's Props
     /// param isn't one object, it's two, delivered back to back -- `index=0` (modeled by
     /// [`sample_props_object`]) carries `volume`/`mute`/`channelVolumes`; `index=1` carries

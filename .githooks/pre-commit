@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stops a commit that would carry stale generated stubs, or that does not pass `just check`.
 #
-# `lua-meta/oblisk.lua` is generated from the Supervisor's payload types and `lua-meta/nodes.lua` is
+# `lua-meta/obelisk.lua` is generated from the Supervisor's payload types and `lua-meta/nodes.lua` is
 # hand-written against the Renderer's node schema. Both have golden-file tests, and both only fire
 # if someone runs them -- which at the end of a long session is exactly what gets skipped. The
 # language server reads these files straight from the working tree, so a stale one is wrong with
@@ -46,7 +46,7 @@ if ! git diff --cached --name-only | grep -qvE '^(dev-config|docs)/|\.md$'; then
         echo "pre-commit: the Lua checks failed. Fix it, or commit with --no-verify and own that." >&2
         exit 1
     fi
-    # The component tests `require` the shipped `components/` and load `dev-config/oblisk/shell.lua`
+    # The component tests `require` the shipped `components/` and load `dev-config/obelisk/shell.lua`
     # (`renderer/src/lua/mod.rs`). Nothing to recompile, so this is the Lua being run, not Rust
     # being built.
     if ! cargo test --quiet -p renderer lua::tests; then
@@ -56,20 +56,20 @@ if ! git diff --cached --name-only | grep -qvE '^(dev-config|docs)/|\.md$'; then
     exit 0
 fi
 
-before="$(git hash-object lua-meta/oblisk.lua)"
+before="$(git hash-object lua-meta/obelisk.lua)"
 if ! UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null 2>&1; then
     # Almost always a build error rather than the generator: this is the first thing to compile the
     # crate after an edit. Do not guess which, just say where to look.
     echo "pre-commit: the supervisor stub check did not run. Try: just stubs" >&2
     exit 1
 fi
-after="$(git hash-object lua-meta/oblisk.lua)"
+after="$(git hash-object lua-meta/obelisk.lua)"
 
 if [ "$before" != "$after" ]; then
     cat >&2 <<'MSG'
-pre-commit: lua-meta/oblisk.lua was stale and has been regenerated.
+pre-commit: lua-meta/obelisk.lua was stale and has been regenerated.
 
-  Review it, then:  git add lua-meta/oblisk.lua
+  Review it, then:  git add lua-meta/obelisk.lua
 
 MSG
     exit 1

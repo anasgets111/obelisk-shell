@@ -1,4 +1,4 @@
-//! Package manager abstraction for `oblisk.updates` (ADR-0134).
+//! Package manager abstraction for `obelisk.updates` (ADR-0134).
 //!
 //! Separates `controller.rs` scheduling/state from package-manager execution, parsing, and reboot
 //! requirements.
@@ -28,7 +28,7 @@ pub struct InstallStep {
     pub package: String,
 }
 
-/// Privileged upgrade command. Backends use `pkexec`, routing the prompt to Oblisk's polkit agent
+/// Privileged upgrade command. Backends use `pkexec`, routing the prompt to Obelisk's polkit agent
 /// (`dbus::polkit`) instead of a terminal.
 pub struct InstallCommand {
     pub program: String,

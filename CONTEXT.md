@@ -1,4 +1,4 @@
-# Oblisk shell
+# Obelisk shell
 
 Current project vocabulary. Implementation contracts live in [docs](docs/lua-api.md); rationale and history live in [decisions](docs/decisions.md).
 
@@ -106,7 +106,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Capability roster**: The complete set of Supervisor capability names with snapshot state exposed to config, including idle. _Avoid_: pre-seed list, known capabilities, `CAPABILITIES`
 
-**IDL**: The typed contract the engine exposes to Lua: capability payload fields, action names and node properties. It is generated into the editor stubs from the Rust types rather than written a second time in Markdown, and `oblisk.version.minor` tracks it. _Avoid_: schema, API surface, wire format
+**IDL**: The typed contract the engine exposes to Lua: capability payload fields, action names and node properties. It is generated into the editor stubs from the Rust types rather than written a second time in Markdown, and `obelisk.version.minor` tracks it. _Avoid_: schema, API surface, wire format
 
 **Capability registry**: The Supervisor's collection of capability controllers and their state/event channels. _Avoid_: capability manager, service registry, plugin table
 
@@ -114,7 +114,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Capability start**: The first request that starts a capability's backend. Started backends remain for the Supervisor's lifetime. _Avoid_: activation, subscription, enabling a capability
 
-**Oblisk namespace**: The Lua table exposing capabilities, output state, rescue state, version and config location. _Avoid_: globals, the state tree
+**Obelisk namespace**: The Lua table exposing capabilities, output state, rescue state, version and config location. _Avoid_: globals, the state tree
 
 **Secure submit**: A field's direct delivery of its native secret buffer to a named capability action without exposing the secret to Lua. _Avoid_: secure handle, password callback
 

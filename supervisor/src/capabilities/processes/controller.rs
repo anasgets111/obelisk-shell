@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 /// declared stop signal exists to avoid.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// `oblisk.processes`'s payload.
+/// `obelisk.processes`'s payload.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ProcessesState {
     /// One entry per name a config declared with `session_process`, keyed by that name. A name
@@ -60,7 +60,7 @@ pub struct SessionProcess {
     /// after an exit so a log line can still name what died.
     pub pid: Option<u32>,
     /// Unix seconds when the current or last run began; `nil` until the first `start`. Elapsed
-    /// time is this subtracted from `oblisk.system`'s clock, so nothing here needs a second timer.
+    /// time is this subtracted from `obelisk.system`'s clock, so nothing here needs a second timer.
     pub started_at: Option<u64>,
     /// How the last finished run ended: its exit status, `nil` while running, before the first
     /// run, or when a signal ended it rather than an exit. Cleared by the next `start`.
@@ -307,7 +307,7 @@ fn kill_best_effort(pid: Pid, signal: Signal) -> io::Result<()> {
     }
 }
 
-/// Wall clock, matching `oblisk.system`'s so a config can subtract the two.
+/// Wall clock, matching `obelisk.system`'s so a config can subtract the two.
 fn unix_seconds() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or_default()
 }
@@ -445,12 +445,12 @@ mod tests {
     async fn a_command_that_is_not_there_says_why_instead_of_looking_like_a_slow_start() {
         let (controller, _rx) = controller();
         controller.declare("t", Signal::SIGTERM);
-        controller.start("t", "oblisk-no-such-binary", &[]);
+        controller.start("t", "obelisk-no-such-binary", &[]);
 
         let state = session(&controller, "t");
         assert!(!state.running);
         assert!(
-            state.start_error.contains("oblisk-no-such-binary"),
+            state.start_error.contains("obelisk-no-such-binary"),
             "the reason has to name the command; a config watching `running` would otherwise wait forever: {state:?}"
         );
     }
@@ -459,7 +459,7 @@ mod tests {
     async fn a_start_clears_what_the_last_run_left_behind() {
         let (controller, _rx) = controller();
         controller.declare("t", Signal::SIGTERM);
-        controller.start("t", "oblisk-no-such-binary", &[]);
+        controller.start("t", "obelisk-no-such-binary", &[]);
         assert!(!session(&controller, "t").start_error.is_empty());
 
         let (cmd, args) = shell("exit 0");

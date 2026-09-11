@@ -1,4 +1,4 @@
-//! `oblisk.lock`: session-lock commands and the lock-screen state (ADR-0042, ADR-0052 decisions 1
+//! `obelisk.lock`: session-lock commands and the lock-screen state (ADR-0042, ADR-0052 decisions 1
 //! and 4).
 //!
 //! The Renderer holds `ext_session_lock_v1` and paints it. This owns acquisition, outcome state,
@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub mod logind;
 
-/// `oblisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
+/// `obelisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
 /// acquisition. Lua cannot rebuild it from layout-time state (ADR-0044), so identical failures
 /// leave one `error` string; empty `error` means no failure, like `keyboard.active_layout`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
@@ -115,7 +115,7 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
             state.authenticating = false;
             state.error = reason;
         }
-        // `Finished` after `Locked` is teardown, not failure; Renderer sets `oblisk.rescue` after
+        // `Finished` after `Locked` is teardown, not failure; Renderer sets `obelisk.rescue` after
         // lock surfaces are gone (ADR-0052 decision 4). Keep `attempts`.
         LockEvent::Reported(shared::LockOutcome::Finished | shared::LockOutcome::Unlocked) => {
             state.active = false;
@@ -242,7 +242,7 @@ pub fn accepts_outcome(state: &LockState, acquisition: u64) -> bool {
     state.active && state.acquisition == acquisition
 }
 
-/// The lock screen's failed-authentication line, not `oblisk.rescue`, which ordinary config
+/// The lock screen's failed-authentication line, not `obelisk.rescue`, which ordinary config
 /// surfaces draw behind the lock (ADR-0052 decision 4). `Success` has no message. Polkit uses the
 /// same words.
 pub(crate) fn error_for_outcome(outcome: &shared::PamOutcome) -> String {
@@ -413,7 +413,7 @@ impl LockController {
     }
 }
 
-/// Every action `oblisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
+/// Every action `obelisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
 /// callback would make it a one-click path past PAM, forbidden by ADR-0042. Unknown `"unlock"` is
 /// logged and dropped.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -434,7 +434,7 @@ pub enum LockAction {
 /// anything that reads as an animation rather than a fault.
 pub const MAX_UNLOCK_ANIMATION: Duration = Duration::from_millis(600);
 
-/// `oblisk.lock` action dispatch (ADR-0037). `lock` takes no arguments, so it has no `parse_*_args`
+/// `obelisk.lock` action dispatch (ADR-0037). `lock` takes no arguments, so it has no `parse_*_args`
 /// sibling.
 pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
@@ -470,7 +470,7 @@ mod tests {
         // locked. The marker is driven off LockOutcome, not active, so RendererLost (not a
         // Reported) cannot reach it.
         let dir = tempfile::tempdir().unwrap();
-        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        let flag = SessionLockedFlag::at(dir.path().join("obelisk-session-locked"));
         flag.apply(compositor_lock_change(&shared::LockOutcome::Locked));
 
         let mut state = LockState::default();
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn the_marker_survives_the_process_that_wrote_it_and_reads_false_when_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oblisk-session-locked");
+        let path = dir.path().join("obelisk-session-locked");
         assert!(!SessionLockedFlag::at(path.clone()).is_set(), "a fresh login has no marker");
 
         SessionLockedFlag::at(path.clone()).apply(SessionLock::Taken);
@@ -500,7 +500,7 @@ mod tests {
         // Both directions repeat in ordinary use. Removing a file that isn't there must not be
         // treated as a failure to clear.
         let dir = tempfile::tempdir().unwrap();
-        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        let flag = SessionLockedFlag::at(dir.path().join("obelisk-session-locked"));
         flag.apply(SessionLock::Released);
         assert!(!flag.is_set());
         flag.apply(SessionLock::Taken);
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn an_unchanged_verdict_touches_nothing_in_either_direction() {
         let dir = tempfile::tempdir().unwrap();
-        let flag = SessionLockedFlag::at(dir.path().join("oblisk-session-locked"));
+        let flag = SessionLockedFlag::at(dir.path().join("obelisk-session-locked"));
         flag.apply(SessionLock::Unchanged);
         assert!(!flag.is_set());
         flag.apply(SessionLock::Taken);

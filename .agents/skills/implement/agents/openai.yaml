@@ -1,5 +1,5 @@
 interface:
   display_name: "Implement"
-  short_description: "Implement an Oblisk slice from the plan"
+  short_description: "Implement an Obelisk slice from the plan"
 policy:
   allow_implicit_invocation: false

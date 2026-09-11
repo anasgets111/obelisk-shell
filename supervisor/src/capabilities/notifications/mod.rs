@@ -1,4 +1,4 @@
-//! Notifications capability (`oblisk.notifications`, `docs/services.md` §1;
+//! Notifications capability (`obelisk.notifications`, `docs/services.md` §1;
 //! `docs/lua-api.md` §2.7/§3.2, ADR-0033).
 //! Hosts `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view,
 //! global DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a
@@ -31,7 +31,7 @@ pub use controller::{
 };
 pub use sound::run_sound_player;
 
-/// Actions accepted by `oblisk.notifications:invoke(...)`; exhaustive dispatch keeps variants and
+/// Actions accepted by `obelisk.notifications:invoke(...)`; exhaustive dispatch keeps variants and
 /// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -239,7 +239,7 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
 pub struct Notification {
     /// Server id, starting at `1`; used by dismiss/reply/action and reused by replacement.
     pub id: u32,
-    /// Arrival time in Unix epoch seconds, matching `oblisk.system.time` (§2.11); age is
+    /// Arrival time in Unix epoch seconds, matching `obelisk.system.time` (§2.11); age is
     /// `system.time - timestamp`. Replacements get fresh timestamps; carried because configs
     /// cannot recover history inside ADR-0021 side-effect-free `computed`s.
     pub timestamp: i64,
@@ -270,7 +270,7 @@ pub struct Notification {
     /// so history never sees them (ADR-0100).
     pub transient: bool,
     /// `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by
-    /// `oblisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`.
+    /// `obelisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`.
     /// `nil` when absent; slashed values are dropped (ADR-0101).
     pub desktop_entry: Option<String>,
     /// Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.

@@ -11,9 +11,9 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-/// `OBLISK_MEMORY_SAMPLE_SECS`: seconds between samples; unset/`0` disables the timer. Named here
+/// `OBELISK_MEMORY_SAMPLE_SECS`: seconds between samples; unset/`0` disables the timer. Named here
 /// so `main.rs` and this module share the string.
-pub(crate) const SAMPLE_SECS_ENV: &str = "OBLISK_MEMORY_SAMPLE_SECS";
+pub(crate) const SAMPLE_SECS_ENV: &str = "OBELISK_MEMORY_SAMPLE_SECS";
 
 /// Passed in at the one production call site, [`log_sample`], instead of being reached for inside
 /// the readers, so a test can point them at a tempdir of fake files. Every sysfs and procfs reader
@@ -193,7 +193,7 @@ pub(crate) fn report_line(label: &str, sample: &Sample) -> String {
     let total_pss: u64 =
         sample.supervisor.rollup.pss + sample.renderers.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
     let mut line = format!(
-        "[oblisk-memory] {label}: total pss {:.1} MiB; supervisor pss {:.1} MiB",
+        "[obelisk-memory] {label}: total pss {:.1} MiB; supervisor pss {:.1} MiB",
         mib(total_pss),
         mib(sample.supervisor.rollup.pss)
     );
@@ -248,7 +248,7 @@ pub(crate) fn sample(proc_root: &Path, renderer_pids: &[(u32, u32)]) -> io::Resu
         match read_process_memory(proc_root, &pid.to_string()) {
             Ok(memory) => renderers.push((generation_id, memory)),
             Err(err) => eprintln!(
-                "[oblisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"
+                "[obelisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"
             ),
         }
     }
@@ -274,7 +274,7 @@ pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)
         renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
     match sample(Path::new(PROC_ROOT), &pids) {
         Ok(sample) => eprintln!("{}", report_line(label, &sample)),
-        Err(err) => eprintln!("[oblisk-memory] {label} sample failed: {err}"),
+        Err(err) => eprintln!("[obelisk-memory] {label} sample failed: {err}"),
     }
 }
 
@@ -594,7 +594,7 @@ drm-engine-video-enhance:\t0 ns\n";
 
         assert_eq!(
             report_line("periodic", &sample),
-            "[oblisk-memory] periodic: total pss 68.0 MiB; supervisor pss 8.0 MiB; \
+            "[obelisk-memory] periodic: total pss 68.0 MiB; supervisor pss 8.0 MiB; \
              generation 0 pss 50.0 MiB uss 40.0 MiB gpu 20.0 MiB (3.0 MiB shared, 1 drm client(s)); \
              generation 1 pss 10.0 MiB uss 5.0 MiB gpu 1.0 MiB (0.5 MiB shared, 1 drm client(s))"
         );
@@ -616,6 +616,6 @@ drm-engine-video-enhance:\t0 ns\n";
                 },
             )],
         };
-        assert!(report_line("check", &sample).starts_with("[oblisk-memory] check: total pss 2.0 MiB;"));
+        assert!(report_line("check", &sample).starts_with("[obelisk-memory] check: total pss 2.0 MiB;"));
     }
 }

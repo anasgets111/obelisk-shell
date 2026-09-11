@@ -1,4 +1,4 @@
-//! `oblisk.processes` owns the programs declared with `session_process`: long-running things whose
+//! `obelisk.processes` owns the programs declared with `session_process`: long-running things whose
 //! lifetime is the shell's rather than a generation's.
 //!
 //! Sibling of `storage` in shape -- a config declares a name, the Supervisor owns what sits behind
@@ -12,7 +12,7 @@ pub use controller::{ProcessesController, ProcessesSignal};
 
 use nix::sys::signal::Signal;
 
-/// Every action `oblisk.processes:invoke(...)` accepts; `dispatch` matches variants exhaustively.
+/// Every action `obelisk.processes:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessesAction {
@@ -86,7 +86,7 @@ pub fn parse_signal_args(arguments: &[serde_json::Value]) -> Option<(String, Sig
     Some((name, signal))
 }
 
-/// `oblisk.processes` action dispatch (ADR-0037). Synchronous: each action touches the entry map
+/// `obelisk.processes` action dispatch (ADR-0037). Synchronous: each action touches the entry map
 /// and hands the work to the per-program task, which is where every await lives.
 pub fn dispatch(controller: &ProcessesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

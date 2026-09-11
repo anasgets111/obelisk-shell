@@ -1,6 +1,6 @@
 //! `pacman` half of `updates:install()` (ADR-0034): progress syntax and reboot heuristic. The
 //! command is `pkexec pacman -Syu --noconfirm`, run by `controller.rs` through
-//! `process::spawn_group_leader_piped`; `pkexec` talks to polkit and triggers the Oblisk polkit
+//! `process::spawn_group_leader_piped`; `pkexec` talks to polkit and triggers the Obelisk polkit
 //! agent's interactive prompt rather than a manual `CheckAuthorization` call. It modifies the real
 //! `/etc/pacman.conf`/`/var/lib/pacman` as root, unlike `check.rs`.
 //!

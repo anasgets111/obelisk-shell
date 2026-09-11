@@ -5,7 +5,7 @@ behavior and reload lifetimes; [roadmap](roadmap.md) owns gaps and proposed work
 [CONTEXT](../CONTEXT.md) owns terminology; [decisions](decisions.md) owns history.
 
 Exact capability fields and action names come from Rust types through
-[generated editor stubs](../supervisor/src/stubs.rs), installed by `oblisk init`.
+[generated editor stubs](../supervisor/src/stubs.rs), installed by `obelisk init`.
 Keep schema inventories there rather than maintaining a second copy in Markdown.
 
 ## 1. Values and signals
@@ -38,12 +38,12 @@ See [VM setup](../renderer/src/lua/mod.rs), [JSON conversion](../renderer/src/lu
 | `geometry(name)` | The laid-out `{ x, y, width, height }` of the node declaring `geometry = geometry(name)`, written by each layout; a pass that changes it earns one follow-up pass, a tween tick none |
 | `delay(signal, ms)` | `signal` once it has held a new value for `ms`; a change that reverts sooner is dropped. Close-hold and trailing debounce in one shape |
 | `pulse(signal, ms)` | `true` for `ms` after `signal` changes value, `false` otherwise; a change inside an open window restarts it. What fires a one-shot animation, since nothing here can call `restart()` |
-| `oblisk.<capability>:on_change(fn)` | Runs `fn(current, previous)` per pushed snapshot; may invoke actions or write state |
+| `obelisk.<capability>:on_change(fn)` | Runs `fn(current, previous)` per pushed snapshot; may invoke actions or write state |
 
 Pass the signal itself to a node property to keep it live:
 
 ```lua
-text { content = oblisk.keyboard.active_layout }
+text { content = obelisk.keyboard.active_layout }
 ```
 
 A capability reads nil until hydrated; maps must handle it. A property resolving to nil uses its
@@ -56,7 +56,7 @@ Capability change handlers are cleared and registered again on evaluation.
 
 ## 2. Capability state
 
-Read state through `oblisk.<name>`; reading requests backend startup. Started backends remain
+Read state through `obelisk.<name>`; reading requests backend startup. Started backends remain
 for the Supervisor's lifetime. These links lead to the actual serialized state definitions.
 
 | Capability | State definition |
@@ -84,9 +84,9 @@ for the Supervisor's lifetime. These links lead to the actual serialized state d
 | `polkit` | [Authentication challenge](../supervisor/src/capabilities/polkit.rs) |
 | `updates` | [Checks, packages and install progress](../supervisor/src/capabilities/updates/controller.rs) |
 
-Renderer-owned members are separate: `oblisk.rescue` carries `is_rescue` and `error_log` for reload
-failures; `oblisk.screens` carries output information. `oblisk.version` is a plain `{ major, minor, patch }`
-table; `oblisk.config_dir` is the loaded config directory path. See [namespace](../renderer/src/lua/namespace.rs)
+Renderer-owned members are separate: `obelisk.rescue` carries `is_rescue` and `error_log` for reload
+failures; `obelisk.screens` carries output information. `obelisk.version` is a plain `{ major, minor, patch }`
+table; `obelisk.config_dir` is the loaded config directory path. See [namespace](../renderer/src/lua/namespace.rs)
 and [output state](../renderer/src/wayland/output.rs).
 
 ## 3. Actions and I/O
@@ -94,8 +94,8 @@ and [output state](../renderer/src/wayland/output.rs).
 ### 3.1 Calling a capability
 
 ```lua
-oblisk.audio:invoke("set_volume", 0.5)
-oblisk.applications:invoke("launch", app_id)
+obelisk.audio:invoke("set_volume", 0.5)
+obelisk.applications:invoke("launch", app_id)
 ```
 
 Arguments follow the action name. There is no `capability:action(...)` sugar and no synchronous
@@ -138,8 +138,8 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 
 | API | Contract |
 | :--- | :--- |
-| `oblisk.idle:register_threshold(seconds, on_idle, on_resume)` | Register inactivity callbacks; reset on re-evaluation |
-| `oblisk.idle:inhibit(reason)` / `release_inhibit()` | Acquire/release one generation-owned hold on logind idle inhibition |
+| `obelisk.idle:register_threshold(seconds, on_idle, on_resume)` | Register inactivity callbacks; reset on re-evaluation |
+| `obelisk.idle:inhibit(reason)` / `release_inhibit()` | Acquire/release one generation-owned hold on logind idle inhibition |
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
@@ -364,11 +364,11 @@ See [wire format and dispatch limits](services.md#13-control-socket-and-wire-for
 
 | Command | Behavior |
 | :--- | :--- |
-| `oblisk init -c <dir>` | Config/editor setup; generates capability field and action stubs |
-| `oblisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
-| `oblisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
-| `oblisk toggle <name>` | Toggles declared boolean state |
-| `oblisk toggle <name> <value>` | Sets declared state to the value, or back to its declared initial when it already holds it; one keybind for a modal whose state names the one showing |
+| `obelisk init -c <dir>` | Config/editor setup; generates capability field and action stubs |
+| `obelisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
+| `obelisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
+| `obelisk toggle <name>` | Toggles declared boolean state |
+| `obelisk toggle <name> <value>` | Sets declared state to the value, or back to its declared initial when it already holds it; one keybind for a modal whose state names the one showing |
 
 `check` does not validate live service behavior or rendered layout.
 See [CLI](../supervisor/src/cli.rs) and [check implementation](../renderer/src/check.rs).

@@ -1,4 +1,4 @@
-//! NetworkManager D-Bus controller (`oblisk.network`; docs/services.md §4;
+//! NetworkManager D-Bus controller (`obelisk.network`; docs/services.md §4;
 //! ADR-0029). It holds `rusty_network_manager` proxies (ADR-0013) and merges their signal streams
 //! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
 //! thread like `audio::mixer`.
@@ -52,7 +52,7 @@ pub struct AccessPointInfo {
     pub active: bool,
 }
 
-/// `oblisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
+/// `obelisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
 /// NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ///
 /// The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
@@ -241,7 +241,7 @@ struct SavedProfile {
     settings: HashMap<String, HashMap<String, OwnedValue>>,
 }
 
-/// Proxies needed by `oblisk.network`, resolved at construction. `Clone` is cheap for zbus handles,
+/// Proxies needed by `obelisk.network`, resolved at construction. `Clone` is cheap for zbus handles,
 /// so writes can move a clone into `tokio::spawn` (ADR-0029).
 #[derive(Clone)]
 pub struct NetworkController {
@@ -256,7 +256,7 @@ pub struct NetworkController {
     ///
     /// Pruned against the live path list on each rebuild; `AccessPointRemoved` already requests it.
     access_points: Arc<Mutex<HashMap<OwnedObjectPath, AccessPointProxy<'static>>>>,
-    /// `oblisk.network` push state (ADR-0037), mutated only by
+    /// `obelisk.network` push state (ADR-0037), mutated only by
     /// [`handle_signal`](Self::handle_signal).
     /// The cloned controller shares it; the mutex is never held across an await.
     state: Arc<Mutex<NetworkState>>,
@@ -820,7 +820,7 @@ impl NetworkController {
     }
 }
 
-/// Actions accepted by `oblisk.network:invoke(...)`; matching variants in `dispatch` keeps the
+/// Actions accepted by `obelisk.network:invoke(...)`; matching variants in `dispatch` keeps the
 /// action table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -834,7 +834,7 @@ pub enum NetworkAction {
     Forget,
 }
 
-/// `oblisk.network` dispatch (ADR-0037). Writes spawn rather than await inline (ADR-0029);
+/// `obelisk.network` dispatch (ADR-0037). Writes spawn rather than await inline (ADR-0029);
 /// `connect`
 /// stashes its intent until paired `secure_submit(network, connect)`.
 pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelope) {

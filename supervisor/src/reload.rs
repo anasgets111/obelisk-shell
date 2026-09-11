@@ -176,7 +176,7 @@ pub struct PbaTimings {
 /// Runs PBA steps 1-5 (D-Bus § 14):
 ///
 /// 1. **Overlapping Spawn**: [`process::spawn_group_leader`], passing `candidate_envs` unchanged
-///    (for example `OBLISK_GENERATION_ID`/`OBLISK_PBA_CANDIDATE`).
+///    (for example `OBELISK_GENERATION_ID`/`OBELISK_PBA_CANDIDATE`).
 /// 2. **State Hydration** through 5. **Evidence Verification**: [`drive_handshake`].
 ///
 /// Step 6 (**Swap & Reap**) is outside this function (see [`PbaOutcome`]). Failure in steps 1-5
@@ -680,7 +680,7 @@ mod tests {
     fn unique_pidfile() -> std::path::PathBuf {
         let unique =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock").as_nanos();
-        std::env::temp_dir().join(format!("oblisk-reload-test-{}-{unique}.pid", std::process::id()))
+        std::env::temp_dir().join(format!("obelisk-reload-test-{}-{unique}.pid", std::process::id()))
     }
 
     #[tokio::test]
@@ -865,7 +865,7 @@ mod tests {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("main_bar".to_string()));
 
         let failure = run_pba(
-            "/no/such/binary-oblisk-reload-test",
+            "/no/such/binary-obelisk-reload-test",
             &[],
             &[],
             &mut link,

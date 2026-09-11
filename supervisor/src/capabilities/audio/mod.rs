@@ -11,7 +11,7 @@ pub mod mixer;
 
 use mixer::{AudioCommand, AudioCommandSender};
 
-/// Actions accepted by `oblisk.audio:invoke(...)`; matching this enum keeps dispatch exhaustive.
+/// Actions accepted by `obelisk.audio:invoke(...)`; matching this enum keeps dispatch exhaustive.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioAction {

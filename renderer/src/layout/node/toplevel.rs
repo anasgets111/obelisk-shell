@@ -21,11 +21,11 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
     parse_string_property(properties, "title", Some(""))
 }
 
-/// § 6's `app_id`, used by compositor window rules, defaulting to `"oblisk-{id}"`. `set_app_id`
+/// § 6's `app_id`, used by compositor window rules, defaulting to `"obelisk-{id}"`. `set_app_id`
 /// remains valid after mapping (`xdg-shell.xml`), unlike layer-shell `namespace`; `id` is still
 /// structural because it is reconcile identity (ADR-0045 decision 1).
 pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
-    let default = format!("oblisk-{id}");
+    let default = format!("obelisk-{id}");
     // Deferred on the evaluation pass; `set_app_id` is a live request.
     if is_deferred_signal(properties, "app_id") {
         return Ok(default);
@@ -398,7 +398,7 @@ mod tests {
         let lua = lua();
         let table: mlua::Table = lua
             .load(
-                r#"return { kind = "window", id = "settings", title = "Oblisk Settings", app_id = "oblisk.settings",
+                r#"return { kind = "window", id = "settings", title = "Obelisk Settings", app_id = "obelisk.settings",
                                 min_size = { width = 320, height = 240 }, max_size = { width = 1280, height = 960 } }"#,
             )
             .eval()
@@ -408,8 +408,8 @@ mod tests {
             spec,
             WindowSpec {
                 id: "settings".to_string(),
-                title: "Oblisk Settings".to_string(),
-                app_id: "oblisk.settings".to_string(),
+                title: "Obelisk Settings".to_string(),
+                app_id: "obelisk.settings".to_string(),
                 min_size: Some(SizeHint { width: 320.0, height: 240.0 }),
                 max_size: Some(SizeHint { width: 1280.0, height: 960.0 }),
             }
@@ -434,10 +434,10 @@ mod tests {
     }
 
     #[test]
-    fn window_app_id_absent_defaults_to_oblisk_dash_id() {
+    fn window_app_id_absent_defaults_to_obelisk_dash_id() {
         let lua = lua();
         let table: mlua::Table = lua.load(r#"return { kind = "window", id = "settings" }"#).eval().unwrap();
-        assert_eq!(window_spec(&props_from_table(&table)).unwrap().app_id, "oblisk-settings");
+        assert_eq!(window_spec(&props_from_table(&table)).unwrap().app_id, "obelisk-settings");
     }
 
     #[test]
@@ -536,14 +536,14 @@ mod tests {
         let lua = lua();
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).unwrap();
         let signal = crate::lua::signal::Signal::new_live(
-            Value::String(lua.create_string("oblisk.later").unwrap()),
+            Value::String(lua.create_string("obelisk.later").unwrap()),
             crate::lua::signal::DirtyFlag::new(),
         )
         .0;
         lua.globals().set("a", signal).unwrap();
         let table: mlua::Table = lua.load(r#"return { kind = "window", id = "w", app_id = a }"#).eval().unwrap();
         let resolved = resolve_properties(&props_from_table(&table), "window", &lua).unwrap();
-        assert_eq!(window_spec(&resolved).unwrap().app_id, "oblisk.later");
+        assert_eq!(window_spec(&resolved).unwrap().app_id, "obelisk.later");
     }
 
     #[test]
@@ -968,7 +968,7 @@ mod tests {
         let table: mlua::Table = lua
             .load(
                 r#"return { kind = "window", id = "w", title = state("t", "Now Playing"),
-                                app_id = state("a", "oblisk.later"),
+                                app_id = state("a", "obelisk.later"),
                                 min_size = state("mn", { width = 320, height = 240 }),
                                 max_size = state("mx", { width = 1280, height = 800 }) }"#,
             )
@@ -976,7 +976,7 @@ mod tests {
             .unwrap();
         let spec = window_spec(&props_from_table(&table)).unwrap();
         assert_eq!(spec.title, "", "the placeholder is what a toplevel that never sends set_title has");
-        assert_eq!(spec.app_id, "oblisk-w", "the same default an absent `app_id` takes");
+        assert_eq!(spec.app_id, "obelisk-w", "the same default an absent `app_id` takes");
         assert_eq!((spec.min_size, spec.max_size), (None, None), "absent means the request is simply not sent");
     }
 }

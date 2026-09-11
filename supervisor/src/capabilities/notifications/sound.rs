@@ -96,7 +96,7 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let stream = pw::stream::StreamBox::new(
         &core,
-        "oblisk-notification-sound",
+        "obelisk-notification-sound",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_ROLE => "Notification",

@@ -1,4 +1,4 @@
-//! `oblisk.workspaces`: per-output workspace state and focused window
+//! `obelisk.workspaces`: per-output workspace state and focused window
 //! (`docs/lua-api.md` § 2.9), from niri's IPC stream (ADR-0056) or Hyprland's event
 //! and command sockets (ADR-0118).
 //!
@@ -6,7 +6,7 @@
 //!
 //! Two compositors still use no trait (ADR-0056 decision 1, ADR-0075 decision 4, ADR-0118): the
 //! protocol-specific seam is `StatePublisher` for reads plus two exhaustive write arms. With
-//! neither compositor, nothing pushes and `oblisk.workspaces` stays `nil`; § 2.9 has no absence
+//! neither compositor, nothing pushes and `obelisk.workspaces` stays `nil`; § 2.9 has no absence
 //! sentinel, and `outputs: []` would mean no workspaces rather than no answer.
 //!
 //! `controller` holds § 2.9's payload, reduction, and publish contract; `niri` owns `niri_ipc`, and
@@ -18,7 +18,7 @@ pub mod niri;
 
 pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args, parse_toggle_special_args};
 
-/// Actions accepted by `oblisk.workspaces:invoke(...)`; exhaustive dispatch keeps variants and
+/// Actions accepted by `obelisk.workspaces:invoke(...)`; exhaustive dispatch keeps variants and
 /// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -27,7 +27,7 @@ pub enum WorkspacesAction {
     ToggleSpecial,
 }
 
-/// `oblisk.workspaces` action dispatch (ADR-0037): each action writes over a fresh compositor
+/// `obelisk.workspaces` action dispatch (ADR-0037): each action writes over a fresh compositor
 /// socket on its own thread, so arms are plain calls rather than `tokio::spawn`.
 pub fn dispatch(controller: &WorkspacesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

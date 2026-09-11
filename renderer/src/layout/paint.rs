@@ -2086,7 +2086,7 @@ mod tests {
         let root = resolved_surface(
             &lua,
             r##"return panel { id = "bar", width = 120, height = 40, child = rect { width = "Fill", height = "Fill", background = "#000000FF", children = {
-                text { content = "Oblisk", font_size = 24, foreground = "#00FF00FF" },
+                text { content = "Obelisk", font_size = 24, foreground = "#00FF00FF" },
             } } }"##,
             LogicalSize { width: 120.0, height: 40.0 },
         );
@@ -2282,7 +2282,7 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
 
-        const TEXT: &str = "Oblisk Shell Renderer";
+        const TEXT: &str = "Obelisk Shell Renderer";
         const FONT_SIZE: f32 = 24.0;
 
         let shaped = shaping.shape(ShapeRequest {
@@ -2333,7 +2333,7 @@ mod tests {
             "the bold chain must lead with a face of its own"
         );
 
-        const TEXT: &str = "Oblisk Shell Renderer";
+        const TEXT: &str = "Obelisk Shell Renderer";
         const FONT_SIZE: f32 = 24.0;
         let shaped = shaping.shape(ShapeRequest {
             text: TEXT.into(),
@@ -2464,7 +2464,7 @@ mod tests {
             &lua,
             r##"return panel { id = "bar", width = 200, height = 50, background = "#0000FFFF", child = rect {
                 width = 40, height = 50, background = "#000000FF", children = {
-                    text { content = "Oblisk Shell Renderer Overflow", font_size = 24, foreground = "#FFFFFFFF" },
+                    text { content = "Obelisk Shell Renderer Overflow", font_size = 24, foreground = "#FFFFFFFF" },
                 } } }"##,
             LogicalSize { width: 200.0, height: 50.0 },
         );

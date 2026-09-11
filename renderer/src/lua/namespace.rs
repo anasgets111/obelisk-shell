@@ -1,5 +1,5 @@
-//! The `oblisk` table for capabilities, `rescue`, `screens`, `version`, and `config_dir`
-//! (`CONTEXT.md`, **Oblisk namespace**).
+//! The `obelisk` table for capabilities, `rescue`, `screens`, `version`, and `config_dir`
+//! (`CONTEXT.md`, **Obelisk namespace**).
 //!
 //! Built once per generation before `shell.lua`; it answers no `SupervisorFrame`, so construction
 //! stays separate from `crate::socket` frame handling.
@@ -12,20 +12,20 @@ use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
 use crate::lua::idle::IdleRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
 
-/// One generation's `oblisk` table and the handles its owner writes after construction.
+/// One generation's `obelisk` table and the handles its owner writes after construction.
 pub(crate) struct Namespace {
     pub(crate) table: mlua::Table,
     /// One `StateSnapshot` hydration handle per `shared::Capability::ALL` name.
     pub(crate) capabilities: HashMap<String, CapabilityHandle>,
     pub(crate) rescue: LiveSignalHandle,
-    /// `oblisk.idle` registry for inbound `SupervisorFrame::IdleEvent` callback dispatch.
+    /// `obelisk.idle` registry for inbound `SupervisorFrame::IdleEvent` callback dispatch.
     pub(crate) idle: IdleRegistry,
     pub(crate) screens: LiveSignalHandle,
     /// Current `screens` payload, for diffing later output changes.
     pub(crate) screens_payload: serde_json::Value,
 }
 
-/// Builds `oblisk`: every roster name, Renderer-sourced `rescue`/`screens`, `idle`, `version`, and
+/// Builds `obelisk`: every roster name, Renderer-sourced `rescue`/`screens`, `idle`, `version`, and
 /// `config_dir`.
 ///
 /// **Roster names stay off the table.** `__index` moves each from a side table on first read and
@@ -65,7 +65,7 @@ pub(crate) fn build(
     table.set("idle", idle.member())?;
     loader.register_idle(idle.clone());
     let rescue = register_rescue_signal(loader, &table, dirty.clone())?;
-    // Seed with an empty list, not `nil`, so `oblisk.screens` loops zero times; pass it to
+    // Seed with an empty list, not `nil`, so `obelisk.screens` loops zero times; pass it to
     // `new_live` rather than `set` so initialization does not dirty an unapplied scene.
     let screens_payload = serde_json::Value::Array(Vec::new());
     let screens = register_screens_signal(loader, &table, dirty.clone(), &screens_payload)?;
@@ -74,22 +74,22 @@ pub(crate) fn build(
     // `shared::config_dir()`. Static string beside `version`, not a pushing capability.
     table
         .set("config_dir", shell_lua_path.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default())?;
-    loader.set_global("oblisk", table.clone())?;
+    loader.set_global("obelisk", table.clone())?;
     Ok(Namespace { table, capabilities, rescue, idle, screens, screens_payload })
 }
 
-/// Puts `pending` behind `oblisk.__index`; first read installs the member and starts its controller
+/// Puts `pending` behind `obelisk.__index`; first read installs the member and starts its controller
 /// (ADR-0070 decision 1).
 ///
 /// `raw_set` installs the member, so the metamethod fires once per name and later reads are
-/// ordinary lookups. This matters because `computed({ oblisk.audio }, f)` in a `list` `itemfn`
+/// ordinary lookups. This matters because `computed({ obelisk.audio }, f)` in a `list` `itemfn`
 /// indexes it once per row per layout pass.
 ///
-/// Returns `nil` for absent names, preserving ordinary-table behavior: `oblisk.audioo` must remain
+/// Returns `nil` for absent names, preserving ordinary-table behavior: `obelisk.audioo` must remain
 /// a Lua nil-index error naming the config line, not a metamethod error.
 fn install_capability_index(
     loader: &Loader,
-    oblisk: &mlua::Table,
+    obelisk: &mlua::Table,
     pending: mlua::Table,
     commands: CommandSender,
 ) -> mlua::Result<()> {
@@ -105,34 +105,34 @@ fn install_capability_index(
     })?;
     let meta = loader.create_table()?;
     meta.set("__index", index)?;
-    oblisk.set_metatable(Some(meta))?;
+    obelisk.set_metatable(Some(meta))?;
     Ok(())
 }
 
-/// `oblisk.rescue` (§ 2.10), returning its update handle.
+/// `obelisk.rescue` (§ 2.10), returning its update handle.
 ///
 /// Bare `lua::signal::Signal`, not [`Capability`]: Renderer-sourced, with no Supervisor dispatch or
 /// roster entry, so `invoke` would only queue a command the Supervisor drops.
-fn register_rescue_signal(loader: &Loader, oblisk: &mlua::Table, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
+fn register_rescue_signal(loader: &Loader, obelisk: &mlua::Table, dirty: DirtyFlag) -> mlua::Result<LiveSignalHandle> {
     let table = rescue_table(loader, false, "")?;
     let (signal, handle) = crate::lua::signal::Signal::new_live(mlua::Value::Table(table), dirty);
-    oblisk.set("rescue", signal)?;
+    obelisk.set("rescue", signal)?;
     Ok(handle)
 }
 
-/// Registers reactive `oblisk.screens` (ADR-0041 decision 2), seeded with `initial`.
+/// Registers reactive `obelisk.screens` (ADR-0041 decision 2), seeded with `initial`.
 ///
 /// Deliberately outside `shared::Capability::ALL` and its map: `smithay_client_toolkit`'s
 /// `OutputState` sources it in the Renderer, not the Supervisor's `StateSnapshot` roster
-/// (ADR-0037/ADR-0041 decision 2). It still lives in `oblisk` because § 2.15 names it there.
+/// (ADR-0037/ADR-0041 decision 2). It still lives in `obelisk` because § 2.15 names it there.
 fn register_screens_signal(
     loader: &Loader,
-    oblisk: &mlua::Table,
+    obelisk: &mlua::Table,
     dirty: DirtyFlag,
     initial: &serde_json::Value,
 ) -> mlua::Result<LiveSignalHandle> {
     let (signal, handle) = crate::lua::signal::Signal::new_live(loader.to_lua_value(initial)?, dirty);
-    oblisk.set("screens", signal)?;
+    obelisk.set("screens", signal)?;
     Ok(handle)
 }
 
@@ -154,7 +154,7 @@ fn version_table(loader: &Loader) -> mlua::Result<mlua::Table> {
 
 /// `expect`, not `0`: a non-numeric `CARGO_PKG_VERSION_*` is a broken build, while silent `0.0.0`
 /// makes config guards take the wrong branch forever. The socket test
-/// `oblisk_version_is_three_integers_a_config_can_compare` reaches this through [`build`] and
+/// `obelisk_version_is_three_integers_a_config_can_compare` reaches this through [`build`] and
 /// catches panic or wrong values.
 fn version_parts() -> [u32; 3] {
     [env!("CARGO_PKG_VERSION_MAJOR"), env!("CARGO_PKG_VERSION_MINOR"), env!("CARGO_PKG_VERSION_PATCH")].map(|part| {
@@ -162,7 +162,7 @@ fn version_parts() -> [u32; 3] {
     })
 }
 
-/// `oblisk.rescue`'s `{ is_rescue, error_log }` table, rebuilt by
+/// `obelisk.rescue`'s `{ is_rescue, error_log }` table, rebuilt by
 /// `RendererClient::set_rescue_state` on each genuine rescue transition.
 pub(crate) fn rescue_table(loader: &Loader, is_rescue: bool, error_log: &str) -> mlua::Result<mlua::Table> {
     let table = loader.create_table()?;

@@ -1,4 +1,4 @@
-//! Client half of `oblisk set` and `oblisk toggle` (ADR-0112): connect to the running Supervisor,
+//! Client half of `obelisk set` and `obelisk toggle` (ADR-0112): connect to the running Supervisor,
 //! send a handshake and one [`shared::SetState`] frame, then disconnect.
 //!
 //! Separate from `socket.rs`, the listener: this is the only external connector, running from a
@@ -20,7 +20,7 @@ pub fn send(set: SetState) -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let mut stream = UnixStream::connect(&path)
             .await
-            .map_err(|err| format!("cannot reach the shell at {}: {err} (is oblisk running?)", path.display()))?;
+            .map_err(|err| format!("cannot reach the shell at {}: {err} (is obelisk running?)", path.display()))?;
         write_json_frame(&mut stream, &ConnectionHandshake { generation_id: CONTROL_CLIENT_GENERATION }).await?;
         write_json_frame(&mut stream, &RendererFrame::SetState(set)).await?;
         stream.shutdown().await?;

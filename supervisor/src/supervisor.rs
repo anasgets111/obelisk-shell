@@ -445,7 +445,7 @@ impl Supervisor {
         let candidate_generation_id = self.take_generation_id();
         let candidate_envs = vec![
             (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
-            ("OBLISK_PBA_CANDIDATE".to_string(), "1".to_string()),
+            ("OBELISK_PBA_CANDIDATE".to_string(), "1".to_string()),
         ];
         // All latest snapshots hydrate Candidate's first evaluation (§ 14.2, ADR-0029), not just
         // audio's.

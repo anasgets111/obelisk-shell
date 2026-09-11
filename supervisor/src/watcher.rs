@@ -1,6 +1,6 @@
 //! Supervisor-side config-file watcher (`CONTEXT.md`, Watcher; ADR-0047 decision 3).
 //!
-//! Watches the whole config directory tree (`~/.config/oblisk/` by default), not just `shell.lua`,
+//! Watches the whole config directory tree (`~/.config/obelisk/` by default), not just `shell.lua`,
 //! for `.lua` changes. Coalesces save bursts
 //! (`CREATE`+`MODIFY`+`CLOSE_WRITE`, or atomic-save `MOVED_TO`) and triggers after the debounce
 //! window since the last relevant event. Watches directories, not inodes, because atomic-save
@@ -67,7 +67,7 @@ fn walk(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `file_type()` would skip symlinked `widgets -> ~/dotfiles/oblisk/widgets`; `metadata()`
+        // `file_type()` would skip symlinked `widgets -> ~/dotfiles/obelisk/widgets`; `metadata()`
         // follows the link.
         if !path.is_dir() {
             continue;

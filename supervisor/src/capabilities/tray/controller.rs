@@ -1,4 +1,4 @@
-//! [`TrayController`]: the `oblisk.tray` write-action dispatcher and state owner.
+//! [`TrayController`]: the `obelisk.tray` write-action dispatcher and state owner.
 //! Split from `dbus::tray` -- see `dbus/tray/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;

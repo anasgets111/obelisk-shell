@@ -1,6 +1,6 @@
 -- Your shell. Everything on screen is declared here or in a file this requires.
 --
--- `oblisk.screens` is the one signal with a value at first evaluation, so a bar per output is a
+-- `obelisk.screens` is the one signal with a value at first evaluation, so a bar per output is a
 -- loop over it. Every other capability reads `nil` until its first push, which is why `content`
 -- takes a signal rather than a string here -- and why the closure below reads `s and s.time`
 -- rather than `s.time`. That first evaluation runs against a nil `s`, and indexing it there fails
@@ -29,7 +29,7 @@ return {
             padding = { left = 12, right = 12 },
             children = {
                 text {
-                    content = oblisk.system:map(function(s)
+                    content = obelisk.system:map(function(s)
                         return os.date("%H:%M", s and s.time)
                     end),
                     font_size = 13,

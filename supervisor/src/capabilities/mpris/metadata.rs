@@ -43,7 +43,7 @@ fn value_as_trackid(value: &Value<'_>) -> Option<String> {
     }
 }
 
-/// One `Metadata` dict reduced to `oblisk.mpris`'s fields; album, disc/track number, genre, and
+/// One `Metadata` dict reduced to `obelisk.mpris`'s fields; album, disc/track number, genre, and
 /// other keys outside the IDL player shape are dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ParsedMetadata {

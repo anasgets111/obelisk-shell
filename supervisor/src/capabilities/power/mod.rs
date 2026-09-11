@@ -1,4 +1,4 @@
-//! `oblisk.power` reports profiles and battery charge/discharge rate
+//! `obelisk.power` reports profiles and battery charge/discharge rate
 //! (`docs/lua-api.md` § 2.13) from two D-Bus services (ADR-0053 amendment).
 //!
 //! § 2.13 combines unrelated facts: power-profiles-daemon supplies `active_profile`/`profiles`,
@@ -14,7 +14,7 @@ pub mod controller;
 
 pub use controller::{PowerController, PowerSignal, parse_set_profile_args};
 
-/// Every action `oblisk.power:invoke(...)` accepts; `dispatch` matches variants exhaustively.
+/// Every action `obelisk.power:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerAction {

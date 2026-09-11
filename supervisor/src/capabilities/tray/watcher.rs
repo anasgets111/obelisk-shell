@@ -53,7 +53,7 @@ impl StatusNotifierWatcher {
         _service: String,
         #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) {
-        // Accepted trivially (ADR-0031). Oblisk is the relevant host; this exists for spec
+        // Accepted trivially (ADR-0031). Obelisk is the relevant host; this exists for spec
         // completeness and permits self-registration (see `TrayController::new`).
         let was_registered = {
             let mut guard = self.host_registered.lock().unwrap();

@@ -1,18 +1,18 @@
 //! Reports what wakes the Renderer's poll loop, what work it does, and its CPU cost when
-//! `OBLISK_PROFILE_IDLE` is set. It replaces ad-hoc probes: each question used to mean a temporary
+//! `OBELISK_PROFILE_IDLE` is set. It replaces ad-hoc probes: each question used to mean a temporary
 //! `eprintln!`, one reading, then deletion. ADR-0124 made polling timeout-free, so a wake with no
 //! work means an unnecessary re-arm and a spin. All figures here are release-build measurements.
 //! Idle costs 0.34% of a core; `dev` resolves roughly four times slower, so compare like builds.
 //!
 //! Unset means two predicted branches per turn and no clock reads: the profiler is behind an
-//! `Option`. Set a positive interval in seconds (`OBLISK_PROFILE_IDLE=10`); invalid input uses
+//! `Option`. Set a positive interval in seconds (`OBELISK_PROFILE_IDLE=10`); invalid input uses
 //! [`DEFAULT_INTERVAL_SECS`] instead of preventing startup.
 
 use std::time::{Duration, Instant};
 
 use nix::sys::resource::{UsageWho, getrusage};
 
-/// Fallback for a non-positive or invalid `OBLISK_PROFILE_IDLE`; ten seconds usually yields
+/// Fallback for a non-positive or invalid `OBELISK_PROFILE_IDLE`; ten seconds usually yields
 /// single-digit idle turns, making an unexpected hundred obvious.
 const DEFAULT_INTERVAL_SECS: u64 = 10;
 
@@ -172,11 +172,11 @@ pub struct IdleProfile {
 }
 
 impl IdleProfile {
-    /// `Some` only when `OBLISK_PROFILE_IDLE` is set.
+    /// `Some` only when `OBELISK_PROFILE_IDLE` is set.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("OBLISK_PROFILE_IDLE").ok()?;
+        let raw = std::env::var("OBELISK_PROFILE_IDLE").ok()?;
         let secs = raw.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
-        eprintln!("[oblisk-renderer] idle profile on, reporting every {secs}s");
+        eprintln!("[obelisk-renderer] idle profile on, reporting every {secs}s");
         Some(Self {
             interval: Duration::from_secs(secs),
             window_started: Instant::now(),
@@ -240,7 +240,7 @@ impl IdleProfile {
             return;
         }
         let cpu = Cpu::now();
-        eprintln!("[oblisk-renderer] {}", render(elapsed, &self.counters, cpu.since(self.cpu_at_window_start)));
+        eprintln!("[obelisk-renderer] {}", render(elapsed, &self.counters, cpu.since(self.cpu_at_window_start)));
         self.window_started = Instant::now();
         self.cpu_at_window_start = cpu;
         self.counters = Counters::default();

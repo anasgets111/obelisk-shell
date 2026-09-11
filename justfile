@@ -1,4 +1,4 @@
-# Recipes for building, running and gating Oblisk.
+# Recipes for building, running and gating Obelisk.
 #
 # Two of these exist because doing them by hand goes wrong in ways nothing else catches.
 #
@@ -23,9 +23,9 @@ build:
 release:
     cargo build --workspace --release
 
-# The dev shell against `dev-config/oblisk`, on the binaries just built.
+# The dev shell against `dev-config/obelisk`, on the binaries just built.
 run: build
-    OBLISK_CONFIG_DIR=dev-config/oblisk target/debug/oblisk
+    OBELISK_CONFIG_DIR=dev-config/obelisk target/debug/obelisk
 
 # Everything a change has to pass before it is done.
 check: fmt-check test lint docs lua types
@@ -79,7 +79,7 @@ docs:
 #
 # The PATH lookup falls back to the copy Zed's Lua extension downloads for itself. Not cleverness
 # for its own sake: that is the only copy on the machine this was written on, so the check reported
-# "skipping" on every run for as long as it existed, and the hole `dev-config/oblisk/.luarc.json`'s
+# "skipping" on every run for as long as it existed, and the hole `dev-config/obelisk/.luarc.json`'s
 # promoted diagnostics exist to close was open the whole time. Newest version wins; the glob is
 # there so a Zed update does not silently turn the check back off.
 types:
@@ -95,7 +95,7 @@ types:
     fi
     log=$(mktemp -d)
     trap 'rm -rf "$log"' EXIT
-    # `share/starter` ships no `.luarc.json` on purpose: `oblisk init` writes one pointing at the
+    # `share/starter` ships no `.luarc.json` on purpose: `obelisk init` writes one pointing at the
     # *installed* stub directory (`setup.rs`'s `luarc_json`), so a checked-in copy would be a second
     # answer that init immediately overwrites. This is that file, with an absolute library path
     # because a relative one resolves against the workspace being checked, not against this config.
@@ -120,9 +120,9 @@ types:
             sed -E '/^[[:space:]]*$/d; /^[[:space:]]*Initializing/d; /^[[:space:]]*[>=]+[[:space:]]*[0-9]+\/[0-9]+/d; /^[[:space:]]*Diagnosis complet/d' >&2
         exit 1
     }
-    # `dev-config/oblisk` has its own `.luarc.json`, which the language server finds on its own and
+    # `dev-config/obelisk` has its own `.luarc.json`, which the language server finds on its own and
     # which also carries the `runtime.path` its `require`s need.
-    check dev-config/oblisk
+    check dev-config/obelisk
     check share/starter --configpath "$log/starter.luarc.json"
     # No library: these files declare everything they reference, which is the point of checking
     # them on their own.
@@ -137,10 +137,10 @@ lua:
     find lua-meta dev-config share -name '*.lua' -print0 | xargs -0 -n1 luac -p
     echo "all lua parses"
 
-# Regenerate `lua-meta/oblisk.lua` from the supervisor's payload types, then show what moved.
+# Regenerate `lua-meta/obelisk.lua` from the supervisor's payload types, then show what moved.
 stubs:
     UPDATE_STUBS=1 cargo test -p supervisor stubs
-    @git diff --stat -- lua-meta/oblisk.lua
+    @git diff --stat -- lua-meta/obelisk.lua
 
 # Formatting as a gate, not a habit. `just fmt` fixes whatever this reports.
 #
@@ -167,12 +167,12 @@ clean:
 # Install layout. `PREFIX` is where it goes, `DESTDIR` is a staging root for a package build, so a
 # PKGBUILD is `just install PREFIX=/usr DESTDIR="$pkgdir"` and nothing else.
 #
-# The Renderer lands in `lib/oblisk`, off `$PATH`, and `bin/oblisk` is a symlink into it. That works
+# The Renderer lands in `lib/obelisk`, off `$PATH`, and `bin/obelisk` is a symlink into it. That works
 # because `current_exe` reads `/proc/self/exe`, which is already symlink-resolved, so the Supervisor
 # still finds its sibling. One command on the user's path, and the pair cannot drift apart.
 #
-# No service unit. Oblisk is started from the compositor's own config, the way a bar is:
-# `spawn-at-startup "oblisk"` in niri, `exec-once = oblisk` in Hyprland, `exec oblisk` in sway.
+# No service unit. Obelisk is started from the compositor's own config, the way a bar is:
+# `spawn-at-startup "obelisk"` in niri, `exec-once = obelisk` in Hyprland, `exec obelisk` in sway.
 prefix := "/usr/local"
 destdir := ""
 
@@ -180,19 +180,19 @@ install: release
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{destdir}}{{prefix}}"
-    install -Dm755 target/release/oblisk          "$root/lib/oblisk/oblisk"
-    install -Dm755 target/release/oblisk-renderer "$root/lib/oblisk/oblisk-renderer"
+    install -Dm755 target/release/obelisk          "$root/lib/obelisk/obelisk"
+    install -Dm755 target/release/obelisk-renderer "$root/lib/obelisk/obelisk-renderer"
     install -dm755                                "$root/bin"
-    ln -sfn ../lib/oblisk/oblisk                  "$root/bin/oblisk"
+    ln -sfn ../lib/obelisk/obelisk                  "$root/bin/obelisk"
     for stub in lua-meta/*.lua; do
-        install -Dm644 "$stub" "$root/share/oblisk/lua-meta/$(basename "$stub")"
+        install -Dm644 "$stub" "$root/share/obelisk/lua-meta/$(basename "$stub")"
     done
-    install -Dm644 share/starter/shell.lua        "$root/share/oblisk/starter/shell.lua"
+    install -Dm644 share/starter/shell.lua        "$root/share/obelisk/starter/shell.lua"
     echo "installed to $root"
 
 uninstall:
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{destdir}}{{prefix}}"
-    rm -rf "$root/lib/oblisk" "$root/share/oblisk" "$root/bin/oblisk"
+    rm -rf "$root/lib/obelisk" "$root/share/obelisk" "$root/bin/obelisk"
     echo "removed from $root"

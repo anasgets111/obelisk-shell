@@ -743,7 +743,7 @@ pub fn parse_transition(properties: &HashMap<String, Value>) -> Result<Option<Tr
         Value::String(path) => {
             let path = path.to_str().map_err(|e| invalid("transition.shader", e.to_string()))?;
             // Absolute, the way `image.source` is: a config names its own files through
-            // `oblisk.config_dir`, and a relative path would resolve against whatever directory
+            // `obelisk.config_dir`, and a relative path would resolve against whatever directory
             // the Renderer happens to have been started in.
             if !path.starts_with('/') {
                 return Err(invalid("transition.shader", format!("expected an absolute path, got `{path}`")));

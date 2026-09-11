@@ -1,4 +1,4 @@
-//! `oblisk.storage` owns JSON files declared with `persistent_table` (ADR-0136). Plain filesystem
+//! `obelisk.storage` owns JSON files declared with `persistent_table` (ADR-0136). Plain filesystem
 //! reads/writes, sibling to `files`/`system`, with no D-Bus proxy or hardware thread.
 //!
 //! The config chooses each path, name, and defaults; "settings", "state", and "cache" are not
@@ -8,7 +8,7 @@ pub mod controller;
 
 pub use controller::{StorageController, StorageSignal};
 
-/// Every action `oblisk.storage:invoke(...)` accepts; `dispatch` matches variants exhaustively.
+/// Every action `obelisk.storage:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageAction {
@@ -37,7 +37,7 @@ pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<(String, String
     Some((path, key, value))
 }
 
-/// `oblisk.storage` action dispatch (ADR-0037). Synchronous: actions touch memory and schedule the
+/// `obelisk.storage` action dispatch (ADR-0037). Synchronous: actions touch memory and schedule the
 /// save task.
 pub fn dispatch(controller: &StorageController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

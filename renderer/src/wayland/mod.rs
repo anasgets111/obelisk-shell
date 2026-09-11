@@ -120,7 +120,7 @@ pub struct App {
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// Whether `OBLISK_PBA_CANDIDATE` was set (Supervisor services § 14.2), read once in [`run`].
+    /// Whether `OBELISK_PBA_CANDIDATE` was set (Supervisor services § 14.2), read once in [`run`].
     is_pba_candidate: bool,
     /// Set after [`App::maybe_send_ready_signal`] sends its one-time `ReadySignal`.
     ready_signal_sent: bool,
@@ -132,7 +132,7 @@ pub struct App {
     /// non-blocking, so dispatch callbacks can use it.
     outbound_tx: tokio::sync::mpsc::UnboundedSender<RendererFrame>,
     /// This Renderer's generation id, stamped into every `SecureSubmit`; read in `main` from
-    /// `OBLISK_GENERATION_ID`.
+    /// `OBELISK_GENERATION_ID`.
     generation_id: u32,
     presentation_time: PresentationTimeState,
     /// Clone used by poll-loop [`App::activate_draw`] to request `wp_presentation_feedback`.
@@ -184,7 +184,7 @@ pub struct App {
     /// [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
     /// [`App::focus_key`] as end-of-turn arming last examined it, for the profiler's `redundant`
-    /// column. Written only while `OBLISK_PROFILE_IDLE` is set; nothing gates on it yet.
+    /// column. Written only while `OBELISK_PROFILE_IDLE` is set; nothing gates on it yet.
     ///
     /// Starts as an empty dead scope rather than the first key observed, so the first focused turn
     /// reads as a change and is not silently classed as removable.
@@ -221,7 +221,7 @@ pub struct App {
 /// whose EGL surfaces and `wl_surface`s talk to the compositor that just left, which is how a log
 /// out became a `khronos-egl` `unwrap()` panic and exit code 101.
 fn exit_because_the_compositor_is_gone(what_failed: &str, err: &dyn std::fmt::Display) -> ! {
-    eprintln!("[oblisk-renderer] {what_failed} failed ({err}); there is no compositor to talk to, so exiting");
+    eprintln!("[obelisk-renderer] {what_failed} failed ({err}); there is no compositor to talk to, so exiting");
     std::process::exit(shared::EXIT_COMPOSITOR_GONE);
 }
 
@@ -264,7 +264,7 @@ pub fn run(
     // `GlobalError::MissingGlobal`.
     let presentation_time = PresentationTimeState::bind(&globals, &qh);
 
-    let is_pba_candidate = std::env::var("OBLISK_PBA_CANDIDATE").is_ok();
+    let is_pba_candidate = std::env::var("OBELISK_PBA_CANDIDATE").is_ok();
 
     // One process-wide shaping handle; `RendererClient` gets a clone (ADR-0039 decision 3).
     // `Loader::new()` stays here because `mlua::Lua` is `!Send`.
@@ -356,7 +356,7 @@ pub fn run(
             // `expand_instances` returns nothing for a miss; log against the real startup output
             // list so an unplugged monitor is explained once.
             eprintln!(
-                "[oblisk-renderer] surface {:?} targets monitor {:?}, which is not connected; no surface created for it",
+                "[obelisk-renderer] surface {:?} targets monitor {:?}, which is not connected; no surface created for it",
                 panel.topology.id, panel.topology.monitor
             );
         }
@@ -367,7 +367,7 @@ pub fn run(
     // this adds the consequence.
     if !app.client.apply_instances() {
         eprintln!(
-            "[oblisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one"
+            "[obelisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one"
         );
     }
 
@@ -380,9 +380,9 @@ pub fn run(
     // Output events can now reconcile against an evaluated scene.
     app.startup_complete = true;
 
-    // `None` unless `OBLISK_PROFILE_IDLE` is set; see `idle_profile`.
+    // `None` unless `OBELISK_PROFILE_IDLE` is set; see `idle_profile`.
     let mut profile = idle_profile::IdleProfile::from_env();
-    // `None` unless `OBLISK_PROFILE_MEMORY` is set; see `memory_profile`.
+    // `None` unless `OBELISK_PROFILE_MEMORY` is set; see `memory_profile`.
     let mut memory = memory_profile::MemoryProfile::from_env();
 
     // Mostly-static surfaces may receive no Wayland event after `ActivateDraw`, so poll
@@ -430,10 +430,10 @@ pub fn run(
                     // unsent request. `std::process::exit` skips SCTK's destructor.
                     if let Err(err) = event_queue.flush() {
                         eprintln!(
-                            "[oblisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor"
+                            "[obelisk-renderer] the last flush before exiting failed ({err}); a session lock requested in this same turn may never have reached the compositor"
                         );
                     }
-                    eprintln!("[oblisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
+                    eprintln!("[obelisk-renderer] {}", supervisor_gone_report(app.session_lock.is_some()));
                     std::process::exit(EXIT_SUPERVISOR_GONE);
                 }
             };
@@ -450,7 +450,7 @@ pub fn run(
                     // strand the session locked; trying the unlock costs at most one failed flush.
                     if !locked && let Err(err) = event_queue.roundtrip(&mut app) {
                         eprintln!(
-                            "[oblisk-renderer] the round trip before an unlock failed ({err}); attempting the unlock anyway rather than exiting with the session locked"
+                            "[obelisk-renderer] the round trip before an unlock failed ({err}); attempting the unlock anyway rather than exiting with the session locked"
                         );
                     }
                     app.set_session_lock(&qh, locked);

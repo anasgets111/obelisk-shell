@@ -4,13 +4,13 @@ resolver = "2"
 
 # One version for the three crates. They ship together, the Supervisor spawns the Renderer as a
 # sibling binary, and `shared` is only ever consumed by those two, so three numbers could differ
-# only by mistake. It is also the number `oblisk --version` prints, the one `oblisk.version` hands
+# only by mistake. It is also the number `obelisk --version` prints, the one `obelisk.version` hands
 # a config (§ 2), and the one stamped into the generated language-server stubs, and those three
 # disagreeing is exactly the failure worth designing out.
 #
 # Versioning tracks the Lua API, because that is the only public interface this has. Minor for an
 # IDL field added or changed, patch for everything else. A config gates on it with
-# `oblisk.version.minor >= n`.
+# `obelisk.version.minor >= n`.
 #
 # Not in force yet, which is why IDL changes keep landing against 0.1.0 (ADR-0069's `scroll`,
 # ADR-0078's `exclusive`). Nothing has been pushed to origin, so this number informs nobody and

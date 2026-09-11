@@ -1,4 +1,4 @@
-//! Media players (`oblisk.mpris`, docs/services.md §3;
+//! Media players (`obelisk.mpris`, docs/services.md §3;
 //! docs/lua-api.md §2.8; ADR-0036).
 //!
 //! Supervisor-owned session-bus MPRIS discovery and zero-polling progress state, so `mpris.players`
@@ -22,7 +22,7 @@ pub mod watcher;
 
 pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args};
 
-/// Actions accepted by `oblisk.mpris:invoke(...)`; exhaustive dispatch keeps variants and arms in
+/// Actions accepted by `obelisk.mpris:invoke(...)`; exhaustive dispatch keeps variants and arms in
 /// sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -32,7 +32,7 @@ pub enum MprisAction {
     SeekRelative,
 }
 
-/// `oblisk.mpris` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
+/// `obelisk.mpris` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
 /// action (ADR-0036/ADR-0029).
 pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

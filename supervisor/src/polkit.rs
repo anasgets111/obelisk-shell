@@ -38,7 +38,7 @@ pub enum AgentRequest {
 
 /// Export path on our unique connection. Any path we control is valid; the spec leaves it to the
 /// caller.
-pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/PolicyKit1/AuthenticationAgent";
+pub const AGENT_OBJECT_PATH: &str = "/org/obelisk/PolicyKit1/AuthenticationAgent";
 
 /// Builds the `unix-session` `Subject` for this process's session.
 ///
@@ -89,7 +89,7 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, called by polkitd after [`register_agent`].
 ///
-/// Forwards only. The challenge becomes `oblisk.polkit` state; the setuid helper runs PAM after
+/// Forwards only. The challenge becomes `obelisk.polkit` state; the setuid helper runs PAM after
 /// `secure_submit("polkit", "authenticate")`, and `main.rs` releases the held reply when it answers
 /// (ADR-0114). zbus uses one task per call, so cancel can arrive while begin waits.
 pub struct AuthenticationAgent {
@@ -126,7 +126,7 @@ impl AuthenticationAgent {
     }
 }
 
-/// Authentication agent, unregistered until config reads `oblisk.polkit` or names it in
+/// Authentication agent, unregistered until config reads `obelisk.polkit` or names it in
 /// `secure_submit` (ADR-0070 decisions 5 and 6, ADR-0114).
 ///
 /// Log registration failures rather than propagating them: another agent for the subject is normal
@@ -276,7 +276,7 @@ mod tests {
             p2p_pair_serving(|peer| peer.serve_at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))).await;
 
         let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&caller_side)
-            .destination("org.oblisk.Supervisor")
+            .destination("org.obelisk.Supervisor")
             .expect("valid destination bus name")
             .path(AGENT_OBJECT_PATH)
             .expect("valid object path")
@@ -296,7 +296,7 @@ mod tests {
                 .call_method(
                     "BeginAuthentication",
                     &(
-                        "org.oblisk.test.action",
+                        "org.obelisk.test.action",
                         "Authenticate to do the thing",
                         "dialog-password",
                         details,
@@ -315,7 +315,7 @@ mod tests {
         let err = call.await.unwrap().expect_err("a Cancelled reply must reach the caller as a D-Bus error");
         let zbus::Error::MethodError(name, _, _) = err else { panic!("expected a method error, got {err:?}") };
         assert_eq!(name.as_str(), "org.freedesktop.PolicyKit1.Error.Cancelled");
-        assert_eq!(received.action_id, "org.oblisk.test.action");
+        assert_eq!(received.action_id, "org.obelisk.test.action");
         assert_eq!(received.message, "Authenticate to do the thing");
         assert_eq!(received.icon_name, "dialog-password");
         assert_eq!(received.cookie, "cookie-123");
@@ -334,7 +334,7 @@ mod tests {
             p2p_pair_serving(|peer| peer.serve_at(AGENT_OBJECT_PATH, AuthenticationAgent::new(tx))).await;
 
         let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&caller_side)
-            .destination("org.oblisk.Supervisor")
+            .destination("org.obelisk.Supervisor")
             .expect("valid destination bus name")
             .path(AGENT_OBJECT_PATH)
             .expect("valid object path")

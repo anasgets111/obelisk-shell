@@ -1,4 +1,4 @@
-//! [`UpdatesController`]: `oblisk.updates` write-action dispatcher and state owner (ADR-0034).
+//! [`UpdatesController`]: `obelisk.updates` write-action dispatcher and state owner (ADR-0034).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use super::backend::{Backend, UpdateCandidate};
 use crate::process;
 
-/// `oblisk.updates` payload. `check_error`/`install_error` are `None` when clear. While
+/// `obelisk.updates` payload. `check_error`/`install_error` are `None` when clear. While
 /// `installing`, `install_total_steps == 0` means the manager has not printed the transaction size.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct UpdatesState {

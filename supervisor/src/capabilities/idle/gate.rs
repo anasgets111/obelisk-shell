@@ -1,9 +1,9 @@
-//! The `oblisk.idle` inhibit gate (ADR-0139): how a held logind inhibitor affects threshold events.
+//! The `obelisk.idle` inhibit gate (ADR-0139): how a held logind inhibitor affects threshold events.
 //!
-//! Oblisk is the idle daemon here. With `IdleAction=ignore` in `logind.conf`, this shell alone acts
+//! Obelisk is the idle daemon here. With `IdleAction=ignore` in `logind.conf`, this shell alone acts
 //! on idleness, so it must honor inhibitors rather than logind.
 //!
-//! ADR-0032 gave `oblisk.idle` `inhibit`/`release_inhibit` writes but no read half. A config could
+//! ADR-0032 gave `obelisk.idle` `inhibit`/`release_inhibit` writes but no read half. A config could
 //! ask logind to prevent idle and still receive `on_idle`; external `systemd-inhibit
 //! --what=idle mpv film.mkv` had the same problem.
 //!

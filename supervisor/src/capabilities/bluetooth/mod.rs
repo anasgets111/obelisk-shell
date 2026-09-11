@@ -1,11 +1,11 @@
-//! BlueZ Bluetooth D-Bus controller (`oblisk.bluetooth`; docs/oblisk-supervisor-
+//! BlueZ Bluetooth D-Bus controller (`obelisk.bluetooth`; docs/obelisk-supervisor-
 //! services-dbus.md §5; docs/lua-api.md §2.6; ADR-0030).
 //!
 //! Proxies follow BlueZ's D-Bus API docs; `org.freedesktop.DBus.ObjectManager` reuses
 //! `zbus::fdo::ObjectManagerProxy` (ADR-0030: no maintained BlueZ proxy crate).
 //!
 //! ponytail: [`BluetoothController::new`] degrades instead of failing like `NetworkController::new`
-//! (`zbus::Result<Self>`). NetworkManager is assumed present for `oblisk.network`; BlueZ may be
+//! (`zbus::Result<Self>`). NetworkManager is assumed present for `obelisk.network`; BlueZ may be
 //! absent with no hardware or no `bluetoothd`, so binding, adapter lookup, and agent registration
 //! log and produce an inert controller: `enabled`/`discovering` are `false`, lists are empty, and
 //! writes log and no-op. This extends `NetworkController::has_wifi_device` to a missing service.
@@ -21,7 +21,7 @@
 use serde::Serialize;
 
 /// Object path where this Supervisor exports `org.bluez.Agent1` on its unique connection name.
-pub const AGENT_OBJECT_PATH: &str = "/org/oblisk/Bluez/Agent1";
+pub const AGENT_OBJECT_PATH: &str = "/org/obelisk/Bluez/Agent1";
 
 pub mod agent;
 pub mod controller;
@@ -30,7 +30,7 @@ pub mod registry;
 
 pub use controller::BluetoothController;
 
-// State shape pushed as `oblisk.bluetooth`'s StateSnapshot (docs/lua-api.md §2.6).
+// State shape pushed as `obelisk.bluetooth`'s StateSnapshot (docs/lua-api.md §2.6).
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -139,7 +139,7 @@ pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
 }
 
-/// Actions accepted by `oblisk.bluetooth:invoke(...)`; exhaustive dispatch keeps variants and arms
+/// Actions accepted by `obelisk.bluetooth:invoke(...)`; exhaustive dispatch keeps variants and arms
 /// in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -153,7 +153,7 @@ pub enum BluetoothAction {
     Forget,
 }
 
-/// `oblisk.bluetooth` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
+/// `obelisk.bluetooth` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
 /// action rather than awaiting inline (ADR-0030). `stop_discovery` leaves the last
 /// `discovered_devices` snapshot.
 pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnvelope) {

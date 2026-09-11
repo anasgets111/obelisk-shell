@@ -1,4 +1,4 @@
-//! Arch's `pacman`, as an `oblisk.updates` backend (ADR-0034, ADR-0134). The one implementation
+//! Arch's `pacman`, as an `obelisk.updates` backend (ADR-0034, ADR-0134). The one implementation
 //! of [`super::backend::Backend`] this Supervisor ships. Everything under here knows about
 //! `libalpm`, `/etc/pacman.conf` and `pacman`'s own stdout; nothing above the trait does.
 
@@ -37,7 +37,7 @@ impl Backend for PacmanBackend {
     }
 
     /// Root upgrade against real `/etc/pacman.conf` and `/var/lib/pacman`. `pkexec` triggers
-    /// Oblisk's registered polkit agent instead of requiring a terminal.
+    /// Obelisk's registered polkit agent instead of requiring a terminal.
     fn install_command(&self) -> InstallCommand {
         InstallCommand {
             program: "pkexec".to_string(),
@@ -101,7 +101,7 @@ mod tests {
         assert_eq!(backend.name(), "pacman");
 
         let command = backend.install_command();
-        assert_eq!(command.program, "pkexec", "elevation goes through polkit, so Oblisk's own agent prompts");
+        assert_eq!(command.program, "pkexec", "elevation goes through polkit, so Obelisk's own agent prompts");
         assert_eq!(command.arguments, vec!["pacman", "-Syu", "--noconfirm"]);
     }
 

@@ -227,7 +227,7 @@ impl ShapingHandle {
         let generation = Arc::new(AtomicU64::new(0));
         let handle_generation = Arc::clone(&generation);
         thread::Builder::new()
-            .name("oblisk-text-shaping".into())
+            .name("obelisk-text-shaping".into())
             .spawn(move || {
                 let mut fonts = WorkerFonts::new(fonts::DEFAULT_CHAIN);
                 while let Ok(request) = rx.recv() {
@@ -257,7 +257,7 @@ impl ShapingHandle {
                     }
                 }
             })
-            .expect("failed to spawn oblisk-text-shaping thread");
+            .expect("failed to spawn obelisk-text-shaping thread");
         Self {
             requests: tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -308,8 +308,8 @@ impl ShapingHandle {
                 },
                 reply_tx,
             ))
-            .expect("oblisk-text-shaping worker thread died");
-        let result = reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying");
+            .expect("obelisk-text-shaping worker thread died");
+        let result = reply_rx.recv().expect("obelisk-text-shaping worker thread died before replying");
 
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         // Cleared wholesale rather than evicted one at a time: an LRU needs a recency order
@@ -345,7 +345,7 @@ impl ShapingHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests
             .send(Request::SetChain(chain.to_vec(), reply_tx))
-            .expect("oblisk-text-shaping worker thread died");
+            .expect("obelisk-text-shaping worker thread died");
         let _ = reply_rx.recv();
     }
 
@@ -386,8 +386,8 @@ impl ShapingHandle {
     /// `FontData` clones an `Arc`, so repeated calls are cheap and copy no font file.
     pub fn font_chain_data(&self) -> Vec<FontFace> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests.send(Request::FontChainData(reply_tx)).expect("oblisk-text-shaping worker thread died");
-        reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
+        self.requests.send(Request::FontChainData(reply_tx)).expect("obelisk-text-shaping worker thread died");
+        reply_rx.recv().expect("obelisk-text-shaping worker thread died before replying")
     }
 
     /// Resolves `family` without measuring anything, so a node that names one is drawn in it even
@@ -408,7 +408,7 @@ impl ShapingHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests
             .send(Request::EnsureFamily(Arc::clone(family), reply_tx))
-            .expect("oblisk-text-shaping worker thread died");
+            .expect("obelisk-text-shaping worker thread died");
         let _ = reply_rx.recv();
         self.ensured.lock().unwrap_or_else(PoisonError::into_inner).insert(Arc::clone(family));
     }
@@ -428,8 +428,8 @@ impl ShapingHandle {
     #[cfg(test)]
     pub fn resolved_primary_family(&self) -> String {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests.send(Request::ResolvedPrimaryFamily(reply_tx)).expect("oblisk-text-shaping worker thread died");
-        reply_rx.recv().expect("oblisk-text-shaping worker thread died before replying")
+        self.requests.send(Request::ResolvedPrimaryFamily(reply_tx)).expect("obelisk-text-shaping worker thread died");
+        reply_rx.recv().expect("obelisk-text-shaping worker thread died before replying")
     }
 }
 
@@ -932,9 +932,9 @@ mod tests {
     fn a_family_nothing_answers_measures_in_the_declared_chain_and_is_only_looked_up_once() {
         let handle = ShapingHandle::spawn();
         let missing = Some("ZZ No Such Family 9184");
-        assert_eq!(handle.shape(req_in("Oblisk", 20.0, missing)).width, handle.shape(req("Oblisk", 20.0)).width);
+        assert_eq!(handle.shape(req_in("Obelisk", 20.0, missing)).width, handle.shape(req("Obelisk", 20.0)).width);
         let generation = handle.font_generation();
-        handle.shape(req_in("Oblisk Shell", 20.0, missing));
+        handle.shape(req_in("Obelisk Shell", 20.0, missing));
         assert_eq!(handle.font_generation(), generation, "a miss is remembered, not retried");
     }
 
@@ -1028,10 +1028,10 @@ mod tests {
             eprintln!("skip: the default chain's family has no bold face installed");
             return;
         }
-        let plain = handle.shape(req("Oblisk Shell Renderer", 20.0));
+        let plain = handle.shape(req("Obelisk Shell Renderer", 20.0));
         let bold = handle.shape(ShapeRequest {
             runs: vec![FontRun { range: 0..21, bold: true, italic: false }],
-            ..req("Oblisk Shell Renderer", 20.0)
+            ..req("Obelisk Shell Renderer", 20.0)
         });
         assert!(bold.width > plain.width, "bold {} should be wider than regular {}", bold.width, plain.width);
     }
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn setting_a_chain_drops_every_measurement_taken_under_the_old_one() {
         let handle = ShapingHandle::spawn();
-        handle.shape(req("Oblisk", 14.0));
+        handle.shape(req("Obelisk", 14.0));
         assert_eq!(handle.cached_len(), 1);
         handle.set_chain(&["Noto Sans".to_string()]);
         assert_eq!(handle.cached_len(), 0);
@@ -1178,9 +1178,9 @@ mod tests {
     #[test]
     fn a_cached_measurement_equals_what_the_worker_returns_cold() {
         let warm = ShapingHandle::spawn();
-        let first = warm.shape(req("Oblisk", 14.0));
-        let cached = warm.shape(req("Oblisk", 14.0));
-        let cold = ShapingHandle::spawn().shape(req("Oblisk", 14.0));
+        let first = warm.shape(req("Obelisk", 14.0));
+        let cached = warm.shape(req("Obelisk", 14.0));
+        let cold = ShapingHandle::spawn().shape(req("Obelisk", 14.0));
         assert_eq!(cached, first);
         assert_eq!(cached, cold);
     }
@@ -1189,7 +1189,7 @@ mod tests {
     fn shapes_nonempty_text_to_a_nonzero_box() {
         let handle = ShapingHandle::spawn();
         let result = handle.shape(ShapeRequest {
-            text: "Oblisk".into(),
+            text: "Obelisk".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: None,
@@ -1226,7 +1226,7 @@ mod tests {
             font: None,
         });
         let long = handle.shape(ShapeRequest {
-            text: "Oblisk Shell".into(),
+            text: "Obelisk Shell".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: None,
@@ -1308,7 +1308,7 @@ mod tests {
         let mut font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
 
         let request = ShapeRequest {
-            text: "Oblisk Shell Renderer".into(),
+            text: "Obelisk Shell Renderer".into(),
             font_size: 24.0,
             line_height: 28.8,
             max_width: None,
@@ -1336,7 +1336,7 @@ mod tests {
     /// yields the entire string N times over. Only the glyph cluster indices delimit a run.
     #[test]
     fn each_wrapped_line_is_its_own_slice_and_not_the_whole_string_again() {
-        const TEXT: &str = "Oblisk Shell Renderer";
+        const TEXT: &str = "Obelisk Shell Renderer";
         let handle = ShapingHandle::spawn();
         let unconstrained = handle.shape(req(TEXT, 14.0));
         assert_eq!(&*unconstrained.lines, [TEXT], "an unwrapped string is one line holding all of it");
@@ -1364,7 +1364,7 @@ mod tests {
     fn the_measured_height_is_the_lines_it_reports() {
         let handle = ShapingHandle::spawn();
         let result = handle.shape(ShapeRequest {
-            text: "Oblisk Shell Renderer".into(),
+            text: "Obelisk Shell Renderer".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: Some(40.0),
@@ -1387,7 +1387,7 @@ mod tests {
     fn a_max_width_narrower_than_the_unconstrained_text_wraps_to_more_lines() {
         let handle = ShapingHandle::spawn();
         let unconstrained = handle.shape(ShapeRequest {
-            text: "Oblisk Shell Renderer".into(),
+            text: "Obelisk Shell Renderer".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: None,
@@ -1395,7 +1395,7 @@ mod tests {
             font: None,
         });
         let wrapped = handle.shape(ShapeRequest {
-            text: "Oblisk Shell Renderer".into(),
+            text: "Obelisk Shell Renderer".into(),
             font_size: 14.0,
             line_height: 18.0,
             max_width: Some(unconstrained.width / 2.0),

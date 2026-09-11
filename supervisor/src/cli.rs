@@ -1,4 +1,4 @@
-//! Argument parsing for the `oblisk` binary.
+//! Argument parsing for the `obelisk` binary.
 //!
 //! Hand-rolled: four flags, two subcommands, and one non-obvious rule (`-c` may name a file).
 //! `clap` would be the workspace's largest dependency; the rule needs custom code either way.
@@ -30,21 +30,21 @@ pub struct Args {
 }
 
 pub const HELP: &str = "\
-oblisk -- a Wayland desktop shell configured in Lua
+obelisk -- a Wayland desktop shell configured in Lua
 
 USAGE:
-    oblisk [OPTIONS]            start the shell
-    oblisk init [OPTIONS]       set up a config directory for editing
-    oblisk check [OPTIONS]      evaluate the config and exit
-    oblisk set <NAME> <VALUE>   write the running config's state(NAME) signal
-    oblisk toggle <NAME>        flip it, when it holds a boolean
-    oblisk toggle <NAME> <VALUE>
+    obelisk [OPTIONS]            start the shell
+    obelisk init [OPTIONS]       set up a config directory for editing
+    obelisk check [OPTIONS]      evaluate the config and exit
+    obelisk set <NAME> <VALUE>   write the running config's state(NAME) signal
+    obelisk toggle <NAME>        flip it, when it holds a boolean
+    obelisk toggle <NAME> <VALUE>
                                 set it to VALUE, or back to its declared
                                 initial when it already is VALUE
 
 OPTIONS:
     -c, --config <DIR>   the config directory, holding shell.lua. Overrides
-                         $OBLISK_CONFIG_DIR and $XDG_CONFIG_HOME.
+                         $OBELISK_CONFIG_DIR and $XDG_CONFIG_HOME.
         --force          init only: overwrite files that already exist
     -V, --version
     -h, --help
@@ -53,8 +53,8 @@ The config is a directory, not a file: `require` resolves inside it, and the
 shell reloads when any .lua file in it changes.
 
 `set` and `toggle` are how a compositor keybind reaches a running config:
-bind `oblisk toggle launcher_open` and the config's `state(\"launcher_open\",
-false)` flips; bind `oblisk toggle modal launcher` and `state(\"modal\", \"\")`
+bind `obelisk toggle launcher_open` and the config's `state(\"launcher_open\",
+false)` flips; bind `obelisk toggle modal launcher` and `state(\"modal\", \"\")`
 becomes \"launcher\", or \"\" again when it already was. VALUE is read as JSON
 (true, 3, \"text\", [1,2]); anything that is not JSON is taken as a string, so
 quoting `notifications` is optional.
@@ -69,7 +69,7 @@ fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| format!("--config {raw} is a file with no parent directory"))?;
-        eprintln!("oblisk: --config takes a directory; using {} because {raw} is a file", parent.display());
+        eprintln!("obelisk: --config takes a directory; using {} because {raw} is a file", parent.display());
         parent.to_path_buf()
     } else {
         given.to_path_buf()
@@ -104,7 +104,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             }
             // Take the state name and `set` value before flags; a value may begin with a dash
             // (`-1`). An option the parser knows is still an option in that slot, or
-            // `oblisk toggle open -c /dir` would store the flag as the value and then choke on the
+            // `obelisk toggle open -c /dir` would store the flag as the value and then choke on the
             // directory.
             _ if matches!(command, Some("set" | "toggle")) && positional.len() < 2 && !is_option(&arg) => {
                 positional.push(arg);
@@ -135,7 +135,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         Some("check") => Command::Check,
         Some("set") => {
             let [name, value] = <[String; 2]>::try_from(positional)
-                .map_err(|_| "set takes a state name and a value: `oblisk set launcher_open true`".to_string())?;
+                .map_err(|_| "set takes a state name and a value: `obelisk set launcher_open true`".to_string())?;
             // Parse JSON when possible; bare words stay strings, so keybinds need no extra quotes.
             let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
             Command::SetState(shared::SetState { name, write: shared::StateWrite::Set(value) })
@@ -144,7 +144,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             let mut positional = positional.into_iter();
             let name = positional
                 .next()
-                .ok_or_else(|| "toggle takes a state name: `oblisk toggle launcher_open`".to_string())?;
+                .ok_or_else(|| "toggle takes a state name: `obelisk toggle launcher_open`".to_string())?;
             let write = match positional.next() {
                 // The same reading as `set`: JSON when it parses, a string otherwise.
                 Some(value) => shared::StateWrite::ToggleTo(
@@ -167,7 +167,7 @@ mod tests {
     use super::*;
 
     fn parse_args(args: &[&str]) -> Result<Args, String> {
-        parse(std::iter::once("oblisk".to_string()).chain(args.iter().map(|a| (*a).to_string())))
+        parse(std::iter::once("obelisk".to_string()).chain(args.iter().map(|a| (*a).to_string())))
     }
 
     /// The state name and value are taken before flags so a value like `-5` is not read as one,
@@ -209,22 +209,22 @@ mod tests {
 
     #[test]
     fn a_config_directory_is_made_absolute() {
-        let args = parse_args(&["-c", "dev-config/oblisk"]).unwrap();
+        let args = parse_args(&["-c", "dev-config/obelisk"]).unwrap();
         let dir = args.config_dir.expect("-c sets a directory");
         assert!(dir.is_absolute(), "a relative -c must be resolved before any Renderer inherits it");
-        assert!(dir.ends_with("dev-config/oblisk"));
+        assert!(dir.ends_with("dev-config/obelisk"));
     }
 
     #[test]
     fn the_long_form_and_the_equals_form_agree() {
-        let a = parse_args(&["--config", "dev-config/oblisk"]).unwrap();
-        let b = parse_args(&["--config=dev-config/oblisk"]).unwrap();
+        let a = parse_args(&["--config", "dev-config/obelisk"]).unwrap();
+        let b = parse_args(&["--config=dev-config/obelisk"]).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn a_path_to_shell_lua_resolves_to_its_directory() {
-        // Accommodate the common `-c ~/.config/oblisk/shell.lua` after editing that file.
+        // Accommodate the common `-c ~/.config/obelisk/shell.lua` after editing that file.
         //
         // A file this test makes, not the shipped config: the rule under test is "a path to a file
         // resolves to its parent", which has nothing to do with what the sample happens to contain.

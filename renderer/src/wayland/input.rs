@@ -599,7 +599,7 @@ impl App {
             return;
         }
         eprintln!(
-            "[oblisk-renderer] {}'s `secure_submit` field ({}/{}) became typable under the keyboard focus already held",
+            "[obelisk-renderer] {}'s `secure_submit` field ({}/{}) became typable under the keyboard focus already held",
             field.surface_id, field.target.capability, field.target.action
         );
         self.focus_secure_submit(Some(field));
@@ -623,7 +623,7 @@ impl App {
             return;
         }
         let opened = on_change.clone();
-        eprintln!("[oblisk-renderer] {surface_id}'s `autofocus` textfield takes the keyboard");
+        eprintln!("[obelisk-renderer] {surface_id}'s `autofocus` textfield takes the keyboard");
         self.focus_text_field(Some(FocusedTextField {
             surface_id: surface_id.clone(),
             id,
@@ -637,7 +637,7 @@ impl App {
         if let Some(on_change) = opened
             && let Err(e) = on_change.call::<()>(String::new())
         {
-            eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
+            eprintln!("[obelisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
         }
     }
 
@@ -677,7 +677,7 @@ impl App {
             .is_some_and(|field| focus_is_still_armed(field, &scope, self.surface_is_live(&field.surface_id)));
         if self.focused_secure_submit.is_some() && !armed {
             eprintln!(
-                "[oblisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
+                "[obelisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
             );
             self.focus_secure_submit(None);
         }
@@ -707,7 +707,7 @@ impl App {
         let gone = self.focused_secure_submit.as_ref().is_some_and(|field| !self.surface_is_live(&field.surface_id));
         if gone {
             eprintln!(
-                "[oblisk-renderer] the surface holding the focused secure_submit field is gone; dropping it and scrubbing its buffer"
+                "[obelisk-renderer] the surface holding the focused secure_submit field is gone; dropping it and scrubbing its buffer"
             );
             self.focus_secure_submit(None);
         }
@@ -729,7 +729,7 @@ impl App {
                 && !self.focused_text_field.as_ref().is_some_and(|field| self.text_field_takes_keys(field))
             {
                 eprintln!(
-                    "[oblisk-renderer] submit pressed while no secure field holds focus; nothing was typed into one and nothing was sent"
+                    "[obelisk-renderer] submit pressed while no secure field holds focus; nothing was typed into one and nothing was sent"
                 );
             }
             return;
@@ -797,7 +797,7 @@ impl App {
         if self.surface_is_live(&field.surface_id) && node_exists {
             return;
         }
-        eprintln!("[oblisk-renderer] the focused textfield is gone; dropping what was typed");
+        eprintln!("[obelisk-renderer] the focused textfield is gone; dropping what was typed");
         self.focus_text_field(None);
     }
 
@@ -846,7 +846,7 @@ impl App {
             if let Some(on_navigate) = on_navigate
                 && let Err(e) = on_navigate.call::<()>(key)
             {
-                eprintln!("[oblisk-renderer] {surface_id}: on_navigate raised, ignoring it: {e}");
+                eprintln!("[obelisk-renderer] {surface_id}: on_navigate raised, ignoring it: {e}");
             }
             return;
         }
@@ -875,21 +875,21 @@ impl App {
         let Some(frame) = submit_frame_for(self.generation_id, target, &mut self.secure_buffer) else {
             match addressed {
                 None => eprintln!(
-                    "[oblisk-renderer] secure_submit dropped: no focused textfield named a capability and action to address it to, so nothing was sent"
+                    "[obelisk-renderer] secure_submit dropped: no focused textfield named a capability and action to address it to, so nothing was sent"
                 ),
                 Some(target) if nothing_typed => eprintln!(
-                    "[oblisk-renderer] secure_submit to {}/{} dropped: nothing had been typed",
+                    "[obelisk-renderer] secure_submit to {}/{} dropped: nothing had been typed",
                     target.capability, target.action
                 ),
                 Some(target) => eprintln!(
-                    "[oblisk-renderer] secure_submit to {}/{} dropped for no recorded reason; this is a bug",
+                    "[obelisk-renderer] secure_submit to {}/{} dropped for no recorded reason; this is a bug",
                     target.capability, target.action
                 ),
             }
             return;
         };
         if let Err(e) = self.outbound_tx.send(frame) {
-            eprintln!("[oblisk-renderer] failed to queue SecureSubmit for the socket thread: {e}");
+            eprintln!("[obelisk-renderer] failed to queue SecureSubmit for the socket thread: {e}");
         }
     }
 
@@ -920,7 +920,7 @@ impl App {
             self.drag = None;
         }
         if let Err((what, e)) = call_on_drag(self.client.lua(), &drag.handler, drag.rect, position, phase) {
-            eprintln!("[oblisk-renderer] {instance_id}: {what}: {e}");
+            eprintln!("[obelisk-renderer] {instance_id}: {what}: {e}");
         }
     }
 
@@ -965,10 +965,10 @@ impl App {
             match rect_table(self.client.lua(), rect) {
                 Ok(rect) => {
                     if let Err(e) = on_wheel.call::<()>((rect, steps)) {
-                        eprintln!("[oblisk-renderer] {surface_id}: on_wheel raised, ignoring it: {e}");
+                        eprintln!("[obelisk-renderer] {surface_id}: on_wheel raised, ignoring it: {e}");
                     }
                 }
-                Err(e) => eprintln!("[oblisk-renderer] {surface_id}: could not build on_wheel's rect argument: {e}"),
+                Err(e) => eprintln!("[obelisk-renderer] {surface_id}: could not build on_wheel's rect argument: {e}"),
             }
             return;
         }
@@ -1015,7 +1015,7 @@ impl App {
             Ok(()) => self.cursor_shown = Some(shape),
             // Remember failure as shown; a missing themed cursor is reported once, not per pixel.
             Err(err) => {
-                eprintln!("[oblisk-renderer] could not set the cursor to {}: {err}", shape.name());
+                eprintln!("[obelisk-renderer] could not set the cursor to {}: {err}", shape.name());
                 self.cursor_shown = Some(shape);
             }
         }
@@ -1056,7 +1056,7 @@ impl App {
         let writes = layout::hover::hover_writes(tree, point);
         let lua = self.client.lua();
         for write in writes {
-            // Non-hover signals stay untouched, so `hover = oblisk.network` cannot overwrite a
+            // Non-hover signals stay untouched, so `hover = obelisk.network` cannot overwrite a
             // capability snapshot (ADR-0062 decision 2).
             let Some(handle) = write.signal.hover_handle() else {
                 continue;
@@ -1070,7 +1070,7 @@ impl App {
                 && let Some(on_hover) = &write.on_hover
                 && let Err(err) = on_hover.call::<()>(write.hovered)
             {
-                eprintln!("[oblisk-renderer] {}: on_hover handler raised: {err}", self.surfaces[index].surface_id);
+                eprintln!("[obelisk-renderer] {}: on_hover handler raised: {err}", self.surfaces[index].surface_id);
             }
             // Rects are edge-only, not merely an optimization: mlua table equality is identity, so
             // a fresh equal table would undo decision 4 on every motion.
@@ -1082,7 +1082,7 @@ impl App {
                     Ok(table) => rect_handle.set(mlua::Value::Table(table)),
                     // The boolean landed; keep the last tooltip position on table-build failure.
                     Err(err) => eprintln!(
-                        "[oblisk-renderer] {}: could not build a hover rect: {err}",
+                        "[obelisk-renderer] {}: could not build a hover rect: {err}",
                         self.surfaces[index].surface_id
                     ),
                 }
@@ -1095,7 +1095,7 @@ impl App {
     fn fire_on_click(&mut self, instance_id: &str, rect: LogicalRect, button: &str, on_click: &Function) {
         // `signal:set()` marks its own dirty flag (ADR-0044 decision 5); this call need not.
         if let Err((what, e)) = call_on_click(self.client.lua(), on_click, rect, button) {
-            eprintln!("[oblisk-renderer] {instance_id}: {what}: {e}");
+            eprintln!("[obelisk-renderer] {instance_id}: {what}: {e}");
         }
     }
 }
@@ -1133,7 +1133,7 @@ impl SeatHandler for App {
                     // Nonfatal: painting, reload, and keyboard input remain; only `on_click` stops.
                     Err(e) => {
                         eprintln!(
-                            "[oblisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"
+                            "[obelisk-renderer] wl_seat::get_pointer failed; no button's on_click will ever fire: {e}"
                         )
                     }
                 }
@@ -1145,7 +1145,7 @@ impl SeatHandler for App {
                 // Nonfatal, but `enter`/`leave` stop tracking focus and stale textfield focus may
                 // outlive the user.
                 Err(e) => eprintln!(
-                    "[oblisk-renderer] wl_seat::get_keyboard failed; keyboard focus will never be tracked: {e}"
+                    "[obelisk-renderer] wl_seat::get_keyboard failed; keyboard focus will never be tracked: {e}"
                 ),
             },
             _ => {}
@@ -1307,7 +1307,7 @@ impl PointerHandler for App {
                             // Links take `href`, not the paragraph rect; a link is not a button.
                             (Some(href), Some(handler)) => {
                                 if let Err(e) = handler.call::<()>(href) {
-                                    eprintln!("[oblisk-renderer] {instance_id}: on_link raised, ignoring it: {e}");
+                                    eprintln!("[obelisk-renderer] {instance_id}: on_link raised, ignoring it: {e}");
                                 }
                             }
                             (_, handler) => {
@@ -1394,14 +1394,14 @@ impl KeyboardHandler for App {
         // A scope with exactly one `secure_submit` becomes typable without a click.
         let next = self.field_the_scope_declares(&scope, self.focused_secure_submit.clone());
         match (&self.keyboard_focus, &next) {
-            (None, _) => eprintln!("[oblisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
+            (None, _) => eprintln!("[obelisk-renderer] keyboard focus entered an untracked surface; not tracking it"),
             (Some(id), Some(field)) => eprintln!(
-                "[oblisk-renderer] keyboard focus entered {id} and takes {}'s `secure_submit` field ({}/{})",
+                "[obelisk-renderer] keyboard focus entered {id} and takes {}'s `secure_submit` field ({}/{})",
                 field.surface_id, field.target.capability, field.target.action
             ),
             // Report the searched popup scope so "no field" distinguishes out-of-reach from hidden.
             (Some(id), None) => eprintln!(
-                "[oblisk-renderer] keyboard focus entered {id}, and neither it nor its shown popups {:?} declare a sole `secure_submit` field",
+                "[obelisk-renderer] keyboard focus entered {id}, and neither it nor its shown popups {:?} declare a sole `secure_submit` field",
                 &scope[1..]
             ),
         }
@@ -1434,7 +1434,7 @@ impl KeyboardHandler for App {
         // keyboard, not the reply. It stops keys/caret until focus returns.
         self.field_input_changed |= self.focused_text_field.is_some();
         self.armed = None;
-        eprintln!("[oblisk-renderer] keyboard focus left {left}");
+        eprintln!("[obelisk-renderer] keyboard focus left {left}");
     }
 
     // § 5.2 has no key-handler property, and ADR-0050 adds none: `secure_submit` (ADR-0005) sends
@@ -1511,19 +1511,19 @@ fn deliver_plain_edit(surface_id: &str, edit: PlainEdit, text: String, callbacks
         && let Some(on_submit) = on_submit
         && let Err(e) = on_submit.call::<()>(text.clone())
     {
-        eprintln!("[oblisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
+        eprintln!("[obelisk-renderer] {surface_id}: on_submit raised, ignoring it: {e}");
     }
     if edit.changed
         && let Some(on_change) = on_change
         && let Err(e) = on_change.call::<()>(if edit.submitted { String::new() } else { text })
     {
-        eprintln!("[oblisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
+        eprintln!("[obelisk-renderer] {surface_id}: on_change raised, ignoring it: {e}");
     }
     if edit.cancelled
         && let Some(on_cancel) = on_cancel
         && let Err(e) = on_cancel.call::<()>(())
     {
-        eprintln!("[oblisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
+        eprintln!("[obelisk-renderer] {surface_id}: on_cancel raised, ignoring it: {e}");
     }
 }
 

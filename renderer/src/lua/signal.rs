@@ -102,7 +102,7 @@ enum SignalKind {
     /// the Loader stays on one Wayland dispatch thread (ADR-0039).
     Live(Rc<RefCell<Value>>),
     /// Engine-written, config-read boolean from `hover(name)` (ADR-0062), separate from `Live` so
-    /// only `hover_handle` can write it and `hover = oblisk.network` gets no writer. `paired_rect`
+    /// only `hover_handle` can write it and `hover = obelisk.network` gets no writer. `paired_rect`
     /// links the boolean to `hover_rect(name)`'s cell; the rect half has `None` and is not a
     /// trigger.
     Hover {
@@ -111,7 +111,7 @@ enum SignalKind {
         dirty: DirtyFlag,
     },
     /// Scroll offset in logical pixels (ADR-0069), written by the wheel handler and layout clamp.
-    /// Separate from `Hover` so only `scroll_handle` writes it; `scroll = oblisk.network` cannot
+    /// Separate from `Hover` so only `scroll_handle` writes it; `scroll = obelisk.network` cannot
     /// overwrite a capability snapshot.
     Scroll {
         cell: Rc<RefCell<Value>>,
@@ -381,7 +381,7 @@ impl Signal {
 
     /// `map(f)` as a one-dependency `Computed`, recomputed on every read (ADR-0044 decision 3).
     /// Shared by
-    /// Lua and Rust so `lua::capability::Capability` makes `oblisk.lock` read like bare
+    /// Lua and Rust so `lua::capability::Capability` makes `obelisk.lock` read like bare
     /// capabilities.
     pub(crate) fn mapped(&self, func: Function) -> Signal {
         Signal(SignalKind::Computed { id: next_computed_id(), deps: Rc::new(vec![self.clone()]), func })
@@ -597,7 +597,7 @@ impl UserData for Signal {
     }
 }
 
-/// Applies an `oblisk set`/`toggle` to named `state` (ADR-0112), using `set`'s marshalling and
+/// Applies an `obelisk set`/`toggle` to named `state` (ADR-0112), using `set`'s marshalling and
 /// dirty checks. Refuses missing state or non-boolean toggle values, the two keybind/config
 /// mismatches.
 pub fn write_state(lua: &Lua, set: &shared::SetState) -> Result<(), String> {
@@ -925,7 +925,7 @@ pub fn from_userdata(ud: &mlua::AnyUserData) -> Option<Signal> {
         return Some(capability.signal());
     }
     // `IdleMember` wraps a capability beside its three threshold methods (ADR-0141); without this
-    // arm `visible = oblisk.idle` is the one unbindable capability.
+    // arm `visible = obelisk.idle` is the one unbindable capability.
     Some(ud.borrow::<crate::lua::idle::IdleMember>().ok()?.signal())
 }
 
@@ -966,7 +966,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 .map(|dep| {
                     // Name the expected type; `borrow`'s error does not.
                     from_userdata(&dep?).ok_or_else(|| {
-                        mlua::Error::runtime("computed() dependencies must be Signals or `oblisk` capabilities, § 1.2")
+                        mlua::Error::runtime("computed() dependencies must be Signals or `obelisk` capabilities, § 1.2")
                     })
                 })
                 .collect::<mlua::Result<Vec<_>>>()?;
@@ -977,7 +977,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
         "delay",
         lua.create_function(|lua, (source, millis): (mlua::AnyUserData, f64)| {
             let source = from_userdata(&source)
-                .ok_or_else(|| mlua::Error::runtime("delay() takes a Signal or an `oblisk` capability first"))?;
+                .ok_or_else(|| mlua::Error::runtime("delay() takes a Signal or an `obelisk` capability first"))?;
             let hold = parse_hold("delay() hold", millis)?;
             let held = source.get_value(lua)?;
             Ok(Signal(SignalKind::Delayed {
@@ -991,7 +991,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
         "pulse",
         lua.create_function(|lua, (source, millis): (mlua::AnyUserData, f64)| {
             let source = from_userdata(&source)
-                .ok_or_else(|| mlua::Error::runtime("pulse() takes a Signal or an `oblisk` capability first"))?;
+                .ok_or_else(|| mlua::Error::runtime("pulse() takes a Signal or an `obelisk` capability first"))?;
             let hold = parse_hold("pulse() window", millis)?;
             let seen = source.get_value(lua)?;
             Ok(Signal(SignalKind::Pulse {
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn the_engine_writes_a_hover_signal_through_its_handle_and_only_a_hover_signal() {
-        // Decision 2's other half: only hover has a writer, so `hover = oblisk.network` cannot let
+        // Decision 2's other half: only hover has a writer, so `hover = obelisk.network` cannot let
         // pointer input overwrite a capability snapshot.
         let dirty = DirtyFlag::new();
         let (hovered, hovered_rect) = Signal::new_hover(dirty.clone(), Value::Nil);
@@ -2068,7 +2068,7 @@ mod tests {
         assert_eq!(result, 2_000_001_000_000);
     }
 
-    /// Resolver must see through `Capability`, or live `oblisk.<name>` becomes a literal.
+    /// Resolver must see through `Capability`, or live `obelisk.<name>` becomes a literal.
     #[test]
     fn from_userdata_sees_through_a_capability_to_its_read_signal() {
         use crate::lua::capability::{Capability, CommandSender};
@@ -2119,7 +2119,7 @@ mod tests {
         lua.globals().set("handle", lua.create_any_userdata(7u32).unwrap()).unwrap();
         let err = lua.load("return computed({handle}, function(n) return n end)").exec().unwrap_err().to_string();
         assert!(
-            err.contains("must be Signals or `oblisk` capabilities"),
+            err.contains("must be Signals or `obelisk` capabilities"),
             "the error must say what was expected: {err}"
         );
     }

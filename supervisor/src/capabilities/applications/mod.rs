@@ -1,4 +1,4 @@
-//! `oblisk.applications`: installed `.desktop` entries (ADR-0061). A top-level capability using
+//! `obelisk.applications`: installed `.desktop` entries (ADR-0061). A top-level capability using
 //! plain filesystem reads, with no D-Bus proxy or hardware thread.
 //!
 //! ADR-0054 decision 5 called for this when a window needed an icon it did not report. The
@@ -14,7 +14,7 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
-/// Actions accepted by `oblisk.applications:invoke(...)`; exhaustive dispatch keeps variants and
+/// Actions accepted by `obelisk.applications:invoke(...)`; exhaustive dispatch keeps variants and
 /// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -24,7 +24,7 @@ pub enum ApplicationsAction {
     OpenUrl,
 }
 
-/// `oblisk.applications` action dispatch (ADR-0037). `refresh` calls `spawn_blocking`; `launch`
+/// `obelisk.applications` action dispatch (ADR-0037). `refresh` calls `spawn_blocking`; `launch`
 /// and `open_url` spawn detached children without waiting.
 pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

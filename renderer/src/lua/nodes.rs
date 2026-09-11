@@ -343,7 +343,7 @@ mod tests {
 
 /// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` stay hand-written: no type describes their 29
 /// scattered `properties.get("...")` calls across `layout/node/`, each validating inline.
-/// `lua-meta/oblisk.lua` is generated (`supervisor/src/stubs.rs`) because capability payloads are
+/// `lua-meta/obelisk.lua` is generated (`supervisor/src/stubs.rs`) because capability payloads are
 /// real `Serialize` structs.
 ///
 /// This guard covers the hand-written half, checking roster drift where a new kind lacks a stub;
@@ -495,7 +495,7 @@ mod meta_stub_tests {
     /// stub by checking `dev-config`. All 455 types are sampled; missing `sample` rows fail.
     /// ponytail: checks, does not derive. The node schema remains hand-written: 49 parse functions
     /// and 45 `properties.get` calls across ten files. Upgrade to per-kind props structs, making
-    /// `nodes.lua` generable like `oblisk.lua`; that rewrites parsing and trades property-specific
+    /// `nodes.lua` generable like `obelisk.lua`; that rewrites parsing and trades property-specific
     /// errors for serde's. Not worth it while this test holds.
     #[test]
     fn every_type_the_stubs_declare_is_accepted_by_the_engine() {
@@ -734,12 +734,12 @@ mod meta_stub_tests {
         out
     }
 
-    /// Every `shared::Capability::ALL` name as an `Oblisk` field.
+    /// Every `shared::Capability::ALL` name as an `Obelisk` field.
     #[test]
     fn the_stubs_declare_every_capability_and_no_others() {
-        let source = meta("oblisk.lua");
-        // The `---@field` block under `---@class Oblisk`, not `ObliskVersion`.
-        let class = source.split("---@class Oblisk\n").nth(1).expect("oblisk.lua declares an Oblisk class");
+        let source = meta("obelisk.lua");
+        // The `---@field` block under `---@class Obelisk`, not `ObeliskVersion`.
+        let class = source.split("---@class Obelisk\n").nth(1).expect("obelisk.lua declares an Obelisk class");
         // Off-roster members lack a `StateSnapshot` and roster entry (`lua::namespace::build`).
         // `idle` left this list under ADR-0141: it is now a roster capability wrapped for three
         // callbacks that cannot cross the wire.
@@ -751,6 +751,6 @@ mod meta_stub_tests {
             .filter(|name| !off_roster.contains(name))
             .collect();
         let expected: BTreeSet<&str> = shared::Capability::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(declared, expected, "lua-meta/oblisk.lua is out of step with shared::Capability::ALL");
+        assert_eq!(declared, expected, "lua-meta/obelisk.lua is out of step with shared::Capability::ALL");
     }
 }

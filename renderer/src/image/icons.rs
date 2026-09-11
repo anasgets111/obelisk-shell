@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn an_absolute_name_is_its_own_path() {
         // `dbus/shm_icons.rs` spools tray icons here as `icon_path`.
-        let spooled = "/dev/shm/oblisk-1000/tray/telegram.png";
+        let spooled = "/dev/shm/obelisk-1000/tray/telegram.png";
         assert_eq!(resolve(spooled, 16), Some(PathBuf::from(spooled)));
         // No stat: nonexistent absolute paths still return themselves.
         assert_eq!(resolve("/nonexistent/x.png", 16), Some(PathBuf::from("/nonexistent/x.png")));
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn a_relative_name_is_not_treated_as_a_path() {
         // Only absolute paths short-circuit; `./x.png` is looked up, not resolved against CWD.
-        assert_eq!(resolve("./oblisk-does-not-exist.png", 16), None);
+        assert_eq!(resolve("./obelisk-does-not-exist.png", 16), None);
     }
 
     #[test]
@@ -172,14 +172,14 @@ mod tests {
     #[test]
     fn a_resolved_name_is_looked_up_once_and_remembered() {
         let calls = std::cell::Cell::new(0);
-        let found = memoized("oblisk-test-alpha", 16, || {
+        let found = memoized("obelisk-test-alpha", 16, || {
             calls.set(calls.get() + 1);
             Some(PathBuf::from("/memo/alpha-16"))
         });
         assert_eq!(found, Some(PathBuf::from("/memo/alpha-16")));
         assert_eq!(calls.get(), 1);
         // The second ask must skip the walk, measured at 1.6ms mean per icon per frame before this.
-        let again = memoized("oblisk-test-alpha", 16, || panic!("a remembered name must not be looked up again"));
+        let again = memoized("obelisk-test-alpha", 16, || panic!("a remembered name must not be looked up again"));
         assert_eq!(again, Some(PathBuf::from("/memo/alpha-16")));
     }
 
@@ -188,19 +188,19 @@ mod tests {
         // A collision draws the *wrong* icon, harder to notice than a missing one: a plausible bar
         // full of icons other than the requested ones.
         assert_eq!(
-            memoized("oblisk-test-beta", 16, || Some(PathBuf::from("/memo/beta-16"))),
+            memoized("obelisk-test-beta", 16, || Some(PathBuf::from("/memo/beta-16"))),
             Some(PathBuf::from("/memo/beta-16"))
         );
         assert_eq!(
-            memoized("oblisk-test-beta", 32, || Some(PathBuf::from("/memo/beta-32"))),
+            memoized("obelisk-test-beta", 32, || Some(PathBuf::from("/memo/beta-32"))),
             Some(PathBuf::from("/memo/beta-32"))
         );
         assert_eq!(
-            memoized("oblisk-test-gamma", 16, || Some(PathBuf::from("/memo/gamma-16"))),
+            memoized("obelisk-test-gamma", 16, || Some(PathBuf::from("/memo/gamma-16"))),
             Some(PathBuf::from("/memo/gamma-16"))
         );
         assert_eq!(
-            memoized("oblisk-test-beta", 16, || panic!("a remembered name must not be looked up again")),
+            memoized("obelisk-test-beta", 16, || panic!("a remembered name must not be looked up again")),
             Some(PathBuf::from("/memo/beta-16"))
         );
     }
@@ -209,8 +209,8 @@ mod tests {
     fn a_name_the_theme_does_not_have_is_remembered_as_absent() {
         // Misses walk the whole inheritance chain and stat every candidate; worst call was 5.5ms.
         // Memoize `None` exactly like a hit.
-        assert_eq!(memoized("oblisk-test-missing", 16, || None), None);
-        assert_eq!(memoized("oblisk-test-missing", 16, || panic!("an absent name must not be looked up again")), None);
+        assert_eq!(memoized("obelisk-test-missing", 16, || None), None);
+        assert_eq!(memoized("obelisk-test-missing", 16, || panic!("an absent name must not be looked up again")), None);
     }
 
     /// A notification's `app_icon` is an arbitrary name from whichever application sent it, so the

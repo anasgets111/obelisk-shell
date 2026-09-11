@@ -68,7 +68,7 @@ pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
 ///
 /// Absent `content` is empty (ADR-0044 decision 1): before the first `StateSnapshot`, a capability
 /// signal reads `nil`, and `run_startup_evaluation` runs before the poll loop drains one. A typo in
-/// `content` therefore renders an empty node; `oblisk.rescue` covers the important failures.
+/// `content` therefore renders an empty node; `obelisk.rescue` covers the important failures.
 pub fn parse_content(properties: &HashMap<String, Value>) -> Result<(String, Vec<StyleRun>), LayoutError> {
     let Some(value) = properties.get("content") else {
         return Ok((String::new(), Vec::new()));

@@ -329,7 +329,7 @@ mod tests {
     }
 
     /// The lockout of 2026-09-07 (ADR-0156). A Candidate evaluates `shell.lua` before it signals
-    /// ready, so every `oblisk.<capability>` the config reads queues a `StartCapability` that
+    /// ready, so every `obelisk.<capability>` the config reads queues a `StartCapability` that
     /// reaches this link ahead of the `ReadySignal` it is waiting for. Dropping those left the
     /// Supervisor with no `lock` controller behind a lock screen that still took keystrokes.
     #[tokio::test]

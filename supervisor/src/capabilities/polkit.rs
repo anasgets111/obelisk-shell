@@ -1,4 +1,4 @@
-//! `oblisk.polkit`: polkitd's pending challenge and the dialog's one action (ADR-0114).
+//! `obelisk.polkit`: polkitd's pending challenge and the dialog's one action (ADR-0114).
 //!
 //! `crate::polkit` owns D-Bus; this owns the config state and held reply. Like `lock`, `main.rs`
 //! builds and pushes it because the bus callback, `secure_submit` frame, and PAM answer all land
@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::polkit::{AgentError, BeginAuthenticationCall, first_unix_user_uid};
 
-/// `oblisk.polkit`'s payload. All fields except `active` are empty while it is false.
+/// `obelisk.polkit`'s payload. All fields except `active` are empty while it is false.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct PolkitState {
     /// polkitd is waiting for the user; the remaining fields describe its request.
@@ -27,7 +27,7 @@ pub struct PolkitState {
     pub error: String,
 }
 
-/// Every action `oblisk.polkit:invoke(...)` accepts (ADR-0037). `cancel` dismisses the prompt and
+/// Every action `obelisk.polkit:invoke(...)` accepts (ADR-0037). `cancel` dismisses the prompt and
 /// tells polkitd's caller `Cancelled`. Variants stay undocumented: schemars would render a doc as
 /// `oneOf`, not the bare `enum` read by the stub generator.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -130,7 +130,7 @@ impl PolkitController {
     }
 }
 
-/// `oblisk.polkit` action dispatch (ADR-0037). Returns whether state changed.
+/// `obelisk.polkit` action dispatch (ADR-0037). Returns whether state changed.
 pub fn dispatch(controller: &mut PolkitController, envelope: &shared::CommandEnvelope) -> bool {
     let Some(action) = crate::parse_action::<PolkitAction>(&envelope.params) else { return false };
     match action {

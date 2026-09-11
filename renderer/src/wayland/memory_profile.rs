@@ -1,4 +1,4 @@
-//! Reports where the Renderer's heap sits when `OBLISK_PROFILE_MEMORY` is set. `smaps` already
+//! Reports where the Renderer's heap sits when `OBELISK_PROFILE_MEMORY` is set. `smaps` already
 //! says how much a generation holds (`supervisor/src/memory.rs`, ADR-0043); it cannot say which
 //! subsystem holds it. A 16h session measured 120.8 MB RSS against 84.8 MB fresh, 48 MB of it in
 //! glibc's `[heap]` against `image`'s 16 MB `TEXTURE_BUDGET`, with no drift while idle.
@@ -11,10 +11,10 @@
 //!
 //! Unset means one `Instant::elapsed` per turn and no counters read: collection is behind a
 //! closure the report interval gates. Set a positive interval in seconds
-//! (`OBLISK_PROFILE_MEMORY=60`); invalid input uses [`DEFAULT_INTERVAL_SECS`] rather than
+//! (`OBELISK_PROFILE_MEMORY=60`); invalid input uses [`DEFAULT_INTERVAL_SECS`] rather than
 //! preventing startup, matching `idle_profile`.
 //!
-//! `OBLISK_PROFILE_MEMORY_TRIM=1` additionally calls `malloc_trim` after each report and prints
+//! `OBELISK_PROFILE_MEMORY_TRIM=1` additionally calls `malloc_trim` after each report and prints
 //! what it returned. That answers a question the counters raise but cannot settle: ADR-0126
 //! measured a trim returning none of the picker's retained 3.6 MB, so whether the free lists this
 //! reports are actually returnable has to be measured, not assumed. Diagnostic only -- it walks
@@ -22,7 +22,7 @@
 
 use std::time::{Duration, Instant};
 
-/// Fallback for a non-positive or invalid `OBLISK_PROFILE_MEMORY`. A minute is short enough to
+/// Fallback for a non-positive or invalid `OBELISK_PROFILE_MEMORY`. A minute is short enough to
 /// bracket one deliberate action and long enough to leave an overnight log readable.
 const DEFAULT_INTERVAL_SECS: u64 = 60;
 
@@ -111,15 +111,15 @@ pub struct MemoryProfile {
 }
 
 impl MemoryProfile {
-    /// `Some` only when `OBLISK_PROFILE_MEMORY` is set.
+    /// `Some` only when `OBELISK_PROFILE_MEMORY` is set.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("OBLISK_PROFILE_MEMORY").ok()?;
+        let raw = std::env::var("OBELISK_PROFILE_MEMORY").ok()?;
         let secs = raw.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
-        eprintln!("[oblisk-renderer] memory profile on, reporting every {secs}s");
+        eprintln!("[obelisk-renderer] memory profile on, reporting every {secs}s");
         let now = Instant::now();
-        let trim = std::env::var("OBLISK_PROFILE_MEMORY_TRIM").is_ok_and(|value| value.trim() != "0");
+        let trim = std::env::var("OBELISK_PROFILE_MEMORY_TRIM").is_ok_and(|value| value.trim() != "0");
         if trim {
-            eprintln!("[oblisk-renderer] memory profile will malloc_trim after each report");
+            eprintln!("[obelisk-renderer] memory profile will malloc_trim after each report");
         }
         Some(Self {
             interval: Duration::from_secs(secs),
@@ -141,17 +141,17 @@ impl MemoryProfile {
         let malloc = Malloc::now();
         let census = Census { malloc, ..census };
         eprintln!(
-            "[oblisk-renderer] {}",
+            "[obelisk-renderer] {}",
             render(self.started.elapsed(), &census, self.previous.as_ref(), self.first.as_ref())
         );
-        eprintln!("[oblisk-renderer] {}", render_surfaces(self.started.elapsed(), &surfaces));
+        eprintln!("[obelisk-renderer] {}", render_surfaces(self.started.elapsed(), &surfaces));
         if self.trim {
             // SAFETY: plain one-integer FFI. `malloc_trim` locks arenas itself, is thread-safe,
             // and only `madvise`s pages the allocator already holds free.
             unsafe {
                 libc::malloc_trim(0);
             }
-            eprintln!("[oblisk-renderer] {}", render_trim(self.started.elapsed(), malloc, Malloc::now()));
+            eprintln!("[obelisk-renderer] {}", render_trim(self.started.elapsed(), malloc, Malloc::now()));
         }
         self.first.get_or_insert(census);
         self.previous = Some(census);

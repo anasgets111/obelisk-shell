@@ -9,7 +9,7 @@ demand and remain started for the Supervisor's lifetime. State is event-driven w
 supports it; the clock, hardware telemetry and update checks use their own schedules.
 Lua owns presentation and user policy.
 
-Capability commands use `oblisk.<name>:invoke("action", ...)`. The exceptions are the
+Capability commands use `obelisk.<name>:invoke("action", ...)`. The exceptions are the
 dedicated idle methods, `persistent_table` and `process.run`.
 
 ## 1. Notifications
@@ -29,7 +29,7 @@ The Supervisor claims `org.freedesktop.Notifications` on the session bus.
 | DND | Gates sound only; critical urgency bypasses DND and automatic expiry |
 | Sounds | Configured per urgency; a trusted client sound-file can override it, suppress-sound silences it; no sound-theme lookup |
 
-Spooled files live under `$XDG_RUNTIME_DIR/oblisk/notifications/`.
+Spooled files live under `$XDG_RUNTIME_DIR/obelisk/notifications/`.
 The [notification types and limits](../supervisor/src/capabilities/notifications/mod.rs)
 and [markup validator](../supervisor/src/capabilities/notifications/markup.rs) define the exact fields.
 
@@ -52,7 +52,7 @@ The Supervisor hosts `org.kde.StatusNotifierWatcher` and reads each item's own o
 | :--- | :--- |
 | Icon selection | Item-local theme path, then theme name, then validated pixmap fallback |
 | Pixmap validation | Positive square size, at most 128×128, exactly width × height × 4 ARGB bytes |
-| Spooling | PNG under `$XDG_RUNTIME_DIR/oblisk/tray/`; Lua receives names or paths |
+| Spooling | PNG under `$XDG_RUNTIME_DIR/obelisk/tray/`; Lua receives names or paths |
 | Activation | `activate(id, x, y)`; menu-only items do not receive Activate; secondary activation and scroll are also supported |
 | Menus | Recursive DBusMenu data; `menu_will_show` refreshes lazy content; `activate_menu_item` selects an item |
 
@@ -120,7 +120,7 @@ See [audio dispatch](../supervisor/src/capabilities/audio/mod.rs) and
 The Supervisor owns `ext_idle_notifier_v1`. Lua registers idle/resume callbacks per duration;
 equal durations share a Wayland listener. Registrations reset on re-evaluation.
 
-`oblisk.idle:inhibit(reason)` and `release_inhibit()` refcount one logind
+`obelisk.idle:inhibit(reason)` and `release_inhibit()` refcount one logind
 `Inhibit(what="idle", mode="block")` fd across generation holds. Logind idle inhibition suppresses
 threshold events and resumes reported thresholds. `idle.inhibited` reflects shell holds;
 `idle.inhibitors` names external holders.
@@ -142,7 +142,7 @@ focus, population, Hyprland special workspaces, and the focused active client (t
 floating state, and Hyprland fullscreen). Actions focus a workspace or toggle special workspaces.
 No complete window list is exposed.
 
-`oblisk.screens` is Renderer-owned output state, not a display-configuration API.
+`obelisk.screens` is Renderer-owned output state, not a display-configuration API.
 See [workspaces](../supervisor/src/capabilities/workspaces/mod.rs) and
 [output handling](../renderer/src/wayland/output.rs).
 
@@ -162,7 +162,7 @@ Generation retirement and Supervisor shutdown reap managed children using SIGTER
 before SIGKILL. In-place reload preserves the generation without restarting processes.
 See [process registry](../supervisor/src/process/registry.rs).
 
-`session_process` declares the other lifetime. Those programs are held by `oblisk.processes` rather
+`session_process` declares the other lifetime. Those programs are held by `obelisk.processes` rather
 than by a generation, so the retirement sweep never sees them; they survive every reload and are
 reaped only at shutdown, with the signal each declaration named and a five-second grace before
 SIGKILL. The longer grace is deliberate: a program is declared this way because it is doing
@@ -195,7 +195,7 @@ See [capability registry](../supervisor/src/capabilities/mod.rs).
 | Config | CLI `-c`, then shared config-path resolver |
 | Declared JSON stores | Absolute path and filename chosen by `persistent_table` |
 | Control socket / lock marker | `$XDG_RUNTIME_DIR` |
-| Spooled images | `$XDG_RUNTIME_DIR/oblisk/<kind>/`; runtime fallback uses `/run/user/<uid>` |
+| Spooled images | `$XDG_RUNTIME_DIR/obelisk/<kind>/`; runtime fallback uses `/run/user/<uid>` |
 
 Declared files push immediately and write 1 second after the last edit via temporary file and rename.
 Pending saves do not flush at shutdown. See [storage](../supervisor/src/capabilities/storage/controller.rs).
@@ -232,7 +232,7 @@ See [wire types](../shared/src/lib.rs), [socket](../supervisor/src/socket.rs) an
 
 Config edits trigger evaluation in the current generation. Value changes reconcile in place;
 topology changes require a candidate generation. Evaluation failure preserves the active scene and
-reports via `oblisk.rescue`.
+reports via `obelisk.rescue`.
 
 ### 14.2 Candidate preparation and presentation
 

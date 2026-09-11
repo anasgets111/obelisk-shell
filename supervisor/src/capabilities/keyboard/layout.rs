@@ -1,4 +1,4 @@
-//! Keyboard layout integration for `oblisk.keyboard` (ADR-0034). `crate::compositor` selects a
+//! Keyboard layout integration for `obelisk.keyboard` (ADR-0034). `crate::compositor` selects a
 //! [`CompositorLink`] at startup; without a supported compositor, layout is empty with count `0`.
 
 use std::io::{BufRead, BufReader};

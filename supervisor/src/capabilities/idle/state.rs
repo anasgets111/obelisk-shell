@@ -1,4 +1,4 @@
-//! What `oblisk.idle` publishes: whether anything holds the session awake, and who.
+//! What `obelisk.idle` publishes: whether anything holds the session awake, and who.
 //!
 //! ADR-0139 kept the gate out of Lua: a read-state roster would buy only push machinery because
 //! `register_threshold` callbacks cannot cross the wire. That hid why a countdown stopped while
@@ -22,7 +22,7 @@ pub struct IdleInhibitor {
     pub why: String,
 }
 
-/// `oblisk.idle` payload (ADR-0141).
+/// `obelisk.idle` payload (ADR-0141).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct IdleState {
     /// Anything is holding the session awake: a logind inhibitor including this shell's own, or

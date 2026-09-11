@@ -1,7 +1,7 @@
 //! `persistent_table { path, name, defaults }` (ADR-0136): named JSON file, read as signals and
 //! written one key at a time.
 //!
-//! Config supplies `path` and `name`, usually from `oblisk.config_dir` and `os.getenv` (one of
+//! Config supplies `path` and `name`, usually from `obelisk.config_dir` and `os.getenv` (one of
 //! ADR-0048's four calls), so `$XDG_STATE_HOME`, `$XDG_CACHE_HOME`, a file beside `shell.lua`, and
 //! three simultaneous files are all the same call with different inputs.
 //!
@@ -20,8 +20,8 @@ use crate::lua::signal::{Signal, from_userdata};
 #[derive(Default)]
 struct StoreRegistry(HashMap<String, Table>);
 
-/// Registers `persistent_table`. Resolve `oblisk.storage` at call time; registration runs in
-/// `Loader::new`, before `lua::namespace::build` creates `oblisk`.
+/// Registers `persistent_table`. Resolve `obelisk.storage` at call time; registration runs in
+/// `Loader::new`, before `lua::namespace::build` creates `obelisk`.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "persistent_table",
@@ -75,13 +75,13 @@ fn join(path: &str, name: &str) -> mlua::Result<String> {
     Ok(format!("{}/{name}", path.trim_end_matches('/')))
 }
 
-/// `oblisk.storage` through namespace `__index`, so the read starts the capability
+/// `obelisk.storage` through namespace `__index`, so the read starts the capability
 /// (ADR-0070 decision 1).
 fn storage_capability(lua: &Lua) -> mlua::Result<mlua::AnyUserData> {
-    let oblisk: Table = lua.globals().get("oblisk").map_err(|_| {
-        mlua::Error::runtime("persistent_table: the `oblisk` namespace is not built yet on this Lua state")
+    let obelisk: Table = lua.globals().get("obelisk").map_err(|_| {
+        mlua::Error::runtime("persistent_table: the `obelisk` namespace is not built yet on this Lua state")
     })?;
-    oblisk.get("storage")
+    obelisk.get("storage")
 }
 
 /// Config table: real `set` field; `__index` answers other keys with per-file signals.
@@ -96,9 +96,9 @@ fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Resul
     )?;
 
     let metatable = lua.create_table()?;
-    let signal_source: mlua::AnyUserData = lua.globals().get::<Table>("oblisk")?.get("storage")?;
+    let signal_source: mlua::AnyUserData = lua.globals().get::<Table>("obelisk")?.get("storage")?;
     let signal = from_userdata(&signal_source)
-        .ok_or_else(|| mlua::Error::runtime("persistent_table: oblisk.storage is not a signal"))?;
+        .ok_or_else(|| mlua::Error::runtime("persistent_table: obelisk.storage is not a signal"))?;
     let path = file.to_string();
     metatable.set(
         "__index",
@@ -113,7 +113,7 @@ fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Resul
     Ok(store)
 }
 
-/// One file key mapped over `oblisk.storage`. `nil` before first push and for absent keys, so § 3.1
+/// One file key mapped over `obelisk.storage`. `nil` before first push and for absent keys, so § 3.1
 /// leaves the property's documented default.
 fn key_signal(lua: &Lua, storage: &Signal, file: &str, key: &str) -> mlua::Result<Signal> {
     let file = file.to_string();

@@ -237,7 +237,7 @@ fn spawn_menu_signal_forwarder(
 /// (ADR-0031).
 /// `connection` is here only to emit `StatusNotifierItemUnregistered`. Registration announced
 /// itself from the day it was written and departure never did, so another host on the bus kept
-/// every item that ever left. Oblisk's own tray reads this registry rather than the signal, which
+/// every item that ever left. Obelisk's own tray reads this registry rather than the signal, which
 /// is why nothing here noticed.
 pub(super) fn spawn_name_owner_changed_forwarder(
     connection: zbus::Connection,

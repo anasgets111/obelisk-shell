@@ -12,7 +12,7 @@ pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
 /// The snapshot-hydrated capability roster (ADR-0037; CONTEXT.md). Each [`Capability::as_str`]
-/// name is both the Lua `oblisk.<name>` member (§ 2) and command `capability` field (§ 3.2), so
+/// name is both the Lua `obelisk.<name>` member (§ 2) and command `capability` field (§ 3.2), so
 /// one spelling reaches one capability. Reading a name starts its Supervisor controller
 /// (ADR-0070); it remains `nil` until the first `StateSnapshot`, so an unread name costs nothing.
 /// `idle` is event-shaped, not snapshot state (ADR-0032), so the Supervisor's `Startable` covers
@@ -42,7 +42,7 @@ macro_rules! roster {
                 }
             }
 
-            /// The `oblisk.<name>` line for generated stubs (`supervisor/src/stubs.rs`). Kept here,
+            /// The `obelisk.<name>` line for generated stubs (`supervisor/src/stubs.rs`). Kept here,
             /// not in the Renderer, so a new variant must provide one.
             pub const fn blurb(self) -> &'static str {
                 match self {
@@ -125,14 +125,14 @@ pub struct ConnectionHandshake {
     pub generation_id: u32,
 }
 
-/// Control clients (`oblisk set`, `oblisk toggle`) use this `generation_id` in
+/// Control clients (`obelisk set`, `obelisk toggle`) use this `generation_id` in
 /// [`ConnectionHandshake`] (ADR-0112). It is not a generation: the Supervisor registers no
 /// outbound channel or snapshot replay for a one-frame peer that hangs up. `u32::MAX` because
 /// generations count up from zero and a real one will never reach it.
 pub const CONTROL_CLIENT_GENERATION: u32 = u32::MAX;
 
 /// External write to a config `state(name, initial)` signal (ADR-0112), such as
-/// `oblisk set launcher_open true`. A control client sends it as [`RendererFrame`], the
+/// `obelisk set launcher_open true`. A control client sends it as [`RendererFrame`], the
 /// Supervisor forwards it as [`SupervisorFrame`] to the authoritative generation, and that
 /// generation applies the same marshal checks as `signal:set()`, refusing undeclared names. This
 /// is the compositor keybind's only write path into a running config.
@@ -151,7 +151,7 @@ pub enum StateWrite {
     /// Flip a boolean. Refused on any other value, since a keybind cannot know the current one
     /// and "toggle" means nothing else.
     Toggle,
-    /// `oblisk toggle <name> <value>`: store this value, unless the state already holds it, in
+    /// `obelisk toggle <name> <value>`: store this value, unless the state already holds it, in
     /// which case restore the initial the config declared. One keybind opens and closes a modal
     /// whose state is the name of the one showing (`state("modal", "")`).
     ToggleTo(serde_json::Value),
@@ -367,7 +367,7 @@ pub enum RendererFrame {
     PresentationEvidence(PresentationEvidence),
     SecureSubmit(SecureSubmit),
     LockReport(LockReport),
-    /// Control-client frame, not a Renderer frame: `oblisk set`/`oblisk toggle` uses
+    /// Control-client frame, not a Renderer frame: `obelisk set`/`obelisk toggle` uses
     /// [`CONTROL_CLIENT_GENERATION`] (ADR-0112). It stays in this enum because the listener has one
     /// decoder for every peer; a separate peer type would duplicate it.
     SetState(SetState),
@@ -377,7 +377,7 @@ pub enum RendererFrame {
     /// do not match the last one sent.
     RequestReload,
     /// Idempotently starts `capability`'s controller when this generation first reads
-    /// `oblisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it (decision
+    /// `obelisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it (decision
     /// 5). No generation ID is needed because the socket identifies the sender, as with
     /// [`Self::RequestReload`]. An existing name is logged and dropped (decision 3).
     StartCapability {

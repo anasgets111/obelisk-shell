@@ -1,4 +1,4 @@
-//! Kernel half of `oblisk.privacy` (ADR-0034): scan `/proc/*/fd/*` symlinks for processes holding
+//! Kernel half of `obelisk.privacy` (ADR-0034): scan `/proc/*/fd/*` symlinks for processes holding
 //! `/dev/videoN`, then rescan on device-node inotify `OPEN`/`CLOSE`. Live testing confirmed
 //! `/dev/video0` emits `IN_OPEN`/`IN_CLOSE_NOWRITE`, a VFS mechanism unlike the unreliable sysfs
 //! attribute notifications used by keyboard lock LEDs (see `hardware::keyboard::locks`).

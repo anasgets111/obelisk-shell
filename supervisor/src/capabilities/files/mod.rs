@@ -1,4 +1,4 @@
-//! `oblisk.files` keeps a config-requested folder listing current through inotify (ADR-0120).
+//! `obelisk.files` keeps a config-requested folder listing current through inotify (ADR-0120).
 //! Plain filesystem reads and one kernel watch per folder, with no D-Bus proxy or hardware thread.
 //!
 //! The config VM has no `io` (ADR-0048); `process.run("ls")` would parse lines for a table the
@@ -9,7 +9,7 @@ pub mod controller;
 
 pub use controller::{FilesController, FilesSignal};
 
-/// Every action `oblisk.files:invoke(...)` accepts. `dispatch` matches this rather than a string,
+/// Every action `obelisk.files:invoke(...)` accepts. `dispatch` matches this rather than a string,
 /// so a variant with no arm (or an arm with no variant) fails the build.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -44,7 +44,7 @@ pub fn parse_unwatch_args(arguments: &[serde_json::Value]) -> Option<String> {
     path.starts_with('/').then(|| path.to_string())
 }
 
-/// `oblisk.files`'s action dispatch (ADR-0037). Synchronous: `watch` spawns the listing and the
+/// `obelisk.files`'s action dispatch (ADR-0037). Synchronous: `watch` spawns the listing and the
 /// inotify loop as a task and returns, and `unwatch` aborts that task.
 pub fn dispatch(controller: &FilesController, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;

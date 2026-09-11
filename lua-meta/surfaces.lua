@@ -23,7 +23,7 @@
 ---@field exclusive? boolean|"Ignore"|Bound `true` reserves screen area along the anchored edge, derived from the size the compositor configures. `false` (default) reserves none but still sits inside what other surfaces reserved. `"Ignore"` reserves none and ignores theirs, which is what a full-screen wallpaper needs to stay behind a bar rather than below it.
 ---@field margin? integer|Edges|Bound Offsets from the anchored edges. Moves the surface itself, unlike `padding`. Bindable on a panel root, where it becomes a live `set_margin` on the layer surface rather than a re-layout.
 ---@field monitor? string An output name, or `"All"`.
----@field namespace? string What the compositor sees, for rules like Hyprland's `layerrule`. Defaults to `"oblisk-{id}"`.
+---@field namespace? string What the compositor sees, for rules like Hyprland's `layerrule`. Defaults to `"obelisk-{id}"`.
 ---@field keyboard_interactivity? "None"|"OnDemand"|"Exclusive"|Bound Default `"None"`. Note that niri gives an `on_demand` layer surface focus the moment it maps, with no click involved.
 ---@field visible? boolean|Bound Unmaps without destroying. Toggling this churns no Wayland objects.
 ---@field child? Node|fun(output: string): Node? The one root node. A surface holds exactly one; use a `row` or `column` for more. A function is called once per output instance with that output's connector name and its return takes the child's place, so one `monitor = "All"` panel can show a different file per screen (ADR-0121); `nil` maps that instance empty. The eval-time probe calls it with `"PROBE"`.

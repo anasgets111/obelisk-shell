@@ -1,0 +1,19 @@
+# Obelisk's PAM stack, for the lock screen (ADR-0052) and polkit authentication
+# (ADR-0028). Install to /etc/pam.d/obelisk.
+#
+# Until this file exists the worker authenticates against "login" instead, which works but is the
+# console-login stack and does considerably more than an unlock needs: pam_shells, pam_nologin,
+# pam_access, pam_time, pam_lastlog2, pam_motd, pam_mail, pam_loginuid, pam_keyinit and
+# pam_systemd all sit on the path between a typed password and an unlocked screen.
+#
+# Two of those are not merely surplus, they are ways to be locked out of your own session:
+# pam_nologin refuses authentication outright while /etc/nologin exists, and pam_shells refuses
+# an account whose shell is not in /etc/shells. Neither has anything to say about whether the
+# person at the keyboard is the person who locked the screen.
+#
+# `system-auth` rather than a hand-written list, so the machine's real password policy is what
+# answers -- pam_faillock, pam_unix and pam_systemd_home included, whatever the admin has set.
+# Only auth and account: `run_conversation` calls `authenticate` then `account_management` and
+# opens no session, so a session or password chain here would be dead configuration.
+auth      include   system-auth
+account   include   system-auth

@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 # The installed name. The crate stays `supervisor`, which is what `-p supervisor` and every module
-# path in the tree already say; this is only what lands in `$PREFIX/lib/oblisk`.
+# path in the tree already say; this is only what lands in `$PREFIX/lib/obelisk`.
 [[bin]]
-name = "oblisk"
+name = "obelisk"
 path = "src/main.rs"
 
 [lints]

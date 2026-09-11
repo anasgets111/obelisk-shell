@@ -2,8 +2,8 @@
 //! here avoids making `scene` depend on a module that already depends on it. Display-list builds
 //! run every dirty turn because list equality controls repaint (ADR-0063 decision 1), while applies
 //! run at capability-push cadence (ADR-0044 decision 2). This also makes malformed values fail once
-//! through `oblisk.rescue` instead of painting with a default every frame. Geometry already fails
-//! `apply` and reaches `oblisk.rescue`; one resolved map cannot give paint a second opinion on
+//! through `obelisk.rescue` instead of painting with a default every frame. Geometry already fails
+//! `apply` and reaches `obelisk.rescue`; one resolved map cannot give paint a second opinion on
 //! malformed values. Paint-time work remains arithmetic needing scale or focus; `icon.size` stays
 //! geometry for the scene's measure callback.
 
