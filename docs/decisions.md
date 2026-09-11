@@ -4350,19 +4350,28 @@ prints the file and `-f` follows it, after `quickshell log -f`.
 
 Three things the shape settles:
 
-- **Only `/dev/null` is taken over.** `capture` reads `/proc/self/fd/2` and returns early unless it
-  says `/dev/null`, so a terminal, a redirect or a pipe keeps the output and `obelisk >mine.log`
-  still fills `mine.log`. An `is_terminal` test was the first version and was wrong about both of
-  the latter. Teeing to both would need a pipe and a pump thread, and that thread dies with an
-  aborting process still holding the panic message it was about to write, so the file gets the
-  descriptors directly instead.
-- **Truncated per run, and no rotation.** It is per-login state beside the control socket, and the
-  run worth reading is the current one. `ponytail:` an `eprintln!` loop can still fill a tmpfs;
-  the ceiling is a size check in `capture`, which needs a writer in the path to enforce it and so
-  costs the paragraph above.
-- **`flock` says who is writing.** `--follow` stops when the shell does, and the kernel releases
-  that lock on a crash as readily as on an exit. It also stops a second shell blanking a running
-  one's log, which is why the open does not truncate and `set_len(0)` comes after the lock.
+- **Only `/dev/null` is taken over, per descriptor.** `capture` reads `/proc/self/fd/1` and `fd/2`
+  and replaces only the ones naming it. Two earlier versions were wrong: an `is_terminal` test
+  swallowed a redirect and a pipe, and testing stderr alone while replacing both left
+  `obelisk >mine.log 2>/dev/null` writing an empty `mine.log`. Teeing rather than replacing needs a
+  pump thread, and that thread dies with an aborting process still holding the panic message it was
+  about to write.
+- **Truncated per run, and no rotation.** Per-login state beside the control socket; the run worth
+  reading is the current one. `ponytail:` a runaway `eprintln!` loop fills `$XDG_RUNTIME_DIR`, and
+  the ceiling is sharper than a large file. `eprintln!` panics when the write fails and release is
+  `panic = "abort"`, so the shell dies and everything else on that tmpfs loses the space. Taken
+  anyway: bounding it needs a size check in the write path, and the only shapes that survive an
+  aborting producer are the rejected pump thread or a separate collector process. That is a second
+  process to bound a loop that is already a bug. It is a new failure though, not a worsened one:
+  the same loop used to write to `/dev/null` for free.
+- **An OFD lock says who is writing.** `--follow` stops when the writer's lock frees, and a crash
+  frees it as readily as an exit. `F_OFD_SETLK`/`F_OFD_GETLK` rather than `flock` for the one
+  property `flock` lacks: the reader can ask without taking. A probe that locks what it tests is
+  itself a writer while it holds it, and a shell starting inside a reader's 200ms poll would find
+  the log owned and spend its whole run on `/dev/null`. The same lock stops a second shell blanking
+  a running one's log, which is why the open does not truncate and `set_len(0)` follows the lock.
+  It frees when the last descriptor on that description closes, Renderer copies included, so a
+  lingering child keeps a follow alive.
 
 quickshell keeps a second, structured `log.qslog` beside the plain one so `-r` can re-filter a
 finished run at read time. Not copied: there are no log levels here to filter by.

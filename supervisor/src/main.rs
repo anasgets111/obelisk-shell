@@ -186,8 +186,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         cli::Command::Run => {
-            // Before anything writes a diagnostic, and before any Renderer inherits the
-            // descriptors (ADR-0199).
+            // Every runtime diagnostic from here on, and every Renderer that inherits these
+            // descriptors (ADR-0199). Argument parsing has already had its say above, so a
+            // detached run still loses a `-c` substitution notice.
             log::capture()?;
             // Exit explicitly: `Shutdown`'s code matters, while `main`'s `Result` only yields 0 or
             // 1 (ADR-0059 decision 3). `run_supervisor` has finished its teardown. Two workers,
