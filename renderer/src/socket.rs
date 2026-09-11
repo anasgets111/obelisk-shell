@@ -1291,6 +1291,7 @@ mod tests {
             declared,
             vec![
                 ("wallpaper", "panel"),
+                ("overview_wallpaper", "panel"),
                 ("bar", "panel"),
                 ("notification_area", "panel"),
                 ("osd", "panel"),
