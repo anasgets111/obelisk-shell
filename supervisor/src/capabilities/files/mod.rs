@@ -20,8 +20,9 @@ pub enum FilesAction {
 
 /// `files:watch(path, extensions?)`'s `arguments: [path, extensions?]`: an absolute folder path,
 /// then an optional array of extensions without the dot (`{ "jpg", "png" }`), matched
-/// case-insensitively. No list means every file. Anything in the list that is not a string is
-/// the whole command being malformed, not one entry being skipped.
+/// case-insensitively. No list -- omitted, `nil`, or the empty table -- means every file. Anything
+/// in the list that is not a string is the whole command being malformed, not one entry being
+/// skipped.
 pub fn parse_watch_args(arguments: &[serde_json::Value]) -> Option<(String, Vec<String>)> {
     let path = arguments.first()?.as_str()?;
     if !path.starts_with('/') {
@@ -33,6 +34,9 @@ pub fn parse_watch_args(arguments: &[serde_json::Value]) -> Option<(String, Vec<
             .iter()
             .map(|item| item.as_str().map(|ext| ext.trim_start_matches('.').to_ascii_lowercase()))
             .collect::<Option<Vec<String>>>()?,
+        // Lua has one table type, so `files:watch("/walls", {})` is an empty list and mlua
+        // marshals it as `{}`, not `[]`. A nonempty object is still a map where a list belongs.
+        Some(serde_json::Value::Object(fields)) if fields.is_empty() => Vec::new(),
         Some(_) => return None,
     };
     Some((path.to_string(), extensions))
@@ -74,6 +78,8 @@ mod tests {
             Some(("/walls".to_string(), vec!["jpg".to_string(), "png".to_string()]))
         );
         assert_eq!(parse_watch_args(&[json!("/walls"), json!(null)]), Some(("/walls".to_string(), vec![])));
+        // What `files:watch("/walls", {})` arrives as. Rejecting it started no watch at all.
+        assert_eq!(parse_watch_args(&[json!("/walls"), json!({})]), Some(("/walls".to_string(), vec![])));
     }
 
     #[test]
@@ -81,6 +87,7 @@ mod tests {
         assert_eq!(parse_watch_args(&[json!("walls")]), None);
         assert_eq!(parse_watch_args(&[json!("/walls"), json!([1])]), None);
         assert_eq!(parse_watch_args(&[json!("/walls"), json!("jpg")]), None);
+        assert_eq!(parse_watch_args(&[json!("/walls"), json!({"jpg": true})]), None);
         assert_eq!(parse_watch_args(&[]), None);
     }
 
