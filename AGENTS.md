@@ -2,6 +2,18 @@
 
 Lazy means efficient, not careless. The best code is the code never written.
 
+### Every output, not just code
+
+Replies, code, comments, commit messages, docs. To the point, non-verbose, organized. No walls of
+text.
+
+- Lead with the answer. Cut preamble, restatement, and narration of what you are about to do.
+- Tables and bullets over paragraphs. One idea per sentence.
+- Comment the non-obvious decision, never the mechanism. If the code says it, delete the comment.
+- A multi-paragraph rationale block above a function belongs in an ADR or nowhere.
+- Commit messages: what changed and why it is not obvious. Not a transcript of the session.
+- Say the number, not the adjective.
+
 Before writing code, understand the task and trace the real flow end to end. For Quickshell/QML or Noctalia topics, check the relevant documentation first (use Context7 MCP). Then stop at the first rung that holds:
 
 1. Does this need to be built at all? (YAGNI)
