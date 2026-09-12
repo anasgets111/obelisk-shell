@@ -374,6 +374,7 @@ impl App {
     /// own configure and cannot paint into a stale one. Release EGL/`wl_egl_window` first; dropping
     /// `Window` then destroys decoration, toplevel, xdg-surface, and wl-surface in protocol order.
     pub(super) fn hide_window(&mut self, index: usize) {
+        self.release_blur_effect(index);
         // Child popups must die before their parent xdg-surface.
         self.drop_child_popups(index);
         self.release_bound(index);

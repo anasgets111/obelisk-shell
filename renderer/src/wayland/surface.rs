@@ -841,6 +841,30 @@ impl App {
         self.surfaces[index].last_blur_region = regions;
     }
 
+    /// Empty the blur region and commit it while the surface still exists. Hyprland blurs the
+    /// *whole* snapshot of a closing surface that still carries a region (`CLayerFadeout`, and the
+    /// same line in `CWindowFadeout`), which on the full-screen modal host is the whole output.
+    /// [`App::apply_blur_region`] emptied it on this pass, but the region is double-buffered and
+    /// the `stale` repaint that would commit it never runs -- the unmap is next. The commit is the
+    /// fix; null is only tidier than an empty region. Not `destroy`: that clears the compositor's
+    /// `m_hasBackgroundEffect`, handing the surface back to any blanket `layerrule blur`.
+    pub(super) fn release_blur_effect(&self, index: usize) {
+        let Some(surface) = self.surfaces[index].role.wl_surface() else {
+            return;
+        };
+        let Some((effect, named)) = self.surfaces[index].blur_effect.as_ref() else {
+            return;
+        };
+        // `hide_window` keeps the effect and `apply_blur_region`'s identity cleanup sits behind its
+        // `blur_supported` guard, so a withdrawn capability can leave one naming a dead surface.
+        // `set_blur_region` on that is `surface_destroyed`, which takes the whole client down.
+        if *named != surface.id() {
+            return;
+        }
+        effect.set_blur_region(None);
+        surface.commit();
+    }
+
     /// Apply § 5.1 `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
     /// Freeze it for PBA Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the
     /// same set, or § 14.2 yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`. Deferred
@@ -886,6 +910,7 @@ impl App {
         if !matches!(self.surfaces[index].role, TrackedRole::Panel { .. }) {
             return;
         }
+        self.release_blur_effect(index);
         self.drop_child_popups(index);
         self.release_bound(index);
         if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
