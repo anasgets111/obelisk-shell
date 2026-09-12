@@ -72,7 +72,7 @@ pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHan
         line_start += line.len() + 1;
         (index == line_index).then_some(start..start + line.len())
     })?;
-    let measured: Vec<(f32, Option<&StyleRun>)> = segments(line.clone(), runs)
+    let measured: Vec<(f32, Option<&StyleRun>)> = segments(line, runs)
         .into_iter()
         .map(|(range, run)| {
             let rebased = run.filter(|run| run.bold || run.italic).map(|run| FontRun {

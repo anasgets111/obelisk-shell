@@ -119,7 +119,16 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(mut buffer) => {
                 let datas = buffer.datas_mut();
                 let stride = CHAN_SIZE * state.channels.max(1) as usize;
-                let data = &mut datas[0];
+                // Indexed, not `[0]`: this is another process's buffer, and a release build turns
+                // an out-of-bounds panic into the whole shell aborting. Quit rather than skip the
+                // turn, because `run_sound_player` plays one file at a time and a loop that never
+                // ends takes every later notification sound with it. Silent because this runs on
+                // the `RT_PROCESS` data thread, where `eprintln!` would both block on stderr and
+                // panic if the write failed -- the abort this branch exists to avoid.
+                let Some(data) = datas.first_mut() else {
+                    state.main_loop.quit();
+                    return;
+                };
                 let n_frames = if let Some(slice) = data.data() {
                     let remaining_frames =
                         state.samples.len().saturating_sub(state.position) / state.channels.max(1) as usize;

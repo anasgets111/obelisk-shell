@@ -608,24 +608,22 @@ impl State {
     unsafe fn capture(gl: &glow::Context) -> Self {
         // SAFETY: caller's contract. Every query below is a plain `glGet` on the current context.
         unsafe {
-            let name = |slot: u32| {
-                let raw = gl.get_parameter_i32(slot);
-                (raw != 0).then_some(raw as u32)
-            };
+            // Zero is GL's "nothing bound", and every `Native*` newtype wraps a `NonZeroU32`,
+            // so the check and the conversion are the same step.
+            let name = |slot: u32| std::num::NonZeroU32::new(gl.get_parameter_i32(slot) as u32);
             let active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE) as u32;
             gl.active_texture(glow::TEXTURE0);
-            let texture_0 = name(glow::TEXTURE_BINDING_2D).map(|raw| glow::NativeTexture(raw.try_into().unwrap()));
+            let texture_0 = name(glow::TEXTURE_BINDING_2D).map(glow::NativeTexture);
             gl.active_texture(glow::TEXTURE1);
-            let texture_1 = name(glow::TEXTURE_BINDING_2D).map(|raw| glow::NativeTexture(raw.try_into().unwrap()));
+            let texture_1 = name(glow::TEXTURE_BINDING_2D).map(glow::NativeTexture);
             gl.active_texture(active_texture);
             let mut scissor_box = [0; 4];
             gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut scissor_box);
             Self {
-                program: name(glow::CURRENT_PROGRAM).map(|raw| glow::NativeProgram(raw.try_into().unwrap())),
+                program: name(glow::CURRENT_PROGRAM).map(glow::NativeProgram),
                 scissor_box,
-                vertex_array: name(glow::VERTEX_ARRAY_BINDING)
-                    .map(|raw| glow::NativeVertexArray(raw.try_into().unwrap())),
-                array_buffer: name(glow::ARRAY_BUFFER_BINDING).map(|raw| glow::NativeBuffer(raw.try_into().unwrap())),
+                vertex_array: name(glow::VERTEX_ARRAY_BINDING).map(glow::NativeVertexArray),
+                array_buffer: name(glow::ARRAY_BUFFER_BINDING).map(glow::NativeBuffer),
                 active_texture,
                 texture_0,
                 texture_1,

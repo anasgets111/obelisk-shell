@@ -469,7 +469,7 @@ impl App {
             .enumerate()
             .filter_map(|(index, output)| {
                 let info = self.output_state.info(&output)?;
-                Some((info.name.clone().unwrap_or_else(|| format!("output-{index}")), output))
+                Some((info.name.unwrap_or_else(|| format!("output-{index}")), output))
             })
             .collect();
 
