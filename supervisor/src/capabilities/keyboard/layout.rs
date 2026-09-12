@@ -3,12 +3,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::compositor::{CompositorKind, hyprland_socket_path};
+use crate::compositor::{CompositorKind, hyprland_request, hyprland_socket_path};
 
 use super::controller::{KeyboardSignal, KeyboardState};
 
@@ -127,24 +127,21 @@ impl CompositorLink for NiriLink {
 
 /// Hyprland IPC uses two sockets under
 /// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`: `.socket2.sock` pushes newline-terminated
-/// `event>>payload` lines, where `activelayout>>...` only triggers a resync; `.socket.sock` accepts
-/// `devices -j` reads and `switchxkblayout <device> <index>` writes.
+/// `event>>payload` lines, where `activelayout>>...` only triggers a resync; `.socket.sock` answers
+/// `j/devices` reads and `switchxkblayout main <index>` writes.
 pub struct HyprlandLink {
     signature: String,
-    /// Primary keyboard device name (`keyboards[].name`) from the latest resync. Hyprland requires
-    /// a real name, not a documented wildcard. `None` until success; `switch_layout` then no-ops.
-    device_name: Arc<Mutex<Option<String>>>,
 }
 
-/// Needed fields from `hyprctl -j devices`'s `keyboards` entries. `active_keymap` is the display
-/// name; comma-separated `layout` only supplies the count. Hyprland provides no code-to-name
-/// table, so `active_layout_index` stays `0`. Prefer `main` (ADR-0034) because array order is not
-/// guaranteed with multiple keyboards.
+/// Needed fields from `j/devices`'s `keyboards` entries; comma-separated `layout` only supplies the
+/// count. `main` is Hyprland's `m_active`, reassigned on every key event, so it is the keyboard
+/// being typed on. `active_layout_index` defaults to `0` on a Hyprland too old to send it.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct HyprlandKeyboard {
-    name: String,
     active_keymap: String,
     layout: String,
+    #[serde(default)]
+    active_layout_index: u32,
     #[serde(default)]
     main: bool,
 }
@@ -157,139 +154,75 @@ fn parse_hyprland_devices(json: &str) -> Option<HyprlandKeyboard> {
     parsed.iter().find(|k| k.main).cloned().or_else(|| parsed.into_iter().next())
 }
 
-fn apply_hyprland_layout(
-    state: &Arc<Mutex<KeyboardState>>,
-    device_name: &Arc<Mutex<Option<String>>>,
-    keyboard: &HyprlandKeyboard,
-) {
+fn apply_hyprland_layout(state: &Arc<Mutex<KeyboardState>>, keyboard: &HyprlandKeyboard) {
     let mut guard = state.lock().unwrap();
     guard.active_layout = keyboard.active_keymap.clone();
+    guard.active_layout_index = keyboard.active_layout_index;
     guard.layout_count = keyboard.layout.split(',').filter(|s| !s.is_empty()).count() as u32;
-    // Hyprland has no code-to-name mapping; keep the previous index (see above).
-    drop(guard);
-    *device_name.lock().unwrap() = Some(keyboard.name.clone());
 }
 
-/// Orders concurrent [`resync_hyprland_layout`] calls so an older, slower `hyprctl` result cannot
-/// overwrite a newer one. Without it, rapid switches leave `KeyboardState` stale. `ticket()`
-/// increments before spawning; `claim()` applies only the newest ticket.
-struct ResyncSequence {
-    next: AtomicU64,
-    last_applied: AtomicU64,
-}
-
-impl ResyncSequence {
-    fn new() -> Self {
-        Self { next: AtomicU64::new(0), last_applied: AtomicU64::new(0) }
-    }
-
-    fn ticket(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn claim(&self, ticket: u64) -> bool {
-        let mut current = self.last_applied.load(Ordering::SeqCst);
-        loop {
-            if ticket < current {
-                return false;
-            }
-            match self.last_applied.compare_exchange(current, ticket, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
-
-async fn resync_hyprland_layout(
-    state: &Arc<Mutex<KeyboardState>>,
-    device_name: &Arc<Mutex<Option<String>>>,
-    sequence: &ResyncSequence,
-) {
-    let ticket = sequence.ticket();
-    let output = match tokio::process::Command::new("hyprctl").args(["-j", "devices"]).output().await {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            eprintln!("keyboard: hyprctl -j devices exited with {}; layout not updated this round", output.status);
-            return;
-        }
+/// `true` once `state` holds a fresh read. Blocking on the event thread, so two reads cannot land
+/// out of order.
+fn resync_hyprland_layout(socket_path: &Path, state: &Arc<Mutex<KeyboardState>>) -> bool {
+    let reply = match hyprland_request(socket_path, "j/devices") {
+        Ok(reply) => reply,
         Err(err) => {
-            eprintln!("keyboard: failed to run hyprctl -j devices: {err}");
-            return;
+            eprintln!("keyboard: Hyprland `devices` request failed; layout not updated this round: {err}");
+            return false;
         }
     };
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        eprintln!("keyboard: hyprctl -j devices produced non-UTF-8 output; layout not updated this round");
-        return;
-    };
-    match parse_hyprland_devices(&text) {
+    match parse_hyprland_devices(&reply) {
         Some(keyboard) => {
-            if sequence.claim(ticket) {
-                apply_hyprland_layout(state, device_name, &keyboard);
-            } else {
-                eprintln!(
-                    "keyboard: dropping a stale hyprctl -j devices result (a more recent layout query already applied)"
-                );
-            }
+            apply_hyprland_layout(state, &keyboard);
+            true
         }
-        None => eprintln!(
-            "keyboard: hyprctl -j devices output didn't contain a usable keyboard entry; layout not updated this round"
-        ),
+        None => {
+            eprintln!(
+                "keyboard: Hyprland `devices` reply held no usable keyboard entry; layout not updated this round"
+            );
+            false
+        }
     }
 }
 
 impl HyprlandLink {
     /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed by
-    /// `compositor::detect_compositor`. Starts the listener and an initial resync so
-    /// `active_layout` is populated before the first `activelayout` event.
+    /// `compositor::detect_compositor`. Connects to the event socket before the first read, so a
+    /// switch in that gap is still a line to process.
     pub fn new(signature: String, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Self {
-        let device_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let sequence = Arc::new(ResyncSequence::new());
-        let socket_path = hyprland_socket_path(&signature, ".socket2.sock");
-        let initial_state = Arc::clone(&state);
-        let initial_device_name = Arc::clone(&device_name);
-        let initial_sequence = Arc::clone(&sequence);
-        tokio::spawn(async move {
-            resync_hyprland_layout(&initial_state, &initial_device_name, &initial_sequence).await;
-        });
-
-        let loop_device_name = Arc::clone(&device_name);
-        let loop_sequence = Arc::clone(&sequence);
-        // The OS listener thread has no Tokio runtime. Free `tokio::spawn` would panic and, under
-        // this workspace's `panic = "abort"` release profile, abort the process; use this handle.
-        let handle = tokio::runtime::Handle::current();
-        std::thread::spawn(move || {
-            let stream = match UnixStream::connect(&socket_path) {
-                Ok(stream) => stream,
-                Err(err) => {
-                    eprintln!(
-                        "keyboard: failed to connect to Hyprland's event socket at {}: {err}",
-                        socket_path.display()
-                    );
-                    return;
-                }
-            };
-            let reader = BufReader::new(stream);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    eprintln!("keyboard: Hyprland event socket read failed; layout will no longer update");
-                    return;
-                };
-                if !line.starts_with("activelayout>>") {
-                    continue;
-                }
-                let state = Arc::clone(&state);
-                let device_name = Arc::clone(&loop_device_name);
-                let sequence = Arc::clone(&loop_sequence);
-                let events = events.clone();
-                handle.spawn(async move {
-                    resync_hyprland_layout(&state, &device_name, &sequence).await;
-                    let _ = events.send(KeyboardSignal::Changed);
+        let events_path = hyprland_socket_path(&signature, ".socket2.sock");
+        let command_path = hyprland_socket_path(&signature, ".socket.sock");
+        match UnixStream::connect(&events_path) {
+            Ok(stream) => {
+                std::thread::spawn(move || {
+                    // Signal the initial read too, or `layout_count` stays `0` and an indicator
+                    // drawn only for two or more layouts hides until the first switch.
+                    if resync_hyprland_layout(&command_path, &state) && events.send(KeyboardSignal::Changed).is_err() {
+                        return;
+                    }
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else {
+                            eprintln!("keyboard: Hyprland event socket read failed; layout will no longer update");
+                            return;
+                        };
+                        if !line.starts_with("activelayout>>") {
+                            continue;
+                        }
+                        if resync_hyprland_layout(&command_path, &state)
+                            && events.send(KeyboardSignal::Changed).is_err()
+                        {
+                            return;
+                        }
+                    }
+                    eprintln!("keyboard: Hyprland event socket closed; layout will no longer update");
                 });
             }
-        });
-
-        Self { signature, device_name }
+            Err(err) => eprintln!(
+                "keyboard: failed to connect to Hyprland's event socket at {}; layout reporting disabled for this run: {err}",
+                events_path.display()
+            ),
+        }
+        Self { signature }
     }
 }
 
@@ -298,28 +231,16 @@ impl CompositorLink for HyprlandLink {
         CompositorKind::Hyprland
     }
 
+    /// `main` is also Hyprland's device target for that keyboard, so no device name is tracked
+    /// here. It refuses an out-of-range index, hence reading the reply.
     fn switch_layout(&self, index: usize) {
-        let Some(device) = self.device_name.lock().unwrap().clone() else {
-            eprintln!(
-                "keyboard: switch_layout called before Hyprland's primary keyboard device name is known; ignored"
-            );
-            return;
-        };
         let socket_path = hyprland_socket_path(&self.signature, ".socket.sock");
-        tokio::spawn(async move {
-            let mut stream = match tokio::net::UnixStream::connect(&socket_path).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    eprintln!(
-                        "keyboard: failed to connect to Hyprland's command socket at {}: {err}",
-                        socket_path.display()
-                    );
-                    return;
-                }
-            };
-            let command = format!("switchxkblayout {device} {index}");
-            if let Err(err) = tokio::io::AsyncWriteExt::write_all(&mut stream, command.as_bytes()).await {
-                eprintln!("keyboard: failed to send switchxkblayout to Hyprland: {err}");
+        std::thread::spawn(move || {
+            let command = format!("switchxkblayout main {index}");
+            match hyprland_request(&socket_path, &command) {
+                Ok(reply) if reply.trim() == "ok" => {}
+                Ok(reply) => eprintln!("keyboard: Hyprland refused `{command}`: {}", reply.trim()),
+                Err(err) => eprintln!("keyboard: Hyprland `{command}` request failed: {err}"),
             }
         });
     }
@@ -331,21 +252,21 @@ mod tests {
 
     #[test]
     fn parse_hyprland_devices_reads_the_first_keyboards_entry() {
-        let json = r#"{"mice":[],"keyboards":[{"active_keymap":"English (US)","layout":"us,ara","name":"at-translated-set-2-keyboard"}],"tablets":[]}"#;
+        let json = r#"{"mice":[],"keyboards":[{"active_keymap":"Arabic (Egypt)","layout":"us,ara","active_layout_index":1}],"tablets":[]}"#;
         let keyboard = parse_hyprland_devices(json).expect("should parse");
-        assert_eq!(keyboard.active_keymap, "English (US)");
-        assert_eq!(keyboard.layout, "us,ara");
-        assert_eq!(keyboard.name, "at-translated-set-2-keyboard");
+        assert_eq!(keyboard.active_keymap, "Arabic (Egypt)");
+        assert_eq!(keyboard.active_layout_index, 1);
     }
 
     #[test]
     fn parse_hyprland_devices_prefers_the_main_keyboard_over_array_order() {
+        // `main` moves to whichever keyboard was typed on last, so array order names the wrong one.
         let json = r#"{"keyboards":[
-            {"active_keymap":"English (US)","layout":"us","name":"secondary-kb","main":false},
-            {"active_keymap":"Arabic (Egypt)","layout":"us,ara","name":"primary-kb","main":true}
+            {"active_keymap":"English (US)","layout":"us,ara","active_layout_index":0,"main":false},
+            {"active_keymap":"Arabic (Egypt)","layout":"us,ara","active_layout_index":1,"main":true}
         ]}"#;
         let keyboard = parse_hyprland_devices(json).expect("should parse");
-        assert_eq!(keyboard.name, "primary-kb");
+        assert_eq!(keyboard.active_layout_index, 1);
     }
 
     #[test]
@@ -360,6 +281,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_hyprland_layout_counts_the_configured_layouts_and_keeps_the_reported_index() {
+        // Regression: the index was pinned to `0`, so Lua could not cycle from the reported value.
+        let json = r#"{"keyboards":[{"active_keymap":"Arabic (Egypt)","layout":"us,ara","active_layout_index":1,"main":true}]}"#;
+        let state = Arc::new(Mutex::new(KeyboardState::default()));
+        apply_hyprland_layout(&state, &parse_hyprland_devices(json).expect("should parse"));
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            (guard.active_layout.as_str(), guard.active_layout_index, guard.layout_count),
+            ("Arabic (Egypt)", 1, 2)
+        );
+    }
+
+    #[test]
+    fn parse_hyprland_devices_defaults_the_index_when_hyprland_omits_it() {
+        let json = r#"{"keyboards":[{"active_keymap":"English (US)","layout":"us"}]}"#;
+        assert_eq!(parse_hyprland_devices(json).expect("should parse").active_layout_index, 0);
+    }
+
+    #[test]
     fn niri_switch_layout_index_validation_accepts_the_full_u8_range() {
         assert_eq!(u8::try_from(0usize), Ok(0));
         assert_eq!(u8::try_from(255usize), Ok(255));
@@ -370,24 +310,5 @@ mod tests {
         // Regression: 256 used to truncate to 0 via `as u8`.
         assert!(u8::try_from(256usize).is_err());
         assert!(u8::try_from(usize::MAX).is_err());
-    }
-
-    #[test]
-    fn resync_sequence_claim_accepts_tickets_in_initiation_order() {
-        let sequence = ResyncSequence::new();
-        let first = sequence.ticket();
-        let second = sequence.ticket();
-        assert!(sequence.claim(first));
-        assert!(sequence.claim(second));
-    }
-
-    #[test]
-    fn resync_sequence_claim_drops_a_ticket_older_than_one_already_applied() {
-        // Regression: an older resync must not overwrite a newer result.
-        let sequence = ResyncSequence::new();
-        let stale = sequence.ticket();
-        let fresh = sequence.ticket();
-        assert!(sequence.claim(fresh));
-        assert!(!sequence.claim(stale));
     }
 }

@@ -772,7 +772,8 @@ universally.
 2. Keep a narrow keyboard-layout trait for Hyprland/niri, not a workspace abstraction.
 3. Select one primary keyboard and expose index-based switching; Lua computes cycling.
 4. Correction: niri reports layout index directly; Hyprland lacks reliable name-to-code correlation.
-   Hyprland read-back remains last-known, a cycling gap.
+   Hyprland read-back remains last-known, a cycling gap. Superseded by ADR-0205: 0.56.2 reports the
+   index itself, and its `main` keyboard is the one being typed on.
 
 ### 0034.3. Camera privacy: kernel-level detection primary, PipeWire supplementary
 
@@ -4549,3 +4550,33 @@ it as its own change with a one-time audit of every painted surface, not folded 
 
 Rejected: a surface property such as `input = "None"`. The wallpaper would be its only writer, and it
 moves a fact the engine can derive into something every future inert surface has to remember.
+
+## 0205. Hyprland's `main` keyboard is the one being typed on, which closes ADR-0034.2's cycling gap
+
+ADR-0034.2 decision 4 recorded that Hyprland "lacks reliable name-to-code correlation" and left
+`active_layout_index` pinned to `0`, a read-back that could not be cycled from. Both halves are
+stale against 0.56.2, verified live rather than from docs:
+
+1. `j/devices`'s `keyboards` entries carry `active_layout_index`. Read it; no name-to-code table is
+   needed. It stays `#[serde(default)]` so an older Hyprland reports the previous `0`.
+2. The `main` field serializes `IKeyboard::m_active`, which `CInputManager::onKeyboardKey`
+   reassigns on every key event. It is the keyboard being typed on, not a fixed primary, so the
+   existing "select one primary keyboard" selection was already right. A physical `grp:alt_shift_toggle`
+   moves exactly that one device.
+3. `switchxkblayout` accepts `main` as a device target, resolved against the same `m_active`. Aim at
+   the word, not a tracked device name; a click before the first read is no longer dropped.
+4. Read `j/devices` over `.socket.sock` rather than spawning `hyprctl`, per ADR-0118 decision 2, and
+   read the write's reply: an out-of-range index answers `layout idx out of range of N` and was
+   silent. `hyprland_request` joins `hyprland_socket_path` in `compositor` (ADR-0118 decision 5).
+5. Signal the initial read. It applied silently before, so `layout_count` stayed `0` in the first
+   snapshot and an indicator drawn only for two or more layouts stayed hidden until the first switch.
+
+The resync is now blocking on the event thread, so the ticket sequence that ordered concurrently
+spawned `hyprctl` calls is deleted rather than ported.
+
+Rejected: targeting `switchxkblayout all`. Layout is per-device, and with `main` tracking the active
+keyboard there is nothing to reconcile; `all` would yank layout on keyboards the user did not touch.
+
+Rejected: following the device named in `activelayout>>DEVICE,KEYMAP` instead of `main`. Measured on
+an eight-keyboard session, every physical toggle named the `main` device, so the two agree and the
+event payload buys only a second source of truth.

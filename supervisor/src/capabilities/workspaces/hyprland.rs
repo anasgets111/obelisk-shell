@@ -32,14 +32,14 @@
 //! - `is_fullscreen` is active-window `fullscreen`: int since Hyprland 0.42 (`0` none, `1`
 //!   maximized, `2` fullscreen), bool before; only the real value counts.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::Path;
 
 use serde::Deserialize;
 
 use super::controller::{FocusedWindow, SpecialWorkspace, StatePublisher, WorkspaceRow};
-use crate::compositor::hyprland_socket_path;
+use crate::compositor::{hyprland_request, hyprland_socket_path};
 
 /// One `j/workspaces` entry. Hyprland's `windows` count identifies empty workspaces without a
 /// client scan.
@@ -224,22 +224,13 @@ fn is_trigger(line: &str) -> bool {
     TRIGGERS.contains(&name)
 }
 
-/// One `.socket.sock` command; Hyprland answers once per connection and closes it.
-fn request(socket_path: &PathBuf, command: &str) -> std::io::Result<String> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.write_all(command.as_bytes())?;
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    Ok(reply)
-}
-
 /// Four parsed reads. `None` logs the failed read and leaves the previous publish, so one dropped
 /// request costs a stale frame, not the run.
 type State = (Vec<WorkspaceRow>, Option<FocusedWindow>, Vec<SpecialWorkspace>);
 
-fn read_state(socket_path: &PathBuf) -> Option<State> {
-    fn read<T: for<'de> Deserialize<'de>>(socket_path: &PathBuf, name: &str) -> Option<T> {
-        let reply = match request(socket_path, &format!("j/{name}")) {
+fn read_state(socket_path: &Path) -> Option<State> {
+    fn read<T: for<'de> Deserialize<'de>>(socket_path: &Path, name: &str) -> Option<T> {
+        let reply = match hyprland_request(socket_path, &format!("j/{name}")) {
             Ok(reply) => reply,
             Err(err) => {
                 eprintln!("workspaces: Hyprland `{name}` request failed; skipping this update: {err}");
@@ -258,7 +249,7 @@ fn read_state(socket_path: &PathBuf) -> Option<State> {
     let workspaces: Vec<HyprlandWorkspace> = read(socket_path, "workspaces")?;
     let monitors: Vec<HyprlandMonitor> = read(socket_path, "monitors")?;
     let clients: Vec<HyprlandClient> = read(socket_path, "clients")?;
-    let active = match request(socket_path, "j/activewindow") {
+    let active = match hyprland_request(socket_path, "j/activewindow") {
         Ok(reply) => reply,
         Err(err) => {
             eprintln!("workspaces: Hyprland `activewindow` request failed; skipping this update: {err}");
@@ -332,7 +323,7 @@ fn dispatch(what: String) {
     };
     std::thread::spawn(move || {
         let socket_path = hyprland_socket_path(&signature, ".socket.sock");
-        match request(&socket_path, &format!("dispatch {what}")) {
+        match hyprland_request(&socket_path, &format!("dispatch {what}")) {
             Ok(reply) if reply.trim() == "ok" => {}
             Ok(reply) => eprintln!("workspaces: Hyprland refused `dispatch {what}`: {}", reply.trim()),
             Err(err) => eprintln!("workspaces: Hyprland `dispatch {what}` request failed: {err}"),

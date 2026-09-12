@@ -11,7 +11,9 @@
 //! only this probe and, since `workspaces::hyprland` (ADR-0118), the two socket locations; both
 //! moved here unchanged in behaviour.
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 
 /// A compositor implemented here, narrower than "a compositor that exists". Other sessions yield
 /// [`detect_compositor`]'s `None`; dependent capabilities degrade rather than guess (ADR-0056
@@ -79,6 +81,18 @@ pub fn hyprland_socket_path(signature: &str, name: &str) -> PathBuf {
 /// test binary, even for unrelated variables.
 fn hyprland_socket_path_in(runtime_dir: &str, signature: &str, name: &str) -> PathBuf {
     PathBuf::from(runtime_dir).join("hypr").join(signature).join(name)
+}
+
+/// One `.socket.sock` command. Hyprland answers once per connection and closes it: `j/<what>`
+/// returns the `hyprctl -j` JSON, a write returns `ok` or the reason it refused. Shared because
+/// `keyboard` and `workspaces` both talk to this socket (ADR-0118 decision 5), and neither should
+/// reach it through a `hyprctl` subprocess (decision 2).
+pub fn hyprland_request(socket_path: &Path, command: &str) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.write_all(command.as_bytes())?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply)
 }
 
 fn session_desktop() -> Option<String> {
