@@ -21,8 +21,9 @@
 -- seconds after typing stops cannot be watched firing.
 local idle = require("lib.idle")
 local store = require("lib.store")
+local compositor = require("lib.compositor")
 
--- `CompositorService.setDisplaysPowered` maps to these niri actions. Pair it with
+-- `CompositorService.setDisplaysPowered`, spelled per compositor in `lib.compositor`. Pair it with
 -- `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen means blanking stopped
 -- halfway. `backlight_pct` is `-1` without a device (§ 2.8); setting it is a dropped write.
 local function set_displays_powered(powered)
@@ -30,7 +31,7 @@ local function set_displays_powered(powered)
         return
     end
     idle.blanked:set(not powered)
-    process.detach("niri", { "msg", "action", powered and "power-on-monitors" or "power-off-monitors" })
+    compositor.detach(powered and "displays_on" or "displays_off")
     obelisk.keyboard:invoke("set_backlight", powered and 100 or 0)
 end
 

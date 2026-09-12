@@ -23,6 +23,7 @@ local icon_button = require("components.icon_button")
 local section_header = require("components.section_header")
 local expanding_pill = require("components.expanding_pill")
 local ui_state = require("lib.ui_state")
+local compositor = require("lib.compositor")
 
 local KIND = "power"
 
@@ -41,13 +42,14 @@ local seconds_left = computed({ obelisk.system, deadline }, function(s, at)
     return math.max(0, at - ((s and s.monotonic) or 0))
 end)
 
--- Mirror `actions`, in order. `logout` is niri's `CompositorImpl.exitSession`.
+-- Mirror `actions`, in order. `logout` is the compositor's own exit, so it goes through
+-- `lib.compositor`; reboot and poweroff are logind's and need no branch.
 local ACTIONS = {
     {
         key = "logout",
         icon = icons.logout,
         run = function()
-            process.detach("niri", { "msg", "action", "quit", "--skip-confirmation" })
+            compositor.detach("logout")
         end
     },
     {
