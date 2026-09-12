@@ -1036,6 +1036,30 @@ impl App {
         self.sync_hover(index, tree, Some(position), false);
     }
 
+    /// The pointer half of `surface::unmap`'s scrub, for the one leave the compositor never sends.
+    ///
+    /// Hiding a panel destroys its layer object from this side (ADR-0088), so no `wl_pointer`
+    /// leave follows and the `Leave` arm below never runs: `pointer_at` keeps naming a surface
+    /// that is gone, every hover signal inside it stays true, and `on_hover(false)` is never
+    /// called. Closing the notification history with the pointer over its list left
+    /// `hold_expiry(300)` standing, pausing every countdown until ADR-0094's deadline released it
+    /// on its own, and the panel reopened pre-tinted.
+    ///
+    /// Same work as `Leave`, because the surface is equally gone: end a held drag at its last
+    /// position, drop the armed click, and write every hover off with `on_hover` firing.
+    pub(super) fn pointer_left_destroyed_surface(&mut self, index: usize) {
+        let surface_id = self.surfaces[index].surface_id.clone();
+        let Some((_, position)) = self.pointer_at.clone().filter(|(at, _)| *at == surface_id) else {
+            return;
+        };
+        self.fire_on_drag(&surface_id, position, "end");
+        self.armed = None;
+        self.cursor_shown = None;
+        self.pointer_at = None;
+        let tree = self.client.scene().surface(&surface_id);
+        self.sync_hover(index, tree, None, true);
+    }
+
     /// Write all `hover` signals, or clear them for `None` (ADR-0062). Collect writes before
     /// `set_changed` because the tree borrow must end; only moved values dirty the scene (decision
     /// 4), so a stationary pointer inside one button re-resolves nothing while device-rate motion

@@ -907,6 +907,9 @@ impl App {
             self.keyboard_focus = None;
             self.focus_secure_submit(None);
         }
+        // The pointer is owed the same scrub, and for more than tint: a hidden panel's `on_hover`
+        // is how a config releases what hovering took.
+        self.pointer_left_destroyed_surface(index);
         eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
