@@ -891,8 +891,27 @@ impl App {
 
     /// Apply § 5.1 `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
     /// Freeze it for PBA Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the
-    /// same set, or § 14.2 yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`. Deferred
-    /// changes apply on the first post-promotion re-resolve.
+    /// same set, or § 14.2 yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`.
+    ///
+    /// A change skipped by that freeze waits for the next full pass. Promotion does not cause one:
+    /// `activate_draw` clears the flag as its last statement (`mod.rs` runs it after the turn's
+    /// `StateScope` dispatch), and `re_resolve_if_dirty` has already taken the dirty flag, so the
+    /// scene holds the new `visible` while the protocol does not. Any ticking signal or capability
+    /// push supplies that pass, under a second for a config with a clock. A config with neither
+    /// keeps the stale value until something else dirties the scene.
+    ///
+    /// `ponytail:` the freeze also ends too early. It lifts when `activate_draw` returns, but the
+    /// presentation feedback it requested is still outstanding, so an ordinary pass on the next
+    /// turn can unmap a surface the `ReadySignal` announced. Its `presented` event then fails
+    /// `surface_id_for` and is dropped (`output.rs`), and the Supervisor's evidence loop
+    /// (`reload.rs`) times out the reload. One frame wide, and a failed reload rolls back.
+    ///
+    /// Both want the freeze to end on evidence completion rather than on promotion. The cheap
+    /// shape is the `PromoteGeneration` frame the Supervisor already sends after that loop
+    /// succeeds, which `socket.rs` currently only logs, plus an explicit branch for an empty
+    /// announced set, which receives no such message. Not taken here: the renderer has no
+    /// evidence-complete state to hang it on (`active_nonce` is set and never cleared), and this
+    /// is the least-tested path in the crate.
     fn apply_visibility(&mut self, index: usize, visible: bool) {
         if self.is_pba_candidate {
             return;
@@ -1316,6 +1335,10 @@ impl App {
     /// it with `nonce`. Draw exactly the `ReadySignal` presenting set; Candidates freeze map state,
     /// so any mismatch would hang or abort the handshake.
     pub(super) fn activate_draw(&mut self, nonce: u64) {
+        // A retained tag, never cleared: one activation per renderer, and `activate_draw` is the
+        // only place feedback is requested. `ponytail:` a second activation would have the
+        // `presented` callbacks read the newer nonce and misattribute the older generation's
+        // frames. Clearing it needs an evidence-complete lifecycle, not a `None` on the way out.
         self.active_nonce = Some(nonce);
         for index in 0..self.surfaces.len() {
             if !self.surfaces[index].map_state.presents() {
