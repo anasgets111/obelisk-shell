@@ -17,7 +17,13 @@ local panel_header = require("components.panel_header")
 local panel_empty_state = require("components.panel_empty_state")
 local icon_button = require("components.icon_button")
 local action_button = require("components.action_button")
+local panel_action_icon = require("components.panel_action_icon")
+local panel_row = require("components.panel_row")
+local section_header = require("components.section_header")
+local toggle = require("components.toggle")
 local meter = require("components.meter")
+local store = require("lib.store")
+local dev_tools = require("config.dev_tools")
 
 local KIND = "updates"
 -- Check hourly: a badge is read on that scale, and each check is a real `-Sy` against a mirror. The
@@ -38,17 +44,18 @@ local started_at = state("updates_install_started_at", 0)
 -- `showCompletedLog` does.
 local log_open = state("updates_log_open", false)
 
--- Exported: the notification's action button in `indicators/updates.lua` is this same click.
-local function install()
-    local u = obelisk.updates:get()
-    if u == nil or (u.count or 0) == 0 or u.installing then
-        return
-    end
-    started_at:set(os.time())
-    dismissed:set(false)
-    log_open:set(false)
-    obelisk.updates:invoke("install")
-end
+-- The tick list replaces the body, as every other view here does.
+local settings_open = state("updates_settings_open", false)
+
+-- Which `requires` binaries are on `PATH`. Lua cannot stat `PATH`, so this is probed once per
+-- process from the first capability push below; `state` is name-keyed, so an in-place reload keeps
+-- the answer rather than blanking the list until the probe re-answers.
+local tools_present = state("updates_tools_present", {})
+
+-- The dev chain's only state: which `config/dev_tools.lua` entry is running, and its output.
+-- `install_log` stays the capability's; the two are concatenated for display.
+local dev_running = state("updates_dev_tool", "")
+local dev_log = state("updates_dev_log", {})
 
 local function packages(u)
     return (u and u.packages) or {}
@@ -94,6 +101,123 @@ end)
 -- answered is a failure, not a success.
 local function install_failed(u)
     return install_ended(u) and (u.install_error ~= nil or u.install_exit_code ~= 0)
+end
+
+-- Absent means on, so a tool added to `config/dev_tools.lua` runs without a `state.json` edit.
+local function tool_enabled(name)
+    return (store.updates_dev_tools:get() or {})[name] ~= false
+end
+
+-- Present as well as ticked: a run of nothing but `[SKIP]` lines is not worth a button.
+local function any_tool_runnable()
+    local present = tools_present:get() or {}
+    for _, tool in ipairs(dev_tools) do
+        if tool_enabled(tool.name) and present[tool.requires] then
+            return true
+        end
+    end
+    return false
+end
+
+-- Id 8002, the plain one; `indicators/updates.lua` keeps 8001 for the offer it must replace.
+local function toast(urgency, title, body)
+    process.detach("notify-send", {
+        "-u", urgency, "-a", "System Updates", "-i", "system-software-update", "--replace-id", "8002", title, body,
+    })
+end
+
+-- Copies to push: mutating the held table leaves the signal's value identical and the scene clean.
+-- ponytail: unbounded, unlike the Supervisor's 200-line tail. A dev run prints hundreds of lines,
+-- not thousands; cap it here if one ever does.
+local function append_dev_log(line)
+    local lines = { table.unpack(dev_log:get() or {}) }
+    lines[#lines + 1] = line
+    dev_log:set(lines)
+end
+
+-- Stops at the first non-zero exit.
+local function run_commands(commands, index, done)
+    local command = commands[index]
+    if command == nil then
+        return done(true)
+    end
+    process.run(command[1], { table.unpack(command, 2) }, append_dev_log, function(code)
+        if code ~= 0 then
+            return done(false)
+        end
+        run_commands(commands, index + 1, done)
+    end)
+end
+
+-- Moved off `indicators/updates.lua`'s install edge: only this file knows when the last tool exited.
+local function report_run(u, failures)
+    if install_failed(u) then
+        return toast("critical", "Update failed", "the updates panel has pacman's output")
+    end
+    if #failures > 0 then
+        return toast("critical", "Update finished with failures", table.concat(failures, ", "))
+    end
+    local count = (u and u.install_total_steps) or 0
+    toast("normal", "Update complete", count > 0
+        and string.format("%d package%s updated", count, count == 1 and "" or "s")
+        or "developer tooling updated")
+end
+
+-- Walks `config/dev_tools.lua`, carrying the failures so far. `command -v` takes the name as `$1`
+-- rather than interpolated. `[SKIP]`, `▶` and `[ OK ]` are the markers `log_colour` already tints:
+-- the `update` script this replaces printed the same three.
+local function run_tools(index, failures)
+    local tool = dev_tools[index]
+    if tool == nil then
+        dev_running:set("")
+        return report_run(obelisk.updates:get(), failures)
+    end
+    if not tool_enabled(tool.name) then
+        return run_tools(index + 1, failures)
+    end
+    process.run("sh", { "-c", 'command -v "$1" >/dev/null', "sh", tool.requires }, function() end, function(code)
+        if code ~= 0 then
+            append_dev_log(string.format("[SKIP] %s (%s not found)", tool.name, tool.requires))
+            return run_tools(index + 1, failures)
+        end
+        dev_running:set(tool.name)
+        append_dev_log("▶ " .. tool.name)
+        run_commands(tool.run, 1, function(ok)
+            append_dev_log((ok and "[ OK ] " or "[FAIL] ") .. tool.name)
+            if not ok then
+                failures[#failures + 1] = tool.name
+            end
+            run_tools(index + 1, failures)
+        end)
+    end)
+end
+
+local function start_dev_tools()
+    dev_log:set({})
+    run_tools(1, {})
+end
+
+-- Exported: the notification's action button in `indicators/updates.lua` is this same click.
+--
+-- A retry runs with no pending count: a run that failed partway can leave the count at zero with
+-- the system still half-upgraded, and refusing there left the failure card holding a dead button.
+local function install()
+    local u = obelisk.updates:get()
+    if u == nil or u.installing or dev_running:get() ~= "" then
+        return
+    end
+    local packages_pending = (u.count or 0) > 0 or install_failed(u)
+    if not packages_pending and not any_tool_runnable() then
+        return
+    end
+    started_at:set(os.time())
+    dismissed:set(false)
+    log_open:set(false)
+    settings_open:set(false)
+    if packages_pending then
+        return obelisk.updates:invoke("install")
+    end
+    start_dev_tools()
 end
 
 -- Replaces `_detectErrorMessage`: pacman's output supplies the reason, and this file turns it into
@@ -142,15 +266,21 @@ local function warning_count(u)
     return count
 end
 
-local function status_line(u)
+-- `is_dismissed` is a parameter, not a `dismissed:get()`: a signal read inside a map over
+-- `obelisk.updates` alone never re-runs on close, and the card kept reading "update complete" after
+-- the buttons under it had gone.
+local function status_line(u, is_dismissed, tool)
     if u == nil then
         return "waiting for the updater"
+    end
+    if tool ~= "" then
+        return "updating " .. tool
     end
     if u.installing then
         local package = u.install_current_package
         return (package ~= nil and package ~= "") and ("installing " .. package) or "starting the install"
     end
-    if not dismissed:get() and install_ended(u) then
+    if not is_dismissed and install_ended(u) then
         return install_failed(u) and "update failed" or "update complete"
     end
     if u.checking then
@@ -165,18 +295,25 @@ local function status_line(u)
     return "up to date"
 end
 
-local function detail_line(u)
+local function detail_line(u, is_dismissed, tool)
     if u == nil then
         return ""
+    end
+    if tool ~= "" then
+        return "developer tooling"
     end
     if u.installing then
         local total = u.install_total_steps or 0
         if total > 0 then
             return string.format("package %d of %d", u.install_current_step or 0, total)
         end
-        return "pacman has not said how many yet"
+        -- No step line yet means pacman is downloading, and it prints nothing per package without a
+        -- tty. `alpm` already sized the transaction, so say what is being fetched rather than that
+        -- we were not told.
+        return string.format("downloading %d package%s · %s", u.count, u.count == 1 and "" or "s",
+            human_bytes(download_total(u)))
     end
-    if not dismissed:get() and install_ended(u) then
+    if not is_dismissed and install_ended(u) then
         if install_failed(u) then
             return failure_reason(u)
         end
@@ -228,8 +365,13 @@ local sorted_packages = obelisk.updates:map(function(u)
     return list
 end)
 
-local log_lines = obelisk.updates:map(function(u)
-    return (u and u.install_log) or {}
+-- Two owners, one view: the capability clears `install_log` per install, the chain appends after.
+local log_lines = computed({ obelisk.updates, dev_log }, function(u, lines)
+    local combined = { table.unpack((u and u.install_log) or {}) }
+    for _, line in ipairs(lines or {}) do
+        combined[#combined + 1] = line
+    end
+    return combined
 end)
 
 -- Mirror `logColor`: red failures are findable in two hundred lines of pacman output.
@@ -253,13 +395,27 @@ local function log_colour(line)
     return theme.DIM
 end
 
-local packages_showing = computed({ obelisk.updates, result_showing }, function(u, showing)
-    return not showing and u ~= nil and not u.installing and #packages(u) > 0
-end)
+-- The tick list takes the whole body, so every other view yields to it.
+local function unless_settings(showing)
+    return computed({ showing, settings_open }, function(visible, settings)
+        return visible and not settings
+    end)
+end
 
-local log_showing = computed({ obelisk.updates, result_showing, log_open }, function(u, showing, open)
-    return u ~= nil and (u.installing or (showing and (install_failed(u) or open)))
-end)
+local packages_showing = unless_settings(computed({ obelisk.updates, result_showing }, function(u, showing)
+    return not showing and u ~= nil and not u.installing and #packages(u) > 0
+end))
+
+local log_showing = unless_settings(computed({ obelisk.updates, result_showing, log_open, dev_running },
+    function(u, showing, open, tool)
+        return u ~= nil and (u.installing or tool ~= "" or (showing and (install_failed(u) or open)))
+    end))
+
+-- `result_showing`, not `install_ended`: the latter stays true for the rest of the session once one
+-- install finishes, and the empty state never came back after it.
+local empty_showing = unless_settings(computed({ obelisk.updates, result_showing }, function(u, showing)
+    return u ~= nil and not showing and not u.installing and not u.checking and (u.count or 0) == 0
+end))
 
 -- Follow the newest line, as the mirror's `followOutput` does. Every push reveals, not only the
 -- lengthening ones: the log is a 200-line tail, so past that the content changes while the length
@@ -274,12 +430,67 @@ end)
 -- layout pass than the read (`lua-meta/signals.lua`), so a recorded offset always trails the real
 -- one by a reveal and a scroll back above it is indistinguishable from sitting at the end. Wants an
 -- engine-side "the wheel moved this viewport" signal.
-obelisk.updates:on_change(function(u)
+obelisk.updates:on_change(function(u, previous)
+    if previous == nil then
+        -- One shell for every tool, not one per tool: this runs on each process start.
+        local names = {}
+        for _, tool in ipairs(dev_tools) do
+            names[#names + 1] = tool.requires
+        end
+        local found = {}
+        process.run("sh", { "-c", 'for n; do command -v "$n" >/dev/null && echo "$n"; done', "sh", table.unpack(names) },
+            function(line)
+                found[line] = true
+            end, function()
+                tools_present:set(found)
+            end)
+    end
     local lines = u ~= nil and #(u.install_log or {}) or 0
     if lines > 0 then
         LOG_SCROLL:reveal(lines)
     end
+    -- Keyed on the stamp moving, like `indicators/updates.lua`: pushes coalesce, and a spawn
+    -- failure raises and clears `installing` too fast for an edge watcher to see the rise.
+    if previous == nil or u == nil or u.installing or not install_ended(u) then
+        return
+    end
+    if u.install_finished_at == previous.install_finished_at and u.install_error == previous.install_error then
+        return
+    end
+    -- Whatever just installed is still in `packages`, and nothing else clears it until the hourly
+    -- tick. A half-finished run leaves a stale list too, so re-check on failure as well
+    -- (`_finishUpdate`'s unconditional `doPoll`).
+    obelisk.updates:invoke("check")
+    if install_failed(u) then
+        -- A half-upgraded system is the wrong place to rebuild a toolchain against.
+        return report_run(u, {})
+    end
+    start_dev_tools()
 end)
+
+-- One row per `config/dev_tools.lua` entry; the subtitle is the binary it needs, so a row ticked on
+-- a machine without it reads as the `[SKIP]` it will produce.
+local tool_rows = {}
+for _, tool in ipairs(dev_tools) do
+    tool_rows[#tool_rows + 1] = panel_row {
+        title = tool.name,
+        subtitle = tool.requires,
+        -- Nothing to decide about a tool this machine cannot run.
+        visible = tools_present:map(function(present)
+            return (present or {})[tool.requires] == true
+        end),
+        trailing = toggle(store.updates_dev_tools, function(ticked)
+            return (ticked or {})[tool.name] ~= false
+        end, function(on)
+            local ticked = {}
+            for key, value in pairs(store.updates_dev_tools:get() or {}) do
+                ticked[key] = value
+            end
+            ticked[tool.name] = on
+            store:set("updates_dev_tools", ticked)
+        end),
+    }
+end
 
 local body = {
     panel_header {
@@ -307,6 +518,9 @@ local body = {
                     return u.reboot_required == true
                 end),
             }),
+            panel_action_icon(icons.settings, function()
+                settings_open:set(not settings_open:get())
+            end, { slot = "updates-settings" }),
             -- Hide refresh while checking/installing; `icon_button` has no disabled state, and a
             -- visible no-op control is worse than a hidden one.
             icon_button(icons.refresh, function()
@@ -322,8 +536,8 @@ local body = {
         },
     },
     panel_card({
-        cell(util.label(obelisk.updates, status_line), theme.FG, theme.font.md),
-        cell(util.label(obelisk.updates, detail_line), theme.DIM, theme.font.xs),
+        cell(computed({ obelisk.updates, dismissed, dev_running }, status_line), theme.FG, theme.font.md),
+        cell(computed({ obelisk.updates, dismissed, dev_running }, detail_line), theme.DIM, theme.font.xs),
         -- Determinate only while pacman counts packages. An unanimated indeterminate bar only
         -- repeats "wait"; wrap it because `meter` has no `visible` property.
         row {
@@ -396,24 +610,29 @@ local body = {
             end,
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", visible = log_showing }),
-    panel_empty_state("nothing to update", util.shown_when(obelisk.updates, function(u)
-        return not u.installing and not u.checking and (u.count or 0) == 0 and not install_ended(u)
-    end), { icon = icons.up_to_date }),
+    panel_empty_state("nothing to update", empty_showing, { icon = icons.up_to_date }),
+    panel_card({ section_header("run with package updates"), column {
+        width = "Fill",
+        children = tool_rows,
+    } }, { background = theme.GLASS_CONTENT, width = "Fill", visible = settings_open }),
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
         children = {
             action_button(
-                obelisk.updates:map(function(u)
-                    return install_failed(u) and "retry" or "update"
+                computed({ obelisk.updates, result_showing }, function(u, showing)
+                    return (showing and install_failed(u)) and "retry" or "update"
                 end),
                 install,
                 "updates-install",
                 {
                     tone = "solid",
                     width = "Fill",
-                    visible = obelisk.updates:map(function(u)
-                        return u ~= nil and not u.installing and (u.count or 0) > 0
+                    visible = computed({ obelisk.updates, result_showing, dev_running }, function(u, showing, tool)
+                        if u == nil or u.installing or tool ~= "" then
+                            return false
+                        end
+                        return (u.count or 0) > 0 or (showing and install_failed(u)) or any_tool_runnable()
                     end),
                 }
             ),

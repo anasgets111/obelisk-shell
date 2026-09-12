@@ -45,6 +45,10 @@ return persistent_table {
         updates_checked_at = 0,
         updates_packages = {},
         updates_notified = "",
+        -- Which `config/dev_tools.lua` entries run behind the package manager, keyed by tool name.
+        -- Absent means on, so a tool added to that file applies without a state.json edit and only
+        -- an explicit `false` here holds one back.
+        updates_dev_tools = {},
         -- `Settings.data.idleService`, flattened into two profiles keyed by UPower mains state.
         -- Each has `<stage>_on`/`<stage>_sec` fields; both share `order`. Stage seconds start when
         -- the preceding stage fires, not when the seat goes idle. This preserves "blank after 5

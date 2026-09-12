@@ -93,7 +93,8 @@ obelisk.storage:on_change(function(_, previous)
 end)
 
 -- On a completed check, remember its time and packages, and announce what is new, as
--- `UpdateService.qml` does.
+-- `UpdateService.qml` does. The install's own outcome is reported by `panels/update_panel.lua`,
+-- which is the only file that knows when the developer tooling behind it has finished too.
 --
 -- "New" compares package names with the stored announced key, like `notifiedPackagesKey`: restarts
 -- do not repeat the same twelve packages, and upgraded packages drop out on the next check.
@@ -103,24 +104,6 @@ obelisk.updates:on_change(function(u, previous)
     if u.last_successful_check and u.last_successful_check ~= store.updates_checked_at:get() then
         store:set("updates_checked_at", u.last_successful_check)
         store:set("updates_packages", u.packages)
-    end
-    -- The panel may be shut when the install ends, so report the outcome where it will be seen.
-    --
-    -- Keyed on the result changing, not on the `installing` edge: `Changed` pushes coalesce
-    -- (ADR-0044 decision 2), and a spawn failure raises and clears `installing` fast enough that a
-    -- config watching only the edge never sees the rise and reports the failure as a success.
-    if previous ~= nil and update_panel.install_ended(u)
-        and (u.install_finished_at ~= previous.install_finished_at or u.install_error ~= previous.install_error)
-    then
-        local done = u.install_current_step or 0
-        if update_panel.install_failed(u) then
-            toast("critical", "Update failed", "the updates panel has pacman's output")
-        elseif done == 0 then
-            toast("normal", "Update complete", "pacman finished")
-        else
-            toast("normal", "Update complete",
-                done == 1 and "1 package updated" or string.format("%d packages updated", done))
-        end
     end
     -- Every fifth consecutive failure, matching the mirror's threshold: the count on the bar is no
     -- longer the system's answer, and only the panel says so.
