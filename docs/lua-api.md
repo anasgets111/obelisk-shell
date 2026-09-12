@@ -162,7 +162,8 @@ Persistence debounce and process group reaping belong to [services](services.md)
 ## 4. Surface lifecycle
 
 A config returns a surface declaration or an array of them. An empty return is valid.
-The declared set is fixed for a generation; `visible` toggles mapping without destroying surfaces.
+The declared set is fixed for a generation; `visible` creates and destroys a surface's protocol
+objects, because layer-shell does not honour a re-map (ADR-0088).
 Topology changes, output hotplug and failure handling belong to
 [services](services.md#14-reload-lifecycle).
 

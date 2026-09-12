@@ -427,6 +427,27 @@ fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
     surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
 }
 
+/// What `visible` owes a panel or window that is in `map_state`. Panels and windows share one
+/// table; only the calls differ. Popups add ADR-0051's dismissal latch, so they keep
+/// [`popup_visibility_action`], and locks have no say at all.
+///
+/// Showing rebuilds from the spec because hiding destroyed the role object (ADR-0088). The two
+/// `Nothing` cells are the steady states: already shown, or already gone.
+fn visibility_action(map_state: MapState, visible: bool) -> VisibilityAction {
+    match (map_state, visible) {
+        (MapState::Unmapped, true) => VisibilityAction::Show,
+        (MapState::AwaitingConfigure | MapState::Mapped, false) => VisibilityAction::Hide,
+        _ => VisibilityAction::Nothing,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VisibilityAction {
+    Show,
+    Hide,
+    Nothing,
+}
+
 impl App {
     /// Track each evaluated instance (ADR-0038 decision 1, ADR-0049 decision 1). Panels create
     /// their layer object regardless of `visible`; windows/popups create only when visible, through
@@ -877,23 +898,22 @@ impl App {
             return;
         }
         match &self.surfaces[index].role {
-            TrackedRole::Panel { .. } => match (self.surfaces[index].map_state, visible) {
-                (MapState::Unmapped, true) => {
-                    // `QueueHandle` is a cheap refcounted handle; clone it across `&mut self`.
+            TrackedRole::Panel { .. } => match visibility_action(self.surfaces[index].map_state, visible) {
+                // `QueueHandle` is a cheap refcounted handle; clone it across `&mut self`.
+                VisibilityAction::Show => {
                     let qh = self.queue_handle.clone();
                     self.show_panel(&qh, index);
                 }
-                (MapState::AwaitingConfigure | MapState::Mapped, false) => self.unmap(index),
-                _ => {}
+                VisibilityAction::Hide => self.unmap(index),
+                VisibilityAction::Nothing => {}
             },
-            TrackedRole::Window { .. } => match (self.surfaces[index].map_state, visible) {
-                (MapState::Unmapped, true) => {
-                    // Clone the cheap refcounted handle across `&mut self`.
+            TrackedRole::Window { .. } => match visibility_action(self.surfaces[index].map_state, visible) {
+                VisibilityAction::Show => {
                     let qh = self.queue_handle.clone();
                     self.show_window(&qh, index);
                 }
-                (MapState::AwaitingConfigure | MapState::Mapped, false) => self.hide_window(index),
-                _ => {}
+                VisibilityAction::Hide => self.hide_window(index),
+                VisibilityAction::Nothing => {}
             },
             // Popup visibility also reads ADR-0051's latch: dismissal leaves it `Unmapped` while
             // `visible` remains true.
@@ -1444,6 +1464,24 @@ mod tests {
         // is a `ready_timeout` hang or an `UnexpectedEvidence` abort.
         assert!(candidate_has_staged([(false, false)].into_iter()));
         assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
+    }
+
+    /// ADR-0088's transition, which had no coverage: hiding a shown panel destroys its object, and
+    /// showing it again rebuilds one. The `Unmapped`/`false` cell is the case that reaches
+    /// `apply_visibility` for every hidden panel on every capability push.
+    #[test]
+    fn visibility_creates_and_destroys_only_on_the_edges() {
+        use VisibilityAction::{Hide, Nothing, Show};
+        for (state, visible, want) in [
+            (MapState::Unmapped, true, Show),
+            (MapState::Unmapped, false, Nothing),
+            (MapState::AwaitingConfigure, false, Hide),
+            (MapState::AwaitingConfigure, true, Nothing),
+            (MapState::Mapped, false, Hide),
+            (MapState::Mapped, true, Nothing),
+        ] {
+            assert_eq!(visibility_action(state, visible), want, "{state:?} with visible = {visible}");
+        }
     }
 
     #[test]

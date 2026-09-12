@@ -266,12 +266,18 @@ impl App {
         let (axes, ceiling) = measurement(spec, instance.available);
         self.client.set_measured_axes(&instance.instance_id, axes, ceiling);
         // A hidden panel has no tree to measure -- an invisible root resolves to no geometry at all
-        // -- so a measured one would be created at `UNMEASURED_EXTENT` and take its first buffer
-        // there, a frame wide of what the pass that shows it will have solved. Leave the layer
-        // object to [`App::show_panel`], which runs on that pass and is already the path a panel
-        // hidden after being shown takes (ADR-0088). PBA staging loses nothing: an `Unmapped`
-        // surface presents no frame either way (`MapState::presents`).
-        let deferred = !visible && measured_axes(spec) != (false, false);
+        // -- so one created here would take its first buffer at `UNMEASURED_EXTENT`, a frame wide of
+        // what the pass that shows it will have solved. Leave the layer object to
+        // [`App::show_panel`], which runs on that pass and is already the path a panel hidden after
+        // being shown takes (ADR-0088).
+        //
+        // Every hidden panel defers, not only a measured one. A fully anchored panel could be sized
+        // here, but keeping its object made `visible = false` mean two things: no object for one
+        // panel, a permanent unmapped object for another. PBA staging loses nothing either way, an
+        // `Unmapped` surface presents no frame (`MapState::presents`) and `candidate_has_staged`
+        // counts a no-object surface complete. `show_panel` and `apply_spec_change` both repeat
+        // [`ambiguous_zero_axis`], so a bad anchor is still refused, on the pass that shows it.
+        let deferred = !visible;
         if !deferred && let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
                 "[obelisk-renderer] surface {:?} leaves its {axis} to the compositor without anchoring both {axis} edges, \
@@ -297,11 +303,6 @@ impl App {
             layer
         });
 
-        // A declared `visible = false` panel that is not deferred still needs `get_layer_surface`'s
-        // initial commit, but no buffer is attached. Unlike an already-shown hidden panel
-        // (ADR-0088), the object has never mapped and can safely remain for PBA staging to see
-        // every declared surface. A deferred one has no object at all, which PBA already treats as
-        // complete by construction (`surface::candidate_has_staged`).
         self.surfaces.push(TrackedSurface {
             role: TrackedRole::Panel {
                 layer,
