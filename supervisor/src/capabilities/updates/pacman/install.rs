@@ -1,4 +1,4 @@
-//! `pacman` half of `updates:install()` (ADR-0034): progress syntax and reboot heuristic. The
+//! `pacman` half of `updates:install()` (ADR-0034): install-progress syntax. The
 //! command is `pkexec pacman -Syu --noconfirm`, run by `controller.rs` through
 //! `process::spawn_group_leader_piped`; `pkexec` talks to polkit and triggers the Obelisk polkit
 //! agent's interactive prompt rather than a manual `CheckAuthorization` call. It modifies the real
@@ -26,13 +26,6 @@ pub fn parse_install_step(line: &str) -> Option<InstallStep> {
         .or_else(|| rest.strip_prefix("reinstalling "))?;
     let package = rest.split_whitespace().next()?.to_string();
     Some(InstallStep { current, total, package })
-}
-
-/// Whether `package_names` includes `linux` or `linux-<variant>` such as `linux-lts`, `linux-zen`,
-/// or `linux-hardened` (ADR-0034 `rebootRequired`). Heuristic only; firmware or glibc can also
-/// require reboot without a kernel package.
-pub fn needs_reboot(package_names: &[String]) -> bool {
-    package_names.iter().any(|name| name == "linux" || name.starts_with("linux-"))
 }
 
 #[cfg(test)]
@@ -77,28 +70,5 @@ mod tests {
     #[test]
     fn parse_install_step_is_none_for_malformed_counts() {
         assert!(parse_install_step("(a/b) installing nss").is_none());
-    }
-
-    // ---- needs_reboot ----
-
-    #[test]
-    fn needs_reboot_is_true_for_the_base_linux_package() {
-        assert!(needs_reboot(&["linux".to_string(), "nss".to_string()]));
-    }
-
-    #[test]
-    fn needs_reboot_is_true_for_a_linux_variant_package() {
-        assert!(needs_reboot(&["linux-zen".to_string()]));
-    }
-
-    #[test]
-    fn needs_reboot_is_false_with_no_kernel_package() {
-        assert!(!needs_reboot(&["nss".to_string(), "gnome-autoar".to_string()]));
-    }
-
-    #[test]
-    fn needs_reboot_does_not_false_positive_on_a_name_merely_starting_with_linux() {
-        // No hyphen after `linux`, so this is not a kernel-variant name.
-        assert!(!needs_reboot(&["linuxfoo".to_string()]));
     }
 }

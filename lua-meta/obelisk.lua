@@ -430,7 +430,7 @@
 ---@field last_successful_check? integer Unix seconds when the last check completed successfully, or `nil` this session. Failed checks preserve the older value.
 ---@field package_manager? string Package manager name, or `nil` when unsupported. Available before any check and used by an indicator to decide whether it belongs on the bar (ADR-0134), e.g. `"pacman"`.
 ---@field packages UpdateCandidate[] Packages that would upgrade, one per entry. A failed check preserves the last good list and [`UpdatesState::count`] while [`UpdatesState::check_error`] reports the gap.
----@field reboot_required boolean A kernel package was installed this session per `Backend::needs_reboot`. Sticky: later installs cannot clear it because the running kernel remains old until restart.
+---@field reboot_required boolean Whether `/run/obelisk-shell-reboot-required` exists. A pacman hook writes it, so a terminal upgrade raises it too, and `/run` being tmpfs means a boot clears it. Nothing in Obelisk writes or clears it.
 
 ---@class WorkspacesState
 ---`obelisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is

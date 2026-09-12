@@ -48,10 +48,6 @@ impl Backend for PacmanBackend {
     fn parse_install_step(&self, line: &str) -> Option<InstallStep> {
         install::parse_install_step(line)
     }
-
-    fn needs_reboot(&self, package_names: &[String]) -> bool {
-        install::needs_reboot(package_names)
-    }
 }
 
 /// Uses a fresh tempdir with one symlink to `db_root/local`, then syncs and checks there, never in

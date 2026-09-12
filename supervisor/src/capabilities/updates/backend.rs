@@ -54,11 +54,6 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Parses one [`Backend::install_command`] output line as progress, if applicable.
     fn parse_install_step(&self, line: &str) -> Option<InstallStep>;
-
-    /// Whether these packages require a reboot because the running kernel stays old. A naming
-    /// heuristic belongs in the backend: Arch uses `linux`/`linux-zen`, Debian `linux-image-*`,
-    /// Fedora `kernel-core`.
-    fn needs_reboot(&self, package_names: &[String]) -> bool;
 }
 
 /// Package manager supported on this machine, or `None`. Mirrors `command -v pacman` without a

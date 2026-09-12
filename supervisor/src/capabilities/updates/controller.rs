@@ -1,8 +1,11 @@
 //! [`UpdatesController`]: `obelisk.updates` write-action dispatcher and state owner (ADR-0034).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use inotify::{Inotify, WatchMask};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
@@ -58,8 +61,9 @@ pub struct UpdatesState {
     /// [`UpdatesState::install_exit_code`], this means the install was never answered and the
     /// failure is Supervisor's.
     pub install_error: Option<String>,
-    /// A kernel package was installed this session per `Backend::needs_reboot`. Sticky: later
-    /// installs cannot clear it because the running kernel remains old until restart.
+    /// Whether `/run/obelisk-shell-reboot-required` exists. A pacman hook writes it, so a
+    /// terminal upgrade raises it too, and `/run` being tmpfs means a boot clears it. Nothing in
+    /// Obelisk writes or clears it.
     pub reboot_required: bool,
 }
 
@@ -103,6 +107,9 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesCo
     Some(UpdatesConfigure { interval_secs, checked_at, packages })
 }
 
+/// Marker file for [`UpdatesState::reboot_required`], written by a pacman hook.
+const REBOOT_MARKER: &str = "/run/obelisk-shell-reboot-required";
+
 /// Tail length for [`UpdatesState::install_log`]. Enough to hold a failure and nearby lines; a
 /// 2,000-package run belongs in a file, not a state payload reserialized on every progress line.
 const LOG_TAIL_LINES: usize = 200;
@@ -125,11 +132,17 @@ impl UpdatesController {
     /// including on machines with no backend and no later scheduler event. This makes the indicator
     /// appear at login rather than after the first check.
     pub fn new(events: UnboundedSender<UpdatesSignal>) -> Self {
-        Self::with_backend(super::backend::detect().map(Arc::from), events)
+        Self::with_backend(super::backend::detect().map(Arc::from), PathBuf::from(REBOOT_MARKER), events)
     }
 
-    /// [`UpdatesController::new`] with a caller-supplied backend for scheduler tests.
-    fn with_backend(backend: Option<Arc<dyn Backend>>, events: UnboundedSender<UpdatesSignal>) -> Self {
+    /// [`UpdatesController::new`] with a caller-supplied backend and marker path for tests. The
+    /// path is a parameter because a real `/run` marker, written by any pacman run on the machine
+    /// running the suite, otherwise pushes an extra `Changed` into every scheduler test.
+    fn with_backend(
+        backend: Option<Arc<dyn Backend>>,
+        reboot_marker: PathBuf,
+        events: UnboundedSender<UpdatesSignal>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(UpdatesState {
             package_manager: backend.as_ref().map(|backend| backend.name().to_string()),
             ..UpdatesState::default()
@@ -138,6 +151,7 @@ impl UpdatesController {
         let (check_now_tx, check_now_rx) = tokio::sync::mpsc::channel(1);
         if let Some(backend) = backend.clone() {
             tokio::spawn(run_check_task(backend, interval_rx, check_now_rx, Arc::clone(&state), events.clone()));
+            tokio::spawn(run_reboot_marker_task(reboot_marker, Arc::clone(&state), events.clone()));
         }
         let _ = events.send(UpdatesSignal::Changed);
         Self { backend, state, interval_tx, check_now_tx, events }
@@ -312,6 +326,57 @@ async fn run_one_check(
     let _ = events.send(UpdatesSignal::Changed);
 }
 
+/// Mirrors `marker`'s existence into [`UpdatesState::reboot_required`] until the controller drops.
+/// `marker` is a parameter so a test can point it at a tempdir.
+///
+/// Watches the parent directory, because an inotify watch needs an inode and the marker usually
+/// does not exist yet. Re-stats rather than reading the mask, so a create and a delete arriving in
+/// one read still leave the right answer.
+async fn run_reboot_marker_task(
+    marker: PathBuf,
+    state: Arc<Mutex<UpdatesState>>,
+    events: UnboundedSender<UpdatesSignal>,
+) {
+    let (Some(dir), Some(name)) = (marker.parent(), marker.file_name()) else {
+        eprintln!("updates: {} is not a file path; the reboot badge stays off", marker.display());
+        return;
+    };
+    publish_reboot_required(&marker, &state, &events);
+
+    let mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::DELETE | WatchMask::MOVED_FROM;
+    let mut stream = match Inotify::init().and_then(|inotify| {
+        inotify.watches().add(dir, mask)?;
+        inotify.into_event_stream(vec![0u8; 4096])
+    }) {
+        Ok(stream) => stream,
+        Err(err) => {
+            // The first stat stands, so a badge raised before login survives; later changes do not.
+            eprintln!("updates: cannot watch {} for the reboot marker: {err}", dir.display());
+            return;
+        }
+    };
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(event) if event.name.as_deref() == Some(name) => publish_reboot_required(&marker, &state, &events),
+            Ok(_) => {}
+            Err(err) => eprintln!("updates: inotify read on {} failed: {err}", dir.display()),
+        }
+    }
+}
+
+/// Pushes only on a change: `/run` is busy and every push re-resolves every surface (ADR-0044
+/// decision 2).
+fn publish_reboot_required(marker: &Path, state: &Arc<Mutex<UpdatesState>>, events: &UnboundedSender<UpdatesSignal>) {
+    let required = marker.exists();
+    let mut guard = state.lock().unwrap();
+    if guard.reboot_required == required {
+        return;
+    }
+    guard.reboot_required = required;
+    drop(guard);
+    let _ = events.send(UpdatesSignal::Changed);
+}
+
 /// Whether the interval's immediate first tick should check or be consumed. Due with no process
 /// check, or when the last success is at least `interval` old.
 fn first_check_is_due(last_successful_check: Option<i64>, now: i64, interval: Duration) -> bool {
@@ -360,31 +425,34 @@ async fn run_install_with_child(
     // detached reading can lose the final failure lines.
     let stderr_drain = child.stderr.take().map(|stderr| {
         let state = Arc::clone(&state);
+        let events = events.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("updates: install stderr: {line}");
                 push_log_line(&mut state.lock().unwrap().install_log, line);
+                let _ = events.send(UpdatesSignal::Changed);
             }
         })
     });
 
-    // Local `Vec`: only this loop accesses it, unlike shared `state`.
-    let mut installed_packages: Vec<String> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let step = backend.parse_install_step(&line);
             let mut guard = state.lock().unwrap();
             push_log_line(&mut guard.install_log, line);
-            // Push on progress lines, not every download-meter line. `Changed` re-resolves every
-            // surface (ADR-0044 decision 2); all lines still enter `install_log`.
-            let Some(step) = step else { continue };
-            guard.install_current_step = step.current;
-            guard.install_total_steps = step.total;
-            guard.install_current_package = step.package.clone();
+            if let Some(step) = step {
+                guard.install_current_step = step.current;
+                guard.install_total_steps = step.total;
+                guard.install_current_package = step.package;
+            }
             drop(guard);
-            installed_packages.push(step.package);
+            // Every line, not only the ones that parse as progress: gating on progress left the
+            // log frozen until the first `(n/m)`. The download phase stays silent regardless,
+            // because pacman prints nothing per package without a tty (measured: its `wchar` does
+            // not move for the whole download). A pty is the only cure and costs ANSI and `\r`
+            // handling; `updates.count` and `download_size` cover the gap in config instead.
             let _ = events.send(UpdatesSignal::Changed);
         }
     }
@@ -398,14 +466,8 @@ async fn run_install_with_child(
     guard.installing = false;
     guard.install_finished_at = Some(now_unix());
     match status {
-        Ok(status) => {
-            // `None` means the process was killed by a signal.
-            guard.install_exit_code = status.code();
-            if status.success() {
-                // Accumulate: a prior kernel install must not be cleared by an unrelated install.
-                guard.reboot_required |= backend.needs_reboot(&installed_packages);
-            }
-        }
+        // `None` means the process was killed by a signal.
+        Ok(status) => guard.install_exit_code = status.code(),
         Err(err) => guard.install_error = Some(format!("failed to wait on the install command: {err}")),
     }
     drop(guard);
@@ -427,6 +489,12 @@ mod tests {
     use super::*;
     use crate::capabilities::updates::backend::{InstallCommand, InstallStep};
 
+    /// A marker path under a fresh tempdir, so a scheduler test never watches the real `/run`
+    /// file and never sees the `Changed` its presence would push.
+    fn no_marker() -> std::path::PathBuf {
+        tempfile::tempdir().unwrap().keep().join("reboot-required")
+    }
+
     /// A backend whose check always fails without touching the network, and whose install-side
     /// answers are `pacman`'s real ones. What is under test around it is the scheduler and the
     /// stdout loop; the parsing has its own tests next to the parser.
@@ -447,10 +515,6 @@ mod tests {
 
         fn parse_install_step(&self, line: &str) -> Option<InstallStep> {
             crate::capabilities::updates::pacman::install::parse_install_step(line)
-        }
-
-        fn needs_reboot(&self, package_names: &[String]) -> bool {
-            crate::capabilities::updates::pacman::install::needs_reboot(package_names)
         }
     }
 
@@ -562,7 +626,7 @@ mod tests {
     /// signal it actually caused.
     async fn failing_controller() -> (UpdatesController, tokio::sync::mpsc::UnboundedReceiver<UpdatesSignal>) {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller = UpdatesController::with_backend(Some(Arc::new(StubBackend)), events_tx);
+        let controller = UpdatesController::with_backend(Some(Arc::new(StubBackend)), no_marker(), events_tx);
         assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed), "construction pushes the backend's name");
         (controller, events_rx)
     }
@@ -642,7 +706,7 @@ mod tests {
         // The whole point of the field: an indicator asks `package_manager` whether it belongs on
         // the bar, and on a machine with no manager nothing else would ever push to tell it.
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let controller = UpdatesController::with_backend(None, events_tx);
+        let controller = UpdatesController::with_backend(None, no_marker(), events_tx);
 
         assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed));
         assert_eq!(controller.snapshot().package_manager, None);
@@ -703,12 +767,13 @@ mod tests {
         assert_eq!(snapshot.install_current_package, "gnome-autoar");
         assert_eq!(snapshot.install_error, None);
 
-        // Progress must ride the updates signal per line, not just at the end (ADR-0034).
+        // Every line rides the signal, not only the two that parse as progress: the `::` line is
+        // the shape the whole download phase prints, and gating on progress froze the log there.
         let mut signal_count = 0;
         while events_rx.try_recv().is_ok() {
             signal_count += 1;
         }
-        assert_eq!(signal_count, 3, "two progress-line signals plus one completion signal");
+        assert_eq!(signal_count, 4, "one signal per output line plus one completion signal");
     }
 
     #[tokio::test]
@@ -764,45 +829,69 @@ mod tests {
         assert_eq!(log.last().map(String::as_str), Some((LOG_TAIL_LINES + 4).to_string().as_str()));
     }
 
-    #[tokio::test]
-    async fn run_install_with_child_flags_reboot_required_when_a_kernel_package_was_installed() {
-        let state = Arc::new(Mutex::new(UpdatesState::default()));
-        let child = process::spawn_group_leader_piped(
-            "sh",
-            &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
-        )
-        .expect("spawn a stub install script");
+    // ---- the reboot marker ----
 
-        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, child).await;
-
-        assert!(state.lock().unwrap().reboot_required);
+    /// Polls until the watcher has published `expected`; the inotify round trip has no completion
+    /// to await.
+    async fn wait_for_reboot_required(state: &Arc<Mutex<UpdatesState>>, expected: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.lock().unwrap().reboot_required != expected {
+            assert!(std::time::Instant::now() < deadline, "reboot_required never became {expected}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
-    async fn reboot_required_stays_true_across_a_later_install_that_did_not_touch_the_kernel() {
+    async fn a_marker_file_written_after_startup_raises_reboot_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("reboot-required");
         let state = Arc::new(Mutex::new(UpdatesState::default()));
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = tokio::spawn(run_reboot_marker_task(marker.clone(), Arc::clone(&state), events_tx));
 
-        let kernel_child = process::spawn_group_leader_piped(
-            "sh",
-            &["-c".to_string(), "echo '(1/1) upgrading linux'; exit 0".to_string()],
-        )
-        .expect("spawn a stub install script");
+        std::fs::write(&marker, "").unwrap();
+        wait_for_reboot_required(&state, true).await;
+        assert_eq!(events_rx.recv().await, Some(UpdatesSignal::Changed), "the badge is Lua-visible, so it pushes");
+
+        std::fs::remove_file(&marker).unwrap();
+        wait_for_reboot_required(&state, false).await;
+
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn a_marker_file_that_already_exists_is_read_before_any_event() {
+        // A shell restart after the hook ran: no inotify event is coming, only the first stat.
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("reboot-required");
+        std::fs::write(&marker, "").unwrap();
+        let state = Arc::new(Mutex::new(UpdatesState::default()));
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, kernel_child).await;
-        assert!(state.lock().unwrap().reboot_required, "first install touched the kernel");
 
-        let unrelated_child = process::spawn_group_leader_piped(
-            "sh",
-            &["-c".to_string(), "echo '(1/1) upgrading nss'; exit 0".to_string()],
-        )
-        .expect("spawn a stub install script");
-        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        run_install_with_child(Arc::new(StubBackend), Arc::clone(&state), events_tx, unrelated_child).await;
+        let watcher = tokio::spawn(run_reboot_marker_task(marker, Arc::clone(&state), events_tx));
+        wait_for_reboot_required(&state, true).await;
 
-        assert!(
-            state.lock().unwrap().reboot_required,
-            "a later install with no kernel package must not clear a still-pending reboot"
-        );
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn a_neighbouring_file_in_the_same_directory_is_ignored() {
+        // `/run` is busy; only this one name may move the badge.
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(UpdatesState::default()));
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = tokio::spawn(run_reboot_marker_task(
+            directory.path().join("reboot-required"),
+            Arc::clone(&state),
+            events_tx,
+        ));
+
+        std::fs::write(directory.path().join("something-else"), "").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!state.lock().unwrap().reboot_required);
+        assert!(events_rx.try_recv().is_err(), "an unrelated file must not push");
+
+        watcher.abort();
     }
 }
