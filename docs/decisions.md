@@ -4587,3 +4587,29 @@ media, system-control and power-button nodes. A key on one of those makes it `ma
 the write both follow a device nothing is typed on until the next real keystroke moves it back.
 Narrowing the set means guessing which nodes are typing devices, against Hyprland's own answer; left
 alone until a session actually reports a wrong layout.
+
+## 0206. Session verbs branch in config, and only the two the compositor owns
+
+`power_menu` ran `niri msg action quit` and the idle stage ran `power-on/off-monitors`, so on
+Hyprland logout and the whole blank stage did nothing.
+
+1. Branch in Lua, in `lib/compositor.lua`, on `workspaces.compositor`. ADR-0119 decision 3 publishes
+   that name so config can choose policy, and ADR-0056 decision 1 refused a compositor trait in the
+   Supervisor; a session verb is not a capability, so neither grows for this.
+2. Only `logout` and display power branch. Reboot, poweroff and suspend are logind's and identical
+   under both compositors; giving them entries would imply a difference that does not exist.
+3. Hyprland's spellings are `hl.dsp.exit()` and `hl.dsp.dpms({ action = "on"|"off" })`. 0.56 parses
+   the command socket as Lua, so the pre-0.56 `dispatch exit` dies in that parser, and `dpms`
+   toggles when passed no table -- the field is always explicit rather than positional.
+4. `detach` returns whether anything ran, and the caller may not record the verb as done on `false`.
+   `idle.blanked` is the `dpms` stage's `done` predicate: setting it on a no-op arms lock and then
+   suspend over a lit screen, and `set_displays_powered`'s own equality guard then refuses every
+   retry. Found in review, not in use.
+
+ADR-0118 decision 2's "command sockets, not subprocesses" binds the Supervisor, which holds the
+socket path and a connection budget. Config has neither and already shells out for `systemctl`, so
+`hyprctl` and `niri` here are subprocesses on purpose.
+
+Rejected: a `session` capability wrapping these in the Supervisor. It buys one compositor check in
+Rust instead of Lua and costs a new action surface, a second place compositor identity is decided,
+and a capability that exists to run two commands.
