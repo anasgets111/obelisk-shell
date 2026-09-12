@@ -1,5 +1,11 @@
 //! `workspaces`' second implementor: Hyprland over its two instance-directory sockets (ADR-0118).
-//! Built to documented IPC, not live-tested because this machine runs niri.
+//! Live against 0.56.2; the fixtures below still carry the shapes it was written to.
+//!
+//! 0.56 replaced the command socket's plain-text language with Lua: `dispatch <what>` is now
+//! sugar for `return hl.dispatch(<what>)`, so the pre-0.56 `dispatch workspace 2` reaches the
+//! parser as `hl.dispatch(workspace 2)` and dies on the space. Reads are untouched -- `j/` is
+//! still the legacy path -- so a stale write syntax leaves a strip that tracks the compositor
+//! perfectly and cannot drive it. Writes here target 0.56 and no earlier.
 //!
 //! Hyprland has no state event stream. `.socket2.sock` sends `event>>payload` lines; `.socket.sock`
 //! returns the `hyprctl -j` JSON. On a workspace/monitor/window event, re-read
@@ -9,8 +15,8 @@
 //!
 //! How Hyprland's model lands on `WorkspaceRow`:
 //!
-//! - `id` is Hyprland's number and `dispatch workspace N` argument, so focusing a new number
-//!   creates it. It is also `idx`: Hyprland has no per-monitor position. `name` is set only when
+//! - `id` is Hyprland's number and the `workspace` field of [`focus_command`], so focusing a new
+//!   number creates it. It is also `idx`: Hyprland has no per-monitor position. `name` is set only when
 //!   it differs from the number.
 //! - Per-output active is `activeWorkspace`; focused is the active workspace of the monitor with
 //!   `focused: true`, matching niri's `is_active`/`is_focused` split.
@@ -20,7 +26,7 @@
 //!   `clients[].focusHistoryID == 0` would incorrectly name the last toplevel.
 //! - Drop ids <= 0. Specials (`special`/`special:` names, ids <= -99) become `special` (ADR-0119),
 //!   shown on the monitor naming them in `specialWorkspace`; toggle with
-//!   `dispatch togglespecialworkspace <name without prefix>`. Other negative named workspaces
+//!   [`toggle_special_command`]. Other negative named workspaces
 //!   drop because neither `u64` ids nor number focus can represent them. A shown special does not
 //!   replace the focused monitor's regular workspace.
 //! - `is_fullscreen` is active-window `fullscreen`: int since Hyprland 0.42 (`0` none, `1`
@@ -334,24 +340,37 @@ fn dispatch(what: String) {
     });
 }
 
-/// `workspaces:focus(id)` as `dispatch workspace N`; a new number creates the empty slot a strip
-/// can pad into.
+/// `workspaces:focus(id)`; a new number creates the empty slot a strip can pad into.
 pub fn focus(id: u64) {
-    dispatch(format!("workspace {id}"));
+    dispatch(focus_command(id));
 }
 
-/// `workspaces:toggle_special(name)` as `dispatch togglespecialworkspace <arg>`. Strip
-/// `special:`; the unnamed `special` passes an empty arg. The dispatcher adds the prefix, so a
-/// full name would become `special:special:term`.
+/// The table form, not `hl.dsp.focus(N)`: `focus` takes one table and reads the field, the same
+/// call that moves focus by `direction`.
+fn focus_command(id: u64) -> String {
+    format!("hl.dsp.focus{{ workspace = {id} }}")
+}
+
+/// `workspaces:toggle_special(name)`.
 pub fn toggle_special(name: &str) {
-    dispatch(match special_argument(name) {
-        "" => "togglespecialworkspace".to_string(),
-        argument => format!("togglespecialworkspace {argument}"),
-    })
+    dispatch(toggle_special_command(name));
+}
+
+/// Strip `special:`; the unnamed `special` passes the empty string, which the dispatcher reads as
+/// the unnamed one. The dispatcher adds the prefix, so a full name would become
+/// `special:special:term`.
+fn toggle_special_command(name: &str) -> String {
+    format!("hl.dsp.workspace.toggle_special(\"{}\")", lua_escape(special_argument(name)))
 }
 
 fn special_argument(name: &str) -> &str {
     name.strip_prefix("special:").unwrap_or(if name == "special" { "" } else { name })
+}
+
+/// The command is Lua source now, and the name inside it came from a config or from the
+/// compositor's own list. A quote in one would close the string and run the rest.
+fn lua_escape(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -592,5 +611,23 @@ mod tests {
         assert_eq!(special_argument("special:term"), "term");
         assert_eq!(special_argument("special"), "");
         assert_eq!(special_argument("term"), "term", "a config passing the short name is not punished");
+    }
+
+    /// 0.56 reads the command as Lua, so both writes are checked as source. Captured from a live
+    /// 0.56.2 socket, which answers `ok` to each of these and a parse error to what they replaced.
+    #[test]
+    fn both_writes_are_the_lua_dispatchers_0_56_accepts() {
+        assert_eq!(focus_command(3), "hl.dsp.focus{ workspace = 3 }");
+        assert_eq!(toggle_special_command("special:term"), r#"hl.dsp.workspace.toggle_special("term")"#);
+        assert_eq!(
+            toggle_special_command("special"),
+            r#"hl.dsp.workspace.toggle_special("")"#,
+            "the unnamed special is the empty argument, not a missing one"
+        );
+        assert_eq!(
+            toggle_special_command(r#"special:a") hl.dsp.exit(--"#),
+            r#"hl.dsp.workspace.toggle_special("a\") hl.dsp.exit(--")"#,
+            "a quote in a name stays inside the string"
+        );
     }
 }
