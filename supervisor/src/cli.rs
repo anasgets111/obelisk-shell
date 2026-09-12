@@ -40,6 +40,8 @@ pub struct Args {
     pub command: Command,
     /// Absolute `-c` directory. `None` leaves `shared::config_dir()`'s own order in charge.
     pub config_dir: Option<PathBuf>,
+    /// `-d`: re-exec detached and give the caller's shell its prompt back.
+    pub detach: bool,
 }
 
 pub const HELP: &str = "\
@@ -61,6 +63,8 @@ USAGE:
 OPTIONS:
     -c, --config <DIR>   the config directory, holding shell.lua. Overrides
                          $OBELISK_CONFIG_DIR and $XDG_CONFIG_HOME.
+    -d, --detach         run only: start the shell in its own session and
+                         return, sending its output to `obelisk log`
         --force          init only: overwrite files that already exist
     -f, --follow         log only: keep printing until the shell exits
     -V, --version
@@ -80,6 +84,8 @@ quoting `notifications` is optional.
 /dev/null: when it does, stdout and stderr go to $XDG_RUNTIME_DIR/obelisk-shell.log
 instead, truncated each run, and `-f` keeps reading until the shell exits. A
 terminal, a redirect or a pipe is left alone and there is no file to read.
+`-d` starts a shell that way deliberately, so `obelisk -d` then `obelisk log -f`
+runs one from a terminal without tying the terminal up.
 
 `call` is for what a keybind wants the shell to *do* rather than look like:
 the config declares `action(\"rec.toggle\", function() ... end)` and the bind is
@@ -111,8 +117,10 @@ fn config_dir_from(raw: &str) -> Result<PathBuf, String> {
 /// Whether `arg` is one of the options this parser knows, rather than a value that merely begins
 /// with a dash. `-1` is a `set` value; `-c` is an option even where a value is expected.
 fn is_option(arg: &str) -> bool {
-    matches!(arg, "-c" | "--config" | "--force" | "-f" | "--follow" | "-V" | "--version" | "-h" | "--help")
-        || arg.starts_with("--config=")
+    matches!(
+        arg,
+        "-c" | "--config" | "-d" | "--detach" | "--force" | "-f" | "--follow" | "-V" | "--version" | "-h" | "--help"
+    ) || arg.starts_with("--config=")
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
@@ -121,6 +129,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let mut config_dir = None;
     let mut force = false;
     let mut follow = false;
+    let mut detach = false;
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -151,13 +160,14 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 let value = args.next().ok_or_else(|| "--config needs a directory".to_string())?;
                 config_dir = Some(config_dir_from(&value)?);
             }
+            "-d" | "--detach" => detach = true,
             "--force" => force = true,
             "-f" | "--follow" => follow = true,
             "-V" | "--version" => {
-                return Ok(Args { command: Command::Version, config_dir });
+                return Ok(Args { command: Command::Version, config_dir, detach });
             }
             "-h" | "--help" => {
-                return Ok(Args { command: Command::Help, config_dir });
+                return Ok(Args { command: Command::Help, config_dir, detach });
             }
             other => {
                 if let Some(value) = other.strip_prefix("--config=") {
@@ -212,7 +222,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     if follow && !matches!(command, Command::Log { .. }) {
         return Err("--follow is only meaningful with `log`".to_string());
     }
-    Ok(Args { command, config_dir })
+    if detach && !matches!(command, Command::Run) {
+        return Err("--detach is only meaningful when starting the shell".to_string());
+    }
+    Ok(Args { command, config_dir, detach })
 }
 
 #[cfg(test)]
@@ -257,7 +270,7 @@ mod tests {
 
     #[test]
     fn no_arguments_runs_the_shell_against_the_default_config() {
-        assert_eq!(parse_args(&[]).unwrap(), Args { command: Command::Run, config_dir: None });
+        assert_eq!(parse_args(&[]).unwrap(), Args { command: Command::Run, config_dir: None, detach: false });
     }
 
     #[test]
@@ -355,6 +368,8 @@ mod tests {
     fn force_without_init_is_refused_rather_than_ignored() {
         assert!(parse_args(&["--force"]).is_err(), "a flag that does nothing is worse than an error");
         assert!(parse_args(&["-f"]).is_err(), "--follow has nothing to follow without `log`");
+        assert!(parse_args(&["log", "-d"]).is_err(), "--detach has nothing to detach without a run");
+        assert!(parse_args(&["-d"]).unwrap().detach, "a bare run takes it");
     }
 
     #[test]

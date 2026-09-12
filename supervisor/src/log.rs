@@ -57,6 +57,11 @@ pub fn print(follow: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = File::open(&path).map_err(|err| {
         format!("no log at {}: {err}. A shell with a terminal or a redirect writes there instead", path.display())
     })?;
+    // Said once, before any of it is printed: without this a dead run's bytes are indistinguishable
+    // from a live one's, and `--follow` returns at once looking like it simply caught up.
+    if !is_locked(&file)? {
+        eprintln!("obelisk: no shell is writing {}; this is the last run's output", path.display());
+    }
     let mut out = io::stdout().lock();
     let mut writer_left = false;
     loop {

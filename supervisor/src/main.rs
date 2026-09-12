@@ -158,6 +158,27 @@ impl Shutdown {
 
 /// Enters the PAM worker's tokio-free path (ADR-0028) before any D-Bus, runtime, or audio-thread
 /// setup. The worker must not construct a tokio runtime.
+/// `obelisk -d`: re-exec in a new session and return, so the terminal gets its prompt back.
+///
+/// One `setsid`, not [`process::spawn_detached`]'s double fork: that orphans a grandchild while the
+/// Supervisor lives on, whereas this parent exits at once. `/dev/null` is the point rather than
+/// tidiness -- it is what makes `log::capture` claim the shared log, so a detached shell is the one
+/// `obelisk log` can read (ADR-0199).
+fn detach_self() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(std::env::args().skip(1).filter(|arg| arg != "-d" && arg != "--detach"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: runs in the forked child where only this thread exists; `setsid` is
+    // async-signal-safe and touches no Rust state.
+    unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+    command.spawn()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     if std::env::var_os("OBELISK_PAM_WORKER").is_some() {
         return pam_worker::run_worker();
@@ -202,6 +223,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         cli::Command::Run => {
+            if args.detach {
+                return detach_self();
+            }
             // Every runtime diagnostic from here on, and every Renderer that inherits these
             // descriptors (ADR-0199). Argument parsing has already had its say above, so a
             // detached run still loses a `-c` substitution notice.
