@@ -506,6 +506,12 @@ impl Supervisor {
                     candidate_generation_id,
                     false,
                 );
+                // A candidate can evaluate far enough to inhibit idle before it fails, and the
+                // `Ok` arm cleans only the *superseded* generation. Without this, logind stayed
+                // blocked until the shell restarted, with no VM left to claim the hold.
+                if let Some(idle) = self.capabilities.idle() {
+                    idle.reset_registrations(candidate_generation_id).await;
+                }
                 eprintln!("generation swap for sequence {sequence} failed: {failure}");
                 eprintln!("{} stays authoritative", self.authoritative.generation_id);
             }
