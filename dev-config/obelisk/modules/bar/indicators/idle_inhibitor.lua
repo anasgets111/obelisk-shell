@@ -42,18 +42,14 @@ local idle_tooltip = tooltip({
     id = "idle_tooltip",
     slot = SLOT,
     children = {
-        cell(idle.reasons:map(function(reasons)
-            if #reasons == 0 then
-                return "nothing is holding this awake"
-            end
-            return "held awake by " .. table.concat(reasons, ", ")
-        end), theme.FG, theme.font.sm),
+        cell(computed({ idle.reasons, idle.inhibited }, idle.held_text), theme.FG, theme.font.sm),
         cell(
-            computed({ idle.schedule, idle.arming, idle.inhibited, idle.enabled }, function(plan, arming, held, on)
+            computed({ idle.schedule, idle.arming, idle.manual, idle.enabled }, function(plan, arming, manual, on)
                 if not on or plan.total == 0 then
                     return "click to hold · right-click for settings"
                 end
-                if held then
+                -- `manual`, not `inhibited`: offering to drop a hold a camera took does nothing.
+                if manual then
                     return "click to drop the manual hold"
                 end
                 -- The armed stage's countdown, matching the modal masthead.

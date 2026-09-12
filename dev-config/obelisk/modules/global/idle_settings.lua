@@ -225,9 +225,7 @@ end
 
 local held_banner = banner(
     icons.awake,
-    idle.reasons:map(function(reasons)
-        return "held awake by " .. table.concat(reasons, ", ")
-    end),
+    computed({ idle.reasons, idle.inhibited }, idle.held_text),
     theme.ACCENT,
     theme.ACCENT_SUBTLE,
     idle.inhibited

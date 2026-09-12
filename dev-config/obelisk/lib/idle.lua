@@ -312,6 +312,19 @@ idle.reasons = computed(
     end
 )
 
+--- Sentence naming the holders. `inhibited` outruns [`idle.reasons`]: our own hold is excluded from
+--- `obelisk.idle.inhibitors`, and ADR-0160's compositor half names nothing at all. Either left the
+--- banner reading "held awake by" with an empty list after it.
+--- @param reasons string[]
+--- @param inhibited boolean
+--- @return string
+function idle.held_text(reasons, inhibited)
+    if #reasons > 0 then
+        return "held awake by " .. table.concat(reasons, ", ")
+    end
+    return inhibited and "held awake by something that did not name itself" or "nothing is holding this awake"
+end
+
 --- Whether anything holds the session awake, including unnamed holders. `obelisk.idle`'s `inhibited`
 --- is the authoritative `BlockInhibited` gate, so an unreadable `who` still stops the countdown
 --- instead of leaving a modal bar that can never fill.
