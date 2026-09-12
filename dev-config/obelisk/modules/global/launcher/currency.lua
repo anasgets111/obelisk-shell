@@ -154,7 +154,7 @@ local function fetch()
         local decoded = code == 0 and json.decode(table.concat(body)) or nil
         local rates = decoded and decoded.usd
         if type(rates) ~= "table" then
-            next_attempt:set(os.time() + RETRY_SECONDS)
+            next_attempt:set(((obelisk.system:get() or {}).monotonic or 0) + RETRY_SECONDS)
             return
         end
         -- `data.usd["usd"] = 1.0`: the base is absent from its own table.
@@ -169,14 +169,15 @@ end
 -- watching for its first push: an in-place reload installs the new handler after the capability has
 -- already pushed, so an edge gate would arm on a cold start and never again.
 obelisk.system:on_change(function(system)
-    local now = system and system.time
-    if not now or obelisk.storage:get() == nil then
+    if not system or obelisk.storage:get() == nil then
         return
     end
-    if now < next_attempt:get() then
+    -- Two clocks on purpose (ADR-0202): the retry is a duration this session owns, while freshness
+    -- is measured against a stamp on disk that outlived the session and is therefore wall time.
+    if system.monotonic < next_attempt:get() then
         return
     end
-    if now - (store.currency_updated_at:get() or 0) >= REFRESH_SECONDS then
+    if system.time - (store.currency_updated_at:get() or 0) >= REFRESH_SECONDS then
         fetch()
     end
 end)

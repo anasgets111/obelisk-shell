@@ -123,8 +123,11 @@ local in_flight = state("weather_fetching", false)
 local retries = state("weather_retries", 0)
 local next_attempt = state("weather_next_attempt", 0)
 
+-- Monotonic, not wall: a retry is a duration this session owns, and setting the clock must not
+-- park the next attempt an hour out (ADR-0202). The stored-freshness deadline below is the other
+-- kind and stays wall, so the two are never compared against the same reading.
 local function schedule(seconds)
-    next_attempt:set(os.time() + seconds)
+    next_attempt:set(((obelisk.system:get() or {}).monotonic or 0) + seconds)
 end
 
 local function failed()
@@ -232,16 +235,18 @@ function weather.refresh()
 end
 
 obelisk.system:on_change(function(system)
-    local now = system and system.time
-    if not now or in_flight:get() or obelisk.storage:get() == nil then
+    if not system or in_flight:get() or obelisk.storage:get() == nil then
         return
     end
-    -- Before anything has been scheduled, the deadline is the stored reading's own hour.
     local due = next_attempt:get()
     if due == 0 then
-        due = (store.weather_updated_at:get() or 0) + REFRESH_SECONDS
-    end
-    if now < due then
+        -- Nothing scheduled yet, so the deadline is the stored reading's own hour. That stamp
+        -- outlived the session, so it is wall time and only `time` can be compared with it.
+        local stale_at = (store.weather_updated_at:get() or 0) + REFRESH_SECONDS
+        if system.time < stale_at then
+            return
+        end
+    elseif system.monotonic < due then
         return
     end
     fetch()

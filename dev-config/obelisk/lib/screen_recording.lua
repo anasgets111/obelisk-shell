@@ -52,15 +52,24 @@ local cancelled = state("recorder_cancelled", false)
 
 -- ## Pause arithmetic
 --
--- `started_at` is the Supervisor's, so it survives reloads; the pause bookkeeping is this config's,
--- because pausing is not something a process reports. `paused_total` accumulates finished pauses
--- and `paused_at` timestamps an open one, zero meaning none. Elapsed time is the difference.
+-- All four stamps are `obelisk.system.monotonic`, including the start: every term is a duration,
+-- so they have to share one clock, and a capability's `started_at` could not join them because a
+-- monotonic reading only compares against another from the same origin (ADR-0202). `recorder`'s own
+-- `started_at` is still the Supervisor's Unix stamp and is left to callers that want a date.
+-- Pause bookkeeping is this config's, because pausing is not something a process reports:
+-- `paused_total` accumulates finished pauses and `paused_at` timestamps an open one, zero meaning
+-- none. Elapsed time is the difference.
 --
 -- Both are `state`, so they survive an in-place reload and reset on a generation swap -- after
 -- which paused seconds count as recorded ones. The mirror has the same hole across a Quickshell
 -- restart and documents it the same way; a debounced disk write per pause is not worth closing it.
 local paused_total = state("recorder_paused_total", 0)
 local paused_at = state("recorder_paused_at", 0)
+local began_at = state("recorder_began_at", 0)
+
+local function monotonic_now()
+    return (obelisk.system:get() or {}).monotonic or 0
+end
 
 local recording = recorder.running:map(function(up)
     return up == true
@@ -136,12 +145,12 @@ local function elapsed_of(now, began, banked, open_since)
 end
 
 local elapsed_text = computed(
-    { obelisk.system, recorder.started_at, paused_total, paused_at, recording },
+    { obelisk.system, began_at, paused_total, paused_at, recording },
     function(s, began, banked, open_since, up)
         if not up then
             return ""
         end
-        return format_elapsed(elapsed_of((s and s.time) or os.time(), began, banked, open_since))
+        return format_elapsed(elapsed_of((s and s.monotonic) or 0, began, banked, open_since))
     end
 )
 
@@ -174,6 +183,7 @@ local function launch(capture_args, label)
     output_path:set(path)
     paused_total:set(0)
     paused_at:set(0)
+    began_at:set(monotonic_now())
     starting:set(true)
     recorder:start("gpu-screen-recorder", args)
 end
@@ -272,10 +282,10 @@ local function toggle_pause()
     recorder:signal("USR2")
     local open_since = paused_at:get()
     if open_since > 0 then
-        paused_total:set(paused_total:get() + (os.time() - open_since))
+        paused_total:set(paused_total:get() + (monotonic_now() - open_since))
         paused_at:set(0)
     else
-        paused_at:set(os.time())
+        paused_at:set(monotonic_now())
     end
 end
 
@@ -363,7 +373,7 @@ obelisk.processes:on_change(function(current, previous)
         cancelled:set(false)
     end
     if was ~= nil and was.running then
-        announce_saved(os.time(), was.started_at, now.exit_code)
+        announce_saved(monotonic_now(), began_at:get(), now.exit_code)
         paused_total:set(0)
         paused_at:set(0)
     end

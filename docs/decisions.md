@@ -4456,9 +4456,16 @@ name holding v, s and c in order, then preferred the shortest.
    session, and monotonic would break them at the first restart.
 4. Exclude suspend with `CLOCK_MONOTONIC`; expose `CLOCK_BOOTTIME` separately if anything needs it.
 
-Still on wall time and still wrong for it: the weather and currency *retry* deadlines, recording
-elapsed/paused time, and the update install duration. The last two mix a capability's wall stamp into
-the arithmetic, so neither is a one-line substitution.
+Amendment: the retry deadlines and the recording clock moved too. Weather and currency each hold
+two deadlines in one handler, a session-owned retry and a freshness check against a stamp on disk, so
+those now read `monotonic` and `time` respectively rather than sharing one. Recording stamps its own
+start instead of reading `recorder.started_at`, because every term in its elapsed calculation is a
+duration and a capability's stamp could not join them: a monotonic reading only compares against
+another from the same origin, and each capability would own a different one.
+
+Still on wall time: the update panel's "took N min" line. Its end is `install_finished_at`, the
+capability's stamp, so moving it would mean config observing the end and stamping it again -- another
+state and an edge detector for a line that is wrong only if the clock is set mid-install.
 
 Deferred: a timer API owning every deadline. Displayed elapsed durations still need a clock to
 subtract.
