@@ -283,6 +283,7 @@ impl RendererClient {
             handle.clear_handlers();
         }
         lua::action::clear(self.loader.lua());
+        lua::timer::clear(self.loader.lua());
     }
 
     /// Returns a handle, lazily adding `obelisk.<capability>` as `nil`, revision `0` (ADR-0029).
@@ -690,7 +691,19 @@ impl RendererClient {
     /// (ADR-0146) or the earliest open `pulse(signal, ms)` window closes (ADR-0153). `None` while
     /// nothing is pending, which is the idle case ADR-0124 keeps timeout-free.
     pub fn next_wake_deadline(&self) -> Option<std::time::Instant> {
-        crate::lua::signal::next_wake_deadline(self.loader.lua())
+        let signals = crate::lua::signal::next_wake_deadline(self.loader.lua());
+        let timers = crate::lua::timer::next_deadline(self.loader.lua());
+        // Scheduled apart because only one of them is answered by re-reading the scene: a due
+        // signal dirties the tree, a due timer runs config code (ADR-0203).
+        signals.into_iter().chain(timers).min()
+    }
+
+    /// Runs the config callbacks whose deadline has passed, before this turn's dirty-tree
+    /// re-resolve. A `state:set` inside one therefore reaches this turn's pass, which resolves the
+    /// *applied* tree: a reload still waiting on `ApplyPendingReload` paints its new bindings when
+    /// that lands, not here.
+    pub fn fire_due_timers(&mut self) {
+        crate::lua::timer::dispatch_due(self.loader.lua(), std::time::Instant::now());
     }
 
     /// Dirties the scene when a `delay` came due or a `pulse` window closed, so this turn's

@@ -141,12 +141,14 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | `obelisk.idle:register_threshold(seconds, on_idle, on_resume)` | Register inactivity callbacks; reset on re-evaluation |
 | `obelisk.idle:inhibit(reason)` / `release_inhibit()` | Acquire/release one generation-owned hold on logind idle inhibition |
 | `fuzzy(haystack, needle)` | fzf's score and match start for one candidate; `nil` for no match. Smart case. The caller sorts |
+| `timer(ms, callback)` | Runs `callback` once, `ms` from now, `[1, 86400000]`; returns a handle with `cancel()`. One evaluation only; the handle is not what keeps it armed |
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
 | `session_process { name, stop_signal? }` | Declares a program whose lifetime is the session's; returns a handle with `running`/`pid`/`started_at`/`exit_code`/`start_error` signals and `start`/`signal`/`stop` methods |
 
-See [idle wrapper](../renderer/src/lua/idle.rs), [store wrapper](../renderer/src/lua/store.rs),
+See [idle wrapper](../renderer/src/lua/idle.rs), [timers](../renderer/src/lua/timer.rs),
+[store wrapper](../renderer/src/lua/store.rs),
 [session-process wrapper](../renderer/src/lua/session_process.rs) and [process API](../renderer/src/lua/process.rs).
 
 `process.run` and `session_process` differ in lifetime, not in what they can launch. A

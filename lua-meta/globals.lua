@@ -37,6 +37,34 @@ function fonts(chain) end
 ---@return integer? score, integer? start `start` is a 0-based index into `haystack`.
 function fuzzy(haystack, needle) end
 
+---@class TimerHandle
+local TimerHandle = {}
+
+---Cancels a pending timer. A no-op once it has fired, once it is already cancelled, and inside its
+---own callback, so nothing has to track which of those happened.
+function TimerHandle:cancel() end
+
+---Runs `callback` once, `ms` from now, on a monotonic clock (ADR-0203).
+---
+---The imperative counterpart to [`delay`] and [`pulse`], which move a *signal* on a clock and
+---remain the answer for a debounce or a temporary flag. This is for what those cannot reach: a
+---retry, or an action due at a deadline whether or not anything is looking at it.
+---
+---Repeat by re-arming inside the callback. There is no repeating flavour, because the delay would
+---then run from the `timer` call the callback makes, not at a fixed rate, and only the config knows
+---whether a missed deadline should be skipped or caught up.
+---
+---Registrations last one evaluation, like [`action`]: re-arm at the top level. A reload clears
+---them, so `cancel` is not the only thing that stops one. The handle is not what keeps a timer
+---armed, so one whose handle is discarded still fires.
+---
+---A callback armed by another callback waits for a later turn, so a one-millisecond timer re-arming
+---itself cannot spin a frame. Callbacks run before the turn re-resolves the tree.
+---@param ms integer Milliseconds from now, `[1, 86400000]`. Outside that raises. A day, not `delay`'s minute, because an idle stage can be two hours out.
+---@param callback fun() No arguments, no return. Raising is logged and skipped; the rest of the batch still runs.
+---@return TimerHandle
+function timer(ms, callback) end
+
 json = {}
 
 ---Decodes JSON without raising. Errors return `nil` plus a message; JSON `null` also returns `nil`

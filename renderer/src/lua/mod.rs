@@ -17,6 +17,7 @@ pub mod session_process;
 pub mod signal;
 pub mod store;
 pub mod surfaces;
+pub mod timer;
 
 pub use nodes::VirtualNode;
 use std::cell::RefCell;
@@ -132,6 +133,7 @@ impl Loader {
         signal::register(&lua, dirty)?;
         store::register(&lua)?;
         session_process::register(&lua)?;
+        timer::register(&lua)?;
         let standard_modules = loaded_module_names(&lua)?;
         Ok(Loader { lua, standard_modules, idle: RefCell::new(None) })
     }

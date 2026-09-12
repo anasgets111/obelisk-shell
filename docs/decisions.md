@@ -4462,3 +4462,33 @@ the arithmetic, so neither is a one-line substitution.
 
 Deferred: a timer API owning every deadline. Displayed elapsed durations still need a clock to
 subtract.
+
+## 0203. `timer(ms, fn)` is a list of its own, because a callback cannot be scheduled the way `delay` is
+
+1. One-shot only, returning a handle with `cancel()`. A repeating flavour would have to choose
+   between fixed-delay and fixed-rate and then answer what a missed deadline means; only the config
+   knows, and re-arming expresses either.
+2. Its own sorted list, not the `WakeDeadline` slot `delay`/`pulse` share. That slot works because
+   those are pull-based: a due wake dirties the scene and the pass re-reads every clock signal it
+   reaches, so nothing needs identity. A callback has to run whether or not any node reads anything,
+   and ADR-0124 never resolves a hidden subtree, so a pull-based timer behind one would never fire.
+3. Cancelling stays effective inside a due batch, including a timer cancelling itself. Taking every
+   callback up front, as `notify_change` takes its handler list, would run one the previous callback
+   had just cancelled.
+4. A timer armed by a callback waits for a later turn.
+5. Dispatch precedes the turn's re-resolve. It resolves the applied tree, so a reload still waiting
+   on `ApplyPendingReload` paints its new bindings when that lands, not from here.
+6. Cleared with `action`'s registrations, before an evaluation and after a failed one (ADR-0115): a
+   callback held past a reload closes over the previous evaluation's locals. Ids keep counting across
+   a clear, so a handle from before it cancels nothing armed after it.
+7. `[1, 86400000]` ms, not `delay`/`pulse`'s 60-second ceiling, which could not express
+   `lib/idle.lua`'s two-hour suspend stage.
+
+Accepted: a topology-changing evaluation arms timers in a process whose scene is then discarded, so
+the outgoing generation's and the candidate's can both be live until the reap. ADR-0115 already
+accepts that overlap for `on_change`.
+
+Accepted: the budget is per callback, as `action` and `on_change` are, so a batch spends one per
+timer. Registry work across a batch is quadratic besides (`TimerRegistry`).
+
+Rejected: a heap with cancellation bookkeeping; the expected workload does not justify it.

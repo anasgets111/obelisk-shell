@@ -470,6 +470,7 @@ pub fn run(
         // per-field commits would show the compositor a half-updated surface.
         // Profiling adds three `clock_gettime` calls per turn for the resolve/repaint split.
         let mut phases = idle_profile::Phases::start(profile.is_some());
+        app.client.fire_due_timers();
         app.client.wake_due_signals();
         // Kept as its own name, not folded into `re_resolved` below: "a pass ran" and "something
         // changed" answer different questions. Only a pass can change any tree, so only a pass
