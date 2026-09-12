@@ -98,7 +98,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 /// only a signal getter's body; a `__index` loop of 200 million iterations made `Scene::apply` take
 /// 26.10s and return `Ok(())` with no `Signal`, on the VM's thread (ADR-0039). `LayoutPassBudget`
 /// now holds the hook for the whole pass and refuses it in 2s with `PassBudgetExceeded`. Scalar
-/// shorthand is shared by `margin`/`padding`/`border_width`; only the last keeps a range check.
+/// shorthand is shared by `margin`/`padding`/`border_width`, each range-checked by [`range_of`].
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation pass: a panel root's `margin` is the live layer-shell anchor
     // offset (`set_margin`, ADR-0038 decision 2), so zero is the absent-key placeholder.
@@ -109,13 +109,14 @@ pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) ->
         return Ok(EdgeInsets::default());
     };
     if let Some(n) = value_as_f32(property, value)? {
+        let n = within(property, n)?;
         return Ok(EdgeInsets { top: n, right: n, bottom: n, left: n });
     }
     let Value::Table(table) = value else {
         return Err(invalid(property, format!("expected a number or a table, got {}", preview_for_error(value))));
     };
     // An absent edge is 0; [`table_number`] rejects nested `Signal`s.
-    let edge = |key: &str| -> Result<f32, LayoutError> { Ok(table_number(property, table, key)?.unwrap_or(0.0)) };
+    let edge = |key: &str| within(property, table_number(property, table, key)?.unwrap_or(0.0));
     Ok(EdgeInsets { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
@@ -132,20 +133,6 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
     Ok(Some(parse_hex_color("background", &s)?))
 }
 
-/// `radius` and `border_width` share `[0, 8192]` with `width`/`height` (§ 5.1). In femtovg 0.26,
-/// `radius = -4` silently squares corners (`path.rs:458` treats values under 0.1 as unrounded),
-/// while `border_width = -4` clamps to 0 and clears paint alpha. Above roughly 8.4e6,
-/// `curve_divisions` (`path/cache.rs:911`) divides by
-/// `acos(1.0) == 0.0`; `inf as u32` becomes `u32::MAX`, causing billions of iterations and tens
-/// of GB of vertices on the Wayland dispatch thread. `margin`/`padding` stay unrestricted because
-/// the solver treats negative margin as CSS layout math, not a femtovg stroke input.
-fn check_geometry_range(property: &str, n: f32) -> Result<(), LayoutError> {
-    if !(0.0..=8192.0).contains(&n) {
-        return Err(invalid(property, format!("must be within [0, 8192], got {n}")));
-    }
-    Ok(())
-}
-
 /// `rect.radius` (§ 5.2 item 1), defaulting to 0.
 pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("radius") else {
@@ -153,8 +140,7 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
     };
     let n = value_as_f32("radius", value)?
         .ok_or_else(|| invalid("radius", format!("expected a number, got {}", preview_for_error(value))))?;
-    check_geometry_range("radius", n)?;
-    Ok(n)
+    within("radius", n)
 }
 
 /// `scale`, `rotate`, `translate` and `origin` (§ 5.1, ADR-0149): a paint-only affine on the
@@ -212,15 +198,25 @@ pub fn invert_affine([a, b, c, d, e, f]: Affine) -> Option<Affine> {
     Some([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)])
 }
 
-/// An `{ x, y }` table of numbers, each defaulting to `default` when absent.
 /// The range `property`'s number is accepted in, and the one an overshooting easing is clamped
-/// into: parser and tween agree by construction. `margin`, `translate` and `rotate` accept a
-/// negative; nothing else does.
+/// into: parser and tween agree by construction. `margin`, `padding`, `translate` and `rotate`
+/// accept a negative; nothing else does. The solver treats a negative inset as CSS layout math,
+/// so only the magnitude is bounded there.
+///
+/// The shared `8192` ceiling is femtovg's. Above roughly 8.4e6 `curve_divisions`
+/// (`path/cache.rs:911`) divides by `acos(1.0) == 0.0`, and `inf as u32` becomes `u32::MAX`:
+/// billions of iterations and tens of GB of vertices on the Wayland dispatch thread. Below zero,
+/// `radius = -4` silently squares corners and `border_width = -4` clears paint alpha.
+///
+/// `font_size` and icon `size` floor at 1 rather than 0. `line_height` is `font_size * 1.2`, and
+/// cosmic-text's `Buffer::new` asserts a non-zero line height, so a zero aborts the Renderer.
+/// Flooring here covers the tween as well, which clamps into this same range.
 pub(super) fn range_of(property: &str) -> (f32, f32) {
     match property {
         "opacity" | "origin" => (0.0, 1.0),
         "scale" => (0.0, 64.0),
-        "margin" | "translate" | "rotate" => (-8192.0, 8192.0),
+        "font_size" | "size" => (1.0, 8192.0),
+        "margin" | "padding" | "translate" | "rotate" => (-8192.0, 8192.0),
         _ => (0.0, 8192.0),
     }
 }
@@ -244,7 +240,7 @@ fn xy(property: &str, value: &Value) -> Result<(f32, f32), LayoutError> {
     Ok((within(property, axis("x")?)?, within(property, axis("y")?)?))
 }
 
-fn within(property: &str, n: f32) -> Result<f32, LayoutError> {
+pub(super) fn within(property: &str, n: f32) -> Result<f32, LayoutError> {
     let (low, high) = range_of(property);
     if !(low..=high).contains(&n) {
         return Err(invalid(property, format!("must be within [{low}, {high}], got {n}")));
@@ -354,14 +350,9 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     Ok(BorderColor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// `rect.border_width` (§ 5.2 item 1), using [`EdgeInsets`] and adding its `[0, 8192]` range check
-/// after [`parse_edge_insets`]. `margin`/`padding` deliberately do not use that check.
+/// `rect.border_width` (§ 5.2 item 1).
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
-    let insets = parse_edge_insets(properties, "border_width")?;
-    for n in [insets.top, insets.right, insets.bottom, insets.left] {
-        check_geometry_range("border_width", n)?;
-    }
-    Ok(insets)
+    parse_edge_insets(properties, "border_width")
 }
 
 pub fn parse_align(properties: &HashMap<String, Value>, property: &str) -> Result<Align, LayoutError> {
@@ -417,10 +408,7 @@ pub fn parse_opacity(properties: &HashMap<String, Value>) -> Result<f32, LayoutE
     let Some(n) = value_as_f32("opacity", value)? else {
         return Err(invalid("opacity", format!("must be a number, got {}", preview_for_error(value))));
     };
-    if !(0.0..=1.0).contains(&n) {
-        return Err(invalid("opacity", format!("must be within [0, 1], got {n}")));
-    }
-    Ok(n)
+    within("opacity", n)
 }
 
 pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {

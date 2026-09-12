@@ -26,16 +26,28 @@ pub struct PhysicalRect {
     pub y1: i32,
 }
 
+/// The coordinate ceiling a snapped edge saturates to, well inside `i32` so that a caller may
+/// subtract two of them.
+///
+/// `as i32` saturates rather than wrapping, so composed transforms or an oversized compositor
+/// configure can land `x0` on `i32::MIN` and `x1` on `i32::MAX`. `x1 - x0` then overflows, and
+/// release builds set `overflow-checks`, so the Renderer aborts. Region walks push those
+/// differences straight into `wl_region::add` (`wayland::surface`) and `scene::push_rounded_rect`
+/// without an intervening clip.
+const COORD_LIMIT: f32 = 1_048_576.0;
+
 /// Snaps `rect` to physical pixel boundaries at fractional output scale `scale`.
 ///
 /// The top-left corner floors down and the bottom-right corner ceils up, so the snapped rect
 /// always fully contains the logical one -- shrinking would clip a glyph or a border stroke.
+/// Both corners saturate at [`COORD_LIMIT`], which is 128x the largest box a config can ask for.
 pub fn snap_to_physical(rect: LogicalRect, scale: f32) -> PhysicalRect {
+    let clamp = |n: f32| n.clamp(-COORD_LIMIT, COORD_LIMIT) as i32;
     PhysicalRect {
-        x0: (rect.x * scale).floor() as i32,
-        y0: (rect.y * scale).floor() as i32,
-        x1: ((rect.x + rect.width) * scale).ceil() as i32,
-        y1: ((rect.y + rect.height) * scale).ceil() as i32,
+        x0: clamp((rect.x * scale).floor()),
+        y0: clamp((rect.y * scale).floor()),
+        x1: clamp(((rect.x + rect.width) * scale).ceil()),
+        y1: clamp(((rect.y + rect.height) * scale).ceil()),
     }
 }
 

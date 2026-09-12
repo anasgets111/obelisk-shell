@@ -400,8 +400,8 @@ pub(super) fn parse_bool(
     }
 }
 
-/// Shared number parser behind [`parse_font_size`], [`parse_icon_size`] and `style::parse_spacing`.
-/// `style::parse_opacity` keeps its own body: it range-checks on top of this.
+/// Shared number parser behind [`parse_font_size`], [`parse_icon_size`] and `style::parse_spacing`,
+/// range-checked against `style::range_of` like every other number a config can write.
 pub(super) fn parse_number(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -410,8 +410,9 @@ pub(super) fn parse_number(
     let Some(value) = properties.get(property) else {
         return Ok(default);
     };
-    value_as_f32(property, value)?
-        .ok_or_else(|| invalid(property, format!("expected a number, got {}", preview_for_error(value))))
+    let n = value_as_f32(property, value)?
+        .ok_or_else(|| invalid(property, format!("expected a number, got {}", preview_for_error(value))))?;
+    style::within(property, n)
 }
 
 /// Shared structural-string parser behind [`parse_surface_id`], `surface::parse_layer`, and
@@ -677,6 +678,20 @@ mod tests {
             parse_font_size(&props).unwrap_err(),
             LayoutError::InvalidProperty { property, .. } if property == "font_size"
         ));
+    }
+
+    /// `line_height` is `font_size * 1.2`, and cosmic-text's `Buffer::new` asserts a non-zero line
+    /// height, so a zero here aborted the Renderer. `-0.0` counts: IEEE 754 says it equals `0.0`.
+    #[test]
+    fn font_size_of_zero_is_rejected_rather_than_reaching_the_shaper() {
+        let lua = lua();
+        for source in [r#"return { kind = "text", font_size = 0 }"#, r#"return { kind = "text", font_size = -0.0 }"#] {
+            let table: mlua::Table = lua.load(source).eval().unwrap();
+            assert!(matches!(
+                parse_font_size(&props_from_table(&table)).unwrap_err(),
+                LayoutError::InvalidProperty { property, .. } if property == "font_size"
+            ));
+        }
     }
 
     #[test]
