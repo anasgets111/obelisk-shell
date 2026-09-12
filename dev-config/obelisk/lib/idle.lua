@@ -2,7 +2,7 @@
 -- `modules/global/idle.lua` runs the clock. Keep this side-effect-free for bar readers, with the
 -- one-way dependency as `lib/media.lua`: `modules/` requires `lib/`, never the reverse.
 -- `IdleService.qml` uses three `IdleMonitor`s with per-stage `timeout` and chained `enabled`. This
--- registers one one-second threshold and counts on `obelisk.system.time`.
+-- registers one one-second threshold and counts on `obelisk.system.monotonic`.
 -- `obelisk.idle:register_threshold` has no removal counterpart (§ 3.2): changing lock from five to
 -- ten minutes would leave both thresholds registered and still lock at five. One registration keeps
 -- editable Lua-number timeouts and a walked stage list.
@@ -218,10 +218,12 @@ end
 -- Use named `state()` signals because registry entries survive config reloads
 -- (ADR-0044 decision 5), preventing an edit from forgetting a manual hold or leaking its inhibitor.
 
---- The `obelisk.system.time` the seat went idle, or `0` while it is awake.
+--- The `obelisk.system.monotonic` reading when the seat went idle, or `0` while it is awake.
+--- Survives an in-place reload, which the clock's epoch also survives; a Supervisor restart builds
+--- both afresh, so the two can never be read against different epochs.
 idle.since = state("idle_since", 0)
 
---- Arming time in `obelisk.system.time`, keyed by `stage.key`. Missing means
+--- Arming time in `obelisk.system.monotonic`, keyed by `stage.key`. Missing means
 --- `IdleMonitor { enabled: false }`;
 --- the stamp makes delay relative, and clearing it makes unlock undo the sequence.
 idle.armed_at = state("idle_armed_at", {})
@@ -433,7 +435,7 @@ end)
 --- `{ key = "", elapsed = 0 }`.
 idle.arming = computed({ obelisk.system, idle.armed_at }, function(s, stamps)
     for key, at in pairs(stamps or {}) do
-        return { key = key, elapsed = math.max(0, ((s and s.time) or 0) - at) }
+        return { key = key, elapsed = math.max(0, ((s and s.monotonic) or 0) - at) }
     end
     return { key = "", elapsed = 0 }
 end)
@@ -443,7 +445,7 @@ idle.elapsed = computed({ obelisk.system, idle.since }, function(s, since)
     if since == 0 then
         return 0
     end
-    return math.max(0, ((s and s.time) or 0) - since)
+    return math.max(0, ((s and s.monotonic) or 0) - since)
 end)
 
 return idle

@@ -149,7 +149,9 @@ See [workspaces](../supervisor/src/capabilities/workspaces/mod.rs) and
 ## 9. Telemetry and clock
 
 `sysinfo` samples CPU (/proc/stat), RAM/swap (/proc/meminfo) and temperatures (/sys/class/hwmon/)
-with configurable intervals; zero disables that sample task. `system.time` ticks once a second.
+with configurable intervals; zero disables that sample task. `system.time` and `system.monotonic`
+are sampled once a second. Take durations from monotonic differences and dates from wall `time`;
+persisted timestamps stay wall. Monotonic counts from the capability's start and excludes suspend.
 See [sysinfo](../supervisor/src/capabilities/sysinfo/mod.rs).
 
 ## 10. Processes

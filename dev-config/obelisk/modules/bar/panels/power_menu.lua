@@ -10,7 +10,8 @@
 -- and sleep lose nothing, so need no countdown. Sleep calls `systemctl suspend`; the mirror's
 -- `suspend()` service is absent here.
 --
--- Countdown is a deadline in `obelisk.system.time`, not a timer. `system` pushes once a second;
+-- Countdown is a deadline in `obelisk.system.monotonic`, not a timer: it ends in `poweroff`, and a
+-- clock step must not fire it early. `system` pushes once a second;
 -- seconds-left is a `computed`, and one `on_change` commits past the deadline (ADR-0115).
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -28,8 +29,7 @@ local KIND = "power"
 -- Mirror `initialCountdown`.
 local COUNTDOWN = 10
 
--- Pending action (`""` for none) and its `obelisk.system.time` deadline. Two `state()`s because a
--- table is not a signal type.
+-- Pending action (`""` for none) and its `obelisk.system.monotonic` deadline.
 local pending = state("power_pending", "")
 local deadline = state("power_deadline", 0)
 
@@ -38,7 +38,7 @@ local counting = pending:map(function(key)
 end)
 
 local seconds_left = computed({ obelisk.system, deadline }, function(s, at)
-    return math.max(0, at - ((s and s.time) or 0))
+    return math.max(0, at - ((s and s.monotonic) or 0))
 end)
 
 -- Mirror `actions`, in order. `logout` is niri's `CompositorImpl.exitSession`.
@@ -82,12 +82,12 @@ end
 
 local function start_countdown(key)
     local s = obelisk.system:get()
-    deadline:set(((s and s.time) or 0) + COUNTDOWN)
+    deadline:set(((s and s.monotonic) or 0) + COUNTDOWN)
     pending:set(key)
 end
 
 obelisk.system:on_change(function(s)
-    if pending:get() ~= "" and s.time >= deadline:get() then
+    if pending:get() ~= "" and s.monotonic >= deadline:get() then
         commit_pending()
     end
 end)

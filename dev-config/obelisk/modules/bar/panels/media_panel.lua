@@ -5,10 +5,10 @@
 -- payload alone gives a bar that jumps once a track and sits still between. The mirror re-reads the
 -- player on a 500ms timer; this anchors the last push against a clock and adds elapsed time.
 --
--- `position_updated_at` is `CLOCK_MONOTONIC`, which no Lua global exposes, so the anchor is
--- `os.time()` taken in `on_change` -- the one place a wall reading and a payload are known to be
--- simultaneous. `obelisk.system.time` ticks the sum once a second. Wall seconds move when the clock
--- is set, so the elapsed term is wrong by the whole adjustment until the next real reading.
+-- `position_updated_at` is `CLOCK_MONOTONIC`, and `obelisk.system.monotonic` is the same kind of
+-- reading, so the anchor is taken from it in `on_change` -- the one place a clock reading and a
+-- payload are known to be simultaneous. `system` ticks the sum once a second. Both ends are on the
+-- monotonic clock, so setting the wall clock no longer jumps playback (ADR-0202).
 --
 -- Writing the anchor in a handler rather than a `:map` is deliberate: ADR-0044 may rerun a map on
 -- the same inputs, so a map that recorded a time would record it repeatedly.
@@ -58,6 +58,13 @@ end)
 -- A repeated number means "no news", so keep counting from the existing anchor; a changed one is
 -- a real reading. `position_updated_at` is the moment of the *read*, not of the value.
 local anchor = state("media_anchor", 0)
+
+--- Stamps the anchor from the same clock `position_us` adds elapsed time against. Every writer goes
+--- through this: a seek that stamped a different clock would jump the position by the two epochs.
+local function anchor_now()
+    anchor:set((obelisk.system:get() or {}).monotonic or 0)
+end
+
 local anchored_position = -1
 
 -- Where we last asked the track to move to, or `-1` while the player's own reading is
@@ -78,12 +85,12 @@ obelisk.mpris.on_change(obelisk.mpris, function()
     end
     anchored_position = position
     seek_base:set(-1)
-    anchor:set(os.time())
+    anchor:set((obelisk.system:get() or {}).monotonic or 0)
 end)
 
--- No `os.time()` fallback: a `computed` must answer the same for the same inputs (ADR-0044), and a
--- clock read makes it answer differently every run. Before `obelisk.system`'s first tick there is no
--- "now", so the anchor is the only honest reading and the elapsed term is zero.
+-- No clock read of its own: a `computed` must answer the same for the same inputs (ADR-0044), and
+-- reading a clock makes it answer differently every run. Before `obelisk.system`'s first tick there
+-- is no "now", so the anchor is the only honest reading and the elapsed term is zero.
 local position_us = computed({ selected, obelisk.system, anchor, seek_base }, function(player, s, anchored, base)
     if not player then
         return -1
@@ -95,7 +102,7 @@ local position_us = computed({ selected, obelisk.system, anchor, seek_base }, fu
         return -1
     end
     local position = base >= 0 and base or reported
-    local now = (s and s.time) or 0
+    local now = (s and s.monotonic) or 0
     if player.play_state == "Playing" and anchored > 0 and now > anchored then
         position = position + (now - anchored) * 1000 * 1000
     end
@@ -153,7 +160,7 @@ local function transport(slot, icon, command, offset, size)
             local estimate = position_us:get() + offset
             estimate = math.max(0, length > 0 and math.min(estimate, length) or estimate)
             seek_base:set(math.floor(estimate))
-            anchor:set(os.time())
+            anchor_now()
             obelisk.mpris:invoke("seek_relative", player.id, offset)
         else
             obelisk.mpris:invoke("control", player.id, command)
@@ -231,7 +238,7 @@ local seek_bar = slider {
             return
         end
         seek_base:set(target)
-        anchor:set(os.time())
+        anchor_now()
         obelisk.mpris:invoke("seek", player.id, target)
     end,
     steps = 0,

@@ -4442,3 +4442,23 @@ Rejected: porting the 350-line JS into `dev-config`, which spends the graph budg
 than the engine version. Also rejected: keeping the five hand-rolled tiers, which agreed with fzf
 everywhere except initials -- "vsc" scored "Visual Studio Code" in the same bucket as every other
 name holding v, s and c in order, then preferred the shortest.
+
+## 0202. `obelisk.system.monotonic` is published beside `time`, because a countdown was reading a clock the user can move
+
+1. Publish monotonic seconds beside `time`, from an `Instant` taken when the `system` capability is
+   first started. The epoch is arbitrary; only a difference is defined. Sample the elapsed clock each
+   tick rather than counting ticks, and gate the push on the whole state rather than the wall second:
+   gating on `time` stalls `monotonic` for as long as a repeating clock correction resamples one
+   second, and a countdown armed from a stalled reading fires the moment it unsticks.
+2. Use it for idle timing, the power countdown, and the media position's elapsed term.
+3. Keep wall time for persisted timestamps and capability-owned stamps. Weather freshness, the
+   updates "last checked" line and notification times are anchored to stamps that outlive the
+   session, and monotonic would break them at the first restart.
+4. Exclude suspend with `CLOCK_MONOTONIC`; expose `CLOCK_BOOTTIME` separately if anything needs it.
+
+Still on wall time and still wrong for it: the weather and currency *retry* deadlines, recording
+elapsed/paused time, and the update install duration. The last two mix a capability's wall stamp into
+the arithmetic, so neither is a one-line substitution.
+
+Deferred: a timer API owning every deadline. Displayed elapsed durations still need a clock to
+subtract.

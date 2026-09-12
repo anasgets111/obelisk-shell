@@ -391,8 +391,9 @@
 ---@field temp_gpu integer GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as [`SysinfoState::temp_cores`], so neither is newer than the other.
 
 ---@class SystemState
----`obelisk.system`'s one Lua-visible field (docs/lua-api.md §2.11), with its
----`StateSnapshot` JSON key unchanged.
+---`obelisk.system`'s Lua-visible fields (docs/lua-api.md §2.11), with their
+---`StateSnapshot` JSON keys unchanged.
+---@field monotonic integer Whole seconds since this controller was built, which is the first time a config asked for `system`. Only a difference means anything; take durations from this rather than from `time`, which `settimeofday` and an NTP step move underneath a deadline. ponytail: `Instant` is `CLOCK_MONOTONIC` on Linux, so a suspend does not count toward an elapsed reading. Suspend-inclusive timing wants `CLOCK_BOOTTIME` as a second field.
 ---@field time integer Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds; milliseconds would be wrong by 1000x.
 
 ---@class StorageState

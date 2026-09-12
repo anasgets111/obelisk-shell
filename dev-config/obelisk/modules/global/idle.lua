@@ -52,7 +52,7 @@ local ACTIONS = {
 obelisk.idle:register_threshold(idle.TICK, function()
     local s = obelisk.system:get()
     -- Back-date by the threshold so "idle 0:42" means since the last keystroke, not the push.
-    idle.since:set(((s and s.time) or 0) - idle.TICK)
+    idle.since:set(((s and s.monotonic) or 0) - idle.TICK)
 end, function()
     -- Any input wakes it. The mirror uses `respectInhibitors: false`: an inhibitor taken while dark
     -- must not leave the screen dark.
@@ -97,11 +97,11 @@ obelisk.system:on_change(function(s)
     if armed then
         -- Use the later of "when this armed" and "when the seat went idle"; active time must not
         -- count toward the stage.
-        next_stamps[armed.key] = stamps[armed.key] or math.max(s.time, since)
+        next_stamps[armed.key] = stamps[armed.key] or math.max(s.monotonic, since)
     end
     idle.armed_at:set(next_stamps)
 
-    if armed and s.time - next_stamps[armed.key] >= armed.delay then
+    if armed and s.monotonic - next_stamps[armed.key] >= armed.delay then
         -- Fire once per arming. A stage with `done` is walked past next tick; a terminal stage
         -- stays armed after acting and would otherwise fire every second.
         local fired = idle.fired_at:get() or {}
