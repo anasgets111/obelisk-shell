@@ -18,7 +18,7 @@ local SLOT = "battery"
 -- Only the draining check changes colour. The glyph shows cable state; a second signal made a
 -- plugged-in battery at 90% use the same green.
 local function battery_color(b)
-    if b == nil or not b.present then
+    if b == nil then
         return theme.DIM
     end
     -- Warn only while draining. Red at 14% on the charger is wrong; the reference service's
@@ -59,7 +59,7 @@ end)
 
 local fill = rect {
     width = obelisk.battery:map(function(b)
-        if b == nil or not b.present then
+        if b == nil then
             return "0%"
         end
         return string.format("%d%%", math.floor(math.max(0, math.min(100, b.percent or 0)) + 0.5))
@@ -102,9 +102,6 @@ local readout = row {
             return { { text = util.battery_glyph(b), bold = true } }
         end), READOUT, theme.icon.md, { align_v = "Center" }),
         cell(util.label(obelisk.battery, function(b)
-            if not b.present then
-                return "ac"
-            end
             return string.format("%d%%", b.percent)
         end):map(function(shown)
             return { { text = shown, bold = true } }
@@ -122,6 +119,13 @@ local battery_module = rect {
     border_width = theme.border_width,
     border_color = theme.GLASS_BORDER,
     hover = hover(SLOT),
+    -- A desktop's UPower `DisplayDevice` answers `present = false`, which drew a dim AC glyph and
+    -- the word "ac": a percentage pill reporting that there is no percentage. Hidden nodes take no
+    -- width and no spacing gap, so the zone closes up, and `shown_when` keeps it down until the
+    -- first snapshot rather than flashing an empty pill.
+    visible = util.shown_when(obelisk.battery, function(b)
+        return b.present
+    end),
     children = { fill, readout },
 }
 
@@ -130,9 +134,6 @@ local battery_tooltip = tooltip({
     slot = SLOT,
     children = {
         cell(util.label(obelisk.battery, function(b)
-            if not b.present then
-                return "no battery"
-            end
             return string.format("%d%% %s%s", b.percent, util.battery_phrase(b.state), util.battery_eta(b))
         end), theme.FG, theme.font.sm),
         cell(util.label(obelisk.power, function(p)
