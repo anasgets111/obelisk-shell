@@ -30,9 +30,8 @@ local function set_displays_powered(powered)
     if idle.blanked:get() == (not powered) then
         return
     end
-    -- Record the blank only once it is actually dispatched. `idle.blanked` is the `dpms` stage's
-    -- `done` predicate, so setting it on a no-op arms lock and then suspend over a lit screen, and
-    -- the guard above then refuses every retry.
+    -- `idle.blanked` is the `dpms` stage's `done` predicate. Setting it on a no-op arms lock and
+    -- then suspend over a lit screen, and the guard above refuses every retry.
     if not compositor.detach(powered and "displays_on" or "displays_off") then
         return
     end

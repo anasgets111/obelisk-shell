@@ -4555,8 +4555,8 @@ moves a fact the engine can derive into something every future inert surface has
 ## 0205. Hyprland's `main` keyboard is the one being typed on, which closes ADR-0034.2's cycling gap
 
 ADR-0034.2 decision 4 recorded that Hyprland "lacks reliable name-to-code correlation" and left
-`active_layout_index` pinned to `0`, a read-back that could not be cycled from. Both halves are
-stale against 0.56.2, verified live rather than from docs:
+`active_layout_index` pinned to `0`, a read-back nothing could cycle from. Both halves are stale
+against 0.56.2, verified live rather than from docs:
 
 1. `j/devices`'s `keyboards` entries carry `active_layout_index`. Read it; no name-to-code table is
    needed. It stays `#[serde(default)]` so an older Hyprland reports the previous `0`.
@@ -4567,13 +4567,16 @@ stale against 0.56.2, verified live rather than from docs:
 3. `switchxkblayout` accepts `main` as a device target, resolved against the same `m_active`. Aim at
    the word, not a tracked device name; a click before the first read is no longer dropped.
 4. Read `j/devices` over `.socket.sock` rather than spawning `hyprctl`, per ADR-0118 decision 2, and
-   read the write's reply: an out-of-range index answers `layout idx out of range of N` and was
-   silent. `hyprland_request` joins `hyprland_socket_path` in `compositor` (ADR-0118 decision 5).
-5. Signal the initial read. It applied silently before, so `layout_count` stayed `0` in the first
-   snapshot and an indicator drawn only for two or more layouts stayed hidden until the first switch.
+   read the write's reply. An out-of-range index answers `layout idx out of range of N` and was
+   silent. `hyprland_request` and `hyprland_command` join `hyprland_socket_path` in `compositor`
+   (ADR-0118 decision 5).
+5. Signal the initial read, and take it whether or not the event socket connects. It applied
+   silently before, so `layout_count` stayed `0` in the first snapshot and an indicator drawn only
+   for two or more layouts stayed hidden until the first switch.
 
-The resync is now blocking on the event thread, so the ticket sequence that ordered concurrently
-spawned `hyprctl` calls is deleted rather than ported.
+The resync blocks on the reader thread, so the ticket sequence that ordered concurrently spawned
+`hyprctl` calls is deleted rather than ported. That thread also owns the connect: it blocks, and an
+`async fn` on a two-worker runtime builds this.
 
 Rejected: targeting `switchxkblayout all`. Layout is per-device, and with `main` tracking the active
 keyboard there is nothing to reconcile; `all` would yank layout on keyboards the user did not touch.
@@ -4583,10 +4586,10 @@ an eight-keyboard session, every physical toggle named the `main` device, so the
 event payload buys only a second source of truth.
 
 Known limitation: `m_active` moves for any keyboard-class device, and that session's eight include
-media, system-control and power-button nodes. A key on one of those makes it `main`, so the read and
-the write both follow a device nothing is typed on until the next real keystroke moves it back.
-Narrowing the set means guessing which nodes are typing devices, against Hyprland's own answer; left
-alone until a session actually reports a wrong layout.
+media, system-control and power-button nodes. A key on one of those makes it `main`, so both the read
+and the write follow a device nothing is typed on until the next real keystroke moves it back.
+Narrowing the set means guessing which nodes type, against Hyprland's own answer. Left alone until a
+session reports a wrong layout.
 
 ## 0206. Session verbs branch in config, and only the two the compositor owns
 
@@ -4595,21 +4598,21 @@ Hyprland logout and the whole blank stage did nothing.
 
 1. Branch in Lua, in `lib/compositor.lua`, on `workspaces.compositor`. ADR-0119 decision 3 publishes
    that name so config can choose policy, and ADR-0056 decision 1 refused a compositor trait in the
-   Supervisor; a session verb is not a capability, so neither grows for this.
+   Supervisor. A session verb is not a capability, so neither grows for this.
 2. Only `logout` and display power branch. Reboot, poweroff and suspend are logind's and identical
    under both compositors; giving them entries would imply a difference that does not exist.
 3. Hyprland's spellings are `hl.dsp.exit()` and `hl.dsp.dpms({ action = "on"|"off" })`. 0.56 parses
-   the command socket as Lua, so the pre-0.56 `dispatch exit` dies in that parser, and `dpms`
-   toggles when passed no table -- the field is always explicit rather than positional.
+   the command socket as Lua, so the pre-0.56 `dispatch exit` dies in that parser. `dpms` toggles
+   when passed no table, so the field is always explicit.
 4. `detach` returns whether anything ran, and the caller may not record the verb as done on `false`.
-   `idle.blanked` is the `dpms` stage's `done` predicate: setting it on a no-op arms lock and then
-   suspend over a lit screen, and `set_displays_powered`'s own equality guard then refuses every
-   retry. Found in review, not in use.
+   `idle.blanked` is the `dpms` stage's `done` predicate. Setting it on a no-op arms lock and then
+   suspend over a lit screen, and `set_displays_powered`'s equality guard then refuses every retry.
+   Found in review, not in use.
 
 ADR-0118 decision 2's "command sockets, not subprocesses" binds the Supervisor, which holds the
 socket path and a connection budget. Config has neither and already shells out for `systemctl`, so
 `hyprctl` and `niri` here are subprocesses on purpose.
 
-Rejected: a `session` capability wrapping these in the Supervisor. It buys one compositor check in
-Rust instead of Lua and costs a new action surface, a second place compositor identity is decided,
-and a capability that exists to run two commands.
+Rejected: a `session` capability wrapping these in the Supervisor. It moves one compositor check
+from Lua to Rust and costs a second place that decides compositor identity, plus a capability whose
+whole job is running two commands.

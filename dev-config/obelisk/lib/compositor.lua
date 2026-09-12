@@ -3,7 +3,7 @@
 --
 -- Hyprland 0.56 parses its command socket as Lua, so a dispatcher is `hl.dsp.<name>(...)` and the
 -- pre-0.56 `dispatch exit` dies in that parser. `dpms` reads `action`, one of `on`/`off`/`toggle`,
--- and toggles when passed no table -- so the field is always explicit.
+-- and toggles when passed no table, so the field is always explicit.
 local COMMANDS = {
     niri = {
         logout = { cmd = "niri", args = { "msg", "action", "quit", "--skip-confirmation" } },
@@ -22,7 +22,7 @@ local compositor = {}
 --- Detach `verb` for the running compositor.
 ---
 --- `false` means nothing ran: no implementor, or `workspaces` has not answered yet (ADR-0056
---- decision 1 leaves it nil). Callers must not record the verb as done on `false` -- `idle.blanked`
+--- decision 1 leaves it nil). A caller must not record the verb as done on `false`. `idle.blanked`
 --- did, and a no-op then armed lock and suspend with the screen still lit.
 --- @param verb "logout"|"displays_on"|"displays_off"
 --- @return boolean ran

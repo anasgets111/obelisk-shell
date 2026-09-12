@@ -94,8 +94,8 @@ pub fn hyprland_request(socket_path: &Path, command: &str) -> std::io::Result<St
 }
 
 /// A write and its reply check, blocking. `capability` prefixes the log line, the only thing the
-/// two callers differ in. Without reading the reply a refusal -- a bad device, an out-of-range
-/// index -- is silent.
+/// two callers differ in. An unread reply makes a refusal silent: a bad device, an index out of
+/// range.
 pub fn hyprland_command(socket_path: &Path, command: &str, capability: &str) {
     match hyprland_request(socket_path, command) {
         Ok(reply) if reply.trim() == "ok" => {}
