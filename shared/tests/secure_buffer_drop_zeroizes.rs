@@ -49,9 +49,7 @@ unsafe impl GlobalAlloc for ZeroCheckingAllocator {
         // let any unrelated `dealloc` between the `store` and this one consume the watch. The
         // test's "did we observe anything" guard then passed on that same swap, so a run that
         // checked nothing reported success.
-        if !ptr.is_null()
-            && WATCHED_PTR.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
-        {
+        if !ptr.is_null() && WATCHED_PTR.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             for i in 0..layout.size() {
                 // Safety: `ptr` is valid for `layout.size()` bytes until this call
                 // returns it to the allocator -- this read happens before that handback

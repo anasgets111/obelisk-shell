@@ -429,7 +429,7 @@ fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
 
 /// What `visible` owes a panel or window that is in `map_state`. Panels and windows share one
 /// table; only the calls differ. Popups add ADR-0051's dismissal latch, so they keep
-/// [`popup_visibility_action`], and locks have no say at all.
+/// `xdg_shell::popup_visibility_action`, and locks have no say at all.
 ///
 /// Showing rebuilds from the spec because hiding destroyed the role object (ADR-0088). The two
 /// `Nothing` cells are the steady states: already shown, or already gone.
