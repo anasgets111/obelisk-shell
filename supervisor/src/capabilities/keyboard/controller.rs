@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
-use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_report};
+use crate::compositor::{CompositorKind, detect_compositor, hyprland_signature, unsupported_session_report};
 
 use super::super::scale::{percent_from_raw, raw_from_percent};
 use super::backlight::KbdBacklightProxy;
@@ -97,11 +97,13 @@ impl KeyboardController {
         let backlight = resolve_backlight(&system_bus, &state, events_tx.clone()).await;
         resolve_locks(leds_root, &state, events_tx.clone()).await;
         let layout: Option<Box<dyn CompositorLink>> = match detect_compositor() {
-            Some(CompositorKind::Hyprland) => {
-                let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-                    .expect("detect_compositor already confirmed this env var is set");
-                Some(Box::new(HyprlandLink::new(signature, Arc::clone(&state), events_tx.clone())))
-            }
+            Some(CompositorKind::Hyprland) => match hyprland_signature() {
+                Some(signature) => Some(Box::new(HyprlandLink::new(signature, Arc::clone(&state), events_tx.clone()))),
+                None => {
+                    eprintln!("keyboard: HYPRLAND_INSTANCE_SIGNATURE is unset or empty; layout reporting disabled");
+                    None
+                }
+            },
             Some(CompositorKind::Niri) => NiriLink::new(Arc::clone(&state), events_tx.clone())
                 .map(|link| Box::new(link) as Box<dyn CompositorLink>),
             None => {

@@ -189,8 +189,8 @@ fn publish(socket_path: &Path, state: &Arc<Mutex<KeyboardState>>, events: &Unbou
 }
 
 impl HyprlandLink {
-    /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed by
-    /// `compositor::detect_compositor`.
+    /// `signature` is a non-empty `$HYPRLAND_INSTANCE_SIGNATURE`, from
+    /// `compositor::hyprland_signature`.
     ///
     /// Everything runs on the reader thread, because `UnixStream::connect` blocks and an `async fn`
     /// on a two-worker runtime calls this. Connecting there, before the first read, also keeps a

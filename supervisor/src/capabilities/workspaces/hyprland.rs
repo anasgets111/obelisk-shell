@@ -39,7 +39,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::controller::{FocusedWindow, SpecialWorkspace, StatePublisher, WorkspaceRow};
-use crate::compositor::{hyprland_command, hyprland_request, hyprland_socket_path};
+use crate::compositor::{hyprland_command, hyprland_request, hyprland_signature, hyprland_socket_path};
 
 /// One `j/workspaces` entry. Hyprland's `windows` count identifies empty workspaces without a
 /// client scan.
@@ -263,15 +263,11 @@ fn read_state(socket_path: &Path) -> Option<State> {
     ))
 }
 
-fn signature() -> Option<String> {
-    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|signature| !signature.is_empty())
-}
-
 /// Connects to the event socket before the first state read, so an intervening change remains a
 /// line to process. One OS thread then re-reads after every trigger until socket end or no
 /// listener.
 pub fn spawn_reader(mut publisher: StatePublisher) {
-    let Some(signature) = signature() else {
+    let Some(signature) = hyprland_signature() else {
         eprintln!(
             "workspaces: HYPRLAND_INSTANCE_SIGNATURE is unset or empty; workspace reporting disabled for this run"
         );
@@ -317,7 +313,7 @@ pub fn spawn_reader(mut publisher: StatePublisher) {
 /// One `dispatch` on its own thread. Hyprland answers `ok` or a reason; anything else is printed
 /// with the command.
 fn dispatch(what: String) {
-    let Some(signature) = signature() else {
+    let Some(signature) = hyprland_signature() else {
         eprintln!("workspaces: `dispatch {what}` requested but HYPRLAND_INSTANCE_SIGNATURE is unset; ignored");
         return;
     };

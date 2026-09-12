@@ -66,6 +66,15 @@ pub fn unsupported_session_report() -> String {
     }
 }
 
+/// `$HYPRLAND_INSTANCE_SIGNATURE`, or `None` when it is unset or empty.
+///
+/// [`detect_compositor`] probes with `var_os`, which accepts bytes `var` rejects, so a session
+/// detected as Hyprland can still have no usable signature. An empty one builds
+/// `$XDG_RUNTIME_DIR/hypr//.socket.sock`, which resolves and never connects.
+pub fn hyprland_signature() -> Option<String> {
+    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().filter(|signature| !signature.is_empty())
+}
+
 /// A socket in Hyprland's per-instance directory,
 /// `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`. `"socket2.sock"` pushes
 /// newline-terminated `event>>payload` lines; `"socket.sock"` answers one plain-text command per
