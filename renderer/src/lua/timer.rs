@@ -32,16 +32,20 @@ struct Entry {
 
 /// Every armed timer, earliest first, in `app_data` beside the other registries.
 ///
-/// ponytail: a sorted `Vec`. Insertion and cancellation are O(n), and dispatching a batch of n due
-/// timers is O(n^2), since each removal shifts the rest. Both ceilings need a config arming
-/// thousands, which is not the one that asked for this. A heap trades them for tombstone
-/// bookkeeping on the cancellation path, which here is the common one.
+/// ponytail: a sorted `Vec`, so arming and cancelling are both O(n) in the number armed. Dispatch
+/// is linear: the due prefix moves into `firing` in one drain, and each callback is taken by index
+/// rather than searched for. A heap would make arming O(log n) at the cost of tombstone bookkeeping
+/// on the cancellation path, which here is the common one.
 #[derive(Default)]
 struct TimerRegistry {
     entries: Vec<Entry>,
     /// Armed by an evaluation whose output has not been applied yet, and dropped if it never is
     /// (ADR-0203). Deadlines are absolute, so the wait costs a promoted timer no accuracy.
     staged: Vec<Entry>,
+    /// The batch [`dispatch_due`] is part-way through. Held here rather than in a local so that
+    /// `cancel` can still reach a timer whose turn has not come, which is the whole point of
+    /// looking each one up again instead of calling a list of closures.
+    firing: Vec<Option<Entry>>,
     /// Whether `arm` is being reached from an evaluation rather than from a callback.
     evaluating: bool,
     next_id: TimerId,
@@ -69,6 +73,9 @@ impl TimerRegistry {
     fn take(&mut self, id: TimerId) -> Option<Function> {
         if let Some(at) = self.entries.iter().position(|entry| entry.id == id) {
             return Some(self.entries.remove(at).callback);
+        }
+        if let Some(slot) = self.firing.iter_mut().find(|slot| slot.as_ref().is_some_and(|entry| entry.id == id)) {
+            return slot.take().map(|entry| entry.callback);
         }
         let at = self.staged.iter().position(|entry| entry.id == id)?;
         Some(self.staged.remove(at).callback)
@@ -120,26 +127,32 @@ pub fn next_deadline(lua: &Lua) -> Option<Instant> {
 ///
 /// Batch cost is quadratic in the number due, per `TimerRegistry`'s ceiling.
 ///
-/// The due set is captured as ids first and each one is looked up again immediately before it runs,
-/// rather than taking all the callbacks up front. That is what lets one callback cancel another in
-/// the same batch: a cancelled timer is gone from the registry by the time its turn comes and is
-/// skipped. A timer's own entry is removed *before* it runs, so cancelling itself from inside is
-/// the same no-op as cancelling it afterwards.
+/// The due prefix moves into the registry's `firing` list, and each callback is taken out of it
+/// immediately before it runs rather than all of them up front. That is what lets one callback
+/// cancel another in the same batch: `cancel` empties the slot and its turn finds nothing. A
+/// timer's own slot is emptied *before* it runs, so cancelling itself from inside is the same
+/// no-op as cancelling it afterwards.
 ///
 /// A timer armed by a callback waits for a later turn: `now` is fixed for the batch, so a fresh
-/// deadline is always past the cutoff. The id set is what holds that for one armed with a deadline
-/// already behind `now`, and is why the batch cannot grow while it runs.
+/// deadline is always past the cutoff. Draining the prefix once is what holds that for one armed
+/// with a deadline already behind `now`, and is why the batch cannot grow while it runs.
 pub fn dispatch_due(lua: &Lua, now: Instant) {
-    let Some(registry) = lua.app_data_ref::<TimerRegistry>() else { return };
-    let due: Vec<TimerId> =
-        registry.entries.iter().take_while(|entry| entry.due <= now).map(|entry| entry.id).collect();
-    drop(registry);
+    let batch = {
+        let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() else { return };
+        let split = registry.entries.partition_point(|entry| entry.due <= now);
+        registry.firing = registry.entries.drain(..split).map(Some).collect();
+        registry.firing.len()
+    };
 
-    for id in due {
+    for index in 0..batch {
         // Re-borrowed per timer, and released before Lua runs: a callback arming or cancelling a
-        // timer takes this same `RefCell`.
-        let taken = lua.app_data_mut::<TimerRegistry>().and_then(|mut registry| registry.take(id));
-        let Some(callback) = taken else { continue };
+        // timer takes this same `RefCell`. A `clear` from inside one empties `firing`, which is why
+        // the slot is read through `get_mut` rather than indexed.
+        let taken = lua
+            .app_data_mut::<TimerRegistry>()
+            .and_then(|mut registry| registry.firing.get_mut(index).and_then(Option::take));
+        let Some(entry) = taken else { continue };
+        let callback = entry.callback;
         // The cap `action` and `on_change` handlers run under. ponytail: per callback, not per
         // batch, so a config arming many timers for one moment can still spend that many budgets in
         // one turn -- the same ceiling a capability with many `on_change` handlers already has.
@@ -150,6 +163,9 @@ pub fn dispatch_due(lua: &Lua, now: Instant) {
         if let Err(err) = outcome {
             eprintln!("timer callback raised, ignoring it: {err}");
         }
+    }
+    if let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() {
+        registry.firing.clear();
     }
 }
 
@@ -163,6 +179,7 @@ pub fn begin_evaluation(lua: &Lua) {
     let mut registry = lua.app_data_mut::<TimerRegistry>().expect("just ensured the registry exists");
     registry.entries.clear();
     registry.staged.clear();
+    registry.firing.clear();
     registry.evaluating = true;
 }
 

@@ -4474,7 +4474,8 @@ subtract.
    and ADR-0124 never resolves a hidden subtree, so a pull-based timer behind one would never fire.
 3. Cancelling stays effective inside a due batch, including a timer cancelling itself. Taking every
    callback up front, as `notify_change` takes its handler list, would run one the previous callback
-   had just cancelled.
+   had just cancelled. The batch is drained out of the armed list in one move and each callback
+   taken from it by index, so dispatch is linear rather than a search-and-shift per timer.
 4. A timer armed by a callback waits for a later turn.
 5. Dispatch precedes the turn's re-resolve. It resolves the applied tree, so a reload still waiting
    on `ApplyPendingReload` paints its new bindings when that lands, not from here.
@@ -4493,6 +4494,6 @@ subtract.
    arming a timer is not an evaluation, so it goes live at once.
 
 Accepted: the budget is per callback, as `action` and `on_change` are, so a batch spends one per
-timer. Registry work across a batch is quadratic besides (`TimerRegistry`).
+timer.
 
 Rejected: a heap with cancellation bookkeeping; the expected workload does not justify it.
