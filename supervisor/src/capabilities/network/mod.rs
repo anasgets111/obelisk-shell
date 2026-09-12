@@ -456,7 +456,7 @@ impl NetworkController {
         eprintln!("network: connect {:?}: saved={saved} secure={secure}, connecting directly", pending.ssid);
         // Re-take it because another connect may have replaced it while the lookup was on the wire.
         if let Some(pending) = self.take_connect_intent() {
-            self.connect(pending, Vec::new()).await;
+            self.connect(pending, shared::Zeroizing::new(Vec::new())).await;
         }
     }
 
@@ -631,11 +631,17 @@ impl NetworkController {
 
     /// Supervisor services §4: turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
     /// `AddAndActivateConnection2`'s dict. The caller `mem::take`s `secret` from the wire frame,
-    /// making this function its owner; every outcome zeroizes it (ADR-0005/ADR-0014).
-    pub async fn connect(&self, pending: PendingNetworkConnect, mut secret: Vec<u8>) {
+    /// making this function its owner (ADR-0005/ADR-0014).
+    ///
+    /// `Zeroizing`, not a bare `Vec`, for the reason `pam_worker`'s two entry points take one: this
+    /// runs in a spawned task, and cancelling it mid-activation drops the future without running
+    /// anything written after the `await`.
+    pub async fn connect(&self, pending: PendingNetworkConnect, secret: shared::Zeroizing<Vec<u8>>) {
         self.begin_connect(&pending.ssid);
         let result = self.connect_inner(&pending, &secret).await;
-        secret.zeroize();
+        // Straight after the read, not at end of scope: the reporting below logs and takes a lock,
+        // and none of it needs the plaintext alive.
+        drop(secret);
         match result {
             // NM accepted the request, not completed it; the activation reports the verdict.
             Ok(active) => self.watch_activation(active, pending.ssid),

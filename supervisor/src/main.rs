@@ -456,9 +456,9 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // Before the catch-all for the same ordering reason as polkit.
                     match supervisor.capabilities.network().and_then(NetworkController::take_connect_intent) {
                         Some(pending) => {
-                            // `mem::take` gives plaintext to `NetworkController::connect`, which
-                            // zeroizes every return path.
-                            let secret = std::mem::take(&mut submit.secret);
+                            // `mem::take` gives plaintext to `NetworkController::connect`,
+                            // wrapped so the spawned task scrubs it on cancellation too.
+                            let secret = shared::Zeroizing::new(std::mem::take(&mut submit.secret));
                             let controller = supervisor
                                 .capabilities
                                 .network()
