@@ -171,7 +171,7 @@ impl TextPainter {
         }
         // SAFETY: femtovg loads every GL entry point through `load_fn` and calls them on this
         // thread. The caller binds the context with `eglMakeCurrent` before constructing this
-        // (`wayland::surface` at its two call sites, the headless EGL helper in paint's tests),
+        // (`wayland::surface::ensure_bound`, or the headless EGL helper in paint's tests),
         // and the renderer is used only from that same thread.
         let renderer = unsafe { OpenGl::new_from_function(load_fn)? };
         let text_context = TextContext::default();

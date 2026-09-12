@@ -3,8 +3,9 @@
 //! Lua strings and input methods.
 //!
 //! ADR-0005 requires callers to call `.zeroize()` immediately after the one sanctioned read
-//! (`expose_secret` into an outgoing IPC envelope), because `Drop` may be delayed by a panic or
-//! early return. `ZeroizeOnDrop` remains the backup.
+//! (`expose_secret` into an outgoing IPC envelope), because `Drop` may be delayed by an early
+//! return. `ZeroizeOnDrop` backs that up, and only that: release is `panic = "abort"`, so on a
+//! panic no destructor runs and the explicit call is the only scrub.
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -174,16 +175,16 @@ mod tests {
         let mut buf = SecureBuffer::new();
         buf.push_str("correct horse battery staple");
         let capacity = buf.bytes.capacity();
-        let ptr = buf.bytes.as_ptr();
         assert!(capacity > 0);
 
         buf.zeroize();
 
         assert!(buf.is_empty());
         assert_eq!(buf.expose_secret(), b"");
-        // SAFETY: `zeroize` clears but does not deallocate; `buf.bytes` still owns the captured
-        // pointer and capacity.
-        let backing = unsafe { std::slice::from_raw_parts(ptr, capacity) };
+        // SAFETY: `zeroize` clears but does not deallocate, so the whole capacity is live and
+        // initialised. Read after the mutation, not before: `Vec::as_ptr` is invalidated by a
+        // later `&mut` to the buffer, and `zeroize` takes one.
+        let backing = unsafe { std::slice::from_raw_parts(buf.bytes.as_ptr(), capacity) };
         assert!(backing.iter().all(|&b| b == 0), "backing allocation was not fully zeroed");
     }
 
@@ -193,14 +194,12 @@ mod tests {
     fn pop_char_zeroizes_the_bytes_it_removes() {
         let mut buf = SecureBuffer::new();
         buf.push_str("hunter2");
-        let ptr = buf.bytes.as_ptr();
-
         assert!(buf.pop_char());
 
         assert_eq!(buf.expose_secret(), b"hunter");
-        // SAFETY: `pop_char` truncates without deallocating, so `buf.bytes` still owns this
-        // allocation and the byte past the new length is valid to read.
-        assert_eq!(unsafe { *ptr.add(6) }, 0, "the removed byte was left in the backing allocation");
+        // SAFETY: `pop_char` truncates without deallocating, so the byte past the new length is
+        // live and initialised. Read after the mutation, for the reason above.
+        assert_eq!(unsafe { *buf.bytes.as_ptr().add(6) }, 0, "the removed byte was left in the backing allocation");
     }
 
     /// A multi-byte character is one Backspace, not one byte; `expose_secret` sends it straight to

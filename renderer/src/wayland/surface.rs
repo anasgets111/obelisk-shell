@@ -231,8 +231,11 @@ pub(super) enum PopupParent {
     Xdg(xdg_surface::XdgSurface),
 }
 pub(super) struct TrackedSurface {
-    pub(super) role: TrackedRole,
+    /// Declared before `role`, which owns the `wl_surface`. Rust drops fields top to bottom and
+    /// wayland-egl requires `wl_egl_window_destroy` first. Every explicit teardown path sequences
+    /// this by hand; an implicit drop, reachable when a fatal EGL error unwinds `App`, does not.
     pub(super) bound: Option<BoundSurface>,
+    pub(super) role: TrackedRole,
     /// Supervisor § 14 `surface_id`: `"{id}@{output}"` for panels, bare `id` for windows; shared
     /// by Lua, the retained scene, Wayland, and PBA.
     pub(super) surface_id: String,
@@ -516,8 +519,8 @@ impl App {
 
     /// Destroys one surface instance (ADR-0038 decision 3). An unplugged monitor produces both
     /// `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`, in either order; the
-    /// no-op handles whichever callback arrives second. Explicit order matters because
-    /// `TrackedSurface` declares `role` before `bound`: drop child popups, `eglDestroySurface`,
+    /// no-op handles whichever callback arrives second. The order is explicit because only this
+    /// path can destroy the EGL surface: drop child popups, `eglDestroySurface`,
     /// `wl_egl_window_destroy`, then role and `wl_surface`. Both protocols require that order;
     /// xdg-shell rejects a parent with live popups, and SCTK preserves role-before-surface.
     pub(super) fn destroy_surface_by_id(&mut self, instance_id: &str) {
@@ -1008,6 +1011,11 @@ impl App {
         if let Err(e) = egl.instance.make_current(egl.display, Some(egl_surface), Some(egl_surface), Some(egl.context))
         {
             log_bind_failure(&surface_id, "eglMakeCurrent", e);
+            // `native_window` drops on this return. `khronos_egl::Surface` has no `Drop`, so
+            // without this the driver keeps a surface bound to a freed `wl_egl_window`.
+            if let Err(err) = egl.instance.destroy_surface(egl.display, egl_surface) {
+                log_bind_failure(&surface_id, "eglDestroySurface", err);
+            }
             self.exit = true;
             return false;
         }
