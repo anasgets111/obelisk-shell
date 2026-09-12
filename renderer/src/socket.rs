@@ -322,8 +322,10 @@ impl RendererClient {
             }
             Err(err) => {
                 eprintln!("control-socket client: startup shell.lua evaluation failed: {err}");
-                // Whatever it registered before raising goes with it.
+                // Whatever it registered before raising goes with it. `discard` after the clear
+                // because that arms the next evaluation; nothing is running one now.
                 self.clear_change_handlers();
+                lua::timer::discard(self.loader.lua());
                 self.set_rescue_state(true, &err.to_string());
                 None
             }
@@ -599,8 +601,10 @@ impl RendererClient {
                 }
             }
             Err(err) => {
-                // Whatever it registered before raising goes with it.
+                // Whatever it registered before raising goes with it. `discard` after the clear
+                // because that arms the next evaluation; nothing is running one now.
                 self.clear_change_handlers();
+                lua::timer::discard(self.loader.lua());
                 self.set_rescue_state(true, &err.to_string());
                 ReevaluateReport::Failed { sequence: request.sequence, error: err.to_string() }
             }

@@ -191,8 +191,10 @@ pub fn promote(lua: &Lua) {
     }
 }
 
-/// The evaluation's output was refused or superseded, so what it armed goes with it. Without this a
-/// generation swap leaves the outgoing process running the incoming config's timers beside it.
+/// The evaluation's output was refused, superseded, or never produced, so what it armed goes with
+/// it. Without this a generation swap leaves the outgoing process running the incoming config's
+/// timers beside it. Also the "no evaluation is in flight" reset: after a failed one, nothing will
+/// arrive to promote, and leaving `evaluating` set would stage a callback's timer forever.
 pub fn discard(lua: &Lua) {
     if let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() {
         registry.staged.clear();
@@ -409,6 +411,21 @@ mod tests {
         fire_everything(&lua);
 
         assert!(!lua.globals().get::<bool>("fired").unwrap());
+    }
+
+    /// After a failed evaluation nothing arrives to promote, so the flag has to come down: a timer
+    /// armed later from a callback would otherwise stage forever and never fire.
+    #[test]
+    fn a_discard_leaves_the_registry_ready_for_a_callback_to_arm_into() {
+        let lua = lua();
+        begin_evaluation(&lua);
+        discard(&lua);
+        lua.load("fired = false; timer(1, function() fired = true end)").exec().unwrap();
+
+        assert!(next_deadline(&lua).is_some(), "armed live, not staged");
+        fire_everything(&lua);
+
+        assert!(lua.globals().get::<bool>("fired").unwrap());
     }
 
     #[test]
