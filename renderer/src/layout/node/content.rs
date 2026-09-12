@@ -375,7 +375,7 @@ pub fn parse_foreground(properties: &HashMap<String, Value>) -> Result<Rgba, Lay
 }
 
 pub fn parse_font_size(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
-    parse_number(properties, "font_size", 12.0)
+    style::within("font_size", parse_number(properties, "font_size", 12.0)?)
 }
 
 /// Absent `size` defaults to 12.0, matching [`parse_font_size`] and ADR-0044's nil rule. A typo
@@ -400,8 +400,8 @@ pub(super) fn parse_bool(
     }
 }
 
-/// Shared number parser behind [`parse_font_size`], [`parse_icon_size`] and `style::parse_spacing`,
-/// range-checked against `style::range_of` like every other number a config can write.
+/// Shared number parser behind [`parse_font_size`], [`parse_icon_size`] and `style::parse_spacing`.
+/// Range-checking is the caller's: only `font_size` has a bound its consumer requires.
 pub(super) fn parse_number(
     properties: &HashMap<String, Value>,
     property: &str,
@@ -410,9 +410,8 @@ pub(super) fn parse_number(
     let Some(value) = properties.get(property) else {
         return Ok(default);
     };
-    let n = value_as_f32(property, value)?
-        .ok_or_else(|| invalid(property, format!("expected a number, got {}", preview_for_error(value))))?;
-    style::within(property, n)
+    value_as_f32(property, value)?
+        .ok_or_else(|| invalid(property, format!("expected a number, got {}", preview_for_error(value))))
 }
 
 /// Shared structural-string parser behind [`parse_surface_id`], `surface::parse_layer`, and

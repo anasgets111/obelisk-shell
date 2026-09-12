@@ -519,8 +519,8 @@ impl App {
 
     /// Destroys one surface instance (ADR-0038 decision 3). An unplugged monitor produces both
     /// `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`, in either order; the
-    /// no-op handles whichever callback arrives second. The order is explicit because only this
-    /// path can destroy the EGL surface: drop child popups, `eglDestroySurface`,
+    /// no-op handles whichever callback arrives second. The order is explicit because an implicit
+    /// drop frees no EGL surface at all: drop child popups, `eglDestroySurface`,
     /// `wl_egl_window_destroy`, then role and `wl_surface`. Both protocols require that order;
     /// xdg-shell rejects a parent with live popups, and SCTK preserves role-before-surface.
     pub(super) fn destroy_surface_by_id(&mut self, instance_id: &str) {

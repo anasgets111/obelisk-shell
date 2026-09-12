@@ -100,7 +100,9 @@ impl KeyboardController {
             Some(CompositorKind::Hyprland) => match hyprland_signature() {
                 Some(signature) => Some(Box::new(HyprlandLink::new(signature, Arc::clone(&state), events_tx.clone()))),
                 None => {
-                    eprintln!("keyboard: HYPRLAND_INSTANCE_SIGNATURE is unset or empty; layout reporting disabled");
+                    eprintln!(
+                        "keyboard: HYPRLAND_INSTANCE_SIGNATURE is unset or empty; layout reporting disabled for this run"
+                    );
                     None
                 }
             },

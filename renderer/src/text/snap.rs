@@ -39,8 +39,12 @@ const COORD_LIMIT: f32 = 1_048_576.0;
 /// Snaps `rect` to physical pixel boundaries at fractional output scale `scale`.
 ///
 /// The top-left corner floors down and the bottom-right corner ceils up, so the snapped rect
-/// always fully contains the logical one -- shrinking would clip a glyph or a border stroke.
-/// Both corners saturate at [`COORD_LIMIT`], which is 128x the largest box a config can ask for.
+/// fully contains the logical one -- shrinking would clip a glyph or a border stroke.
+///
+/// Containment holds within [`COORD_LIMIT`] and not past it: a rect whose corners exceed the limit
+/// is truncated to it, and one lying wholly beyond collapses to zero area and is dropped by the
+/// emptiness guards downstream. Composed transforms reach that range (two nested nodes at the
+/// documented `scale = 64` maximum compose to 4096x), and every such rect is already off-screen.
 pub fn snap_to_physical(rect: LogicalRect, scale: f32) -> PhysicalRect {
     let clamp = |n: f32| n.clamp(-COORD_LIMIT, COORD_LIMIT) as i32;
     PhysicalRect {

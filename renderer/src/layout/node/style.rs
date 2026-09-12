@@ -40,10 +40,7 @@ pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> R
         return Ok(SizeMode::Content);
     };
     if let Some(n) = value_as_f32(property, value)? {
-        if !(0.0..=8192.0).contains(&n) {
-            return Err(invalid(property, format!("must be within [0, 8192], got {n}")));
-        }
-        return Ok(SizeMode::Pixels(n));
+        return Ok(SizeMode::Pixels(within(property, n)?));
     }
     if let Value::String(s) = value {
         let s = checked_string(property, s)?;
@@ -71,8 +68,7 @@ pub fn parse_size_bound(properties: &HashMap<String, Value>, property: &str) -> 
         return Ok(None);
     };
     match value_as_f32(property, value)? {
-        Some(n) if (0.0..=8192.0).contains(&n) => Ok(Some(n)),
-        Some(n) => Err(invalid(property, format!("must be within [0, 8192], got {n}"))),
+        Some(n) => within(property, n).map(Some),
         None => Err(invalid(property, format!("expected a number of pixels, got {}", preview_for_error(value)))),
     }
 }
@@ -98,7 +94,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 /// only a signal getter's body; a `__index` loop of 200 million iterations made `Scene::apply` take
 /// 26.10s and return `Ok(())` with no `Signal`, on the VM's thread (ADR-0039). `LayoutPassBudget`
 /// now holds the hook for the whole pass and refuses it in 2s with `PassBudgetExceeded`. Scalar
-/// shorthand is shared by `margin`/`padding`/`border_width`, each range-checked by [`range_of`].
+/// shorthand is shared by `margin`/`padding`/`border_width`; only the last keeps a range check.
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation pass: a panel root's `margin` is the live layer-shell anchor
     // offset (`set_margin`, ADR-0038 decision 2), so zero is the absent-key placeholder.
@@ -109,14 +105,13 @@ pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) ->
         return Ok(EdgeInsets::default());
     };
     if let Some(n) = value_as_f32(property, value)? {
-        let n = within(property, n)?;
         return Ok(EdgeInsets { top: n, right: n, bottom: n, left: n });
     }
     let Value::Table(table) = value else {
         return Err(invalid(property, format!("expected a number or a table, got {}", preview_for_error(value))));
     };
     // An absent edge is 0; [`table_number`] rejects nested `Signal`s.
-    let edge = |key: &str| within(property, table_number(property, table, key)?.unwrap_or(0.0));
+    let edge = |key: &str| -> Result<f32, LayoutError> { Ok(table_number(property, table, key)?.unwrap_or(0.0)) };
     Ok(EdgeInsets { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
@@ -199,24 +194,27 @@ pub fn invert_affine([a, b, c, d, e, f]: Affine) -> Option<Affine> {
 }
 
 /// The range `property`'s number is accepted in, and the one an overshooting easing is clamped
-/// into: parser and tween agree by construction. `margin`, `padding`, `translate` and `rotate`
-/// accept a negative; nothing else does. The solver treats a negative inset as CSS layout math,
-/// so only the magnitude is bounded there.
+/// into: parser and tween agree by construction. `margin`, `translate` and `rotate` accept a
+/// negative; nothing else does.
 ///
-/// The shared `8192` ceiling is femtovg's. Above roughly 8.4e6 `curve_divisions`
-/// (`path/cache.rs:911`) divides by `acos(1.0) == 0.0`, and `inf as u32` becomes `u32::MAX`:
-/// billions of iterations and tens of GB of vertices on the Wayland dispatch thread. Below zero,
-/// `radius = -4` silently squares corners and `border_width = -4` clears paint alpha.
+/// `radius` and `border_width` share the `8192` ceiling with `width`/`height` (§ 5.1). It is
+/// femtovg 0.26's: above roughly 8.4e6 `curve_divisions` (`path/cache.rs:911`) divides by
+/// `acos(1.0) == 0.0`, and `inf as u32` becomes `u32::MAX`, so billions of iterations and tens of
+/// GB of vertices land on the Wayland dispatch thread. Below zero, `radius = -4` silently squares
+/// corners (`path.rs:458` treats under 0.1 as unrounded) and `border_width = -4` clamps to 0 and
+/// clears paint alpha.
 ///
-/// `font_size` and icon `size` floor at 1 rather than 0. `line_height` is `font_size * 1.2`, and
-/// cosmic-text's `Buffer::new` asserts a non-zero line height, so a zero aborts the Renderer.
-/// Flooring here covers the tween as well, which clamps into this same range.
+/// `font_size` alone floors at 1. `line_height` is `font_size * 1.2` and cosmic-text's
+/// `Buffer::new` asserts a non-zero line height, so a zero aborts the Renderer. Flooring here
+/// rather than in the parser covers the tween too, which clamps into this same range. Icon `size`
+/// needs no floor: it becomes a `Measure::Square` and the painter takes its pixels from the
+/// resolved box, so it never reaches a shaper.
 pub(super) fn range_of(property: &str) -> (f32, f32) {
     match property {
         "opacity" | "origin" => (0.0, 1.0),
         "scale" => (0.0, 64.0),
-        "font_size" | "size" => (1.0, 8192.0),
-        "margin" | "padding" | "translate" | "rotate" => (-8192.0, 8192.0),
+        "font_size" => (1.0, 8192.0),
+        "margin" | "translate" | "rotate" => (-8192.0, 8192.0),
         _ => (0.0, 8192.0),
     }
 }
@@ -350,9 +348,14 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     Ok(BorderColor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// `rect.border_width` (§ 5.2 item 1).
+/// `rect.border_width` (§ 5.2 item 1), adding the range check [`parse_edge_insets`] leaves to its
+/// callers. `margin`/`padding` deliberately do not take it.
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
-    parse_edge_insets(properties, "border_width")
+    let insets = parse_edge_insets(properties, "border_width")?;
+    for n in [insets.top, insets.right, insets.bottom, insets.left] {
+        within("border_width", n)?;
+    }
+    Ok(insets)
 }
 
 pub fn parse_align(properties: &HashMap<String, Value>, property: &str) -> Result<Align, LayoutError> {
