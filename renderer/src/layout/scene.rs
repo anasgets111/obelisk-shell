@@ -1915,13 +1915,20 @@ fn elide_cut(
 /// click-through and, under focus-follows-mouse, focus-through; the popup's empty space below its
 /// cards therefore takes neither clicks nor keyboard focus.
 ///
+/// Painting claims input on every layer but `Background`, where a handler is the only thing that
+/// does (ADR-0204). Paint stands in for interactivity because a drawn overlay must not leak a click
+/// to the window behind it; nothing is behind the bottom layer, so there the proxy claims a whole
+/// output for a wallpaper that cannot use it and takes the desktop's focus-through with it.
+///
 /// Applies to any surface whose visible content is smaller than the surface itself: empty space
 /// (clicks pass through) with nothing visible, a no-op for a tightly-sized bar whose child fills
 /// it.
 pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<PhysicalRect> {
+    // A role with no `layer` at all -- window, popup, lock -- keeps the paint proxy.
+    let paint_claims = !matches!(node::parse_layer(&surface_root.properties), Ok(node::LayerKind::Background));
     let mut regions = Vec::new();
     for child in &surface_root.children {
-        collect_input_regions(child, 0.0, 0.0, scale, &mut regions);
+        collect_input_regions(child, 0.0, 0.0, scale, paint_claims, &mut regions);
     }
     regions
 }
@@ -2113,12 +2120,19 @@ fn inset_at(r: i32, row: i32) -> i32 {
     (r - (r * r - dy * dy).max(0.0).sqrt()).round() as i32
 }
 
-fn collect_input_regions(node: &ResolvedNode, origin_x: f32, origin_y: f32, scale: f32, out: &mut Vec<PhysicalRect>) {
+fn collect_input_regions(
+    node: &ResolvedNode,
+    origin_x: f32,
+    origin_y: f32,
+    scale: f32,
+    paint_claims: bool,
+    out: &mut Vec<PhysicalRect>,
+) {
     if !node.in_flow() {
         return;
     }
     let rect = LogicalRect { x: origin_x + node.rect.x, y: origin_y + node.rect.y, ..node.rect };
-    if takes_input_as_a_box(node) {
+    if takes_input_as_a_box(node, paint_claims) {
         let bounds = painted_bounds(node, rect);
         if bounds.width > 0.0 && bounds.height > 0.0 {
             out.push(snap_to_physical(bounds, scale));
@@ -2126,7 +2140,7 @@ fn collect_input_regions(node: &ResolvedNode, origin_x: f32, origin_y: f32, scal
         return;
     }
     for child in &node.children {
-        collect_input_regions(child, rect.x, rect.y, scale, out);
+        collect_input_regions(child, rect.x, rect.y, scale, paint_claims, out);
     }
 }
 
@@ -2180,14 +2194,15 @@ fn painted_bounds(node: &ResolvedNode, rect: LogicalRect) -> LogicalRect {
 /// [`overlay_input_regions`]'s "solid" test. A `background` of `#00000000` counts: the IDL says it
 /// draws a transparent rectangle where an absent one draws nothing, and a config that wrote it
 /// asked for a box.
-fn takes_input_as_a_box(node: &ResolvedNode) -> bool {
-    let paints = match &node.paint {
-        Some(PaintStyle::Box { background, widths, .. }) => {
-            background.is_some() || [widths.top, widths.right, widths.bottom, widths.left].iter().any(|w| *w > 0.0)
-        }
-        Some(_) => true,
-        None => false,
-    };
+fn takes_input_as_a_box(node: &ResolvedNode, paint_claims: bool) -> bool {
+    let paints = paint_claims
+        && match &node.paint {
+            Some(PaintStyle::Box { background, widths, .. }) => {
+                background.is_some() || [widths.top, widths.right, widths.bottom, widths.left].iter().any(|w| *w > 0.0)
+            }
+            Some(_) => true,
+            None => false,
+        };
     paints
         || (node.kind == "button"
             && ["on_click", "on_drag", "on_wheel"]

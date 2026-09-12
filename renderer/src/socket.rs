@@ -1012,6 +1012,72 @@ mod tests {
         );
     }
 
+    /// ADR-0204. A `Background` wallpaper paints an opaque box and a full-surface image and can
+    /// receive nothing, so it must claim no input: it occludes nothing, and claiming the output
+    /// stopped the compositor clearing window focus over an empty workspace.
+    #[test]
+    fn a_background_surface_claims_input_only_where_a_handler_sits_not_where_it_paints() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_lua = write_shell_lua(
+            dir.path(),
+            r##"return {
+                panel {
+                    id = "wallpaper", layer = "Background",
+                    anchor = { top = true, bottom = true, left = true, right = true },
+                    exclusive = "Ignore", width = "Fill", height = "Fill",
+                    background = "#11111bff",
+                    child = rect {
+                        width = "Fill", height = "Fill", background = "#202020ff",
+                        children = {
+                            button { width = 120, height = 40, on_click = function() end },
+                        },
+                    },
+                },
+            }"##,
+        );
+        let (mut client, _rx) = test_client(&shell_lua);
+        assert!(run_startup(&mut client), "the config must resolve into a scene");
+        let tree = client.scene().surface("wallpaper@TEST").expect("the panel resolved");
+
+        assert_eq!(
+            layout::overlay_input_regions(tree, 1.0),
+            [crate::text::snap::PhysicalRect { x0: 0, y0: 0, x1: 120, y1: 40 }],
+            "the handler's box alone; the painted ground and the painted root claim nothing"
+        );
+    }
+
+    /// The same tree on `Top` keeps the paint proxy, because there a drawn card must not leak a
+    /// click to the window behind it. This is the half of the walk ADR-0204 did not change.
+    #[test]
+    fn a_top_surface_still_claims_input_where_it_paints() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_lua = write_shell_lua(
+            dir.path(),
+            r##"return {
+                panel {
+                    id = "host", layer = "Top",
+                    anchor = { top = true, bottom = true, left = true, right = true },
+                    exclusive = false, width = "Fill", height = "Fill",
+                    child = rect {
+                        width = "Fill", height = "Fill", background = "#202020ff",
+                        children = {
+                            button { width = 120, height = 40, on_click = function() end },
+                        },
+                    },
+                },
+            }"##,
+        );
+        let (mut client, _rx) = test_client(&shell_lua);
+        assert!(run_startup(&mut client), "the config must resolve into a scene");
+        let tree = client.scene().surface("host@TEST").expect("the panel resolved");
+
+        assert_eq!(
+            layout::overlay_input_regions(tree, 1.0),
+            [crate::text::snap::PhysicalRect { x0: 0, y0: 0, x1: 1920, y1: 1080 }],
+            "the painted ground claims the surface and the walk stops there"
+        );
+    }
+
     /// One 1920x1080 `"TEST"` output keeps fixture ids readable (`"bar@TEST"`).
     fn test_outputs() -> Vec<OutputGeometry> {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]

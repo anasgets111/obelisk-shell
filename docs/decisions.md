@@ -4504,3 +4504,48 @@ Accepted: the budget is per callback, as `action` and `on_change` are, so a batc
 timer.
 
 Rejected: a heap with cancellation bookkeeping; the expected workload does not justify it.
+
+## 0204. A `Background` surface claims input only where a handler sits, because paint stands in for occlusion and nothing is behind the bottom layer
+
+ADR-0038 decision 5 derives a surface's input region from what it draws: a visible node claims its
+box when it paints, or when it is a `button` carrying a pointer handler. ADR-0195 restated the reason
+as "what can be clicked has one right answer and so needs no config input". The wallpaper is the
+counterexample.
+
+`modules/global/wallpaper.lua` paints an opaque ground and a full-surface `image`, and carries no
+handler and no `hover`, so the walk handed the compositor `0,0 3440x1440`. Measured on Hyprland
+0.56.2: toggling a special workspace off over an empty workspace left the hidden scratchpad's window
+focused, so the bar's active-window widget kept naming it and `killactive` still killed it.
+`CInputManager::mouseMoveUnified` walks Overlay, Top, windows, then Bottom and Background; with no
+window on the workspace it reached the wallpaper, and a found surface that is not keyboard-focusable
+is no reason to clear window focus -- `refocusLastWindow` re-asserts the last window outright.
+Twenty toggles: stale focus every time with the shell up, none with it stopped, none with the
+wallpaper's region emptied.
+
+Paint is not an aesthetic here, it is a stand-in for occlusion: a drawn card must not leak a click to
+the window behind it. Nothing is behind `Background`, so there the stand-in claims a whole output for
+a surface that cannot use it, and takes the desktop's focus-through with it.
+
+1. **The carve-out is by layer, not by surface and not by config.** `Background` drops the paint half
+   of the solid test and keeps the handler half. Every other layer is unchanged, `Bottom` included,
+   which has something under it.
+2. **A role with no `layer` keeps the proxy.** A window, popup or lock parses no layer, so the walk
+   reads `parse_layer` and treats anything but `Ok(Background)` as occluding.
+3. **A clickable wallpaper stays expressible.** A `button` with `on_click` claims its box on
+   `Background` exactly as it does anywhere else.
+
+Rejected: dropping the paint proxy on every layer, so that only interactivity ever claims. It is the
+more uniform rule, and removing the paint/input coupling is the better long-term model, but as
+written it is wrong twice over. `hover` is not a pointer handler, and `dev-config`'s battery,
+bluetooth, network, updates, screen-recorder, idle-inhibitor, launcher and wallpaper indicators are
+`rect`s carrying `hover` and no `on_click`: they receive pointer events today only because they
+paint, so the rule would silently retire eight tooltips. Counting `hover` as interactivity repairs
+that and does fix the wallpaper, which leaves one real trade -- the engine would stop guaranteeing
+that a drawn overlay is opaque to input, and a future painted surface with neither handler nor hover
+would leak clicks and focus-follows-mouse focus to whatever sits behind it. That failure is silent
+and lands a stray click in another window, which is the shape of bug this ADR exists because of. Do
+it as its own change with a one-time audit of every painted surface, not folded into a focus fix;
+`tooltip` and `osd` are the two surfaces it would newly make click-through.
+
+Rejected: a surface property such as `input = "None"`. The wallpaper would be its only writer, and it
+moves a fact the engine can derive into something every future inert surface has to remember.

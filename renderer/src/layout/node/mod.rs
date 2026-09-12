@@ -44,7 +44,9 @@ pub use style::{
     parse_edge_insets, parse_list_direction, parse_opacity, parse_size_bound, parse_size_mode, parse_spacing,
     parse_transform, parse_visible,
 };
-pub use surface::{Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec};
+pub use surface::{
+    Anchor, Exclusive, KeyboardInteractivity, LayerKind, PanelSpec, SurfaceTopology, panel_spec, parse_layer,
+};
 pub use toplevel::{
     ConstraintAdjustment, PopupAnchor, PopupOffset, PopupSpec, SizeHint, WindowSpec, popup_spec, window_spec,
 };
