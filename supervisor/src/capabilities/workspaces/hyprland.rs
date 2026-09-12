@@ -346,9 +346,10 @@ pub fn focus(id: u64) {
 }
 
 /// The table form, not `hl.dsp.focus(N)`: `focus` takes one table and reads the field, the same
-/// call that moves focus by `direction`.
+/// call that moves focus by `direction`. Parenthesised because Hyprland appends a "syntax might need
+/// to be updated" note to errors from a command with no `(` in it.
 fn focus_command(id: u64) -> String {
-    format!("hl.dsp.focus{{ workspace = {id} }}")
+    format!("hl.dsp.focus({{ workspace = {id} }})")
 }
 
 /// `workspaces:toggle_special(name)`.
@@ -367,10 +368,18 @@ fn special_argument(name: &str) -> &str {
     name.strip_prefix("special:").unwrap_or(if name == "special" { "" } else { name })
 }
 
-/// The command is Lua source now, and the name inside it came from a config or from the
-/// compositor's own list. A quote in one would close the string and run the rest.
+/// The command is Lua source now, and a quote in a name -- from a config or the compositor's own
+/// list -- would close the string and run the rest. `\\ddd` is padded to three digits: Lua reads up
+/// to three, so an unpadded escape swallows a following digit.
 fn lua_escape(name: &str) -> String {
-    name.replace('\\', "\\\\").replace('"', "\\\"")
+    name.chars()
+        .map(|c| match c {
+            '\\' => "\\\\".to_string(),
+            '"' => "\\\"".to_string(),
+            c if c.is_ascii_control() => format!("\\{:03}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -617,7 +626,7 @@ mod tests {
     /// 0.56.2 socket, which answers `ok` to each of these and a parse error to what they replaced.
     #[test]
     fn both_writes_are_the_lua_dispatchers_0_56_accepts() {
-        assert_eq!(focus_command(3), "hl.dsp.focus{ workspace = 3 }");
+        assert_eq!(focus_command(3), "hl.dsp.focus({ workspace = 3 })");
         assert_eq!(toggle_special_command("special:term"), r#"hl.dsp.workspace.toggle_special("term")"#);
         assert_eq!(
             toggle_special_command("special"),
@@ -628,6 +637,16 @@ mod tests {
             toggle_special_command(r#"special:a") hl.dsp.exit(--"#),
             r#"hl.dsp.workspace.toggle_special("a\") hl.dsp.exit(--")"#,
             "a quote in a name stays inside the string"
+        );
+        assert_eq!(
+            toggle_special_command("special:a\n5"),
+            r#"hl.dsp.workspace.toggle_special("a\0105")"#,
+            "a control byte is escaped, padded so the digit after it stays a digit"
+        );
+        assert_eq!(
+            toggle_special_command("special:é"),
+            r#"hl.dsp.workspace.toggle_special("é")"#,
+            "a non-ASCII name reaches the socket as itself, not as its bytes read as codepoints"
         );
     }
 }
