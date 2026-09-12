@@ -4484,9 +4484,13 @@ subtract.
 7. `[1, 86400000]` ms, not `delay`/`pulse`'s 60-second ceiling, which could not express
    `lib/idle.lua`'s two-hour suspend stage.
 
-Accepted: a topology-changing evaluation arms timers in a process whose scene is then discarded, so
-the outgoing generation's and the candidate's can both be live until the reap. ADR-0115 already
-accepts that overlap for `on_change`.
+8. A registration is staged until its evaluation's output is applied, then promoted; discarded if
+   that output is refused or superseded. Without it a topology change leaves the outgoing process
+   running the incoming config's timers beside the candidate's, and both fire. Timers alone get this
+   and `action`/`on_change` keep ADR-0115's overlap, because only a timer fires without an external
+   trigger: an action waits for `obelisk call`, and a handler waits for a push both generations get
+   anyway. Deadlines are absolute, so staging costs a promoted timer no accuracy, and a callback
+   arming a timer is not an evaluation, so it goes live at once.
 
 Accepted: the budget is per callback, as `action` and `on_change` are, so a batch spends one per
 timer. Registry work across a batch is quadratic besides (`TimerRegistry`).

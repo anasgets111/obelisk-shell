@@ -39,11 +39,16 @@ struct Entry {
 #[derive(Default)]
 struct TimerRegistry {
     entries: Vec<Entry>,
+    /// Armed by an evaluation whose output has not been applied yet, and dropped if it never is
+    /// (ADR-0203). Deadlines are absolute, so the wait costs a promoted timer no accuracy.
+    staged: Vec<Entry>,
+    /// Whether `arm` is being reached from an evaluation rather than from a callback.
+    evaluating: bool,
     next_id: TimerId,
 }
 
 impl TimerRegistry {
-    /// Keeps `entries` sorted by deadline, and registration order within one deadline, so two
+    /// Keeps the list sorted by deadline, and registration order within one deadline, so two
     /// timers armed for the same moment fire in the order the config wrote them.
     fn arm(&mut self, due: Instant, callback: Function) -> mlua::Result<TimerId> {
         let id = self.next_id;
@@ -51,17 +56,22 @@ impl TimerRegistry {
             .next_id
             .checked_add(1)
             .ok_or_else(|| mlua::Error::runtime("timer ids are exhausted; this VM has armed 2^64 timers"))?;
-        let at = self.entries.partition_point(|entry| entry.due <= due);
-        self.entries.insert(at, Entry { due, id, callback });
+        let list = if self.evaluating { &mut self.staged } else { &mut self.entries };
+        let at = list.partition_point(|entry| entry.due <= due);
+        list.insert(at, Entry { due, id, callback });
         Ok(id)
     }
 
     /// Removes `id` and hands back its callback, or `None` when it already fired or was cancelled.
     /// One lookup serves both `cancel` and dispatch, which is what makes cancelling a timer that is
-    /// gone a no-op rather than an error.
+    /// gone a no-op rather than an error. Searches `staged` too, so a config cancelling at its top
+    /// level reaches the timer it just armed.
     fn take(&mut self, id: TimerId) -> Option<Function> {
-        let at = self.entries.iter().position(|entry| entry.id == id)?;
-        Some(self.entries.remove(at).callback)
+        if let Some(at) = self.entries.iter().position(|entry| entry.id == id) {
+            return Some(self.entries.remove(at).callback);
+        }
+        let at = self.staged.iter().position(|entry| entry.id == id)?;
+        Some(self.staged.remove(at).callback)
     }
 }
 
@@ -143,12 +153,33 @@ pub fn dispatch_due(lua: &Lua, now: Instant) {
     }
 }
 
-/// Drops every armed timer before an evaluation re-arms them, the counterpart to
-/// [`super::action::clear`], and after a *failed* one. `next_id` keeps counting, so a handle from
-/// before this cannot cancel whatever is armed after it.
-pub fn clear(lua: &Lua) {
+/// Drops the live set and holds back what the evaluation about to run arms, the counterpart to
+/// [`super::action::clear`]. `next_id` keeps counting, so a handle from before this cancels nothing
+/// armed after it.
+pub fn begin_evaluation(lua: &Lua) {
+    if lua.app_data_ref::<TimerRegistry>().is_none() {
+        lua.set_app_data(TimerRegistry::default());
+    }
+    let mut registry = lua.app_data_mut::<TimerRegistry>().expect("just ensured the registry exists");
+    registry.entries.clear();
+    registry.staged.clear();
+    registry.evaluating = true;
+}
+
+/// The evaluation's output reached the screen, so what it armed becomes the live set.
+pub fn promote(lua: &Lua) {
     if let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() {
-        registry.entries.clear();
+        registry.entries = std::mem::take(&mut registry.staged);
+        registry.evaluating = false;
+    }
+}
+
+/// The evaluation's output was refused or superseded, so what it armed goes with it. Without this a
+/// generation swap leaves the outgoing process running the incoming config's timers beside it.
+pub fn discard(lua: &Lua) {
+    if let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() {
+        registry.staged.clear();
+        registry.evaluating = false;
     }
 }
 
@@ -297,7 +328,8 @@ mod tests {
         let lua = lua();
         lua.load("stale_fired = false; kept = timer(1, function() stale_fired = true end)").exec().unwrap();
 
-        clear(&lua);
+        begin_evaluation(&lua);
+        promote(&lua);
         lua.load("replacement_fired = false; timer(1, function() replacement_fired = true end)").exec().unwrap();
         lua.load("kept:cancel()").exec().expect("a handle outliving its registration still answers");
         fire_everything(&lua);
@@ -316,7 +348,8 @@ mod tests {
         lua.load("timer(2, function() second_fired = true end)").exec().unwrap();
         let clear_fn = lua
             .create_function(|lua, ()| {
-                clear(lua);
+                begin_evaluation(lua);
+                promote(lua);
                 Ok(())
             })
             .unwrap();
@@ -344,6 +377,46 @@ mod tests {
         fire_everything(&lua);
 
         assert!(lua.globals().get::<bool>("fired").unwrap(), "one bad callback must not take the batch with it");
+    }
+
+    /// The generation-swap case: an evaluation whose output nothing applies must not leave its
+    /// timers running in the process that kept the old scene.
+    #[test]
+    fn a_discarded_evaluations_timers_never_fire() {
+        let lua = lua();
+        begin_evaluation(&lua);
+        lua.load("fired = false; timer(1, function() fired = true end)").exec().unwrap();
+
+        assert!(next_deadline(&lua).is_none(), "staged timers do not wake the poll loop");
+        discard(&lua);
+        fire_everything(&lua);
+
+        assert!(!lua.globals().get::<bool>("fired").unwrap());
+    }
+
+    #[test]
+    fn an_applied_evaluations_timers_fire_once_promoted() {
+        let lua = lua();
+        begin_evaluation(&lua);
+        lua.load("fired = false; timer(1, function() fired = true end)").exec().unwrap();
+        promote(&lua);
+
+        assert!(next_deadline(&lua).is_some(), "promoted timers arm the poll loop");
+        fire_everything(&lua);
+
+        assert!(lua.globals().get::<bool>("fired").unwrap());
+    }
+
+    /// A config cancelling at its top level is cancelling something still staged.
+    #[test]
+    fn cancel_reaches_a_timer_the_same_evaluation_armed() {
+        let lua = lua();
+        begin_evaluation(&lua);
+        lua.load("fired = false; timer(1, function() fired = true end):cancel()").exec().unwrap();
+        promote(&lua);
+        fire_everything(&lua);
+
+        assert!(!lua.globals().get::<bool>("fired").unwrap());
     }
 
     #[test]

@@ -283,7 +283,7 @@ impl RendererClient {
             handle.clear_handlers();
         }
         lua::action::clear(self.loader.lua());
-        lua::timer::clear(self.loader.lua());
+        lua::timer::begin_evaluation(self.loader.lua());
     }
 
     /// Returns a handle, lazily adding `obelisk.<capability>` as `nil`, revision `0` (ADR-0029).
@@ -317,6 +317,7 @@ impl RendererClient {
                 self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
                 // ADR-0044 decision 2 target: later pushes skip `shell.lua`.
                 self.state.applied_output = Some(output);
+                lua::timer::promote(self.loader.lua());
                 Some(specs)
             }
             Err(err) => {
@@ -588,7 +589,9 @@ impl RendererClient {
                 self.set_rescue_state(false, "");
                 let topology_changed = self.state.applied_topology.as_ref().is_some_and(|applied| applied != &topology);
                 if topology_changed {
-                    // Another generation owns the swap; keep this scene unchanged.
+                    // Another generation owns the swap; keep this scene unchanged. Its timers go
+                    // with the output nothing will apply, or both generations would run them.
+                    lua::timer::discard(self.loader.lua());
                     ReevaluateReport::TopologyChanged { sequence: request.sequence }
                 } else {
                     self.state.pending = Some((request.sequence, output, topology));
@@ -633,8 +636,10 @@ impl RendererClient {
                 // The poll loop repaints on `re_resolve_if_dirty`.
                 self.dirty.mark();
                 self.settle_geometry();
+                lua::timer::promote(self.loader.lua());
             }
             Err(err) => {
+                lua::timer::discard(self.loader.lua());
                 eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}")
             }
         }
