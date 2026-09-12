@@ -583,7 +583,6 @@ end)
 
 return modal({
     kind = "wallpaper_picker",
-    keyboard = true,
     card = panel_card({ search, body }, {
         width = theme.wallpaper_picker_width,
         height = theme.wallpaper_picker_height,

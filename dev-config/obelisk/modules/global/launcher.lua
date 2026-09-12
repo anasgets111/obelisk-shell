@@ -501,7 +501,6 @@ end)
 
 return modal({
     kind = "launcher",
-    keyboard = true,
     card = panel_card({
         search,
         panel_card({ special_row, app_list, no_results, no_apps }, {

@@ -12,11 +12,9 @@ local CLOSED_SCALE = 0.97
 ---@class ModalOpts
 ---@field kind string The `modal` state value that shows this one, e.g. `"launcher"`.
 ---@field card table The card node, positioned by its own `margin` or aligns within the screen.
----@field keyboard? boolean Take the keyboard exclusively while showing; a field inside needs it.
 
 ---@class Modal
 ---@field kind string
----@field keyboard boolean
 ---@field node table The screen-sized wrapper carrying the card and its motion.
 
 -- `modal_host`'s outside catcher is every card's ancestor, and a hit takes the innermost handled
@@ -55,7 +53,6 @@ return function(opts)
     end)
     return {
         kind = opts.kind,
-        keyboard = opts.keyboard or false,
         -- Screen-sized, so the card keeps its own `margin` or centre alignment, and scale pivots on
         -- the screen's centre. Stacking, not a column: columns control child placement, which would
         -- drop a card's own `align_v` and hang every card from the top. Hidden after exit, subtrees

@@ -16,6 +16,11 @@ local any_modal = ui_state.active_modal:map(function(kind)
     return kind ~= ""
 end)
 
+-- Mapped through the last card's exit fade (ADR-0146). `keyboard_interactivity` reads this same
+-- signal, so the two cannot drop in different passes: `None` on a still-mapped full-screen host makes
+-- Hyprland refocus the last focused window, onto its workspace.
+local shown = util.linger(any_modal, theme.animation_ms)
+
 local cards = {}
 for _, modal in ipairs(modals) do
     table.insert(cards, modal.node)
@@ -29,17 +34,12 @@ return panel {
     exclusive = false,
     width = "Fill",
     height = "Fill",
-    -- Mapped through the last card's exit fade (ADR-0146).
-    visible = util.linger(any_modal, theme.animation_ms),
-    -- Exclusive only while a modal that wants it shows, not while it exits: a field must be typable
-    -- without a click, and a fading surface must hold nothing.
-    keyboard_interactivity = ui_state.active_modal:map(function(kind)
-        for _, modal in ipairs(modals) do
-            if modal.kind == kind and modal.keyboard then
-                return "Exclusive"
-            end
-        end
-        return "None"
+    visible = shown,
+    -- Any modal, not only the ones with a field, and released by the unmap rather than on a live
+    -- surface: which kind is fading is not knowable in the same pass as the unmap. Costs
+    -- `theme.animation_ms` of swallowed typing; a stray workspace switch is worse.
+    keyboard_interactivity = shown:map(function(open)
+        return open and "Exclusive" or "None"
     end),
     child = rect {
         width = "Fill",

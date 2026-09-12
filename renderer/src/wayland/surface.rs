@@ -693,7 +693,7 @@ impl App {
                 };
                 let (axes, ceiling) = layer::measurement(&fresh, output_size);
                 self.client.set_measured_axes(&surface_id, axes, ceiling);
-                self.apply_spec_change(index, fresh);
+                self.apply_spec_change(index, fresh, visible);
             }
             Some(Err(err)) => eprintln!(
                 "[obelisk-renderer] {surface_id}: re-resolved panel properties are invalid, keeping the last applied ones: {err}"

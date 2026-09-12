@@ -416,9 +416,16 @@ impl App {
     ///
     /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
     /// procedure, and Supervisor services § 14.2 keeps Candidates invisible until `ActivateDraw`.
-    pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec) {
-        let TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, measured, requested, .. } =
-            &self.surfaces[index].role
+    pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec, visible: bool) {
+        // [`App::apply_visibility`]'s own unmap test, run before it: a mapped panel going invisible
+        // loses its layer object later this pass, so requests sent now die with it. Not just waste --
+        // `keyboard_interactivity: None` on a still-mapped surface makes Hyprland refocus the last
+        // focused window, onto its workspace. A panel that is merely still hidden keeps its layer and
+        // [`App::show_panel`] never re-sends, so it does need them.
+        let unmapping =
+            !visible && matches!(self.surfaces[index].map_state, MapState::AwaitingConfigure | MapState::Mapped);
+        let (TrackedRole::Panel { layer: Some(layer), spec: applied, output_size, measured, requested, .. }, false) =
+            (&self.surfaces[index].role, unmapping)
         else {
             // No layer object: hidden after being shown (ADR-0088), or deferred at creation because
             // it measures an axis and had no tree to measure. Nothing can be sent, but the spec must
