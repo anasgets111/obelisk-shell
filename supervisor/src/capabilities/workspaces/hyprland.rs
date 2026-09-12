@@ -39,7 +39,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::controller::{FocusedWindow, SpecialWorkspace, StatePublisher, WorkspaceRow};
-use crate::compositor::{hyprland_request, hyprland_socket_path};
+use crate::compositor::{hyprland_command, hyprland_request, hyprland_socket_path};
 
 /// One `j/workspaces` entry. Hyprland's `windows` count identifies empty workspaces without a
 /// client scan.
@@ -323,11 +323,7 @@ fn dispatch(what: String) {
     };
     std::thread::spawn(move || {
         let socket_path = hyprland_socket_path(&signature, ".socket.sock");
-        match hyprland_request(&socket_path, &format!("dispatch {what}")) {
-            Ok(reply) if reply.trim() == "ok" => {}
-            Ok(reply) => eprintln!("workspaces: Hyprland refused `dispatch {what}`: {}", reply.trim()),
-            Err(err) => eprintln!("workspaces: Hyprland `dispatch {what}` request failed: {err}"),
-        }
+        hyprland_command(&socket_path, &format!("dispatch {what}"), "workspaces");
     });
 }
 

@@ -84,15 +84,24 @@ fn hyprland_socket_path_in(runtime_dir: &str, signature: &str, name: &str) -> Pa
 }
 
 /// One `.socket.sock` command. Hyprland answers once per connection and closes it: `j/<what>`
-/// returns the `hyprctl -j` JSON, a write returns `ok` or the reason it refused. Shared because
-/// `keyboard` and `workspaces` both talk to this socket (ADR-0118 decision 5), and neither should
-/// reach it through a `hyprctl` subprocess (decision 2).
+/// returns the `hyprctl -j` JSON, a write returns `ok` or the reason it refused (ADR-0118).
 pub fn hyprland_request(socket_path: &Path, command: &str) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket_path)?;
     stream.write_all(command.as_bytes())?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     Ok(reply)
+}
+
+/// A write and its reply check, blocking. `capability` prefixes the log line, the only thing the
+/// two callers differ in. Without reading the reply a refusal -- a bad device, an out-of-range
+/// index -- is silent.
+pub fn hyprland_command(socket_path: &Path, command: &str, capability: &str) {
+    match hyprland_request(socket_path, command) {
+        Ok(reply) if reply.trim() == "ok" => {}
+        Ok(reply) => eprintln!("{capability}: Hyprland refused `{command}`: {}", reply.trim()),
+        Err(err) => eprintln!("{capability}: Hyprland `{command}` request failed: {err}"),
+    }
 }
 
 fn session_desktop() -> Option<String> {

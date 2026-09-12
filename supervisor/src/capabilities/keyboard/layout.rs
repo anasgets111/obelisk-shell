@@ -3,12 +3,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::compositor::{CompositorKind, hyprland_request, hyprland_socket_path};
+use crate::compositor::{CompositorKind, hyprland_command, hyprland_request, hyprland_socket_path};
 
 use super::controller::{KeyboardSignal, KeyboardState};
 
@@ -130,20 +130,30 @@ impl CompositorLink for NiriLink {
 /// `event>>payload` lines, where `activelayout>>...` only triggers a resync; `.socket.sock` answers
 /// `j/devices` reads and `switchxkblayout main <index>` writes.
 pub struct HyprlandLink {
-    signature: String,
+    command_path: PathBuf,
 }
 
 /// Needed fields from `j/devices`'s `keyboards` entries; comma-separated `layout` only supplies the
 /// count. `main` is Hyprland's `m_active`, reassigned on every key event, so it is the keyboard
-/// being typed on. `active_layout_index` defaults to `0` on a Hyprland too old to send it.
+/// being typed on -- including a media or power-button node, which is Hyprland's own definition of
+/// active and not narrowed here.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct HyprlandKeyboard {
     active_keymap: String,
     layout: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "layout_index")]
     active_layout_index: u32,
     #[serde(default)]
     main: bool,
+}
+
+/// `0` for an absent, null or out-of-range `active_layout_index`, the shapes a version skew
+/// produces. `#[serde(default)]` alone covers only an absent key, and `parse_hyprland_devices`
+/// drops an entry that fails to deserialize, so one bad value would leave no layout at all rather
+/// than a wrong index. Same tolerance as `workspaces`' `fullscreen_flag`.
+fn layout_index<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    use serde::Deserialize;
+    Ok(serde_json::Value::deserialize(deserializer)?.as_u64().and_then(|index| u32::try_from(index).ok()).unwrap_or(0))
 }
 
 fn parse_hyprland_devices(json: &str) -> Option<HyprlandKeyboard> {
@@ -161,7 +171,7 @@ fn apply_hyprland_layout(state: &Arc<Mutex<KeyboardState>>, keyboard: &HyprlandK
     guard.layout_count = keyboard.layout.split(',').filter(|s| !s.is_empty()).count() as u32;
 }
 
-/// `true` once `state` holds a fresh read. Blocking on the event thread, so two reads cannot land
+/// `true` once `state` holds a fresh read. Blocking on the reader thread, so two reads cannot land
 /// out of order.
 fn resync_hyprland_layout(socket_path: &Path, state: &Arc<Mutex<KeyboardState>>) -> bool {
     let reply = match hyprland_request(socket_path, "j/devices") {
@@ -185,44 +195,51 @@ fn resync_hyprland_layout(socket_path: &Path, state: &Arc<Mutex<KeyboardState>>)
     }
 }
 
+/// `false` only when nobody is listening any more, which ends the reader.
+fn publish(socket_path: &Path, state: &Arc<Mutex<KeyboardState>>, events: &UnboundedSender<KeyboardSignal>) -> bool {
+    !resync_hyprland_layout(socket_path, state) || events.send(KeyboardSignal::Changed).is_ok()
+}
+
 impl HyprlandLink {
     /// `signature` is `$HYPRLAND_INSTANCE_SIGNATURE`, already confirmed by
-    /// `compositor::detect_compositor`. Connects to the event socket before the first read, so a
-    /// switch in that gap is still a line to process.
+    /// `compositor::detect_compositor`.
+    ///
+    /// Everything runs on the reader thread: `UnixStream::connect` blocks, and this is called from
+    /// an `async fn` on a two-worker runtime. Connecting there, before the first read, also keeps a
+    /// switch in that gap a line still to process.
     pub fn new(signature: String, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) -> Self {
         let events_path = hyprland_socket_path(&signature, ".socket2.sock");
         let command_path = hyprland_socket_path(&signature, ".socket.sock");
-        match UnixStream::connect(&events_path) {
-            Ok(stream) => {
-                std::thread::spawn(move || {
-                    // Signal the initial read too, or `layout_count` stays `0` and an indicator
-                    // drawn only for two or more layouts hides until the first switch.
-                    if resync_hyprland_layout(&command_path, &state) && events.send(KeyboardSignal::Changed).is_err() {
-                        return;
-                    }
-                    for line in BufReader::new(stream).lines() {
-                        let Ok(line) = line else {
-                            eprintln!("keyboard: Hyprland event socket read failed; layout will no longer update");
-                            return;
-                        };
-                        if !line.starts_with("activelayout>>") {
-                            continue;
-                        }
-                        if resync_hyprland_layout(&command_path, &state)
-                            && events.send(KeyboardSignal::Changed).is_err()
-                        {
-                            return;
-                        }
-                    }
-                    eprintln!("keyboard: Hyprland event socket closed; layout will no longer update");
-                });
+        let reader_path = command_path.clone();
+        std::thread::spawn(move || {
+            let stream = match UnixStream::connect(&events_path) {
+                Ok(stream) => Some(stream),
+                Err(err) => {
+                    eprintln!(
+                        "keyboard: failed to connect to Hyprland's event socket at {}; layout will not update after the first read: {err}",
+                        events_path.display()
+                    );
+                    None
+                }
+            };
+            // Read once even with no event socket: the layout is still right, just frozen, and an
+            // indicator drawn only for two or more layouts would otherwise never appear.
+            if !publish(&reader_path, &state, &events) {
+                return;
             }
-            Err(err) => eprintln!(
-                "keyboard: failed to connect to Hyprland's event socket at {}; layout reporting disabled for this run: {err}",
-                events_path.display()
-            ),
-        }
-        Self { signature }
+            let Some(stream) = stream else { return };
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else {
+                    eprintln!("keyboard: Hyprland event socket read failed; layout will no longer update");
+                    return;
+                };
+                if line.starts_with("activelayout>>") && !publish(&reader_path, &state, &events) {
+                    return;
+                }
+            }
+            eprintln!("keyboard: Hyprland event socket closed; layout will no longer update");
+        });
+        Self { command_path }
     }
 }
 
@@ -231,17 +248,14 @@ impl CompositorLink for HyprlandLink {
         CompositorKind::Hyprland
     }
 
-    /// `main` is also Hyprland's device target for that keyboard, so no device name is tracked
-    /// here. It refuses an out-of-range index, hence reading the reply.
+    /// `main` is also Hyprland's device target for that keyboard, so no device name is tracked here.
+    ///
+    /// ponytail: one OS thread per switch, for one blocking round trip. Unbounded if a config calls
+    /// this in a loop; a shared worker is the upgrade, and `workspaces`' dispatch has the same shape.
     fn switch_layout(&self, index: usize) {
-        let socket_path = hyprland_socket_path(&self.signature, ".socket.sock");
+        let socket_path = self.command_path.clone();
         std::thread::spawn(move || {
-            let command = format!("switchxkblayout main {index}");
-            match hyprland_request(&socket_path, &command) {
-                Ok(reply) if reply.trim() == "ok" => {}
-                Ok(reply) => eprintln!("keyboard: Hyprland refused `{command}`: {}", reply.trim()),
-                Err(err) => eprintln!("keyboard: Hyprland `{command}` request failed: {err}"),
-            }
+            hyprland_command(&socket_path, &format!("switchxkblayout main {index}"), "keyboard");
         });
     }
 }
@@ -297,6 +311,20 @@ mod tests {
     fn parse_hyprland_devices_defaults_the_index_when_hyprland_omits_it() {
         let json = r#"{"keyboards":[{"active_keymap":"English (US)","layout":"us"}]}"#;
         assert_eq!(parse_hyprland_devices(json).expect("should parse").active_layout_index, 0);
+    }
+
+    #[test]
+    fn a_keyboard_entry_survives_an_index_hyprland_sends_in_an_unexpected_shape() {
+        // `#[serde(default)]` covers an absent key only, so a null or negative value used to fail
+        // the whole entry and leave `KeyboardState` with no layout at all.
+        for index in ["null", "-1", "1.5", "\"1\""] {
+            let json = format!(
+                r#"{{"keyboards":[{{"active_keymap":"English (US)","layout":"us,ara","active_layout_index":{index}}}]}}"#
+            );
+            let keyboard = parse_hyprland_devices(&json).unwrap_or_else(|| panic!("{index} dropped the entry"));
+            assert_eq!(keyboard.active_layout_index, 0, "{index}");
+            assert_eq!(keyboard.active_keymap, "English (US)", "{index}");
+        }
     }
 
     #[test]
