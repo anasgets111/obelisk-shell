@@ -118,6 +118,28 @@ mod tests {
         assert_eq!(p.x1, -5); // ceil(-5.6) = -5
     }
 
+    /// Two nested nodes at the documented `scale = 64` maximum compose to 4096x, which puts an
+    /// 8192-wide box past the limit. Before the clamp both corners saturated to `i32::MIN`/`MAX`
+    /// and the `x1 - x0` below overflowed, which release turns into an abort rather than a wrap.
+    #[test]
+    fn coordinates_past_the_limit_saturate_so_a_width_still_fits_an_i32() {
+        let r = LogicalRect { x: -3.0e7, y: -3.0e7, width: 6.0e7, height: 6.0e7 };
+        let p = snap_to_physical(r, 1.0);
+        assert_eq!((p.x0, p.x1), (-1_048_576, 1_048_576));
+        assert_eq!(p.x1 - p.x0, 2_097_152);
+        assert_eq!(p.y1 - p.y0, 2_097_152);
+    }
+
+    /// A rect lying wholly past the limit collapses instead of saturating to a full-width box,
+    /// and the emptiness guards downstream drop it. Documented on [`snap_to_physical`].
+    #[test]
+    fn a_rect_wholly_past_the_limit_collapses_to_zero_area() {
+        let r = LogicalRect { x: 3.0e7, y: 3.0e7, width: 10.0, height: 10.0 };
+        let p = snap_to_physical(r, 1.0);
+        assert_eq!(p.x0, p.x1);
+        assert_eq!(p.y0, p.y1);
+    }
+
     #[test]
     fn border_band_already_aligned_is_unchanged() {
         assert_eq!(snap_border_band(4.0, 1.0, 1.0), (4.0, 1.0));

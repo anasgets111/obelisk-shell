@@ -25,6 +25,13 @@ const SECRET: &str = "correct horse battery staple secret text";
 /// Zero means "not currently watching anything".
 static WATCHED_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// Index of the first non-zero byte seen in the watched allocation, or [`CLEAN`]. `dealloc`
+/// records rather than asserts, like `secure_buffer_growth_zeroizes`'s `LEAK_FOUND`: a panic
+/// there unwinds out of `GlobalAlloc` from inside drop glue, skipping the handback below and
+/// leaking the block instead of failing cleanly.
+static FIRST_DIRTY_BYTE: AtomicUsize = AtomicUsize::new(CLEAN);
+const CLEAN: usize = usize::MAX;
+
 struct ZeroCheckingAllocator;
 
 // SAFETY: `alloc`/`dealloc` delegate every allocation to `System`, adding only a read of memory
@@ -38,13 +45,21 @@ unsafe impl GlobalAlloc for ZeroCheckingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if WATCHED_PTR.swap(0, Ordering::SeqCst) == ptr as usize && !ptr.is_null() {
+        // `compare_exchange`, not `swap`: the harness allocates on its own thread, and a `swap`
+        // let any unrelated `dealloc` between the `store` and this one consume the watch. The
+        // test's "did we observe anything" guard then passed on that same swap, so a run that
+        // checked nothing reported success.
+        if !ptr.is_null()
+            && WATCHED_PTR.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
             for i in 0..layout.size() {
                 // Safety: `ptr` is valid for `layout.size()` bytes until this call
                 // returns it to the allocator -- this read happens before that handback
                 // completes.
-                let byte = unsafe { core::ptr::read(ptr.add(i)) };
-                assert_eq!(byte, 0, "byte {i} of a dropped SecureBuffer's allocation was not zeroed");
+                if unsafe { core::ptr::read(ptr.add(i)) } != 0 {
+                    FIRST_DIRTY_BYTE.store(i, Ordering::SeqCst);
+                    break;
+                }
             }
         }
         // SAFETY: `ptr`/`layout` are the pair the caller received from `alloc` above and are
@@ -73,4 +88,6 @@ fn dropping_a_secure_buffer_zeroizes_before_deallocation() {
         0,
         "SecureBuffer's backing allocation was never deallocated; this test observed nothing"
     );
+    let dirty = FIRST_DIRTY_BYTE.load(Ordering::SeqCst);
+    assert_eq!(dirty, CLEAN, "byte {dirty} of a dropped SecureBuffer's allocation was not zeroed");
 }

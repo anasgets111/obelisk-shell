@@ -193,9 +193,13 @@ pub fn invert_affine([a, b, c, d, e, f]: Affine) -> Option<Affine> {
     Some([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)])
 }
 
-/// The range `property`'s number is accepted in, and the one an overshooting easing is clamped
-/// into: parser and tween agree by construction. `margin`, `translate` and `rotate` accept a
-/// negative; nothing else does.
+/// The range an overshooting easing is clamped into, and the one [`within`] enforces for the
+/// parsers that call it. Those are not the same set. The tween clamps every numeric property,
+/// while `spacing`, icon `size`, `margin` and `padding` take no parser bound: out of range there
+/// is a layout the solver absorbs, not a crash, and `snap_to_physical` bounds the coordinates
+/// that reach `wl_region`. Add a parser bound only where a consumer refuses the value.
+///
+/// `margin`, `translate` and `rotate` accept a negative; nothing else does.
 ///
 /// `radius` and `border_width` share the `8192` ceiling with `width`/`height` (§ 5.1). It is
 /// femtovg 0.26's: above roughly 8.4e6 `curve_divisions` (`path/cache.rs:911`) divides by
