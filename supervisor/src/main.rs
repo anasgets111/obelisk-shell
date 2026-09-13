@@ -241,7 +241,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
-    let connection = zbus::Connection::system().await?;
+    let connection = capabilities::with_call_timeout(zbus::connection::Builder::system()).await?;
 
     let (tx, mut agent_requests) = tokio::sync::mpsc::unbounded_channel();
     let mut polkit_agent = PolkitAgent::new(tx);

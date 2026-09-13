@@ -31,14 +31,9 @@ impl TrayController {
     /// (ADR-0031). With `DoNotQueue` unset, zbus queues and returns `Ok(InQueue)`, so only a hard
     /// `Err` is failure, and it does not stop construction.
     ///
-    /// Exports [`WATCHER_OBJECT_PATH`] regardless of name ownership, then calls
-    /// `RegisterStatusNotifierHost` at the well-known name so D-Bus routes to the actual owner.
+    /// Exports [`WATCHER_OBJECT_PATH`] before claiming the name, so a call routed to the new owner
+    /// finds the object. Awaits no app (ADR-0031 amendment).
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<TraySignal>) -> Self {
-        match connection.request_name_with_flags(WATCHER_BUS_NAME, BitFlags::<RequestNameFlags>::empty()).await {
-            Ok(reply) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) -> {reply}"),
-            Err(err) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) failed: {err}"),
-        }
-
         // Sweep before spooling; leftovers belong to a previous run and otherwise survive
         // (ADR-0074).
         crate::capabilities::shm_icons::sweep(super::icon::SPOOL_SUBDIR);
@@ -55,26 +50,38 @@ impl TrayController {
         if let Err(err) = connection.object_server().at(WATCHER_OBJECT_PATH, watcher).await {
             eprintln!("tray: failed to export StatusNotifierWatcher at {WATCHER_OBJECT_PATH}: {err}");
         }
+        match connection.request_name_with_flags(WATCHER_BUS_NAME, BitFlags::<RequestNameFlags>::empty()).await {
+            Ok(reply) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) -> {reply}"),
+            Err(err) => eprintln!("tray: RequestName({WATCHER_BUS_NAME}) failed: {err}"),
+        }
 
-        match StatusNotifierWatcherClientProxy::new(&connection).await {
-            Ok(watcher_client) => {
-                let our_unique_name = connection.unique_name().map(|name| name.to_string()).unwrap_or_default();
-                if let Err(err) = watcher_client.register_status_notifier_host(&our_unique_name).await {
-                    eprintln!("tray: RegisterStatusNotifierHost failed: {err}");
+        let task = (connection, registry.clone(), events.clone());
+        tokio::spawn(async move {
+            let (connection, registry, events) = task;
+            match StatusNotifierWatcherClientProxy::new(&connection).await {
+                Ok(watcher_client) => {
+                    let our_unique_name = connection.unique_name().map(|name| name.to_string()).unwrap_or_default();
+                    if let Err(err) = watcher_client.register_status_notifier_host(&our_unique_name).await {
+                        eprintln!("tray: RegisterStatusNotifierHost failed: {err}");
+                    }
                 }
+                Err(err) => eprintln!(
+                    "tray: failed to bind the StatusNotifierWatcher client proxy for RegisterStatusNotifierHost: {err}"
+                ),
             }
-            Err(err) => eprintln!(
-                "tray: failed to bind the StatusNotifierWatcher client proxy for RegisterStatusNotifierHost: {err}"
-            ),
-        }
-
-        match zbus::fdo::DBusProxy::new(&connection).await {
-            Ok(dbus_proxy) => {
-                adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
-                spawn_name_owner_changed_forwarder(connection.clone(), dbus_proxy, registry.clone(), events.clone());
+            match zbus::fdo::DBusProxy::new(&connection).await {
+                Ok(dbus_proxy) => {
+                    spawn_name_owner_changed_forwarder(
+                        connection.clone(),
+                        dbus_proxy.clone(),
+                        registry.clone(),
+                        events.clone(),
+                    );
+                    adopt_existing_items(&connection, &dbus_proxy, &registry, &events).await;
+                }
+                Err(err) => eprintln!("tray: failed to bind org.freedesktop.DBus for NameOwnerChanged tracking: {err}"),
             }
-            Err(err) => eprintln!("tray: failed to bind org.freedesktop.DBus for NameOwnerChanged tracking: {err}"),
-        }
+        });
 
         Self { registry, events }
     }
@@ -233,9 +240,8 @@ const ADOPTION_OBJECT_PATHS: [&str; 3] =
 /// clients to re-register after `StatusNotifierHostRegistered`, but Slack does not; without this
 /// bus scan, restarting the shell lost Slack until Slack restarted.
 ///
-/// Serial because each `register_item` reads properties and optional `GetLayout`, while a session
-/// has only a handful of items. Duplicates are harmless: `(unique_name, object_path)` is the key,
-/// so re-registration overwrites the entry.
+/// One task per name, so an app that answers nothing delays only its own adoption. Duplicates are
+/// harmless: `(unique_name, object_path)` is the key, so re-registration overwrites the entry.
 ///
 /// ponytail: finds only items that claimed a well-known name. An item registering only
 /// `RegisterStatusNotifierItem("/some/object/path")` is invisible without introspecting every
@@ -254,38 +260,42 @@ async fn adopt_existing_items(
             return;
         }
     };
-    for name in names.iter().filter(|name| is_item_bus_name(name.as_str())) {
-        // No sender: this well-known branch does not need one, and no call supplies it.
-        let resolved = match resolve_registration(connection, name.as_str(), None).await {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                eprintln!("tray: {name} looks like an item but could not be resolved: {err}");
-                continue;
-            }
-        };
-        let mut refusals = Vec::new();
-        for candidate in ADOPTION_OBJECT_PATHS {
-            let object_path = match OwnedObjectPath::try_from(candidate) {
-                Ok(path) => path,
+    let mut adoptions = tokio::task::JoinSet::new();
+    for name in names.into_iter().filter(|name| is_item_bus_name(name.as_str())) {
+        let (connection, registry, events) = (connection.clone(), registry.clone(), events.clone());
+        adoptions.spawn(async move {
+            // No sender: this well-known branch does not need one, and no call supplies it.
+            let resolved = match resolve_registration(&connection, name.as_str(), None).await {
+                Ok(resolved) => resolved,
                 Err(err) => {
-                    eprintln!("tray: {candidate} is not an object path: {err}");
-                    continue;
+                    eprintln!("tray: {name} looks like an item but could not be resolved: {err}");
+                    return;
                 }
             };
-            let attempt = ResolvedRegistration { object_path, ..resolved.clone() };
-            match register_item(connection, registry, events, attempt).await {
-                Ok(()) => {
-                    eprintln!("tray: adopted {name} at {candidate}, registered before this host started");
-                    refusals.clear();
-                    break;
+            let mut refusals = Vec::new();
+            for candidate in ADOPTION_OBJECT_PATHS {
+                let object_path = match OwnedObjectPath::try_from(candidate) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        eprintln!("tray: {candidate} is not an object path: {err}");
+                        continue;
+                    }
+                };
+                let attempt = ResolvedRegistration { object_path, ..resolved.clone() };
+                match register_item(&connection, &registry, &events, attempt).await {
+                    Ok(()) => {
+                        eprintln!("tray: adopted {name} at {candidate}, registered before this host started");
+                        return;
+                    }
+                    Err(err) => refusals.push(err),
                 }
-                Err(err) => refusals.push(err),
             }
-        }
-        if !refusals.is_empty() {
-            eprintln!("tray: failed to adopt {name}: {}", refusals.join("; "));
-        }
+            if !refusals.is_empty() {
+                eprintln!("tray: failed to adopt {name}: {}", refusals.join("; "));
+            }
+        });
     }
+    while adoptions.join_next().await.is_some() {}
 }
 
 #[cfg(test)]

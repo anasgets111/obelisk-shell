@@ -43,6 +43,12 @@ use tray::{TrayController, TraySignal};
 use updates::{UpdatesController, UpdatesSignal};
 use workspaces::{WorkspacesController, WorkspacesSignal};
 
+/// Every Supervisor bus gets the 25s call timeout Qt, GDBus and libdbus default to; zbus has none
+/// (ADR-0070 amendment).
+pub async fn with_call_timeout(builder: zbus::Result<zbus::connection::Builder<'_>>) -> zbus::Result<zbus::Connection> {
+    builder?.method_timeout(std::time::Duration::from_secs(25)).build().await
+}
+
 pub mod applications;
 pub mod audio;
 pub mod battery;
@@ -349,7 +355,7 @@ impl Capabilities {
             // Own session bus; missing it yields `inert`.
             Capability::Tray => {
                 if self.tray.is_none() {
-                    self.tray = Some(match zbus::Connection::session().await {
+                    self.tray = Some(match with_call_timeout(zbus::connection::Builder::session()).await {
                         Ok(bus) => TrayController::new(bus, self.senders.tray.clone()).await,
                         Err(err) => {
                             eprintln!(
@@ -364,7 +370,7 @@ impl Capabilities {
             // RequestName's DoNotQueue.
             Capability::Notifications => {
                 if self.notifications.is_none() {
-                    self.notifications = Some(match zbus::Connection::session().await {
+                    self.notifications = Some(match with_call_timeout(zbus::connection::Builder::session()).await {
                         Ok(bus) => {
                             NotificationsController::new(bus, self.senders.notifications.clone(), self.sound_tx.clone())
                                 .await
@@ -381,7 +387,7 @@ impl Capabilities {
             // Own session bus (ADR-0036); `new` spawns discovery and returns.
             Capability::Mpris => {
                 if self.mpris.is_none() {
-                    self.mpris = Some(match zbus::Connection::session().await {
+                    self.mpris = Some(match with_call_timeout(zbus::connection::Builder::session()).await {
                         Ok(bus) => MprisController::new(bus, self.senders.mpris.clone()),
                         Err(err) => {
                             eprintln!(

@@ -111,7 +111,7 @@ pub(super) trait DBusMenu {
         property_names: &[&str],
     ) -> zbus::Result<(u32, RawMenuLayout)>;
 
-    #[zbus(name = "Event")]
+    #[zbus(name = "Event", no_reply)]
     fn event(&self, id: i32, event_id: &str, data: &Value<'_>, timestamp: u32) -> zbus::Result<()>;
 
     #[zbus(name = "AboutToShow")]

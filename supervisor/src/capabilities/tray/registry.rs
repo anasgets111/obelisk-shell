@@ -108,10 +108,7 @@ pub(super) async fn register_item(
     // eliminates, the race.
     if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(connection).await {
         match dbus_proxy.name_has_owner(BusName::from(unique_name.clone())).await {
-            Ok(false) => {
-                eprintln!("tray: {unique_name} disconnected during registration; not inserting a registry entry");
-                return Ok(());
-            }
+            Ok(false) => return Err(format!("{unique_name} disconnected during registration")),
             Ok(true) => {}
             Err(err) => {
                 eprintln!("tray: pre-insert liveness check for {unique_name} failed (proceeding anyway): {err}")

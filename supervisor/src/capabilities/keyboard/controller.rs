@@ -84,7 +84,7 @@ pub struct KeyboardController {
 }
 
 impl KeyboardController {
-    /// `system_bus` is the existing `zbus::Connection::system()` used by `KbdBacklightProxy`
+    /// `system_bus` is the Supervisor's system bus, used by `KbdBacklightProxy`
     /// (ADR-0034). A failed `GetMaxBrightness()` yields [`Backlight::Unavailable`]. `leds_root`
     /// (default `/sys/class/leds`) is the test-injected sysfs fallback root. Layout selects one
     /// [`CompositorLink`] via `crate::compositor`'s env probe, or `None` without an implementor.

@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::TraySignal;
 use super::registration::resolve_registration;
 use super::registry::{ItemRegistry, register_item};
+use super::{TraySignal, WATCHER_OBJECT_PATH};
 
 pub(super) struct StatusNotifierWatcher {
     pub(super) connection: zbus::Connection,
@@ -23,7 +23,6 @@ impl StatusNotifierWatcher {
         &self,
         service: String,
         #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         let sender = header.sender().map(|s| s.to_string());
         // Log as well as return: the registering icon usually shows nothing, so a refused
@@ -38,12 +37,17 @@ impl StatusNotifierWatcher {
         // pair and now says so (ADR-0172).
         let registered_id = format!("{}{}", resolved.unique_name.as_str(), resolved.object_path.as_str());
 
-        register_item(&self.connection, &self.registry, &self.events, resolved).await.map_err(|err| {
-            eprintln!("tray: RegisterStatusNotifierItem({service:?}) failed: {err}");
-            zbus::fdo::Error::Failed(format!("RegisterStatusNotifierItem({service:?}) failed: {err}"))
-        })?;
-
-        let _ = emitter.status_notifier_item_registered(&registered_id).await;
+        // Reply before asking the item anything (ADR-0031 amendment).
+        let (connection, registry, events) = (self.connection.clone(), self.registry.clone(), self.events.clone());
+        tokio::spawn(async move {
+            if let Err(err) = register_item(&connection, &registry, &events, resolved).await {
+                eprintln!("tray: RegisterStatusNotifierItem({service:?}) failed: {err}");
+                return;
+            }
+            if let Ok(emitter) = zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH) {
+                let _ = StatusNotifierWatcher::status_notifier_item_registered(&emitter, &registered_id).await;
+            }
+        });
         Ok(())
     }
 
@@ -188,7 +192,7 @@ mod tests {
         }
     }
 
-    /// One of the two tests here that really calls the peer, so its stubs go in through
+    /// A test that really calls the peer, so its stubs go in through
     /// `p2p_pair_serving` rather than `object_server().at(..)`; see `test_support::p2p_pair` for
     /// why that ordering is the difference between a reply and a dropped call.
     ///
@@ -206,14 +210,61 @@ mod tests {
 
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let watcher = test_watcher(connection.clone(), registry.clone());
-        let emitter =
-            zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
 
         let message = register_call_message(":1.5");
-        let result = watcher.register_status_notifier_item(":1.5".to_string(), message.header(), emitter).await;
+        let result = watcher.register_status_notifier_item(":1.5".to_string(), message.header()).await;
 
         assert!(result.is_ok(), "a claimed unique name equal to the real sender must be accepted: {result:?}");
-        assert_eq!(registry.lock().unwrap().len(), 1, "a matching registration must create exactly one registry entry");
+        assert_eq!(wait_for_entries(&registry, 1).await.len(), 1, "a matching registration must create one entry");
+    }
+
+    struct SilentStatusNotifierItem;
+
+    #[zbus::interface(name = "org.kde.StatusNotifierItem")]
+    impl SilentStatusNotifierItem {
+        #[zbus(property, name = "Status")]
+        async fn status(&self) -> String {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_that_never_answers_holds_neither_its_reply_nor_the_next_item() {
+        let (connection, _peer) = p2p_pair_serving(|peer| {
+            peer.serve_at("/Silent", SilentStatusNotifierItem)?
+                .serve_at("/Live", StubStatusNotifierItem)?
+                .serve_at("/org/freedesktop/DBus", StubDBusDaemon)
+        })
+        .await;
+        let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let watcher = test_watcher(connection.clone(), registry.clone());
+
+        for path in ["/Silent", "/Live"] {
+            let message = register_call_message(":1.5");
+            let reply = watcher.register_status_notifier_item(path.to_string(), message.header());
+            tokio::time::timeout(std::time::Duration::from_millis(500), reply)
+                .await
+                .expect("RegisterStatusNotifierItem must reply without waiting on the item")
+                .expect("a registration from the real sender is accepted");
+        }
+
+        let paths = wait_for_entries(&registry, 1).await;
+        assert_eq!(paths, ["/Live"], "the live item lands while the silent one is still being asked");
+    }
+
+    async fn wait_for_entries(registry: &ItemRegistry, count: usize) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let paths: Vec<String> =
+                    registry.lock().unwrap().keys().map(|(_, object_path)| object_path.to_string()).collect();
+                if paths.len() >= count {
+                    return paths;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the registry never reached the expected size")
     }
 
     #[tokio::test]
@@ -221,12 +272,10 @@ mod tests {
         let (connection, _peer) = p2p_pair().await;
         let registry: ItemRegistry = Arc::new(Mutex::new(HashMap::new()));
         let watcher = test_watcher(connection.clone(), registry.clone());
-        let emitter =
-            zbus::object_server::SignalEmitter::new(&connection, WATCHER_OBJECT_PATH).expect("valid signal emitter");
 
         // The real sender is :1.5; the call claims fabricated, never-connected :999.1.
         let message = register_call_message(":1.5");
-        let result = watcher.register_status_notifier_item(":999.1".to_string(), message.header(), emitter).await;
+        let result = watcher.register_status_notifier_item(":999.1".to_string(), message.header()).await;
 
         assert!(result.is_err(), "a fabricated unique name not equal to the real sender must be rejected");
         assert!(registry.lock().unwrap().is_empty(), "a rejected registration must not create a registry entry");

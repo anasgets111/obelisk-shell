@@ -108,8 +108,8 @@ pub struct IdleController {
 }
 
 impl IdleController {
-    /// Constructs both halves and returns immediately. `system_bus` is the Supervisor's existing
-    /// `zbus::Connection::system()`; inhibit uses it directly (ADR-0032).
+    /// Constructs both halves and returns immediately. `system_bus` is the Supervisor's system bus;
+    /// inhibit uses it directly (ADR-0032).
     ///
     /// Notify starts [`NotifyState::Inert`] and upgrades to `Live` in a bounded `spawn_blocking`
     /// task running [`connect_wayland_idle`]. Its `roundtrip()` hung once against niri; awaiting

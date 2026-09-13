@@ -702,6 +702,10 @@ Reuse ADR-0029's capability snapshot plumbing.
 Amendment, ADR-0054: the spool overwrites in place, but Renderer texture keys use path, modification
 time and length, fixing stale icons without changing the no-spool-suffix decision.
 
+Amendment to decision 5: `RegisterStatusNotifierItem` replies once the sender passes the check, and a
+spawned task fetches the item, as KDE's and Quickshell's watchers do. `TrayController::new` no longer
+awaits host registration or adoption, which froze the Supervisor when a tray app raced it at boot.
+
 ## 0032. Idle capability splits transport but keeps one controller
 
 One Supervisor controller owns Wayland idle notification and logind inhibition. One idle-notify
@@ -1429,6 +1433,9 @@ construction is an upgrade if measured startup cost warrants it.
 6. Polkit registration/session-subject failures log and continue, including an already-owned agent.
 
 7. Permit empty configs and zero surfaces; their presentation handshake completes without work.
+
+Amendment to decision 4: every Supervisor D-Bus connection sets the 25s call timeout Qt, GDBus and
+libdbus default to, so an inline start waits at most that per call and then takes its error path.
 
 ## 0071. The GL context is built by the first surface that needs it
 
