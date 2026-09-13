@@ -16,9 +16,8 @@
 --
 -- ## Not carried over
 --
--- Displays tab (`DisplaySettings.qml`), transition/theme/dark-mode rows (no animation model,
--- ADR-0055 decision 4, and this config has one theme), and `~/.cache/thumbnails` are not carried
--- over. Pool downscale makes tiles cheap and each generation decodes once.
+-- Displays tab (`DisplaySettings.qml`) and theme/dark-mode rows (this config has one theme). Tiles
+-- read and write `~/.cache/thumbnails` through `async` (ADR-0122), as the mirror's previews do.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local cell = require("components.cell")
@@ -28,6 +27,7 @@ local modal = require("components.modal")
 local wallpaper = require("lib.wallpaper")
 local panel_card = require("components.panel_card")
 local panel_empty_state = require("components.panel_empty_state")
+local spinner = require("components.spinner")
 local icon_button = require("components.icon_button")
 
 local SCROLL = scroll("wallpaper_grid")
@@ -185,9 +185,12 @@ local function move(delta)
     SCROLL:reveal(math.ceil(next_index / COLUMNS))
 end
 
-local function select_first()
-    selected_path:set("")
-    SCROLL:reveal(1)
+-- `updateSelection`: with no query, ring the applied file and scroll to it; else the first match.
+local function reset_selection()
+    local entries = filtered:get() or {}
+    local index = math.max(1, trimmed:get() == "" and index_of(entries, current_path:get()) or 1)
+    selected_path:set(entries[index] and entries[index].path or "")
+    SCROLL:reveal(math.ceil(index / COLUMNS))
 end
 
 local function close()
@@ -333,7 +336,7 @@ local function state_is(name)
 end
 
 local empty_states = {
-    panel_empty_state("Loading wallpapers…", state_is("loading"), { icon = icons.wallpaper }),
+    panel_empty_state("Loading wallpapers…", state_is("loading"), { icon = spinner(state_is("loading"), theme.icon.xl) }),
     panel_empty_state(
         obelisk.files:map(function(f)
             local folder = wallpaper.folder_in(f)
@@ -366,7 +369,7 @@ local search = rect {
             foreground = theme.FG,
             on_change = function(text)
                 query:set(text)
-                select_first()
+                reset_selection()
             end,
             on_submit = apply_selected,
             on_cancel = function(cleared)
@@ -444,7 +447,7 @@ local monitor_row = list {
     itemfn = function(option)
         return choice(option.value, option.label, effective_monitor, function(value)
             monitor:set(value)
-            selected_path:set("")
+            reset_selection()
         end, "wallpaper-monitor-" .. option.value)
     end,
     key = function(option)
@@ -550,7 +553,8 @@ local sidebar = panel_card({
     padding = { top = theme.spacing.md, right = theme.spacing.md, bottom = theme.spacing.md, left = theme.spacing.md },
 })
 
-local grid_card_children = { grid, table.unpack(empty_states) }
+-- A `rect` stacks, so an empty state centres over the grid instead of under its `Fill`.
+local grid_card_children = { rect { width = "Fill", height = "Fill", children = { grid, table.unpack(empty_states) } } }
 
 local body = row {
     width = "Fill",

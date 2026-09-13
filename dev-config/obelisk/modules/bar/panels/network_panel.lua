@@ -24,6 +24,7 @@ local panel_toggle_card = require("components.panel_toggle_card")
 local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
 local panel_empty_state = require("components.panel_empty_state")
+local spinner = require("components.spinner")
 local action_button = require("components.action_button")
 local ui = require("lib.ui_state")
 
@@ -225,20 +226,20 @@ local body = {
         end),
         subtitle = util.label(obelisk.network, state_line),
         trailing = {
-            -- Rescan is lit while scanning. The mirror uses a spinner; this has none, so the same
-            -- lit-ground rule as DND and Bluetooth scan says "running". `scanning` flips on click
-            -- (§ 2.5), making the light immediate.
+            -- The mirror swaps rescan for a spinner while scanning; `scanning` flips on click (§ 2.5).
             icon_button(icons.refresh, function()
                 obelisk.network:invoke("scan")
             end, {
                 slot = "network-rescan",
                 size = theme.control.sm,
                 icon_size = theme.icon.sm,
-                background = obelisk.network:map(function(n)
-                    return (n and n.scanning) and theme.ACCENT_MEDIUM or theme.GLASS_CONTROL
+                visible = util.shown_when(obelisk.network, function(n)
+                    return radio_on(n) and not n.scanning
                 end),
-                visible = util.shown_when(obelisk.network, radio_on),
             }),
+            spinner(util.shown_when(obelisk.network, function(n)
+                return n.scanning
+            end), theme.icon.md),
             -- `NetworkService.setNetworkingEnabled` controls the whole stack; off hides the tiles,
             -- avoiding a radio control that does nothing.
             toggle(obelisk.network, function(n)
@@ -360,22 +361,12 @@ local body = {
                 secure_submit = { capability = "network", action = "connect" },
                 font_size = theme.font.sm,
             }),
-            -- The mirror's `OSpinner` beside "Connecting…". There is no spinner node here, so the
-            -- word breathes instead, using `loops = "Infinite"` as in `power_menu.lua` (ADR-0152).
-            -- Its presence gates the sequence: the pulse exists only while waiting.
-            text {
-                content = "connecting…",
-                foreground = theme.DIM,
-                font_size = theme.font.xs,
+            -- The mirror's `OSpinner` beside "Connecting…".
+            row {
+                spacing = theme.spacing.xs,
+                align_v = "Center",
                 visible = during("waiting"),
-                animate = {
-                    opacity = {
-                        duration = theme.animation_slow_ms,
-                        easing = "InOutQuad",
-                        loops = "Infinite",
-                        keyframes = { 1, 0.4, 1 },
-                    },
-                },
+                children = { spinner(during("waiting"), theme.icon.md), cell("connecting…", theme.DIM, theme.font.xs) },
             },
             -- `⚠ errorMessage` under the field, not at the card's top, where the mirror puts it:
             -- the error belongs to the network being asked about.

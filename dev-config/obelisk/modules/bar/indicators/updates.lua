@@ -7,8 +7,7 @@
 -- ADR-0134 adds the "checking" state. `UpdatesState` always carried the in-flight flag; only this
 -- indicator treated it as never checked.
 --
--- The mirror spins while installing. Here colour carries the state; rotation needs a per-frame
--- property, and ADR-0021's 5ms timer cap provides no timer to drive it.
+-- The mirror spins while installing. Here colour carries the state.
 --
 -- Visible when a package manager exists. `LeftSide.qml` wraps it in a `Loader` whose `active` is
 -- `UpdateService.ready`, matching `ArchChecker.qml`'s `MainService.isArchBased && command -v

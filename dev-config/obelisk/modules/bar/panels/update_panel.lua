@@ -5,8 +5,8 @@
 -- Supervisor publishes `install_exit_code` and pacman's output; "failed retrieving file" becomes
 -- "could not download; check the connection". Numbers are language-neutral; that sentence is not.
 --
--- Not carried over: spinner (no per-frame property, ADR-0021) and copy-log button (no clipboard
--- primitive). `modules/bar/indicators/updates.lua` schedules the checks (ADR-0115) on the cadence
+-- Not carried over: copy-log button (no clipboard primitive).
+-- `modules/bar/indicators/updates.lua` schedules the checks (ADR-0115) on the cadence
 -- declared below and installs from the notification action through `install` here.
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -15,6 +15,7 @@ local cell = require("components.cell")
 local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local panel_empty_state = require("components.panel_empty_state")
+local spinner = require("components.spinner")
 local icon_button = require("components.icon_button")
 local action_button = require("components.action_button")
 local panel_action_icon = require("components.panel_action_icon")
@@ -417,6 +418,11 @@ local empty_showing = unless_settings(computed({ obelisk.updates, result_showing
     return u ~= nil and not showing and not u.installing and not u.checking and (u.count or 0) == 0
 end))
 
+-- The mirror's "Checking…".
+local checking_showing = unless_settings(computed({ obelisk.updates, result_showing }, function(u, showing)
+    return u ~= nil and not showing and not u.installing and u.checking == true
+end))
+
 -- Follow the newest line, as the mirror's `followOutput` does. Every push reveals, not only the
 -- lengthening ones: the log is a 200-line tail, so past that the content changes while the length
 -- does not.
@@ -492,6 +498,11 @@ for _, tool in ipairs(dev_tools) do
     }
 end
 
+-- The mirror's "Working…": installing before pacman has counted the packages.
+local working = util.shown_when(obelisk.updates, function(u)
+    return u.installing and (u.install_total_steps or 0) == 0
+end)
+
 local body = {
     panel_header {
         title = "updates",
@@ -555,6 +566,12 @@ local body = {
                 end, theme.ACCENT, "Fill"),
             },
         },
+        row {
+            spacing = theme.spacing.sm,
+            align_v = "Center",
+            visible = working,
+            children = { spinner(working, theme.control.sm), cell("working…", theme.DIM, theme.font.xs) },
+        },
     }, { background = theme.GLASS_CONTENT, width = "Fill", spacing = theme.spacing.xs }),
     -- List: name left, old/new versions in fixed columns, arrow between them. A heading row would
     -- duplicate the table's headings.
@@ -611,6 +628,7 @@ local body = {
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", visible = log_showing }),
     panel_empty_state("nothing to update", empty_showing, { icon = icons.up_to_date }),
+    panel_empty_state("checking…", checking_showing, { icon = spinner(checking_showing, theme.control.sm) }),
     panel_card({ section_header("run with package updates"), column {
         width = "Fill",
         children = tool_rows,

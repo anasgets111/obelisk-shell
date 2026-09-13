@@ -13,12 +13,15 @@ local util = require("lib.util")
 
 ---@param message string|Bound
 ---@param visible boolean|Bound
----@param opts? { icon?: string|Bound, subtext?: string|Bound }
+---@param opts? { icon?: string|Bound|table, subtext?: string|Bound }
 return function(message, visible, opts)
     opts = opts or {}
     local lines = {}
-    if opts.icon then
-        lines[#lines + 1] = glyph(opts.icon, theme.DIM, theme.icon.xl, { align = "Center" })
+    local mark = opts.icon
+    if type(mark) == "table" then
+        lines[#lines + 1] = mark
+    elseif mark then
+        lines[#lines + 1] = glyph(mark, theme.DIM, theme.icon.xl, { align = "Center" })
     end
     lines[#lines + 1] = cell(message, theme.DIM, theme.font.sm, { align = "Center" })
     if opts.subtext then
