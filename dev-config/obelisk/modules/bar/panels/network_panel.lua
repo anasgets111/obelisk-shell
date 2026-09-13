@@ -156,7 +156,7 @@ local function access_point_row(entry)
     local ap = entry.ap
     local band, color = util.band_of(ap)
 
-    local leading = { glyph(util.wifi_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
+    local leading = { glyph(icons.wifi[util.signal_tier(ap.strength)], color, theme.icon.md, { align_v = "Center" }) }
     if band then
         leading[#leading + 1] = cell({ { text = band, bold = true } }, color, theme.font.xs, { align_v = "End" })
     end

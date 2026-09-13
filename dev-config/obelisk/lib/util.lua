@@ -160,7 +160,7 @@ function util.network_glyph(n)
     if n.ssid == nil then
         return icons.wifi_none
     end
-    return util.wifi_glyph(n.strength)
+    return icons.wifi[util.signal_tier(n.strength)]
 end
 
 -- `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0, 1-indexed here. The bars in the bar, the
@@ -170,23 +170,16 @@ function util.signal_tier(strength)
     return percent >= 95 and 4 or percent >= 80 and 3 or percent >= 50 and 2 or 1
 end
 
-function util.wifi_glyph(strength)
-    return require("config.icons").wifi[util.signal_tier(strength)]
-end
-
 -- Bluetooth devices by shown name, then MAC. The Supervisor builds both lists from a `HashMap`, so
--- their order can change on any rebuild and rows would swap under the pointer.
+-- their order can change on any rebuild and rows would swap under the pointer. `"\0"` sorts below
+-- every name character, so a name that prefixes another still sorts first.
 function util.sorted_devices(devices)
     local function key(device)
-        return (device.name ~= nil and device.name ~= "") and device.name:lower() or (device.mac or "")
+        return (device.name ~= "" and device.name:lower() or device.mac) .. "\0" .. device.mac
     end
     local out = table.move(devices or {}, 1, #(devices or {}), 1, {})
     table.sort(out, function(left, right)
-        local left_key, right_key = key(left), key(right)
-        if left_key ~= right_key then
-            return left_key < right_key
-        end
-        return (left.mac or "") < (right.mac or "")
+        return key(left) < key(right)
     end)
     return out
 end

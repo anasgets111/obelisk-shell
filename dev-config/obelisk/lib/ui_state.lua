@@ -118,22 +118,16 @@ local function open_hidden_prompt()
     hidden_prompt:set(true)
 end
 
--- Discovery runs while the bluetooth panel shows, as `BluetoothPanel.qml`'s `shouldDiscover`. The
--- literal kind, like `"notifications"` below: requiring the panel here would be a cycle.
---
--- Sent on every edge, not only when `discovering` differs: the Supervisor keeps it as intent and
--- matches BlueZ to it, so a close before the start is reported still stops the scan, and a radio
--- switched on with the panel up starts one.
-local function set_bluetooth_discovery(on)
-    obelisk.bluetooth:invoke(on and "start_discovery" or "stop_discovery")
-end
-
 -- The MAC whose codec list is open in the bluetooth panel, or `""`; cleared when the panel closes.
 local bluetooth_codec_for = state("bluetooth_codec_for", "")
 
+-- Discovery runs while the bluetooth panel shows, as `BluetoothPanel.qml`'s `shouldDiscover`. The
+-- literal kind, like `"notifications"` below: requiring the panel here would be a cycle. Both edges
+-- are sent, not only a change of `discovering`: the Supervisor keeps it as intent and matches BlueZ
+-- to it, so a close before the start is reported still stops the scan.
 local function leave_bluetooth_panel()
     if panel_open:get() and panel_kind:get() == "bluetooth" then
-        set_bluetooth_discovery(false)
+        obelisk.bluetooth:invoke("stop_discovery")
         bluetooth_codec_for:set("")
     end
 end
@@ -181,7 +175,7 @@ local function toggle_panel(kind, rect)
     panel_kind:set(kind)
     panel_open:set(true)
     if kind == "bluetooth" then
-        set_bluetooth_discovery(true)
+        obelisk.bluetooth:invoke("start_discovery")
     end
 end
 

@@ -39,18 +39,6 @@ end
 
 local ui = require("lib.ui_state")
 
-local function connected(b)
-    return util.sorted_devices(b and b.connected_devices)
-end
-
-local function paired(b)
-    return util.sorted_devices(b and b.paired_devices)
-end
-
-local function discovered(b)
-    return util.sorted_devices(b and b.discovered_devices)
-end
-
 local function enabled(b)
     return b ~= nil and b.enabled
 end
@@ -62,9 +50,10 @@ local function state_line(b)
     if not b.enabled then
         return "off"
     end
-    local first = connected(b)[1]
+    local joined = util.sorted_devices(b.connected_devices)
+    local first = joined[1]
     if first then
-        local parts = { string.format("%d connected", #connected(b)), display_name(first) }
+        local parts = { string.format("%d connected", #joined), display_name(first) }
         local battery = battery_text(first)
         if battery then
             parts[#parts + 1] = battery
@@ -156,7 +145,8 @@ local rows = computed({ obelisk.bluetooth, obelisk.audio, ui.bluetooth_codec_for
             end
         end
     end
-    local joined, known, found = connected(b), paired(b), discovered(b)
+    local joined = util.sorted_devices(b.connected_devices)
+    local known, found = util.sorted_devices(b.paired_devices), util.sorted_devices(b.discovered_devices)
     if #joined + #known > 0 then
         out[#out + 1] = { kind = "header", label = "paired", key = "header-paired" }
         add(joined, "connected")
@@ -340,8 +330,9 @@ local body = {
             end
             return b.discovering and "scanning…" or "no devices found"
         end),
-        util.shown_when(obelisk.bluetooth, function(b)
-            return not b.enabled or (#connected(b) == 0 and #paired(b) == 0 and #discovered(b) == 0)
+        -- `rows` is empty exactly when the radio is off or every device list is.
+        computed({ obelisk.bluetooth, rows }, function(b, out)
+            return b ~= nil and #out == 0
         end),
         { icon = icons.bt_off }
     ),
