@@ -49,6 +49,9 @@ pub struct ConnectedDevice {
     /// `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a
     /// capability.
     pub category: String,
+    /// Same as [`DiscoveredDevice::busy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -59,6 +62,9 @@ pub struct PairedDevice {
     pub name: String,
     /// Drawing hint, the same set as [`ConnectedDevice::category`].
     pub category: String,
+    /// Same as [`DiscoveredDevice::busy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -69,6 +75,12 @@ pub struct DiscoveredDevice {
     pub name: String,
     /// Always `false`; every entry in this pool is unpaired (IDL contract).
     pub paired: bool,
+    /// `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device
+    /// runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ
+    /// has no property for a call in flight, so a pair or connect started by another client or by
+    /// the device itself never shows here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]

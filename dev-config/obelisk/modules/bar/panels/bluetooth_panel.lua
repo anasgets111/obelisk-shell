@@ -19,6 +19,7 @@ local panel_row = require("components.panel_row")
 local panel_action_icon = require("components.panel_action_icon")
 local info_badge = require("components.info_badge")
 local panel_empty_state = require("components.panel_empty_state")
+local spinner = require("components.spinner")
 
 local KIND = "bluetooth"
 local SCROLL = scroll("bluetooth_devices")
@@ -148,11 +149,32 @@ local rows = obelisk.bluetooth:map(function(b)
     return out
 end)
 
+-- One shared always-on signal for every busy row's spinner. `itemfn` runs on each push, and a
+-- signal minted per row there would grow the registry for the life of the session.
+local SPINNING = obelisk.bluetooth:map(function()
+    return true
+end)
+
+-- The mirror's `busy` row: a spinner in place of the actions, the action as the subtitle, and no
+-- click, so a second pair or connect cannot start over the first.
+local function busy_row(device)
+    return panel_row {
+        slot = "bluetooth-device-" .. tostring(device.mac),
+        icon = device_icon(device),
+        title = display_name(device),
+        subtitle = device.busy .. "…",
+        trailing = spinner(SPINNING, theme.icon.md),
+    }
+end
+
 local function device_row(item)
     if item.kind == "header" then
         return section_header(item.label)
     end
     local device = item.device
+    if device.busy ~= nil then
+        return busy_row(device)
+    end
     local trailing = {}
     if item.status == "connected" then
         local badge = battery_badge(device)

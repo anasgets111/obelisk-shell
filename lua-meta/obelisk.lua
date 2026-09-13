@@ -114,12 +114,14 @@
 
 ---@class ConnectedDevice
 ---@field battery integer Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed), per the IDL.
+---@field busy? string Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a capability.
 ---@field codec? string Always `None` for now; codec query/control is deferred (ADR-0030) to an `audio` capability with a live PipeWire `Device` proxy.
 ---@field mac string Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
 ---@field name string The device's advertised name.
 
 ---@class DiscoveredDevice
+---@field busy? string `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ has no property for a call in flight, so a pair or connect started by another client or by the device itself never shows here.
 ---@field mac string Canonical MAC address accepted by `bluetooth:pair(mac)`.
 ---@field name string Advertised name, often empty when the device broadcasts only an address.
 ---@field paired boolean Always `false`; every entry in this pool is unpaired (IDL contract).
@@ -197,6 +199,7 @@
 ---@field workspaces WorkspaceEntry[] Workspaces on this output, ordered by [`WorkspaceEntry::idx`]; the strip draws these because the two ids above are opaque.
 
 ---@class PairedDevice
+---@field busy? string Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint, the same set as [`ConnectedDevice::category`].
 ---@field mac string Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
 ---@field name string The device's advertised name.

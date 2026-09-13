@@ -28,6 +28,8 @@ pub struct BluetoothController {
     /// Push state (ADR-0037), mutated only by [`handle_signal`](Self::handle_signal). The mutex is
     /// never held across an await.
     state: Arc<Mutex<BluetoothState>>,
+    /// MAC to the action this Supervisor is running for it, drawn as each device's `busy`.
+    busy: Arc<Mutex<HashMap<String, &'static str>>>,
     /// Signal sender used by [`clear_discovered`](Self::clear_discovered) to share the forwarders'
     /// FIFO.
     events: UnboundedSender<BluetoothSignal>,
@@ -99,7 +101,13 @@ impl BluetoothController {
 
         register_agent_best_effort(&connection).await;
 
-        let controller = Self { adapter, devices, state: Arc::new(Mutex::new(BluetoothState::default())), events };
+        let controller = Self {
+            adapter,
+            devices,
+            state: Arc::new(Mutex::new(BluetoothState::default())),
+            busy: Arc::default(),
+            events,
+        };
         // Hydrate before returning, because the forwarders above are already queueing and zbus
         // yields a cached property's current value as its stream's first item: one of them writes
         // the first snapshot a config ever sees. Each signal re-derives only its own half, so
@@ -173,6 +181,7 @@ impl BluetoothController {
             guard.values().map(|entry| (entry.mac.clone(), entry.device.clone(), entry.battery.clone())).collect()
         };
 
+        let running = self.busy.lock().unwrap().clone();
         let mut connected = Vec::new();
         let mut paired_only = Vec::new();
         let mut discovered = Vec::new();
@@ -180,22 +189,32 @@ impl BluetoothController {
             let paired = device.paired().await.unwrap_or(false);
             let is_connected = device.connected().await.unwrap_or(false);
             let name = device.name().await.unwrap_or_default();
+            let busy = running.get(&mac).map(|action| action.to_string());
             if !paired {
-                discovered.push(DiscoveredDevice { mac, name, paired: false });
+                discovered.push(DiscoveredDevice { mac, name, paired: false, busy });
                 continue;
             }
             let category = class_to_category(device.class().await.unwrap_or(0)).to_string();
             if !is_connected {
-                paired_only.push(PairedDevice { mac, name, category });
+                paired_only.push(PairedDevice { mac, name, category, busy });
                 continue;
             }
             let battery_percent = match &battery {
                 Some(battery) => battery.percentage().await.map(i32::from).unwrap_or(-1),
                 None => -1,
             };
-            connected.push(ConnectedDevice { mac, name, battery: battery_percent, codec: None, category });
+            connected.push(ConnectedDevice { mac, name, battery: battery_percent, codec: None, category, busy });
         }
         (connected, paired_only, discovered)
+    }
+
+    /// Marks `mac` as running `action` until the guard drops, pushing a rebuild on both edges so
+    /// the row spins on the click. A later action replaces the label, which is how `pair` hands the
+    /// row to its `connect`; the earlier guard then finds its label gone and leaves it.
+    fn mark_busy(&self, mac: &str, action: &'static str) -> BusyGuard<'_> {
+        self.busy.lock().unwrap().insert(mac.to_string(), action);
+        let _ = self.events.send(BluetoothSignal::DeviceRegistryChanged);
+        BusyGuard { controller: self, mac: mac.to_string(), action }
     }
 
     /// Synchronously resolves `mac` to its tracked path and `Device1` proxy. No `.await`, so the
@@ -249,6 +268,7 @@ impl BluetoothController {
             eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
+        let _busy = self.mark_busy(mac, "pairing");
         if let Err(err) = device.pair().await {
             eprintln!("bluetooth: pair({mac:?}) failed: {err}");
             return;
@@ -263,6 +283,7 @@ impl BluetoothController {
             eprintln!("bluetooth: connect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
+        let _busy = self.mark_busy(mac, "connecting");
         if let Err(err) = device.set_trusted(true).await {
             eprintln!("bluetooth: failed to set Trusted on {mac:?}: {err}");
         }
@@ -273,13 +294,13 @@ impl BluetoothController {
 
     /// `bluetooth:disconnect(mac)`.
     pub async fn disconnect(&self, mac: &str) {
-        match self.resolve_device(mac) {
-            Some((_, device)) => {
-                if let Err(err) = device.disconnect().await {
-                    eprintln!("bluetooth: disconnect({mac:?}) failed: {err}");
-                }
-            }
-            None => eprintln!("bluetooth: disconnect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice),
+        let Some((_, device)) = self.resolve_device(mac) else {
+            eprintln!("bluetooth: disconnect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
+            return;
+        };
+        let _busy = self.mark_busy(mac, "disconnecting");
+        if let Err(err) = device.disconnect().await {
+            eprintln!("bluetooth: disconnect({mac:?}) failed: {err}");
         }
     }
 
@@ -297,5 +318,60 @@ impl BluetoothController {
         if let Err(err) = adapter.remove_device(&path).await {
             eprintln!("bluetooth: RemoveDevice({mac:?}) failed: {err}");
         }
+    }
+}
+
+/// Clears its action from the busy map when the call ends, on every return path and on
+/// cancellation.
+struct BusyGuard<'a> {
+    controller: &'a BluetoothController,
+    mac: String,
+    action: &'static str,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.controller.busy.lock().unwrap();
+        if busy.get(&self.mac) == Some(&self.action) {
+            busy.remove(&self.mac);
+        }
+        drop(busy);
+        let _ = self.controller.events.send(BluetoothSignal::DeviceRegistryChanged);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller() -> (BluetoothController, tokio::sync::mpsc::UnboundedReceiver<BluetoothSignal>) {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let controller = BluetoothController {
+            adapter: None,
+            devices: Arc::default(),
+            state: Arc::default(),
+            busy: Arc::default(),
+            events,
+        };
+        (controller, receiver)
+    }
+
+    #[test]
+    fn a_pair_hands_its_row_to_the_connect_that_follows_it() {
+        let (controller, mut receiver) = controller();
+        let running = |c: &BluetoothController| c.busy.lock().unwrap().get("AA").copied();
+
+        let pairing = controller.mark_busy("AA", "pairing");
+        assert_eq!(running(&controller), Some("pairing"));
+        let connecting = controller.mark_busy("AA", "connecting");
+        assert_eq!(running(&controller), Some("connecting"));
+
+        drop(connecting);
+        assert_eq!(running(&controller), None, "the connect ending clears the row");
+        drop(pairing);
+        assert_eq!(running(&controller), None, "the pair's guard does not resurrect or clear a newer label");
+
+        let pushes = std::iter::from_fn(|| receiver.try_recv().ok()).count();
+        assert_eq!(pushes, 4, "every edge rebuilds, so the spinner follows each one");
     }
 }
