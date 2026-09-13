@@ -1,5 +1,4 @@
-//! BlueZ Bluetooth D-Bus controller (`obelisk.bluetooth`; docs/obelisk-supervisor-
-//! services-dbus.md §5; docs/lua-api.md §2.6; ADR-0030).
+//! BlueZ Bluetooth D-Bus controller (`obelisk.bluetooth`; ADR-0030).
 //!
 //! Proxies follow BlueZ's D-Bus API docs; `org.freedesktop.DBus.ObjectManager` reuses
 //! `zbus::fdo::ObjectManagerProxy` (ADR-0030: no maintained BlueZ proxy crate).
@@ -34,7 +33,7 @@ pub mod registry;
 
 pub use controller::BluetoothController;
 
-// State shape pushed as `obelisk.bluetooth`'s StateSnapshot (docs/lua-api.md §2.6).
+// State shape pushed as `obelisk.bluetooth`'s StateSnapshot.
 // ---------------------------------------------------------------------------------------------
 
 /// The call this Supervisor is running for a device, drawn as its `busy`.
@@ -135,7 +134,9 @@ pub struct BluetoothState {
     pub connected_devices: Vec<ConnectedDevice>,
     /// Paired devices that are not connected, unordered like `connected_devices`.
     pub paired_devices: Vec<PairedDevice>,
-    /// Unpaired devices BlueZ knows. A stop keeps them; BlueZ expires each after `TemporaryTimeout` (30s).
+    /// Unpaired devices BlueZ knows. A stop keeps them; only devices still marked temporary expire,
+    /// after `TemporaryTimeout` (30s by default) -- one that was connected/trusted, or stored from
+    /// an earlier session, stays.
     pub discovered_devices: Vec<DiscoveredDevice>,
     /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
     #[serde(skip_serializing_if = "Option::is_none")]

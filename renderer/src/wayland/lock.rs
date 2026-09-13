@@ -10,13 +10,13 @@ use crate::wayland::surface::TrackedRole;
 /// ADR-0052 decision 3's refusal for a config with no `lock` node: acquiring would paint nothing,
 /// and the compositor does not unlock on client death (ADR-0042), leaving only a VT switch. That
 /// is a denial of service, not fail-secure.
-const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface (§ 6.4), so locking the session would leave a black screen with no password field and no way back \
+const NO_LOCK_DECLARED: &str = "this config declares no `lock` surface, so locking the session would leave a black screen with no password field and no way back \
      in short of a VT switch; the lock was refused (ADR-0052 decision 3)";
 /// ADR-0052 decision 3's other refusal. `lock { id = "x" }` is legal because `child` is optional,
 /// so a tracked node can still resolve to a black screen. Check for exactly one
 /// `layout::secure_submit` `UNLOCK_TARGET`, the only source of an unlock `SecureSubmit`; distinct
 /// from [`NO_LOCK_DECLARED`], which means no `lock` node at all.
-const LOCK_CANNOT_AUTHENTICATE: &str = "this config's `lock` surface (§ 6.4) does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
+const LOCK_CANNOT_AUTHENTICATE: &str = "this config's `lock` surface does not hold exactly one `textfield` with `secure_submit = { capability = \"lock\", action = \"authenticate\" }` \
      and nothing else, so the compositor handing it keyboard focus would arm no field, nothing on it could ever authenticate, and the only way back in \
      would be a VT switch; the lock was refused (ADR-0052 decision 3)";
 /// A release request for a lock the compositor never acknowledged with `locked`; nothing was

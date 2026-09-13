@@ -2,7 +2,7 @@
 -- `modules/osd/service.lua` supplies the entry. It follows the mirror's `Behavior on opacity`/`y`
 -- and lingers through exit (ADR-0146), because the mirror unmaps its window before its fade-out.
 --
--- One `panel` with two `visible`-switched rows, not two panels. § 6 gives each surface its own
+-- One `panel` with two `visible`-switched rows, not two panels. Each surface has its own
 -- compositor identity; otherwise a volume change during a toggle would overlap at one position.
 local theme = require("config.theme")
 local util = require("lib.util")
@@ -126,7 +126,7 @@ local fact_row = row {
 return panel {
     id = "osd",
     layer = "Overlay",
-    -- No `left`/`right`: § 6's anchors map directly to `zwlr_layer_surface_v1`; the
+    -- No `left`/`right`: anchors map directly to `zwlr_layer_surface_v1`; the
     -- `renderer/src/wayland/layer.rs` `anchor_for` is a bare bitflag map. The protocol centres an
     -- axis with neither edge anchored, leaving its width measurable; two anchored edges span it.
     anchor = { bottom = true },

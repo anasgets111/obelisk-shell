@@ -1,4 +1,4 @@
-//! `xdg_shell`'s client-picked `window` (`xdg_toplevel`) and `popup` (`xdg_popup`) roles (§ 6),
+//! `xdg_shell`'s client-picked `window` (`xdg_toplevel`) and `popup` (`xdg_popup`) roles,
 //! including positioners, size negotiation, and the ADR-0049/0051 dismissal latch. Shared
 //! bind/paint/(un)map logic is in `surface`.
 
@@ -16,7 +16,7 @@ enum PopupAction {
     Destroy,
     Nothing,
 }
-/// ADR-0051 decision 2's pure latch machine for § 5.1's `visible`. `dismissed_at` is the pointer
+/// ADR-0051 decision 2's pure latch machine for `visible`. `dismissed_at` is the pointer
 /// count at dismissal; it holds while that count is unchanged (first amendment), since the `visible
 /// = false` edge is otherwise unobservable and a bool would latch forever. The caller clears it on
 /// that edge.
@@ -54,7 +54,7 @@ fn parent_instance_index<'a>(
     first
 }
 /// Popup buffer size. Positive configure axes are authoritative because the compositor may slide,
-/// flip, or resize for § 6 constraints. Non-positive axes use the requested size: SCTK's
+/// flip, or resize for positioner constraints. Non-positive axes use the requested size: SCTK's
 /// `PopupInner` starts pending dimensions at `-1`, which would crash `WlEglSurface::new`; clamp to
 /// at least 1.
 ///
@@ -69,7 +69,7 @@ fn popup_size_for(configured: (i32, i32), requested: (f32, f32)) -> (u32, u32) {
     };
     (axis(configured.0, requested.0), axis(configured.1, requested.1))
 }
-/// § 6 `anchor` to `xdg_positioner`; `Center` is protocol `none`, centered in the anchor rectangle.
+/// `anchor` to `xdg_positioner`; `Center` is protocol `none`, centered in the anchor rectangle.
 fn positioner_anchor(anchor: PopupAnchor) -> xdg_positioner::Anchor {
     match anchor {
         PopupAnchor::Center => xdg_positioner::Anchor::None,
@@ -83,7 +83,7 @@ fn positioner_anchor(anchor: PopupAnchor) -> xdg_positioner::Anchor {
         PopupAnchor::BottomRight => xdg_positioner::Anchor::BottomRight,
     }
 }
-/// § 6 `gravity` to its separate but identical protocol enum; `Center` again maps to `none`,
+/// `gravity` to its separate but identical protocol enum; `Center` again maps to `none`,
 /// which centers the surface over the anchor point on axes without specified gravity.
 fn positioner_gravity(gravity: PopupAnchor) -> xdg_positioner::Gravity {
     match gravity {
@@ -98,7 +98,7 @@ fn positioner_gravity(gravity: PopupAnchor) -> xdg_positioner::Gravity {
         PopupAnchor::BottomRight => xdg_positioner::Gravity::BottomRight,
     }
 }
-/// Six independent § 6 `constraint_adjustment` booleans to the protocol bitmask; precedence is
+/// Six independent `constraint_adjustment` booleans to the protocol bitmask; precedence is
 /// compositor-defined, so config array order carries no meaning.
 fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::ConstraintAdjustment {
     let mut bits = xdg_positioner::ConstraintAdjustment::None;
@@ -110,7 +110,7 @@ fn positioner_constraint(adjustment: ConstraintAdjustment) -> xdg_positioner::Co
     bits.set(xdg_positioner::ConstraintAdjustment::ResizeY, adjustment.resize_y);
     bits
 }
-/// Sends all § 6 positioner fields in protocol order, from the one value that is also what a live
+/// Sends all positioner fields in protocol order, from the one value that is also what a live
 /// popup remembers being given ([`Placement`]), so a field cannot be sent without being compared.
 /// An open popup's positioner is replaced through `xdg_popup.reposition`; a fresh one gets its at
 /// `get_popup`, which consumes it.
@@ -140,7 +140,7 @@ fn configure_positioner(positioner: &XdgPositioner, placement: &Placement) {
 const REPOSITION_SINCE: u32 = 3;
 /// Fallback for a compositor-selected window axis without `min_size`. ponytail: fixed 640x480;
 /// with no min size, that is the opening size when the first configure leaves an axis zero.
-/// Upgrade: § 6 advisory initial size or solver-backed `Content` sizing (ADR-0077).
+/// Upgrade: an advisory initial size property, or solver-backed `Content` sizing (ADR-0077).
 const UNCONFIGURED_WINDOW_SIZE: (f32, f32) = (640.0, 480.0);
 /// Toplevel buffer size. `xdg_toplevel::configure` binds maximized and fullscreen sizes, so `Some`
 /// axes are authoritative; tiling compositors, including niri, always take this branch. A `None`
@@ -168,7 +168,7 @@ fn toplevel_size_for(
         axis(new_size.1, UNCONFIGURED_WINDOW_SIZE.1, min.height, max.height),
     )
 }
-/// Live `xdg_toplevel` changes (§ 6, ADR-0049 amendment). All protocol fields are diffed because
+/// Live `xdg_toplevel` changes (ADR-0049 amendment). All protocol fields are diffed because
 /// title/app-id and size hints remain double-buffered after mapping; `id` is only reconcile
 /// identity. `Option<Option<SizeHint>>` distinguishes unchanged from changed-to-absent, which
 /// must reach `set_min_size(None)`/`set_max_size(None)` as protocol unset.
@@ -264,7 +264,7 @@ impl App {
         }
     }
 
-    /// Diff a fresh `window` spec and send changed fields (§ 6). Hidden windows have no object to
+    /// Diff a fresh `window` spec and send changed fields. Hidden windows have no object to
     /// update, but retain the latest spec so a title changed three times while closed opens with
     /// the third value (ADR-0049 decision 1).
     pub(super) fn apply_window_change(&mut self, index: usize, fresh: WindowSpec) {
@@ -328,7 +328,7 @@ impl App {
         }
     }
 
-    /// Creates the toplevel and its required initial unbuffered commit (§ 6, ADR-0040 decisions
+    /// Creates the toplevel and its required initial unbuffered commit (ADR-0040 decisions
     /// 4-5, ADR-0049 decision 1), then waits in `AwaitingConfigure`. SCTK acks configure before
     /// the handler. `XdgShell::bind` already picked up `zxdg_decoration_manager_v1` with
     /// `xdg_wm_base`, so `WindowDecorations::RequestServer` plus
@@ -356,7 +356,7 @@ impl App {
         window.request_decoration_mode(Some(DecorationMode::Server));
         window.set_title(spec.title.clone());
         window.set_app_id(spec.app_id.clone());
-        // Hints do not clamp layout (§ 6), but bound the size chosen for `None` configure axes.
+        // Hints do not clamp layout, but bound the size chosen for `None` configure axes.
         window.set_min_size(size_hint_pair(spec.min_size));
         window.set_max_size(size_hint_pair(spec.max_size));
         // Required initial commit without a buffer; configure then permits attachment.
@@ -386,7 +386,7 @@ impl App {
         eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
-    /// Creates positioner and popup in protocol order (§ 6, ADR-0040 decision 2, ADR-0049
+    /// Creates positioner and popup in protocol order (ADR-0040 decision 2, ADR-0049
     /// decisions 1-2, ADR-0051 decisions 1 and 3). `get_popup` consumes every positioner field.
     /// Use [`Popup::from_surface`], not `Popup::new`: the latter commits before a layer parent is
     /// rooted and causes `invalid_popup_parent`. Request grabs before mapping or get
@@ -434,7 +434,7 @@ impl App {
                 if self.refusal_is_new(index, PopupRefusal::Unarmed) {
                     eprintln!(
                         "[obelisk-renderer] {surface_id}: `grab = true` and no input event armed a serial this turn, so it is not opened. \
-                         A popup may only be opened in response to real user input (§ 6.3); open it from an `on_click`, or declare `grab = false`. \
+                         A popup may only be opened in response to real user input; open it from an `on_click`, or declare `grab = false`. \
                          Logged once until it opens or `visible` resolves false."
                     );
                 }
@@ -649,9 +649,9 @@ impl App {
     }
 }
 
-/// `xdg_toplevel` handler for `window` (§ 6).
+/// `xdg_toplevel` handler for `window`.
 impl WindowHandler for App {
-    /// `xdg_toplevel::close` is a request, not a command: § 6 lets config ignore it. Do not destroy
+    /// `xdg_toplevel::close` is a request, not a command: config may ignore it. Do not destroy
     /// here; doing so would leave `visible=true` describing a missing window and the next resolve
     /// would create a second one (ADR-0049 decision 2). Clone the callback before Lua; log and
     /// swallow raises like `fire_on_click`.
@@ -662,7 +662,7 @@ impl WindowHandler for App {
         let surface_id = self.surfaces[index].surface_id.clone();
         let on_close =
             self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_close") {
-                // § 6 leaves this key opaque to `layout::node`, as § 5.2 leaves `on_click`; this
+                // This key is opaque to `layout::node`, as `on_click` also is; this
                 // is its only type check.
                 Some(Value::Function(on_close)) => Some(on_close.clone()),
                 _ => None,
@@ -708,9 +708,9 @@ impl WindowHandler for App {
     }
 }
 
-/// `xdg_popup` handler for `popup` (§ 6).
+/// `xdg_popup` handler for `popup`.
 impl PopupHandler for App {
-    /// SCTK has acked the configure. Ignore compositor placement because § 6 gives config no
+    /// SCTK has acked the configure. Ignore compositor placement because config has no
     /// binding for it. Only `Initial` is built; `Reactive` needs `set_reactive` and `Reposition`
     /// needs `xdg_popup.reposition`, while a fresh popup per open handles changing anchors.
     fn configure(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup, configure: PopupConfigure) {
@@ -726,8 +726,8 @@ impl PopupHandler for App {
 
     /// `popup_done` is compositor dismissal, not a request. It is why ADR-0040 uses a real
     /// `xdg_popup` instead of a second `panel`: layer-shell has no compositor-agnostic
-    /// click-outside dismissal. Then destroy children/object, latch ADR-0051 decision 2, and call §
-    /// 6 `on_dismiss` against the already-gone popup. A denied grab arrives here as normal
+    /// click-outside dismissal. Then destroy children/object, latch ADR-0051 decision 2, and call
+    /// `on_dismiss` against the already-gone popup. A denied grab arrives here as normal
     /// `popup_done` (ADR-0051 decision 3); clone callbacks and swallow raises. The latch, not this
     /// callback, prevents the re-resolve livelock.
     fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
@@ -741,7 +741,7 @@ impl PopupHandler for App {
 
         let on_dismiss =
             self.client.scene().surface(&surface_id).and_then(|tree| match tree.properties.get("on_dismiss") {
-                // § 6 leaves this key opaque too.
+                // This key is opaque too.
                 Some(Value::Function(on_dismiss)) => Some(on_dismiss.clone()),
                 _ => None,
             });
@@ -790,8 +790,8 @@ mod tests {
     #[test]
     fn an_unconfigured_toplevel_axis_takes_the_min_size_the_config_declared() {
         // "If this value is None, you may set the size of the window as you wish", which is the
-        // ordinary first configure on a floating compositor. `min_size` is the only thing § 6
-        // lets a config say about a window's size, so it is what the client says back.
+        // ordinary first configure on a floating compositor. `min_size` is the only thing a config
+        // can say about a window's size, so it is what the client says back.
         let mut spec = settings_window();
         spec.min_size = Some(SizeHint { width: 320.0, height: 240.0 });
         assert_eq!(toplevel_size_for((None, None), &spec), (320, 240));
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_axis_with_no_min_size_falls_back_to_the_named_constant() {
-        // Its `ponytail:` states the ceiling: § 6 gives a config nothing else to say here, and a
+        // Its `ponytail:` states the ceiling: a config has nothing else to say here, and a
         // toplevel's root is forced to the surface, so no content size exists to prefer instead.
         assert_eq!(toplevel_size_for((None, None), &settings_window()), (640, 480));
     }
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn a_size_hint_that_moved_to_absent_is_still_a_change_that_has_to_reach_the_wire() {
         // The reason the field is `Option<Option<_>>`: the outer layer is "did it move", the inner
-        // one is § 6's absent-versus-present, and dropping a `max_size` from a config has to send
+        // one is absent-versus-present, and dropping a `max_size` from a config has to send
         // the protocol's zero (meaning unset) rather than leaving the old maximum standing.
         let mut applied = settings_window();
         applied.max_size = Some(SizeHint { width: 1280.0, height: 800.0 });
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn a_popup_with_nothing_armed_falls_back_to_the_first_instance_of_its_parent() {
-        // The `grab = false` popup opened by a D-Bus notification: § 6 gives it no way to say
+        // The `grab = false` popup opened by a D-Bus notification: config has no way to say
         // which monitor it means (see `parent_instance_index`'s ponytail).
         let instances = ["bar@eDP-1", "bar@DP-1"];
         assert_eq!(parent_instance_index(instances.into_iter(), "bar", None), Some(0));
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn a_popup_parents_to_a_window_by_its_bare_instance_id() {
-        // § 6: a popup parents to either a `panel` or a `window`, and a window's instance carries
+        // A popup parents to either a `panel` or a `window`, and a window's instance carries
         // no `@output` because the compositor places it.
         let instances = ["bar@eDP-1", "settings"];
         assert_eq!(parent_instance_index(instances.into_iter(), "settings", None), Some(1));
@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn a_popup_configure_is_taken_as_given_because_the_compositor_may_have_constrained_it() {
-        // § 6's `constraint_adjustment` lets the compositor slide, flip or resize the popup to
+        // `constraint_adjustment` lets the compositor slide, flip or resize the popup to
         // keep it on screen, and the size it lands on is the one that has to be painted.
         assert_eq!(popup_size_for((180, 90), (200.0, 120.0)), (180, 90));
     }
@@ -989,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn section_6_3s_center_is_the_protocols_none_on_both_requests() {
+    fn center_is_the_protocols_none_on_both_requests() {
         // The XML is what makes this a translation, not a fudge: with no edge specified the anchor
         // point is "in the center of the anchor rectangle", and a gravity of `none` centers the
         // surface "over the anchor point on any axis that had no gravity specified".
@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(
             positioner_constraint(ConstraintAdjustment::default()),
             xdg_positioner::ConstraintAdjustment::FlipY | xdg_positioner::ConstraintAdjustment::SlideX,
-            "§ 6.3's default is dropdown behaviour, not the protocol's"
+            "the config default is dropdown behaviour, not the protocol's"
         );
         assert_eq!(
             positioner_constraint(ConstraintAdjustment {

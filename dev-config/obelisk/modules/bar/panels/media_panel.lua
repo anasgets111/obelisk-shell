@@ -128,7 +128,7 @@ local has_player = selected:map(function(player)
     return player ~= false
 end)
 
--- `identity` is the empty-string sentinel (§ 2.x), so fallbacks test `""`, not a plain `or` chain.
+-- `identity` is the empty-string sentinel, so fallbacks test `""`, not a plain `or` chain.
 local function first_nonempty(...)
     for _, candidate in ipairs({ ... }) do
         if candidate ~= nil and candidate ~= "" then

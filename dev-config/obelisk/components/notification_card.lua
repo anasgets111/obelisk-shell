@@ -390,7 +390,7 @@ return function(group, ui, opts)
             ui.toggle_group(group.key)
         end, "notification-group-" .. group.key)
     end
-    -- Dismiss each member because § 3.2 has neither `dismiss_all` nor `dismiss_group`. Ghost style
+    -- Dismiss each member because there is neither `dismiss_all` nor `dismiss_group`. Ghost style
     -- matches `variant: "ghost"`: the glyph is the control, not a filled circle beside the title.
     header[#header + 1] = icon_button(icons.close, function()
         for _, notification in ipairs(items) do
@@ -414,7 +414,7 @@ return function(group, ui, opts)
     } }
 
     -- Collapsed groups show the newest and count the rest in the header; expanded groups show all.
-    -- The feed caps `#items` at twenty (§ 2.7), so no runaway guard is needed.
+    -- The feed caps `#items` at twenty, so no runaway guard is needed.
     local shown = (is_group and not expanded) and { items[1] } or items
     for _, notification in ipairs(shown) do
         children[#children + 1] = message(notification, ui, {

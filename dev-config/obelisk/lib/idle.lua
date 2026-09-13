@@ -3,7 +3,7 @@
 -- one-way dependency as `lib/media.lua`: `modules/` requires `lib/`, never the reverse.
 -- `IdleService.qml` uses three `IdleMonitor`s with per-stage `timeout` and chained `enabled`. This
 -- registers one one-second threshold and counts on `obelisk.system.monotonic`.
--- `obelisk.idle:register_threshold` has no removal counterpart (§ 3.2): changing lock from five to
+-- `obelisk.idle:register_threshold` has no removal counterpart: changing lock from five to
 -- ten minutes would leave both thresholds registered and still lock at five. One registration keeps
 -- editable Lua-number timeouts and a walked stage list.
 -- In `IdleService.qml`, each `enabled` gates on the preceding stage: `_lockDone` is
@@ -241,7 +241,7 @@ idle.fired_at = state("idle_fired_at", {})
 idle.manual = state("idle_manual", false)
 
 --- Whether a logind inhibitor is out in our name right now. Not derived from [`idle.reasons`]:
---- `inhibit`/`release_inhibit` are counted (§ 3.2), so this is the count, and a wrong one leaks.
+--- `inhibit`/`release_inhibit` are counted, so this is the count, and a wrong one leaks.
 idle.holding = state("idle_holding", false)
 
 --- @param power table? `obelisk.power`'s payload

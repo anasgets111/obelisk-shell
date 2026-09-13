@@ -1,15 +1,15 @@
-//! `obelisk.workspaces`: per-output workspace state and focused window
-//! (`docs/lua-api.md` § 2.9), from niri's IPC stream (ADR-0056) or Hyprland's event
+//! `obelisk.workspaces`: per-output workspace state and focused window,
+//! from niri's IPC stream (ADR-0056) or Hyprland's event
 //! and command sockets (ADR-0118).
 //!
 //! Top-level because this is a compositor Unix socket, not a device or D-Bus interface.
 //!
 //! Two compositors still use no trait (ADR-0056 decision 1, ADR-0075 decision 4, ADR-0118): the
 //! protocol-specific seam is `StatePublisher` for reads plus two exhaustive write arms. With
-//! neither compositor, nothing pushes and `obelisk.workspaces` stays `nil`; § 2.9 has no absence
+//! neither compositor, nothing pushes and `obelisk.workspaces` stays `nil`; the payload has no absence
 //! sentinel, and `outputs: []` would mean no workspaces rather than no answer.
 //!
-//! `controller` holds § 2.9's payload, reduction, and publish contract; `niri` owns `niri_ipc`, and
+//! `controller` holds the payload, reduction, and publish contract; `niri` owns `niri_ipc`, and
 //! `hyprland` owns Hyprland JSON.
 
 pub mod controller;

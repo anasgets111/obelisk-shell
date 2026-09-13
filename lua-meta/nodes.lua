@@ -1,5 +1,5 @@
 ---@meta
--- The nine geometric nodes (`lua-api.md` § 5.2) and their shared properties (§ 5.1).
+-- The nine geometric nodes and their shared properties.
 --
 -- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `obelisk.lua` is
 -- generated: capability payloads are `Serialize` structs, while a node's schema is 29 scattered

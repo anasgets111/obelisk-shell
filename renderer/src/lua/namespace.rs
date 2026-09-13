@@ -34,7 +34,7 @@ pub(crate) struct Namespace {
 /// (ADR-0037); an unread name costs only that `nil`, not the old D-Bus subscription. The unrelated
 /// unrostered `crate::socket` lazy path starts from `StateSnapshot`, not here.
 ///
-/// **One table, so typos raise.** § 6's `lock` constructor owns global `lock`; a bare `lock` signal
+/// **One table, so typos raise.** The `lock` constructor owns global `lock`; a bare `lock` signal
 /// once overwrote it silently and broke every `lock { ... }` declaration (ADR-0052 decision 1).
 pub(crate) fn build(
     loader: &Loader,
@@ -109,7 +109,7 @@ fn install_capability_index(
     Ok(())
 }
 
-/// `obelisk.rescue` (§ 2.10), returning its update handle.
+/// `obelisk.rescue`, returning its update handle.
 ///
 /// Bare `lua::signal::Signal`, not [`Capability`]: Renderer-sourced, with no Supervisor dispatch or
 /// roster entry, so `invoke` would only queue a command the Supervisor drops.
@@ -124,7 +124,7 @@ fn register_rescue_signal(loader: &Loader, obelisk: &mlua::Table, dirty: DirtyFl
 ///
 /// Deliberately outside `shared::Capability::ALL` and its map: `smithay_client_toolkit`'s
 /// `OutputState` sources it in the Renderer, not the Supervisor's `StateSnapshot` roster
-/// (ADR-0037/ADR-0041 decision 2). It still lives in `obelisk` because § 2.15 names it there.
+/// (ADR-0037/ADR-0041 decision 2).
 fn register_screens_signal(
     loader: &Loader,
     obelisk: &mlua::Table,

@@ -119,7 +119,7 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
 }
 
 /// Builds the minimal `AddAndActivateConnection2` dict: security only for a secured intent,
-/// and `hidden`/`scan-ssid` only when `intent.hidden` is set.
+/// and `hidden` only when `intent.hidden` is set.
 pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, HashMap<&str, Value<'_>>> {
     let mut dict: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
 
@@ -133,8 +133,6 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     wireless.insert("mode", Value::new("infrastructure"));
     if intent.hidden {
         wireless.insert("hidden", Value::new(true));
-        // Redundant for NM, which probes hidden networks from `hidden` alone and ignores this key.
-        wireless.insert("scan-ssid", Value::new(true));
     }
     dict.insert("802-11-wireless", wireless);
 
@@ -358,7 +356,7 @@ impl NetworkController {
         }
     }
 
-    /// Supervisor services §4: turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
+    /// Turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
     /// `AddAndActivateConnection2`'s dict. The caller `mem::take`s `secret` from the wire frame,
     /// making this function its owner (ADR-0005/ADR-0014).
     ///
@@ -607,12 +605,11 @@ mod tests {
     }
 
     #[test]
-    fn build_connection_dict_marks_hidden_and_scan_ssid_for_a_hidden_network() {
+    fn build_connection_dict_marks_hidden_for_a_hidden_network() {
         let intent = connection_intent("HiddenNet", true, &[]).unwrap();
         let dict = build_connection_dict(&intent);
         let wireless = &dict["802-11-wireless"];
         assert!(bool::try_from(wireless["hidden"].clone()).unwrap());
-        assert!(bool::try_from(wireless["scan-ssid"].clone()).unwrap());
     }
 
     #[test]

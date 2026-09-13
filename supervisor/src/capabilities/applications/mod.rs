@@ -3,7 +3,7 @@
 //!
 //! ADR-0054 decision 5 called for this when a window needed an icon it did not report. The
 //! launcher needs every name/icon/command, a focused window has `app_id` but no icon, and a tray
-//! item may have neither `IconName` nor `IconPixmap`. Enumerate instead of § 3.2's synchronous
+//! item may have neither `IconName` nor `IconPixmap`. Enumerate instead of the synchronous
 //! `system:find_icon(app_id, ...)`: the control socket has no reply shape for it, and launchers
 //! need the whole list.
 

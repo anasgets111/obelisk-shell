@@ -12,8 +12,7 @@
 //! the build rather than the golden test.
 //!
 //! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting all
-//! 19 `parse_*_args` functions, only with an IDL change for named arguments
-//! (docs/lua-api.md § 7).
+//! 19 `parse_*_args` functions, only with an IDL change for named arguments.
 
 use std::collections::BTreeMap;
 
@@ -132,16 +131,15 @@ fn payload_class(schema: &Schema) -> String {
     schema.get("title").and_then(|t| t.as_str()).unwrap_or("table").to_string()
 }
 
-/// Action variants as declaration-ordered wire strings for `invoke`, in the `rename_all` spellings
-/// `parse_action` accepts: one `enum` array, or [`const_enum`]'s form once a variant has a doc comment.
+/// Action variants as wire strings for `invoke`, in the `rename_all` spellings `parse_action`
+/// accepts: one `enum` array, or [`const_enum`]'s form once a variant has a doc comment. Order is
+/// schemars' output order, not declaration order: a mixed enum pools its undocumented variants into
+/// one `enum` branch emitted before the documented `const` branches.
 fn action_names(schema: &Schema) -> Vec<String> {
     if let Some(variants) = const_enum(schema.as_value()) {
         return variants.into_iter().map(|(name, _)| name.to_string()).collect();
     }
-    schema
-        .get("enum")
-        .and_then(|e| e.as_array())
-        .map_or_else(Vec::new, |v| v.iter().filter_map(|n| n.as_str()).map(str::to_string).collect())
+    enum_strings(schema.as_value()).map_or_else(Vec::new, |v| v.into_iter().map(str::to_string).collect())
 }
 
 /// `audio` -> `AudioCapability`.
@@ -158,11 +156,16 @@ fn capability_class(capability: &str) -> String {
     out
 }
 
+/// A schema's `enum` as its string variants, or `None` if it has none.
+fn enum_strings(fragment: &serde_json::Value) -> Option<Vec<&str>> {
+    let variants = fragment.get("enum")?.as_array()?;
+    let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
+    (!names.is_empty()).then_some(names)
+}
+
 /// A schema's `enum` as a LuaCATS string union, or `None` if it has none.
 fn string_enum(fragment: &serde_json::Value) -> Option<String> {
-    let variants = fragment.get("enum")?.as_array()?;
-    let names: Vec<String> = variants.iter().filter_map(|v| v.as_str()).map(|v| format!("\"{v}\"")).collect();
-    if names.is_empty() { None } else { Some(names.join("|")) }
+    Some(enum_strings(fragment)?.into_iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join("|"))
 }
 
 /// Fieldless enum form with one `oneOf`/`const` branch per documented variant. schemars switches to
@@ -563,9 +566,8 @@ mod tests {
         }
     }
 
-    /// The golden test only compares against itself, so it passed while audio, lock and
-    /// notifications had no `invoke` at all: a doc comment on a variant turns schemars' `enum` into
-    /// a `oneOf`.
+    /// A doc comment on a variant turns schemars' `enum` into a `oneOf`; every action enum must
+    /// still yield an invoke union regardless of which form it renders as.
     #[test]
     fn every_action_enum_yields_an_invoke_union() {
         for (capability, _, actions) in super::capability_schemas() {

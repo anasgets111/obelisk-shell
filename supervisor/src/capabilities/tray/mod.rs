@@ -1,5 +1,4 @@
-//! System tray host (`obelisk.tray`, docs/services.md §2;
-//! docs/lua-api.md §2.14; ADR-0031).
+//! System tray host (`obelisk.tray`, ADR-0031).
 //!
 //! Hosts `org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` and handles registered
 //! `org.kde.StatusNotifierItem`s and optional `com.canonical.dbusmenu` menus. Hand-written proxies
@@ -18,12 +17,12 @@ use serde::Serialize;
 
 use item::TrayItem;
 
-/// Well-known bus name and object path for `org.kde.StatusNotifierWatcher` (§2).
+/// Well-known bus name and object path for `org.kde.StatusNotifierWatcher`.
 const WATCHER_BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_OBJECT_PATH: &str = "/StatusNotifierWatcher";
 /// Fixed item path when `RegisterStatusNotifierItem`'s `service` is a bus name (ADR-0031).
 const DEFAULT_ITEM_OBJECT_PATH: &str = "/StatusNotifierItem";
-/// Maximum accepted ARGB pixmap dimension (§2.1, ADR-0031).
+/// Maximum accepted ARGB pixmap dimension (ADR-0031).
 const MAX_PIXMAP_DIMENSION: i32 = 128;
 
 /// Cap on every string an item supplies: `Title`, `Id`, `Status`, both `ToolTip` halves, the three

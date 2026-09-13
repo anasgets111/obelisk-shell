@@ -36,7 +36,7 @@ local store = require("lib.store")
 
 local settings = store.idle:map(idle.read)
 
--- Whether UPower reports a battery. `present` is false on desktops (§ 2.2), so no battery column;
+-- Whether UPower reports a battery. `present` is false on desktops, so no battery column;
 -- the mirror gates its second column the same way.
 local has_battery = obelisk.battery:map(function(b)
     return b ~= nil and b.present

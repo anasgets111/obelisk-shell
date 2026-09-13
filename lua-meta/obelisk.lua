@@ -43,7 +43,7 @@
 --- Payload types ------------------------------------------------------------------------------
 
 ---@class AccessPointInfo
----One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
+---One scanned AP, resolved to `network.available_networks`
 ---and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
@@ -53,7 +53,7 @@
 ---@field strength integer Signal strength, `0` to `100`.
 
 ---@class ActiveClient
----§ 2.9's `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
+---`active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
 ---rejects fabricated `false`; ADR-0119 lets Hyprland provide it). `class` is Wayland `app_id`;
 ---Wayland has no X11 `WM_CLASS` equivalent.
 ---@field class string Wayland `app_id`, e.g. `"firefox"`. Named `class` for X11 familiarity; use it with `applications.by_app_id`.
@@ -63,13 +63,13 @@
 
 ---@class AppStream
 ---A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
----§ 2.4 names `id`/`name` (ADR-0053 decision 3), while ADR-0016's `pid`/`process_name` remain.
+---ADR-0053 decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
 ---@field id integer PipeWire registry id, the `MixerState::apps` key.
----@field muted boolean § 2.4 per-app mute, from the same `Props` as `volume`.
+---@field muted boolean Per-app mute, from the same `Props` as `volume`.
 ---@field name? string `application.name`, if the client set one.
 ---@field pid integer `application.process.id` recorded for the owning process.
 ---@field process_name? string `/proc/{pid}/comm`, if the process still existed when observed.
----@field volume number § 2.4 per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
+---@field volume number Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
 
 ---@class AppSummary
 ---One application as config sees it (ADR-0061). Display data only: argv stays private because
@@ -82,7 +82,7 @@
 ---@field name string Unlocalized `Name=`. `Name[xx]` is not read (ADR-0061), so this is English on a localized system.
 
 ---@class AudioDevice
----One § 2.4 `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
+---One `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
 ---`node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
 ---@field active boolean Whether `default.audio.sink`/`default.audio.source` currently routes here.
 ---@field icon? string PipeWire's `device.icon-name` hint, such as `"audio-card-analog"`; not resolved here. `None` means the node carried no hint, as with a virtual sink.
@@ -97,7 +97,7 @@
 ---| "FullyCharged" # Charged and holding. A battery stopped below full reports `PendingCharge` instead.
 ---| "PendingCharge" # Waiting to charge: not draining, not taking current.
 ---| "PendingDischarge" # Waiting to discharge, by name; UPower defines it no further.
----§ 2.2's `battery.state`, one of UPower's seven `Device.State` values.
+---`battery.state`, one of UPower's seven `Device.State` values.
 ---
 ---A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making a battery that
 ---is merely not moving indistinguishable from one that is draining. On a laptop that sets
@@ -163,7 +163,7 @@
 ---@field ssid string The network the join was for.
 
 ---@class MenuItem
----One DBusMenu layout node, resolved to `tray.items[].menu` (docs/lua-api.md §2.14).
+---One DBusMenu layout node, resolved to `tray.items[].menu`.
 ---@field children MenuItem[] Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose children are dropped with an stderr line.
 ---@field enabled boolean `false` for a greyed-out entry. Activation is a no-op; keep it to preserve the application's layout instead of filtering it.
 ---@field icon_name? string Theme icon name, or `nil`; DBusMenu pixmaps are not carried.
@@ -174,13 +174,13 @@
 ---@field toggle_type? string `"checkmark"`, `"radio"`, or `nil` for an entry that is not a toggle.
 
 ---@class Notification
----Queued `notifications.feed[]` object (idl §2.7; ADR-0033, ADR-0090). `expire_timeout` and
+---Queued `notifications.feed[]` object (ADR-0033, ADR-0090). `expire_timeout` and
 ---`replaces_id` affect processing but are not feed data.
 ---@field actions NotificationAction[] Offered buttons in sender order, excluding `default` and `inline-reply`; often empty.
 ---@field app_icon? string Application icon: theme name (for example `"firefox"`) or trusted absolute path; `nil` if neither was supplied. Feeds `icon { name = ... }` (ADR-0054 decision 2). ADR-0091 fixed the former bug that sent theme names through absolute-path validation, leaving nearly every notification with the generic fallback.
 ---@field app_name string Sending application, truncated to 64 bytes at a character boundary.
 ---@field body NotificationSpan[] Body spans, truncated to 512 bytes before parsing. Text carries bold/italic/underline/href; images carry trusted paths, so config draws without parsing markup.
----@field desktop_entry? string `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by `obelisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`. `nil` when absent; slashed values are dropped (ADR-0101).
+---@field desktop_entry? string `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by `obelisk.applications.by_app_id` instead of the mutable/non-unique `app_name`. `nil` when absent; slashed values are dropped (ADR-0101).
 ---@field expired boolean Whether the timeout expired. Ordinary expiry retires the entry from popups but leaves it in feed history (ADR-0100), after `NotificationClosed(id, reason=1)`; replacements reset it. Never true for critical or `expire_timeout = 0` notifications.
 ---@field has_default_action boolean Whether the card is activatable via `notifications:invoke_action(id, "default")`; separate from `actions` because `default` is not a button.
 ---@field has_reply boolean Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.
@@ -188,8 +188,8 @@
 ---@field image_path? string Attached picture (album art/avatar/thumbnail) as an existing absolute path: decoded image spooled to runtime storage or a trusted sender path. `nil` when absent; never a theme name (ADR-0091). Formerly shared `icon_path` with the application icon; now separate.
 ---@field reply_placeholder? string `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say, "Reply to Alice" rather than a generic "Reply"; capped at 64 bytes, `nil` if absent, and meaningless without [`Notification::has_reply`] (ADR-0101).
 ---@field summary string Plain-text title, truncated to 128 bytes at a character boundary; markup is parsed out.
----@field timestamp integer Arrival time in Unix epoch seconds, matching `obelisk.system.time` (§2.11); age is `system.time - timestamp`. Replacements get fresh timestamps; carried because configs cannot recover history inside ADR-0021 side-effect-free `computed`s.
----@field transient boolean `hints["transient"]`: popup-only (§1). Expired transient entries are removed, not retired, so history never sees them (ADR-0100).
+---@field timestamp integer Arrival time in Unix epoch seconds, matching `obelisk.system.time`; age is `system.time - timestamp`. Replacements get fresh timestamps; carried because configs cannot recover history inside ADR-0021 side-effect-free `computed`s.
+---@field transient boolean `hints["transient"]`: popup-only. Expired transient entries are removed, not retired, so history never sees them (ADR-0100).
 ---@field urgency Urgency `"low"`, `"normal"`, or `"critical"`; missing hint means `"normal"`. Critical bypasses DND and never expires.
 
 ---@class NotificationAction
@@ -213,7 +213,7 @@
 ---@field underline? boolean Whether the run was inside `<u>`.
 
 ---@class OutputWorkspaces
----One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
+---One output's workspace state; ADR-0056 decision 3 added ordered `workspaces` entries.
 ---@field active_workspace integer [`WorkspaceEntry::id`] visible on this output; every output has one.
 ---@field focused_workspace? integer Present only on the focused output (ADR-0056 decision 4); `out.focused_workspace ~= nil` tests whether this is the focused monitor.
 ---@field name string Connector name, e.g. `"eDP-1"`; matches `obelisk.screens.name` and a surface's `monitor`.
@@ -276,7 +276,7 @@
 ---@field attention_icon_path? string File half of the attention artwork, matching `attention_icon_name`.
 ---@field icon_name? string Theme icon name for `icon { name = ... }`; exclusive with [`TrayItem::icon_path`].
 ---@field icon_path? string Decoded, bounds-checked PNG in the runtime directory for `image { source = ... }`; set when the item sent pixels instead of a theme name.
----@field id string docs/lua-api.md §2.14 id: sanitized D-Bus unique name with the item's object path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
+---@field id string Sanitized D-Bus unique name with the item's object path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
 ---@field item_is_menu boolean `true` means left click opens the menu instead of activating the item.
 ---@field menu? MenuItem[] Top-level menu entries, or `nil` without `com.canonical.dbusmenu`. Fetched at registration and on layout updates.
 ---@field name string Display name: `Title`, falling back to `Id` when `Title` is empty.
@@ -316,18 +316,18 @@
 ---@field entries AppSummary[] Visible, launchable installed entries, sorted by name. Rebuilt by `applications:refresh()`; directories are not watched, so mid-session installs wait for it.
 
 ---@class AudioState
----Full `obelisk.audio` payload (§ 2.4, ADR-0053 decision 3).
+---Full `obelisk.audio` payload (ADR-0053 decision 3).
 ---@field apps AppStream[] One entry per app playing audio; empty is normal.
 ---@field bluetooth BluetoothCodecs[] One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device; `audio:set_default_sink(id)` takes [`AudioDevice::id`].
----@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators (§ 3.2).
+---@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators.
 ---@field source_volume number Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or with no input device.
 ---@field sources AudioDevice[] Every input device, on the same terms as [`AudioState::sinks`].
 ---@field volume number Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
 
 ---@class BatteryState
----`obelisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys verbatim
+---`obelisk.battery`'s full payload. Field names are the `StateSnapshot` JSON keys verbatim
 ---and may not be renamed. `Default` is the correct desktop answer when no battery exists.
 ---@field percent integer Charge, `0` to `100`, rounded against the battery's full capacity, not its charge limit. A machine capped at 70 therefore reads `70`, not `100`.
 ---@field present boolean Whether UPower's display device is a battery and present. `false` on a desktop is an answer, not missing data; check it before drawing the other fields.
@@ -344,14 +344,14 @@
 ---@field available boolean An adapter is bound; without one every other field is inert and every write a logged no-op.
 ---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
 ---@field discoverable boolean Other devices can find this adapter and ask to pair; the agent asks first. BlueZ turns it off after `DiscoverableTimeout` (180s by default).
----@field discovered_devices DiscoveredDevice[] Unpaired devices BlueZ knows. A stop keeps them; BlueZ expires each after `TemporaryTimeout` (30s).
+---@field discovered_devices DiscoveredDevice[] Unpaired devices BlueZ knows. A stop keeps them; only devices still marked temporary expire, after `TemporaryTimeout` (30s by default) -- one that was connected/trusted, or stored from an earlier session, stays.
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered, so always `false` without one.
 ---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
 ---@field pairing_request? PairingRequest The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
 
 ---@class BrightnessState
----`obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
+---`obelisk.brightness`'s full payload. `percent` is the unchanged `StateSnapshot` JSON
 ---key. `Default` (`0`) precedes the first read, but no-device construction emits no signal, so
 ---Lua never observes the placeholder (see `brightness/mod.rs`).
 ---@field percent integer Screen backlight, `0` to `100`, from sysfs `brightness` (the requested value), not `actual_brightness`, which can lag during a hardware fade.
@@ -399,7 +399,7 @@
 ---down radio from a powered radio with no association.
 ---@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected, then saved, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so a drawn list does not blank; payload order is ready to draw.
 ---@field connect_error? JoinError The last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the Wi-Fi device's `StateChanged` reason, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`. It names its network, so a sheet opened for another one does not read a leftover failure as its own.
----@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
+---@field connected boolean A connection carries the default route, from `PrimaryConnection`. `/` means none, hence offline.
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and clears when the attempt reaches a verdict or `network:abort_connect` stops it.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
 ---@field ethernet_ip? string The first activated wired device's IPv4 address without its prefix, or `nil`.
@@ -420,7 +420,7 @@
 ---@field feed Notification[] Newest 20 first, including unread retired entries until dismissed (ADR-0100); `expired` distinguishes them. This is a view of the 100-entry queue, so older entries remain dismissable by id after leaving the list (ADR-0033).
 
 ---@class PowerState
----`obelisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
+---`obelisk.power`'s full payload. Optional fields are omitted from JSON, so unavailable
 ---host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
 ---@field active_profile? string Active platform profile, e.g. `"balanced"`, set by `power:set_profile`; `nil` without power-profiles-daemon.
 ---@field energy_rate? number UPower's `EnergyRate` in watts, unchanged. It is positive in both directions, so [`PowerState::on_battery`] supplies the sign; `nil` without UPower.
@@ -433,7 +433,7 @@
 ---@field screencast_users PrivacyUser[] Apps producing PipeWire screen-capture streams (ADR-0137). Names may be the portal's identity for portal-created nodes. wlr-screencopy recorders (`wf-recorder`, `grim`) bypass PipeWire and never appear.
 
 ---@class SysinfoState
----`obelisk.sysinfo`'s five Lua-visible fields (docs/lua-api.md §2.12), with field
+---`obelisk.sysinfo`'s five Lua-visible fields, with field
 ---names unchanged from the `StateSnapshot` JSON keys.
 ---@field cpu_percent integer Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.
 ---@field ram_percent integer Physical memory in use, `0` to `100`.
@@ -442,10 +442,10 @@
 ---@field temp_gpu integer GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as [`SysinfoState::temp_cores`], so neither is newer than the other.
 
 ---@class SystemState
----`obelisk.system`'s Lua-visible fields (docs/lua-api.md §2.11), with their
+---`obelisk.system`'s Lua-visible fields, with their
 ---`StateSnapshot` JSON keys unchanged.
 ---@field monotonic integer Whole seconds since this controller was built, which is the first time a config asked for `system`. Only a difference means anything; take durations from this rather than from `time`, which `settimeofday` and an NTP step move underneath a deadline. ponytail: `Instant` is `CLOCK_MONOTONIC` on Linux, so a suspend does not count toward an elapsed reading. Suspend-inclusive timing wants `CLOCK_BOOTTIME` as a second field.
----@field time integer Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds; milliseconds would be wrong by 1000x.
+---@field time integer Unix epoch seconds, not milliseconds. `os.date` expects seconds; milliseconds would be wrong by 1000x.
 
 ---@class StorageState
 ---`obelisk.storage`'s payload (ADR-0136).
@@ -484,8 +484,8 @@
 ---@field reboot_required boolean Whether `/run/obelisk-shell-reboot-required` exists. A pacman hook writes it, so a terminal upgrade raises it too, and `/run` being tmpfs means a boot clears it. Nothing in Obelisk writes or clears it.
 
 ---@class WorkspacesState
----`obelisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
----omitted, not `null` (§ 2.9 says `nil` when unfocused).
+---`obelisk.workspaces` payload. Field names are JSON keys; absent `active_client` is
+---omitted, not `null` (`nil` when unfocused).
 ---@field active_client? ActiveClient Focused toplevel, or `nil` if none. One window per session, not per output; an unfocused monitor cannot be queried (ADR-0056 decision 4).
 ---@field compositor string Source compositor, `"niri"` or `"hyprland"` (ADR-0119). Hyprland creates a numbered workspace on focus, so strips pad empty slots there; niri keeps its trailing empty one.
 ---@field outputs OutputWorkspaces[] One entry per output, keyed by connector name; empty until the first compositor answer.

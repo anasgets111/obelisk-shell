@@ -11,7 +11,7 @@ use udev::MonitorSocket;
 use super::super::read_attr;
 use super::super::scale::{percent_from_raw, raw_from_percent};
 
-/// `obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
+/// `obelisk.brightness`'s full payload. `percent` is the unchanged `StateSnapshot` JSON
 /// key. `Default` (`0`) precedes the first read, but no-device construction emits no signal, so
 /// Lua never observes the placeholder (see `brightness/mod.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, schemars::JsonSchema)]
@@ -26,7 +26,7 @@ pub enum BrightnessSignal {
     Changed,
 }
 
-/// § 2.3 device preference from `Documentation/ABI/stable/sysfs-class-backlight`: firmware (0) <
+/// Device preference from `Documentation/ABI/stable/sysfs-class-backlight`: firmware (0) <
 /// platform (1) < raw (2), with unknown/missing last (3), not excluded.
 fn device_type_rank(entry_dir: &Path) -> u8 {
     match read_attr(entry_dir, "type").as_deref() {
@@ -67,7 +67,7 @@ fn read_percent(device_dir: &Path, max: i32) -> u8 {
     percent_from_raw(brightness, max) as u8
 }
 
-/// `brightness:set(pct)`'s `arguments: [pct]`; § 3.2 range validation is deferred to
+/// `brightness:set(pct)`'s `arguments: [pct]`; range validation is deferred to
 /// `scale::raw_from_percent`.
 pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()

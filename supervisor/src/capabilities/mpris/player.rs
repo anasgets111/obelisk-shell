@@ -85,7 +85,7 @@ pub(super) fn ordered_players(registry: &PlayerRegistry) -> Vec<PlayerState> {
 }
 
 /// Cross-process-comparable `CLOCK_MONOTONIC` microseconds, matching the IDL's timestamp field;
-/// opaque `std::time::Instant` would not. Known gap (ADR-0036): unbuilt `system.time` (§2.11) is
+/// opaque `std::time::Instant` would not. Known gap (ADR-0036): `system.time` is
 /// 1Hz, too coarse for this resolution.
 /// How long after a `PlaybackStatus` change to read `Position` again; Quickshell uses the same
 /// 100ms for the same players.

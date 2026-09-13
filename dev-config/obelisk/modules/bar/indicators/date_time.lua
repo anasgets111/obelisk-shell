@@ -3,8 +3,8 @@
 -- Date and time share `%a %d %b  %I:%M %p`; separate cells read as two modules. The mirror uses
 -- `TimeService.format("datetime")`.
 --
--- Seconds are omitted. A per-second clock re-resolves for a digit nobody reads; § 4.2's
--- `system.time` still pushes at its own cadence.
+-- Seconds are omitted. A per-second clock re-resolves for a digit nobody reads; `system.time`
+-- still pushes at its own cadence.
 --
 -- Twelve-hour with AM/PM, fixed. `TimeService.qml` asks `Qt.locale()` whether the short time format
 -- carries an `AP` marker and picks `HH:mm` or `hh:mm AP` from the answer; a config has no locale to

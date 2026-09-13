@@ -62,7 +62,7 @@ pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
         .collect()
 }
 
-/// Parses `text.content` as one string or notification-body-style runs (§ 2.7, ADR-0104), joining
+/// Parses `text.content` as one string or notification-body-style runs (ADR-0104), joining
 /// run text and preserving each run's style. The run shape is a body span minus `kind`, so text
 /// spans can stream through; the caller filters image spans, which have no `text`.
 ///
@@ -156,19 +156,19 @@ fn parse_runs(runs: &mlua::Table) -> Result<(String, Vec<StyleRun>), LayoutError
     Ok((content, styles))
 }
 
-/// `icon.name` (§ 5.2 item 5) is a theme name or absolute path; `image::icons::resolve` tells them
+/// `icon.name` is a theme name or absolute path; `image::icons::resolve` tells them
 /// apart. It defaults to `""` for the same pre-first-push nil rule as `content` (ADR-0044).
 pub fn parse_icon_name(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "name")
 }
 
-/// `textfield.placeholder` (§ 5.2 item 8) is empty by default. `image.source` is an absolute path,
+/// `textfield.placeholder` is empty by default. `image.source` is an absolute path,
 /// never an icon theme name (ADR-0054 decision 3).
 pub fn parse_placeholder(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     parse_optional_string(properties, "placeholder")
 }
 
-/// `textfield.mask_character` (§ 5.2 item 8) is drawn once per typed character. It defaults to
+/// `textfield.mask_character` is drawn once per typed character. It defaults to
 /// U+2022 BULLET; `""` draws nothing, and longer strings use their first character.
 pub fn parse_mask_character(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     let declared = parse_optional_string(properties, "mask_character")?;
@@ -218,7 +218,7 @@ fn parse_optional_string(properties: &HashMap<String, Value>, property: &str) ->
     }
 }
 
-/// `text.foreground` (§ 5.2 item 4) defaults to white; `layout::paint::paint_text` uses that same
+/// `text.foreground` defaults to white; `layout::paint::paint_text` uses that same
 /// white when a present value is malformed. `TextAlign` places glyphs inside the node's
 /// box, unlike `align_h`, which places the node in its parent; it matters only when the box is
 /// wider than the measured text.
@@ -233,7 +233,7 @@ pub enum TextAlign {
     End,
 }
 
-/// `font` (§ 5.2 item 4): the font family this node measures and paints in, as the config wrote it
+/// `font`: the font family this node measures and paints in, as the config wrote it
 /// (ADR-0144). Absent -- which is most nodes -- means the chain `fonts { ... }` declared.
 ///
 /// A family name rather than a fixed set of roles, because a Nerd-Font-patched body family carries
@@ -275,7 +275,7 @@ pub enum Elide {
     End,
 }
 
-/// `elide` (`lua-api.md` § 5.2 item 4). Only `"End"` is offered: the reference config
+/// `elide`. Only `"End"` is offered: the reference config
 /// uses neither head nor middle elision, and middle elision needs a grapheme budget across runs.
 pub fn parse_elide(properties: &HashMap<String, Value>) -> Result<Elide, LayoutError> {
     let Some(value) = properties.get("elide") else {
@@ -303,7 +303,7 @@ pub enum Wrap {
     Word,
 }
 
-/// `wrap` (`lua-api.md` § 5.2 item 4) defaults to `None`. Before this, a fixed-width
+/// `wrap` defaults to `None`. Before this, a fixed-width
 /// `text` measured its full wrapped height but painted one clipped line; making wrapping default
 /// would have drawn into that extra height everywhere. `None` now measures one line, keeping box
 /// and paint consistent.
@@ -321,7 +321,7 @@ pub fn parse_wrap(properties: &HashMap<String, Value>) -> Result<Wrap, LayoutErr
     }
 }
 
-/// `max_lines` (`lua-api.md` § 5.2 item 4) is uncapped when absent or `0`; zero lets
+/// `max_lines` is uncapped when absent or `0`; zero lets
 /// signal-driven values spell "absent" because `Bound` cannot. Negatives error rather than being
 /// clamped, which would hide a sign mistake in config arithmetic. It is consulted
 /// only for [`parse_wrap`] = `Word`, so setting both unconditionally is safe.
@@ -337,7 +337,7 @@ pub fn parse_max_lines(properties: &HashMap<String, Value>) -> Result<Option<usi
     Ok((n >= 1.0).then_some(n as usize))
 }
 
-/// `text_align` (`lua-api.md` § 5.2 item 4) defaults to `Start` and uses the same
+/// `text_align` defaults to `Start` and uses the same
 /// string boundary as `fit`, `layer`, `align_h`, and `on_click`. `Start`/`End` match `align_h`.
 pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign, LayoutError> {
     let Some(value) = properties.get("text_align") else {
@@ -354,7 +354,7 @@ pub fn parse_text_align(properties: &HashMap<String, Value>) -> Result<TextAlign
     }
 }
 
-/// § 5.1's declared `foreground`, or `None` when absent. Icons preserve their file colours unless
+/// The declared `foreground`, or `None` when absent. Icons preserve their file colours unless
 /// a `currentColor` fill uses this value (ADR-0072).
 pub fn parse_optional_foreground(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     if !properties.contains_key("foreground") {

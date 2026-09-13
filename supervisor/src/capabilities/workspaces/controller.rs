@@ -14,8 +14,8 @@ use crate::compositor::{CompositorKind, detect_compositor, unsupported_session_r
 
 use super::{hyprland, niri};
 
-/// `obelisk.workspaces` payload (§ 2.9). Field names are JSON keys; absent `active_client` is
-/// omitted, not `null` (§ 2.9 says `nil` when unfocused).
+/// `obelisk.workspaces` payload. Field names are JSON keys; absent `active_client` is
+/// omitted, not `null` (`nil` when unfocused).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspacesState {
     /// Source compositor, `"niri"` or `"hyprland"` (ADR-0119). Hyprland creates a numbered
@@ -51,7 +51,7 @@ pub struct SpecialWorkspace {
     pub shown_on: Option<String>,
 }
 
-/// One output's workspace state; `workspaces` is ADR-0056 decision 3's addition to § 2.9.
+/// One output's workspace state; ADR-0056 decision 3 added ordered `workspaces` entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct OutputWorkspaces {
     /// Connector name, e.g. `"eDP-1"`; matches `obelisk.screens.name` and a surface's `monitor`.
@@ -89,7 +89,7 @@ pub struct WorkspaceEntry {
     pub app_id: Option<String>,
 }
 
-/// § 2.9's `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
+/// `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
 /// rejects fabricated `false`; ADR-0119 lets Hyprland provide it). `class` is Wayland `app_id`;
 /// Wayland has no X11 `WM_CLASS` equivalent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -126,14 +126,14 @@ pub struct WorkspaceRow {
     pub app_id: Option<String>,
 }
 
-/// The focused toplevel reduced to § 2.9's three `active_client` fields.
+/// The focused toplevel reduced to the three `active_client` fields.
 ///
 /// The adaptor decides which window is focused (niri flags each one); [`derive_state`] maps the
 /// winner into the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedWindow {
     pub title: String,
-    /// Wayland `app_id`, filling § 2.9's `class` (ADR-0056 decision 5).
+    /// Wayland `app_id`, filling `class` (ADR-0056 decision 5).
     pub app_id: String,
     pub is_floating: bool,
     /// `None` when unreported; it stays absent in the payload.
@@ -146,7 +146,7 @@ pub enum WorkspacesSignal {
     Changed,
 }
 
-/// Folds rows into § 2.9's payload. Pure and unit-tested without a compositor. Sorts outputs by
+/// Folds rows into the payload. Pure and unit-tested without a compositor. Sorts outputs by
 /// connector and workspaces by `idx`; omits an output with no active workspace rather than
 /// fabricating an id (should be unreachable).
 pub fn derive_state(workspaces: &[WorkspaceRow], focused: Option<&FocusedWindow>) -> WorkspacesState {
@@ -421,7 +421,7 @@ mod tests {
         let client = derive_state(&[], Some(&focused)).active_client.expect("a focused window produces active_client");
 
         assert_eq!(client.title, "src/main.rs - Neovim");
-        assert_eq!(client.class, "kitty", "§ 2.9's `class` is Wayland's `app_id`; a Wayland toplevel has no WM_CLASS");
+        assert_eq!(client.class, "kitty", "`class` is Wayland's `app_id`; a Wayland toplevel has no WM_CLASS");
         assert!(client.is_floating);
     }
 

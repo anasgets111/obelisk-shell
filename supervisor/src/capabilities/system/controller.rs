@@ -1,7 +1,7 @@
-//! [`SystemController`] feeds `obelisk.system.time` (docs/lua-api.md §2.11) from one
+//! [`SystemController`] feeds `obelisk.system.time` from one
 //! wall-clock-aligned task, refreshed every second.
 //!
-//! §2.11 has no interval argument, so it ticks unconditionally from construction to shutdown,
+//! `system.time` has no interval argument, so it ticks unconditionally from construction to shutdown,
 //! aligning its first wake to the wall-clock second boundary ([`time_until_next_second`]).
 
 use std::sync::{Arc, Mutex};
@@ -9,11 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `obelisk.system`'s Lua-visible fields (docs/lua-api.md §2.11), with their
+/// `obelisk.system`'s Lua-visible fields, with their
 /// `StateSnapshot` JSON keys unchanged.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {
-    /// Unix epoch seconds, not milliseconds. §2.11 omits the unit, but `os.date` expects seconds;
+    /// Unix epoch seconds, not milliseconds. `os.date` expects seconds;
     /// milliseconds would be wrong by 1000x.
     pub time: i64,
     /// Whole seconds since this controller was built, which is the first time a config asked for
@@ -42,7 +42,7 @@ pub fn should_emit(last_emitted: Option<&SystemState>, current: &SystemState) ->
     last_emitted != Some(current)
 }
 
-/// `SystemTime::now()`'s epoch truncated to whole seconds for §2.11's `time`; one pinned seam.
+/// `SystemTime::now()`'s epoch truncated to whole seconds for `time`; one pinned seam.
 pub fn epoch_seconds(now: SystemTime) -> i64 {
     now.duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs() as i64).unwrap_or(0)
 }

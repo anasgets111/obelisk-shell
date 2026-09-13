@@ -36,7 +36,7 @@ use supervisor::Supervisor;
 /// (ADR-0024).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// § 14.2 ready-signal and § 14.3 evidence-verification deadlines (`reload::PbaTimings`), scaled
+/// Ready-signal and evidence-verification deadlines (`reload::PbaTimings`), scaled
 /// above `reload.rs`'s test constants for a Candidate binding Wayland/EGL. Healthy Candidates fit;
 /// wedged ones cannot hang a config edit.
 const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {

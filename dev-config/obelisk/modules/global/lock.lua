@@ -113,14 +113,14 @@ local function status_item(icon_glyph, label, visible)
     }
 end
 
--- Built per output because the compositor calls `child` for each lock surface (§ 6). Each surface
+-- Built per output because the compositor calls `child` for each lock surface. Each surface
 -- owns its wallpaper and field, matching `LockScreen.qml`'s per-`screen`
 -- `WallpaperService.wallpaperPath`. Unlike `LockContent.qml`, the field is on every output, so the
 -- compositor can focus the sole `secure_submit` field on whichever screen has keyboard focus.
 local function content(output)
-    -- § 6 routes authentication through a `textfield` with `secure_submit`. With `mask_character`
+    -- Authentication routes through a `textfield` with `secure_submit`. With `mask_character`
     -- too, keystrokes stay in a native buffer on the Renderer's Wayland thread and leave as a
-    -- `("lock", "authenticate")` envelope, never a Lua value (§ 5.2 item 8, ADR-0005/ADR-0027). No
+    -- `("lock", "authenticate")` envelope, never a Lua value (ADR-0005/ADR-0027). No
     -- `on_change`/`on_submit`: either callback would reopen the closed path.
     --
     -- It is the surface's only `secure_submit` field, so compositor keyboard focus needs no click.
@@ -360,7 +360,9 @@ local function content(output)
     }
 end
 
--- Declared, not open. § 6 gives `lock` only `id` and `child`; the compositor creates one per output
+-- Declared, not open. `lock` refuses `visible`, `monitor`, `anchor`, `width`, and `height`, but
+-- otherwise takes the common and box properties like any other surface. The compositor creates
+-- one per output
 -- while locked. No Wayland object exists until `obelisk.lock:invoke("lock")` (ADR-0049).
 return lock {
     id = "lock_screen",

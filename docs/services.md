@@ -94,8 +94,9 @@ Supported actions are enable, visibility, start/stop discovery, pair, connect, d
 and answering a pairing prompt. The agent registers as `DisplayYesNo` and puts each confirmation,
 authorization or code display in `pairing_request` for the user, but only while the adapter is
 visible or this shell is pairing that device.
-Starting discovery clears the discovered list. Stopping keeps it; BlueZ expires unpaired devices after
-`TemporaryTimeout` (30 s by default).
+Starting discovery clears the discovered list. Stopping keeps it; BlueZ expires only devices it still
+marks temporary, after `TemporaryTimeout` (30s by default). A device that was connected/trusted, or
+stored from an earlier session, stays.
 
 ### 5.2 Battery and category
 

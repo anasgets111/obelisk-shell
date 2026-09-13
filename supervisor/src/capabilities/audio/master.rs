@@ -1,4 +1,4 @@
-//! Master output volume/mute (§ 2.4) from the default sink's `SPA_PARAM_Props` pod and the
+//! Master output volume/mute from the default sink's `SPA_PARAM_Props` pod and the
 //! metadata lookup that selects that sink.
 //!
 //! It is absent from `info().props()`: after `Node::subscribe_params(&[ParamType::Props])`, it
@@ -8,7 +8,7 @@
 //!
 //! **Linear vs cubic:** at 30%, scalar `SPA_PROP_volume` stayed `1.0`, while
 //! `SPA_PROP_channelVolumes` was `[0.027004944, 0.027004944]` (`0.3^3 = 0.027`; `wpctl`/`pactl`
-//! show `0.30`). Live `wpctl set-mute` confirmed `SPA_PROP_mute` flips independently (§ 2.4). We
+//! show `0.30`). Live `wpctl set-mute` confirmed `SPA_PROP_mute` flips independently. We
 //! max and cube-root the channels, rather than using scalar `volume` or raw `channelVolumes`,
 //! because stereo channels may differ.
 
@@ -18,7 +18,7 @@ use pipewire::spa::sys as spa_sys;
 use pipewire::spa::utils::Id;
 use serde::Serialize;
 
-/// Master output volume/mute, as § 2.4 specifies (`audio.volume`, `audio.muted`).
+/// Master output volume/mute (`audio.volume`, `audio.muted`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MasterVolume {
     pub volume: f32,
@@ -67,7 +67,7 @@ pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
     Some(RawSinkProps { mute, channel_volumes: channel_volumes? })
 }
 
-/// Converts raw `Props` to § 2.4's value: the cube root of the loudest channel. Empty channels
+/// Converts raw `Props` to the reported value: the cube root of the loudest channel. Empty channels
 /// report `0.0` instead of panicking.
 pub fn master_volume_from_props(props: &RawSinkProps) -> MasterVolume {
     let peak_linear = props.channel_volumes.iter().copied().fold(0.0_f32, f32::max);
@@ -83,7 +83,7 @@ pub fn parse_default_device_name(json: &str) -> Option<String> {
 }
 
 /// Resolves the metadata name against tracked `Audio/Sink` or `Audio/Source` `node.name` values,
-/// not registry ids, for § 2.4's `sinks`/`sources` active flag.
+/// not registry ids, for the `sinks`/`sources` active flag.
 ///
 /// ponytail: startup metadata and `global` events have no ordering guarantee, and removal may
 /// have no fresh `default.audio.sink` update. An untracked name falls back to the lowest id,
@@ -121,7 +121,7 @@ pub fn compute_master<'a>(
 
 /// Inverse of [`master_volume_from_props`]'s cube root, spread across `channels`. PipeWire stores
 /// `channelVolumes` cubed, so skipping this wrote 30% as 67%, the read mistake (ADR-0053).
-/// Clamps `linear` to `[0.0, 1.0]` (§ 3.2). § 2.4 has one volume per device, so every channel gets
+/// Clamps `linear` to `[0.0, 1.0]`. There is one volume per device, so every channel gets
 /// the same value, flattening balance.
 pub fn cubed_channel_volumes(linear: f32, channels: usize) -> Option<Vec<f32>> {
     if channels == 0 {

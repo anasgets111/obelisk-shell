@@ -29,7 +29,7 @@ local ui = require("lib.ui_state")
 local KIND = "network"
 local SCROLL = scroll("network_aps")
 
--- Payload order is connected, saved, then descending raw signal (§ 2.5). The list re-sorts by tier.
+-- Payload order is connected, saved, then descending raw signal. The list re-sorts by tier.
 local function access_points(n)
     return (n and n.available_networks) or {}
 end
@@ -91,7 +91,7 @@ local radio_up_and_idle = computed({ obelisk.network, ui.hidden_join }, function
 end)
 
 -- The error card's close button, the mirror's `errorDismissed`. `connect_error` itself stays until
--- the next attempt (§ 2.5), so the dismissal is view state and a new attempt re-arms it.
+-- the next attempt, so the dismissal is view state and a new attempt re-arms it.
 local error_dismissed = state("network_error_dismissed", false)
 
 obelisk.network:on_change(function(n, previous)
@@ -186,7 +186,7 @@ local function access_point_row(entry)
         opacity = entry.blocked and theme.opacity.disabled or nil,
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
         on_activate = clickable and function()
-            -- `hidden` is required (§ 3.2); scanned `available_networks` entries are not hidden.
+            -- `hidden` is required; scanned `available_networks` entries are not hidden.
             obelisk.network:invoke("connect", ap.ssid, false)
         end or nil,
     }
@@ -245,11 +245,10 @@ local function field_box(shown, field)
     }
 end
 
--- Enter, or Next. `hidden = true` is what makes the Supervisor write `802-11-wireless.hidden` and
--- `scan-ssid`, so NetworkManager probes for the name instead of waiting to see it advertised
--- (§ 3.2) -- and what makes it treat the target as secured even though no scanned row says so,
--- since a network it cannot see is one it cannot ask about. So either a saved profile answers and
--- the join goes through, or `password_ssid` comes back and this same sheet asks for the rest.
+-- Enter, or Next. `hidden = true` is what makes the Supervisor write `802-11-wireless.hidden` --
+-- and what makes it treat the target as secured even though no scanned row says so, since a
+-- network it cannot see is one it cannot ask about. So either a saved profile answers and the join
+-- goes through, or `password_ssid` comes back and this same sheet asks for the rest.
 --
 -- The name is kept because the sheet is titled with it and a Retry reconnects to it; the Supervisor
 -- has its own copy parked under the intent.
@@ -299,7 +298,7 @@ local body = {
         end),
         subtitle = obelisk.network:map(state_line),
         trailing = {
-            -- The mirror swaps rescan for a spinner while scanning; `scanning` flips on click (§ 2.5).
+            -- The mirror swaps rescan for a spinner while scanning; `scanning` flips on click.
             icon_button(icons.refresh, function()
                 obelisk.network:invoke("scan")
             end, {

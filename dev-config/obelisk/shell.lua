@@ -9,7 +9,7 @@
 -- exposed the need for clock, battery and volume data sources; none had a source until that ADR.
 --
 -- Editing reloads the stack. Changing surface `id`/`layer`/`anchor`/`monitor`/`namespace` changes
--- topology and triggers a full PBA generation swap (dbus spec § 14); other edits reload in place on
+-- topology and triggers a full PBA generation swap; other edits reload in place on
 -- the same Lua VM.
 
 -- Imports mirror the Quickshell tree. `config/` holds tokens, `components/` dumb reusable widgets,
@@ -48,7 +48,7 @@ local settings = require("modules.bar.panels.settings")
 local panel_host = require("modules.shell.panel_host")
 local modal_host = require("modules.global.modal_host")
 -- Each tooltip is its own surface, not a bar child: `popup` is an `xdg_popup` rooted under the bar
--- (§ 6, ADR-0062). `visible = false` creates no Wayland object until hover.
+-- (ADR-0062). `visible = false` creates no Wayland object until hover.
 local battery_tooltip = require("modules.bar.indicators.battery").tooltip
 local clock_tooltip = require("modules.bar.indicators.date_time").tooltip
 local launcher_tooltip = require("modules.bar.indicators.launcher_button").tooltip

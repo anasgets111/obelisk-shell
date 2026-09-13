@@ -1231,7 +1231,7 @@ mod tests {
     fn only_svg_is_rasterized_by_size() {
         assert!(is_vector(Path::new("/usr/share/icons/Adwaita/symbolic/x.svg")));
         assert!(is_vector(Path::new("/tmp/X.SVG")));
-        assert!(!is_vector(Path::new("/dev/shm/obelisk-1000/tray/telegram.png")));
+        assert!(!is_vector(Path::new("/run/user/1000/obelisk/tray/telegram.png")));
         assert!(!is_vector(Path::new("/tmp/no-extension")));
         // `.svgz` is unsupported (see `rasterize_svg`'s ponytail): vector treatment would feed gzip
         // bytes to XML, so it takes the raster path and fails there.

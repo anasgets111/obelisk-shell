@@ -1,5 +1,5 @@
 ---@meta
--- The four surface roles (`lua-api.md` § 6, ADR-0040); a `wl_surface` stays inert.
+-- The four surface roles (ADR-0040); a `wl_surface` stays inert.
 -- Protocol assigns its role. This shell has one constructor per role. `shell.lua` returns the set,
 -- freshly evaluated on every reload (ADR-0038).
 --
@@ -13,7 +13,8 @@
 ---@alias Rect { x: number, y: number, width: number, height: number }
 ---@alias PopupAnchor "Top"|"Bottom"|"Left"|"Right"|"TopLeft"|"TopRight"|"BottomLeft"|"BottomRight"|"Center"
 
----A surface root uses `rect`'s `NodeBase` properties, paints like one, and keeps its § 6 topology.
+---A surface root uses `rect`'s `NodeBase` properties, paints like one, and keeps its own topology
+---(`id`, `layer`, `anchor`, `monitor`, `namespace`) instead of a parent's layout slot.
 ---@class PanelProps: NodeBase, BoxBase
 ---@field id string Unique. A surface targeting several outputs is one Wayland surface per output, addressed as `"{id}@{output}"`.
 ---@field layer "Background"|"Bottom"|"Top"|"Overlay" Required, no default: a typo'd layer that quietly stacked a bar on `Background` would be worse than an error.
@@ -35,7 +36,7 @@
 ---@field min_size? { width: integer, height: integer } Advisory; the spec says a client should not rely on the compositor obeying it.
 ---@field max_size? { width: integer, height: integer } Advisory.
 ---@field on_close? fun() A request, not a command. The callback may decline by doing nothing; the window stays open until the config sets `visible = false`.
----@field visible? boolean|Bound `false` unmaps the surface without destroying it, so its state and its `id` survive. This is how a panel is opened and closed.
+---@field visible? boolean|Bound Hiding destroys the toplevel and showing recreates it; its state and `id` survive (ADR-0049). This is how a window is opened and closed.
 ---@field child? Node The one root node. A surface holds exactly one; use a `row` or `column` for more.
 
 ---@class PopupProps: NodeBase, BoxBase
@@ -50,7 +51,7 @@
 ---@field offset? { x?: integer, y?: integer } Pixel nudge after anchor and gravity. Either axis alone is fine; the absent one is `0`.
 ---@field grab? boolean|Bound Default `true`. A compositor may deny the grab, in which case the popup is dismissed immediately and `on_dismiss` fires. That is a normal outcome, not an error.
 ---@field on_dismiss? fun() Fires when the compositor takes the popup down: a click outside, a denied grab, or the parent going away. Not called when the config unmaps it itself.
----@field visible? boolean|Bound `false` unmaps the surface without destroying it, so its state and its `id` survive. This is how a panel is opened and closed.
+---@field visible? boolean|Bound Hiding destroys the popup and showing recreates it; its state and `id` survive (ADR-0049). This is how a popup is opened and closed.
 ---@field child? Node The one root node. A surface holds exactly one; use a `row` or `column` for more.
 
 ---@class LockProps: NodeBase, BoxBase

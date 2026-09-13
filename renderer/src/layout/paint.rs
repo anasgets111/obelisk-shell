@@ -616,7 +616,7 @@ fn draw_for(
     let dissolve = node.dissolve.as_ref();
     match node.paint.as_ref()? {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
-        // fill, then borders (`lua-api.md` § 5.2 item 1). `clip` is not read here: it
+        // fill, then borders. `clip` is not read here: it
         // decides what this node's *children* are cut to, `build_node`'s question, not this one's.
         PaintStyle::Box { background, radius, colors, widths, clip: _ } => Some(Draw::Box {
             background: background.map(|color| fade(color, opacity)),
@@ -625,7 +625,7 @@ fn draw_for(
             widths: *widths,
         }),
 
-        // `text` (§ 5.2 item 4): `content` through `TextPainter`, at `rect`, coloured by
+        // `text`: `content` through `TextPainter`, at `rect`, coloured by
         // `foreground`. `elide`, `wrap` and `max_lines` are absent on purpose: `Scene::apply`
         // already rewrote `content` to the string that fits -- ellipsized, or line-broken with
         // `\n` -- in the only place the box width and the shaping worker are both in reach.
@@ -651,7 +651,7 @@ fn draw_for(
             })
         }
 
-        // Icons use `Contain` and the shorter edge: § 5.2's `size` is a bounding-box diameter.
+        // Icons use `Contain` and the shorter edge: `size` is a bounding-box diameter.
         PaintStyle::Icon { name, color } => Some(Draw::Icon {
             name: name.clone(),
             px: physical_edge(rect.width.min(rect.height), scale),
@@ -739,7 +739,7 @@ fn draw_for(
                 runs: Vec::new(),
                 font_size: *font_size,
                 // A `textfield` draws its placeholder and its masked content in the declared
-                // chain; nothing in § 5.2 lets one name a family.
+                // chain; nothing lets one name a family.
                 font: None,
                 color: fade(*color, opacity),
                 align: *align,
@@ -959,7 +959,7 @@ enum EdgeAxis {
 }
 
 /// One border edge: paints only where both a colour and a non-zero width say so
-/// (`node::parse_border_color`'s doc comment: `border_width` alone is documented § 5.2 behaviour,
+/// (`node::parse_border_color`'s doc comment: `border_width` alone is documented behaviour,
 /// not a bug). Snaps the edge's thin axis with `snap_border_band` first, the same whole-physical-
 /// pixel treatment as the uniform-radius stroke above; the long axis is left alone, since only the
 /// thin axis can straddle a pixel boundary and blur.
@@ -1609,7 +1609,7 @@ mod tests {
         resolved_surface(lua, src, LogicalSize { width: 200.0, height: 40.0 })
     }
 
-    /// The plain half of § 5.2 item 8 (ADR-0092). Unfocused it is a placeholder like any other
+    /// The plain half of `textfield` (ADR-0092). Unfocused it is a placeholder like any other
     /// field; focused it shows what has been typed, with a caret after it.
     #[test]
     fn a_plain_textfield_shows_its_placeholder_until_it_is_focused() {
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(drawn[0].chars().all(|c| c == '*'), "nothing but the mask glyph may reach the list");
     }
 
-    /// § 5.2 item 8 makes `mask_character` optional, and a field that omits it should still look
+    /// `mask_character` is optional, and a field that omits it should still look
     /// like a password field rather than draw nothing.
     #[test]
     fn a_field_without_a_mask_character_falls_back_to_a_bullet() {

@@ -90,14 +90,14 @@ pub enum LoaderError {
     /// `shell.lua` failed to parse or raised during evaluation.
     #[error("shell.lua failed to evaluate: {0}")]
     Eval(#[from] mlua::Error),
-    /// Clean evaluation returned neither a § 6 surface nor an array. Empty array and no return are
-    /// valid: a config may declare no surfaces (ADR-0070 decision 7).
+    /// Clean evaluation returned neither a root-role surface nor an array. Empty array and no
+    /// return are valid: a config may declare no surfaces (ADR-0070 decision 7).
     #[error("shell.lua's top-level return must be a `panel` node or an array of them: {0}")]
     InvalidTopLevelReturn(String),
     /// [`Loader::evaluate_file`] could not read `shell.lua` (missing file, permissions).
     #[error("failed to read shell.lua: {0}")]
     Io(#[from] std::io::Error),
-    /// A valid top-level surface had a mistyped § 6 topology field
+    /// A valid top-level surface had a mistyped topology field
     /// (`id`/`layer`/`anchor`/`monitor`), distinct from [`Self::InvalidTopLevelReturn`].
     #[error("shell.lua's surface topology is invalid: {0}")]
     InvalidTopology(String),
@@ -109,7 +109,7 @@ impl From<nodes::DeserializeError> for LoaderError {
     }
 }
 
-/// One `Loader::evaluate` result: top-level `panel` nodes with § 6 topology
+/// One `Loader::evaluate` result: top-level `panel` nodes with topology
 /// (`id`/`layer`/`anchor`/`monitor`/`exclusive`) directly in `properties`, so the Watcher can diff
 /// them without walking into `child`.
 #[derive(Debug)]
@@ -275,11 +275,11 @@ fn collect_surfaces(value: Value) -> Result<Vec<VirtualNode>, LoaderError> {
     Ok(surfaces)
 }
 
-/// Admits all four § 6 root roles (ADR-0040 decision 1). Declaration location and Wayland-object
+/// Admits all four root roles (ADR-0040 decision 1). Declaration location and Wayland-object
 /// lifetime are separate (ADR-0052 decision 2), as ADR-0049 already established for `window` (no
 /// `xdg_toplevel`
 /// until `visible` is true) and `popup`. `lock` owns no `ext_session_lock_surface_v1` until the
-/// compositor sends `locked`; rejecting it would leave § 6's authored lock-screen `child` nowhere
+/// compositor sends `locked`; rejecting it would leave the authored lock-screen `child` nowhere
 /// legal to write.
 fn require_surface(node: &VirtualNode) -> Result<(), LoaderError> {
     match node.kind.as_str() {
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn evaluate_accepts_a_window_and_a_popup_at_the_top_level_beside_a_panel() {
-        // ADR-0040 decision 1: all four § 6 roles may be declared at the root.
+        // ADR-0040 decision 1: root roles may be mixed together in the top-level array.
         let loader = test_loader();
         let output = loader
             .evaluate(

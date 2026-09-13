@@ -6,8 +6,8 @@ local panel_card = require("components.panel_card")
 local panel_header = require("components.panel_header")
 local section_header = require("components.section_header")
 
--- A real `xdg_toplevel`, opened by `power_menu.lua` and closable through its `panel_header`. § 6
--- gives a `window` no monitor, anchor, or size; inspect placement with `niri msg windows`.
+-- A real `xdg_toplevel`, opened by `power_menu.lua` and closable through its `panel_header`. A
+-- `window` gets no monitor, anchor, or size; inspect placement with `niri msg windows`.
 --
 -- This holds readouts without indicators. Bluetooth moved to `panels/bluetooth_panel.lua` when it
 -- gained its own opener, matching Quickshell's control-behind-what-it-controls split. The system
@@ -15,7 +15,7 @@ local section_header = require("components.section_header")
 -- panel, where the mirror instantiates it, and a second copy here was the same numbers twice.
 --
 -- What is left is thin on purpose. This file is the config's only `window {}`, so it is also the
--- only exercise of § 6's toplevel -- surviving a compositor that gives it no monitor, anchor or
+-- only exercise of the toplevel -- surviving a compositor that gives it no monitor, anchor or
 -- size. Deleting it for being thin would delete that.
 return window {
     id = "settings",

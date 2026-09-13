@@ -19,7 +19,7 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
 
-    /// Pointer and keyboard only; § 5.2 has no touch property. `is_none` guards are required:
+    /// Pointer and keyboard only; there is no touch property. `is_none` guards are required:
     /// `wl_seat::capabilities` restates the full set: gaining a keyboard re-announces the pointer,
     /// and duplicate SCTK objects would duplicate events into one armed/focus state.
     fn new_capability(
@@ -50,7 +50,7 @@ impl SeatHandler for App {
                     }
                 }
             }
-            // Use the compositor keymap (`None` rmlvo); § 5.2 has no `on_key` for this shell to
+            // Use the compositor keymap (`None` rmlvo); there is no `on_key` for this shell to
             // interpret, so imposing a layout would serve no policy.
             Capability::Keyboard if self.keyboard.is_none() => match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(keyboard) => self.keyboard = Some(keyboard),

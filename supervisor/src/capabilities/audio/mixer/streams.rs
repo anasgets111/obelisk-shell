@@ -34,7 +34,7 @@ const STREAM_OUTPUT_VIDEO: &str = "Stream/Output/Video";
 const STREAM_CAPTURE_SINK: &str = "stream.capture.sink";
 
 /// A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
-/// § 2.4 names `id`/`name` (ADR-0053 decision 3), while ADR-0016's `pid`/`process_name` remain.
+/// ADR-0053 decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
     /// PipeWire registry id, the `MixerState::apps` key.
@@ -45,10 +45,10 @@ pub struct AppStream {
     pub name: Option<String>,
     /// `/proc/{pid}/comm`, if the process still existed when observed.
     pub process_name: Option<String>,
-    /// § 2.4 per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master
+    /// Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master
     /// sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
     pub volume: f32,
-    /// § 2.4 per-app mute, from the same `Props` as `volume`.
+    /// Per-app mute, from the same `Props` as `volume`.
     pub muted: bool,
 }
 

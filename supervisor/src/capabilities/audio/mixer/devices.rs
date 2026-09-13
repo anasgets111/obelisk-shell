@@ -9,7 +9,7 @@ use serde::Serialize;
 use super::PropsLookup;
 use crate::capabilities::audio::master;
 
-/// One § 2.4 `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
+/// One `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
 /// `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AudioDevice {
@@ -116,7 +116,7 @@ pub(super) struct DeviceNames {
 }
 
 impl DeviceNames {
-    /// § 2.4's `name`, falling back to the routing name so an unnamed device remains selectable.
+    /// The display `name`, falling back to the routing name so an unnamed device remains selectable.
     fn display(&self) -> String {
         self.description.clone().unwrap_or_else(|| self.node_name.clone())
     }
@@ -142,7 +142,7 @@ pub(super) struct DeviceRoute {
     pub(super) profile_device: i32,
 }
 
-/// Builds a § 2.4 device array, ordered by registry id for deterministic publishes.
+/// Builds a device array, ordered by registry id for deterministic publishes.
 pub(super) fn device_list<'a>(
     devices: impl Iterator<Item = (u32, &'a DeviceNames)> + Clone,
     default_name: Option<&str>,
@@ -161,7 +161,7 @@ pub(super) fn device_list<'a>(
     list
 }
 
-/// § 2.4's display name: `node.description`, then `node.nick`, then `node.name`.
+/// The display name: `node.description`, then `node.nick`, then `node.name`.
 /// Live `pw-dump` shows the first two absent on streams and present on every sink/source.
 pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
     props

@@ -289,8 +289,8 @@ local body = {
         end,
     },
     section_header("brightness"),
-    -- No brightness module, matching Quickshell, so § 3.2's one argument-taking command is driven
-    -- here (Phase 25 item 2). Two buttons are clearer than left-up/right-down semantics.
+    -- No brightness module, matching Quickshell, so `obelisk.brightness` is driven here. Two
+    -- buttons are clearer than left-up/right-down semantics.
     --
     -- One row, not three: the level bar sits between two buttons, like reference `Slider.qml` and
     -- `components/meter.lua` for battery/volume. No drag: a press supplies a rect and button name;

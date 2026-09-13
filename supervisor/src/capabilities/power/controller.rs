@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedValue;
 
-/// `obelisk.power`'s full payload (§ 2.13). Optional fields are omitted from JSON, so unavailable
+/// `obelisk.power`'s full payload. Optional fields are omitted from JSON, so unavailable
 /// host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
@@ -49,7 +49,7 @@ trait UPower {
 }
 
 /// The composite `DisplayDevice`, not `battery_BAT0`: UPower sums every battery there.
-/// `EnergyRate` is a positive watt magnitude while charging or discharging; § 2.13 wants no
+/// `EnergyRate` is a positive watt magnitude while charging or discharging; `obelisk.power` wants no
 /// direction, so configs needing it read `obelisk.battery.state`.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.Device",
@@ -85,7 +85,7 @@ const POWER_PROFILES_ENDPOINTS: [(&str, &str, &str); 2] = [
     ("net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"),
 ];
 
-/// Extracts § 2.13's profile names from daemon descriptions. Missing or non-string `Profile`
+/// Extracts profile names from daemon descriptions. Missing or non-string `Profile`
 /// entries are skipped; `power:set_profile(p)` validates against this list.
 fn profile_names(profiles: &[HashMap<String, OwnedValue>]) -> Vec<String> {
     profiles
@@ -222,7 +222,7 @@ async fn run_power_task(
     }
     if upower.is_none() && device.is_none() && profiles.is_none() {
         eprintln!(
-            "power: nothing on this host can answer any of § 2.13's fields; power reporting disabled for this run"
+            "power: nothing on this host can answer any of obelisk.power's fields; power reporting disabled for this run"
         );
         return;
     }

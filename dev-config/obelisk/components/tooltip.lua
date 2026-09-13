@@ -2,7 +2,7 @@
 -- takes the hover boolean and `anchor_rect` takes the engine-written rect.
 --
 -- `grab = false` is required. A grabbing popup takes the pointer off its source node and flickers;
--- hover also has no click to carry the armed input serial required by § 6.
+-- hover also has no click to carry the required armed input serial.
 --
 -- The 4px offset opens below the anchor, keeping a pointer resting on the pill out of the tooltip
 -- so their hover states do not fight. Moving down closes it when leaving the bar turns hover off.
@@ -42,7 +42,7 @@ return function(opts)
         -- width and height because its rows fill the card rather than sizing it.
         width = opts.width,
         height = opts.height,
-        -- § 6 defaults `grab` to `true`, but hover cannot produce the required input serial.
+        -- `grab` defaults to `true`, but hover cannot produce the required input serial.
         -- Without this, `visible = true` resolves and is refused on every re-resolve.
         grab = false,
         -- Centre under the indicator, matching `Tooltip.qml`'s

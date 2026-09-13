@@ -3,8 +3,8 @@
 -- Pure arithmetic and existing nodes need no capability, subprocess, or engine feature. A grid is a
 -- `column` of `row`s once the offsets are computed.
 --
--- Use `os.date`/`os.time`, with `obelisk.system.time` supplying *today*. § 2.x has no calendar
--- capability and should not grow one.
+-- Use `os.date`/`os.time`, with `obelisk.system.time` supplying *today*. There is no calendar
+-- capability, and none should be added.
 --
 -- Not a panel. `DateTimeDisplay.qml` puts this in the clock's hover tooltip; a click opens the
 -- notifications panel, so the always-visible bar readout does not open a month grid.
@@ -145,9 +145,10 @@ local title = cell(obelisk.system:map(function(s)
     return { { text = os.date("%B %Y", (s and s.time) or os.time()), bold = true } }
 end), theme.FG, theme.font.sm, { width = "Fill", align = "Center" })
 
--- `implicitWidth`/`implicitHeight` are measured by the mirror, but § 6 sizes a popup surface
--- explicitly, so its host cannot measure this like a `Column`. Height follows row count: a
--- five-week month is one `DAY_SIDE` shorter than a six-week one, and § 6 takes `integer|Bound`.
+-- `implicitWidth`/`implicitHeight` are measured by the mirror, but a popup surface's size is
+-- explicit, so its host cannot measure this like a `Column`. Height follows row count: a
+-- five-week month is one `DAY_SIDE` shorter than a six-week one, and surface size takes
+-- `integer|Bound`.
 --
 -- 1.2 is `renderer::text::shaping::LINE_HEIGHT_RATIO`. Sizing a fixed surface is the one place a
 -- config has to know it; everything else lets the engine measure.

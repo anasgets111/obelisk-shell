@@ -9,10 +9,10 @@ use zbus::zvariant::OwnedObjectPath;
 use super::{AccessPointInfo, NetworkController, NetworkSignal};
 use crate::capabilities::bind;
 
-/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/services.md § 4).
+/// How many deduplicated APs [`dedup_and_top20`] keeps.
 const MAX_AVAILABLE_NETWORKS: usize = 20;
 
-/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"`
+/// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"`.
 /// Real Wi-Fi hardware falls inside one range, so `None` is honest "no band", not a
 /// guessed default.
 pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
@@ -78,7 +78,7 @@ pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo>
     deduped
 }
 
-/// § 2.5's `ssid`: `"Ethernet"` for a wired default route, the associated AP's name otherwise,
+/// `ssid`: `"Ethernet"` for a wired default route, the associated AP's name otherwise,
 /// and `None` when neither holds, which Lua reads as `nil` for offline.
 ///
 /// Wired wins because `ssid` names what `NetworkState::connected` describes. A docked laptop may

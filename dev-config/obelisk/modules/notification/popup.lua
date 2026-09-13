@@ -10,7 +10,7 @@ local util = require("lib.util")
 local ui = require("lib.ui_state")
 local notification_card = require("components.notification_card")
 
--- Visible stack count matches `maxVisibleNotifications`. The feed carries twenty (§ 2.7), too many
+-- Visible stack count matches `maxVisibleNotifications`. The feed carries twenty, too many
 -- for a screen; the rest belong one click away in history.
 local MAX_CARDS = 4
 

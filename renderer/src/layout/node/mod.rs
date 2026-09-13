@@ -1,7 +1,7 @@
-//! Typed, validated properties for `VirtualNode` (`docs/lua-api.md` § 5.1).
+//! Typed, validated properties for `VirtualNode`.
 //! `resolve_properties` reads each ordinary `Signal` once per node/pass (ADR-0044 decision 1);
 //! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals. A
-//! `panel`'s other § 6 properties are live fields, not exceptions. Plain tables remain
+//! `panel`'s other properties are live fields, not exceptions. Plain tables remain
 //! metamethod-backed, so each `table.get` can still run `__index`; see `parse_edge_insets`'s
 //! `ponytail:`. A signal resolving to another signal errors rather than reading again, while
 //! `MAX_TREE_DEPTH` bounds recursive tree construction.
@@ -182,7 +182,7 @@ pub(crate) fn invalid(property: &str, detail: impl Into<String>) -> LayoutError 
 pub(crate) const MAX_ARRAY_ELEMENTS: usize = 10_000;
 
 /// Maximum rejected-value preview, separate from `marshal::MAX_STRING_BYTES`: 200 bytes bounds a
-/// `rescue` `error_log` line (§ 2.10) without limiting valid string properties.
+/// `rescue` `error_log` line without limiting valid string properties.
 const MAX_ERROR_VALUE_PREVIEW_BYTES: usize = 200;
 
 /// Crate-visible because `layout::scene`'s `list` parser reports bad `source`, `itemfn`, or `key`
@@ -252,9 +252,9 @@ fn checked_string(property: &str, s: &mlua::LuaString) -> Result<String, LayoutE
     Ok(s)
 }
 
-/// Strict `#RRGGBB` / `#RRGGBBAA` hex colour parsing (§ 5.2's `rect.background`, `border_color`,
-/// `text.foreground`). No 3-digit shorthand, no named colours, no bare digits without `#`: § 5.2
-/// specifies none of them.
+/// Strict `#RRGGBB` / `#RRGGBBAA` hex colour parsing (`rect.background`, `border_color`,
+/// `text.foreground`). No 3-digit shorthand, no named colours, no bare digits without `#`: none
+/// of them is specified.
 fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
     let Some(digits) = s.strip_prefix('#') else {
         return Err(invalid(property, format!("hex colour must start with `#`, got `{s}`")));
@@ -296,7 +296,7 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size` are all valid requests
 /// on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on every open (ADR-0049
 /// decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a
-/// `lock`'s § 6 property list is only `id` and `child`, already the universal arm's as a reconcile
+/// `lock`'s property list is only `id` and `child`, already the universal arm's as a reconcile
 /// identity rather than a protocol field. `hover` joins it there on any kind (ADR-0062 decision 3):
 /// it names the signal the pointer handler writes, and a resolved `hover` would arrive as the
 /// boolean `false`, saying nothing about *which* signal that is.
@@ -335,7 +335,7 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 /// nil` reads the same. Everything else, including a `UserData` that is not a `Signal`, is copied
 /// through unchanged, for whichever parser reads it. Every property resolves, including ones no
 /// parser reads today: the resolved map is what the paint stage reads a colour or radius straight
-/// off (`ResolvedNode::properties`), and § 5.1 puts no property out of a `Signal`'s reach, so there
+/// off (`ResolvedNode::properties`), and no property is out of a `Signal`'s reach, so there
 /// is no subset safe to skip. A getter that raises fails the whole apply, even for a property
 /// nothing downstream looked at: deferring would mean keeping the getter around to re-run later,
 /// the second read this function prevents.
@@ -346,7 +346,7 @@ fn is_structural_property(kind: &str, property: &str) -> bool {
 /// retained map, reordering the reconcile match before resolution.
 ///
 /// ponytail: every property *holding a `Signal`* is evaluated every pass, paint-only ones
-/// included (`background`, `color`, `radius`), each buying its own ADR-0021 5ms budget (§ 1.2), so
+/// included (`background`, `color`, `radius`), each buying its own ADR-0021 5ms budget, so
 /// four signal-bound paint properties cost four budgets in a pass ADR-0044 decision 2 now runs per
 /// capability push. Upgrade path: [`parse_edge_insets`]'s `ponytail:` whole-pass budget.
 pub fn resolve_properties(
@@ -358,7 +358,7 @@ pub fn resolve_properties(
     // Sorted, and the sort is the point: `properties` is a `HashMap` with per-process randomised
     // iteration order, so two failing properties on one node used to name whichever the hash seed
     // reached first, differing across runs. `renderer/src/socket.rs` puts this message in the
-    // `rescue` global's `error_log` for a human to read (§ 2.10, ADR-0024), so which property a
+    // `rescue` global's `error_log` for a human to read (ADR-0024), so which property a
     // broken config names must be a function of the config alone. Do not "optimise" this into a
     // bare `for (property, value) in properties`.
     let mut names: Vec<&String> = properties.keys().collect();
@@ -454,7 +454,7 @@ fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bo
 
 /// The value under `property`, or `None` when it is absent *or* a deferred `Signal`.
 ///
-/// Seven § 6 parsers take the same default for both, so they read the property through this
+/// Seven parsers take the same default for both, so they read the property through this
 /// instead of writing [`is_deferred_signal`] and `properties.get` one after the other. Order does
 /// not matter: a deferred property missing from the map takes the default either way. Parsers whose
 /// deferred and absent answers differ -- `parse_anchor_rect`, `parse_popup_extent` -- keep both

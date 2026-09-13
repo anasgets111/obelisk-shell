@@ -9,13 +9,13 @@ use std::path::Path;
 use crate::layout::{self, node::SurfaceSpec};
 use crate::lua::{LoadOutput, Loader, LoaderError};
 
-/// Parses every declared § 6 role and returns the roster. Field type errors are
+/// Parses every declared root role and returns the roster. Field type errors are
 /// [`LoaderError::InvalidTopology`], distinct from top-level shape errors.
 ///
-/// **Parse every role, including unused-path properties.** § 6 violations become protocol errors
+/// **Parse every role, including unused-path properties.** Role violations become protocol errors
 /// (`invalid_positioner` for zero `anchor_rect`, `invalid_size` for `max_size < min_size`) that
 /// kill the connection. Catch config typos as `layout::node::LayoutError` during evaluation, in
-/// `rescue.error_log` (§ 2.10, ADR-0046).
+/// `rescue.error_log` (ADR-0046).
 ///
 /// **Literal fast-fail only, not the authoritative spec** for moving properties (ADR-0049 decision
 /// 2): a `Signal` in `window.title` or `popup.anchor_rect` is skipped via
@@ -43,17 +43,17 @@ pub(crate) fn surface_specs(output: &LoadOutput) -> Result<Vec<SurfaceSpec>, Loa
         });
     }
     // **At most one `lock`, checked here on startup and `Reevaluate`.** This is the only place
-    // that can enforce it: every declaration passes through this function on both paths. Other § 6
+    // that can enforce it: every declaration passes through this function on both paths. Other
     // roles may repeat.
     // Two locks make `expand_instances` produce two per-output instances and
     // `App::ensure_lock_surfaces` send two `get_lock_surface` requests. ext-session-lock-v1 calls
     // this `duplicate_output`; the compositor disconnects without unlocking, leaving only a VT
     // switch.
-    // § 6 gives `lock` no monitor and one surface per output, so two screens have no valid layout.
+    // `lock` has no monitor and one surface per output, so two screens have no valid layout.
     let locks = specs.iter().filter(|spec| matches!(spec, SurfaceSpec::Lock(_))).count();
     if locks > 1 {
         return Err(LoaderError::InvalidTopology(format!(
-            "this config declares {locks} `lock` surfaces; § 6.4 gives a `lock` no `monitor` and exactly one surface per output, so a config may \
+            "this config declares {locks} `lock` surfaces; a `lock` has no `monitor` and exactly one surface per output, so a config may \
              declare at most one -- a second would ask the compositor for two lock surfaces on one output, which is `duplicate_output`, which kills \
              the connection with the session still locked"
         )));

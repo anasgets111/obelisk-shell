@@ -55,7 +55,7 @@ pub(in crate::wayland) struct ArmedSerial {
 
 /// Innermost `button` with callable `on_click` in a hit path (ADR-0050 decision 1). Scan inward:
 /// the deepest node is normally the button's `text` child. A button without a handler is
-/// transparent, and only `Value::Function` counts; `layout::node` leaves the key opaque (§ 5.2).
+/// transparent, and only `Value::Function` counts; `layout::node` leaves the key opaque.
 fn clickable_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(LogicalRect, Option<&'a Function>, bool)> {
     path.iter().enumerate().rev().find_map(|(depth, node)| {
         if node.kind != "button" {
@@ -198,7 +198,7 @@ fn release_completes_click(
 }
 
 /// Call `on_click` with its button rect in surface logical coordinates (ADR-0050 decision 3). The
-/// rect round-trips to popup `anchor_rect` through Lua (§ 6). Error labels distinguish building the
+/// rect round-trips to popup `anchor_rect` through Lua. Error labels distinguish building the
 /// engine's argument from a raised config handler.
 fn call_on_click(
     lua: &Lua,
@@ -310,7 +310,7 @@ impl PointerHandler for App {
                     self.focus_secure_submit(masked);
                     self.focus_text_field(plain);
                     // A textfield press arms no click, so an ancestor button cannot fire
-                    // (ADR-0092); § 5.2 makes textfield a leaf. This keeps notification reply boxes
+                    // (ADR-0092); `textfield` is a leaf. This keeps notification reply boxes
                     // from also activating the card.
                     self.armed = hit.button.filter(|_| !pressed_a_field).map(|clickable| ArmedClick {
                         instance_id: instance_id.clone(),
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn an_on_click_that_is_not_a_function_is_not_a_click_handler() {
-        // Nothing in `layout::node` parses this key (§ 5.2 leaves it opaque), so a config writing
+        // Nothing in `layout::node` parses this key (it stays opaque), so a config writing
         // `on_click = "quit"` reaches here as a string and must simply not fire.
         let lua = Lua::new();
         let mut button = hit_node(&lua, "button", (0.0, 0.0, 40.0, 24.0), false);

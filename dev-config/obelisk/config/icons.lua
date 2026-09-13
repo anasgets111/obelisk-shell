@@ -101,7 +101,7 @@ icons.cpu             = "\u{F035B}"
 icons.ram             = "\u{F061A}"
 icons.gpu             = "\u{F08AE}"
 
--- Bluetooth device categories, one per § 2.6 `category`, avoid using the generic glyph for a mouse
+-- Bluetooth device categories, one per `category`, avoid using the generic glyph for a mouse
 -- or headset.
 icons.device          = {
     keyboard   = "\u{F030C}",

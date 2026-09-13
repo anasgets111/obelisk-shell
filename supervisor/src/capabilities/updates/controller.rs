@@ -294,7 +294,7 @@ async fn run_check_task(
 }
 
 /// Runs one scheduled or manual check. Pushes when `checking` rises and when the result is written,
-/// so the state is visible during the sync. Failures preserve `count`/`packages` (§2.14) and write
+/// so the state is visible during the sync. Failures preserve `count`/`packages` and write
 /// only `check_error`.
 async fn run_one_check(
     backend: &Arc<dyn Backend>,
@@ -656,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn failed_checks_count_up_and_leave_the_last_good_answer_alone() {
         let (controller, mut events_rx) = failing_controller().await;
-        // A count from an earlier good check, which a failure must not blank (§ 2.14).
+        // A count from an earlier good check, which a failure must not blank.
         controller.state.lock().unwrap().count = 3;
 
         controller.check_now();

@@ -120,7 +120,7 @@ pub struct App {
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// Whether `OBELISK_PBA_CANDIDATE` was set (Supervisor services § 14.2), read once in [`run`].
+    /// Whether `OBELISK_PBA_CANDIDATE` was set (PBA protocol), read once in [`run`].
     is_pba_candidate: bool,
     /// Set after [`App::maybe_send_ready_signal`] sends its one-time `ReadySignal`.
     ready_signal_sent: bool,
@@ -159,7 +159,7 @@ pub struct App {
     /// Focused surface instance id (ADR-0050); `input::keyboard::focus_is_still_armed` requires a
     /// `secure_submit` field's declaring surface to match it.
     ///
-    /// ponytail: nothing else consumes it (§ 5.2 has no `on_key`; ADR-0050 declines to invent
+    /// ponytail: nothing else consumes it (there is no `on_key` property; ADR-0050 declines to invent
     /// one). Upgrade path: an IDL key-handler property, dispatching into this surface's tree.
     keyboard_focus: Option<String>,
     /// Press waiting for release (ADR-0050 decision 2, [`ArmedClick`]).
@@ -189,7 +189,7 @@ pub struct App {
     /// Starts as an empty dead scope rather than the first key observed, so the first focused turn
     /// reads as a change and is not silently classed as removable.
     last_focus_key: (Vec<String>, bool),
-    /// Focused plain `textfield` and its draft, the unmasked § 5.2 item 8 half (ADR-0092). Only a
+    /// Focused plain `textfield` and its draft, the unmasked half (ADR-0092). Only a
     /// press selects it; sole-field `enter` fallback cannot serve multiple reply boxes.
     ///
     /// Mutually exclusive with `focused_secure_submit`; the innermost textfield is one kind.
@@ -325,14 +325,14 @@ pub fn run(
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // Candidate order from `services.md` § 14.2: evaluate shell.lua, bind
+    // Candidate order from the PBA protocol: evaluate shell.lua, bind
     // declared layer surfaces (ADR-0038 decision 1), commit null buffers (`bind_and_clear`'s
     // candidate branch), and signal ready (`maybe_send_ready_signal`).
     //
     // ponytail: this runs inside the PBA ready window (`ready_timeout` 2s,
     // `supervisor/src/main.rs`'s `PBA_TIMINGS`); first `text` shaping blocks on
     // `FontSystem::new()`.
-    // Accepted because § 14.2 requires evaluate-before-bind.
+    // Accepted because the PBA protocol requires evaluate-before-bind.
     //
     // Seed `screens` before evaluation (ADR-0041 decision 2): configs loop over it during the
     // first pass, so seeding after evaluation would declare no per-monitor panels.
@@ -348,7 +348,7 @@ pub fn run(
     let instances = expand_instances(&specs, &outputs);
     for spec in &specs {
         let SurfaceSpec::Panel(panel) = spec else {
-            // Only a `panel` names a monitor (§ 6); toplevels are compositor-placed and popups use
+            // Only a `panel` names a monitor; toplevels are compositor-placed and popups use
             // a parent.
             continue;
         };
@@ -362,9 +362,9 @@ pub fn run(
         }
     }
     app.client.set_instances(instances.clone());
-    // The first resolve validates only: § 14.2 requires evaluate-before-bind, so instances use
-    // output logical sizes and are never painted. Evaluation/apply already log and set rescue;
-    // this adds the consequence.
+    // The first resolve validates only: the PBA protocol requires evaluate-before-bind, so
+    // instances use output logical sizes and are never painted. Evaluation/apply already log and
+    // set rescue; this adds the consequence.
     if !app.client.apply_instances() {
         eprintln!(
             "[obelisk-renderer] no scene was applied at startup; surfaces still bind, and paint nothing until a reload or a push produces one"

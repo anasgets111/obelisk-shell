@@ -220,7 +220,7 @@ function util.active_access_point(n)
 end
 
 -- Hide a module with no content instead of showing a "--" pill. `visible` is a signal-bound base
--- property (§ 5.1), so hidden children are skipped by row positioning rather than laid out at zero
+-- property, so hidden children are skipped by row positioning rather than laid out at zero
 -- width. Use a codepoint budget here, the exception to `components/cell.lua`'s pixel-box rule.
 -- Centre-zone modules need content-sized nodes between two `Fill` sides; bounding them made short
 -- "(1) WhatsApp" sit a hundred pixels left of centre. ponytail: "WWWW" and "iiii" share four
@@ -236,7 +236,7 @@ function util.truncate(value, limit)
     return s:sub(1, utf8.offset(s, limit + 1) - 1) .. "..."
 end
 
--- `notification.body` is a parsed freedesktop markup span array (§ 2.7, ADR-0033). The Supervisor
+-- `notification.body` is a parsed freedesktop markup span array (ADR-0033). The Supervisor
 -- parses it once, and `text.content` accepts the same run shape (ADR-0104): links become underlined
 -- `link_color` runs with `href`, while the engine draws/reports pressed runs but knows no URLs.
 -- Image spans go to `util.notification_images` because `text` refuses runs without `text`. Like

@@ -16,7 +16,7 @@ use crate::capabilities::truncate_utf8_bytes;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
-    /// docs/lua-api.md §2.14 id: sanitized D-Bus unique name with the item's object
+    /// Sanitized D-Bus unique name with the item's object
     /// path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
     pub id: String,
     /// Display name: `Title`, falling back to `Id` when `Title` is empty.
@@ -131,7 +131,7 @@ pub(super) async fn fetch_tray_item_base(
     }
 }
 
-/// One icon triple defined by docs/lua-api.md §2.5 (`{X}IconName`, `{X}IconPixmap`,
+/// One icon triple (`{X}IconName`, `{X}IconPixmap`,
 /// `IconThemePath`) resolved to the config's `(name, path)` pair (ADR-0074). `spool_suffix` keeps
 /// the three PNGs distinct; otherwise the last write to `{unique_name}.png` would win.
 fn resolve_variant(

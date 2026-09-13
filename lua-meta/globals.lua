@@ -143,8 +143,7 @@ local SessionProcessHandle = {}
 ---Runs the program, replacing whatever the last run left behind.
 ---
 ---A name already running is left alone rather than started twice; `running` says which case this
----was. Nothing is returned: the outcome arrives as state, like every other capability
----(docs/lua-api.md § 3).
+---was. Nothing is returned: the outcome arrives as state, like every other capability.
 ---@param cmd string The executable. Resolved on `PATH`; no shell, so no globbing, no pipes and no quoting rules.
 ---@param args? string[] One element per argument, already split. Omitted means a bare command.
 function SessionProcessHandle:start(cmd, args) end

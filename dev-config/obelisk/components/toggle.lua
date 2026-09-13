@@ -1,4 +1,4 @@
--- On/off switch for the boolean writes in § 3.2, including `bluetooth:set_enabled`,
+-- On/off switch for boolean writes, including `bluetooth:set_enabled`,
 -- `network:set_wifi_enabled`, and `audio:set_muted`. The next capability snapshot is the only
 -- readback.
 -- Takes the raw signal plus `read`, as `components/meter.lua` does, because `obelisk.bluetooth`

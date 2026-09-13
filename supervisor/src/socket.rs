@@ -4,8 +4,7 @@
 //! secure textfield submissions (ADR-0005). Accepts simultaneous connections during a swap, with
 //! Generation `N` and Candidate `N+1` registered by `generation_id`.
 //!
-//! Command-dispatch routing remains deferred (ADR-0020), including `lua-api.md`
-//! § 3.2's ~30 write commands.
+//! Command-dispatch routing remains deferred (ADR-0020), including the ~30 write commands.
 //! Decode inbound frames as `shared::RendererFrame` (ADR-0024) and forward them unchanged.
 //!
 //! A connection does not get to say which generation it is. The handshake's `generation_id` is a
@@ -44,7 +43,7 @@ const CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Connections handled at once, across Renderers and control clients.
 ///
-/// A swap has two Renderers live (§ 14.2) and `obelisk set` is one short-lived client at a time, so
+/// A swap has two Renderers live and `obelisk set` is one short-lived client at a time, so
 /// the working set is single digits. This is sized to leave that room untouched while refusing the
 /// unbounded accept loop that preceded it: past this, `accept` still runs -- the listener must not
 /// wedge -- but the new connection is closed immediately.
@@ -53,7 +52,7 @@ const MAX_CONNECTIONS: usize = 64;
 /// Decoded frames queued from all peers toward `main`'s loop.
 ///
 /// Bounded with backpressure rather than a drop policy: `main` reads these in protocol order, and
-/// PBA's evidence, reload reports and lock reports are each load-bearing (§ 14.2, ADR-0025), so a
+/// PBA's evidence, reload reports and lock reports are each load-bearing (ADR-0025), so a
 /// dropped frame is a stalled handshake rather than a lost log line. A full queue instead parks
 /// the one connection task that is producing faster than `main` consumes, which is the peer that
 /// should be waiting.

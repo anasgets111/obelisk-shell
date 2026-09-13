@@ -1,4 +1,4 @@
-//! [`BatteryController`] owns read-only `obelisk.battery` telemetry (§ 2.2).
+//! [`BatteryController`] owns read-only `obelisk.battery` telemetry.
 //! Module-level behavior is documented in `battery/mod.rs`.
 
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// § 2.2's `battery.state`, one of UPower's seven `Device.State` values.
+/// `battery.state`, one of UPower's seven `Device.State` values.
 ///
 /// A boolean collapsed `PendingCharge` and `PendingDischarge` into `false`, making a battery that
 /// is merely not moving indistinguishable from one that is draining. On a laptop that sets
@@ -64,7 +64,7 @@ impl BatteryStatus {
     }
 }
 
-/// `obelisk.battery`'s full payload (§ 2.2). Field names are the `StateSnapshot` JSON keys verbatim
+/// `obelisk.battery`'s full payload. Field names are the `StateSnapshot` JSON keys verbatim
 /// and may not be renamed. `Default` is the correct desktop answer when no battery exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 pub struct BatteryState {
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(BatteryStatus::from_upower(u32::MAX), BatteryStatus::Unknown);
     }
 
-    /// These names are § 2.2's wire format and config comparisons; renaming one is breaking.
+    /// These names are the wire format and config comparisons; renaming one is breaking.
     #[test]
     fn the_state_serializes_under_the_name_a_config_compares_against() {
         let json = serde_json::to_string(&BatteryState {

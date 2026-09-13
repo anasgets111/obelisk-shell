@@ -15,8 +15,8 @@ use crate::text::snap::LogicalRect;
 /// logical coordinates -- the same space `on_click` hands a config (ADR-0050 decision 3), so a
 /// tooltip `popup` binding `anchor_rect` to it lands over the node the way a dropdown lands over
 /// the button that opened it. Leaving it `None` on the way out is deliberate: the rect signal keeps
-/// the last place the pointer was, so `anchor_rect` stays a valid non-zero rect (§ 6 refuses a
-/// zero one) while the popup is closing.
+/// the last place the pointer was, so `anchor_rect` stays a valid non-zero rect (a zero one is
+/// refused) while the popup is closing.
 pub struct HoverWrite {
     pub signal: Signal,
     pub hovered: bool,
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!((rect.x, rect.y, rect.width, rect.height), (14.0, 7.0, 30.0, 10.0));
 
         // None on the way out, so the rect signal keeps the last place the pointer was and
-        // `anchor_rect` stays a valid non-zero rect while the popup closes (§ 6).
+        // `anchor_rect` stays a valid non-zero rect while the popup closes.
         let leaving = hover_writes(&tree, None);
         assert!(!leaving[0].hovered);
         assert!(leaving[0].rect.is_none());

@@ -1,10 +1,10 @@
-//! PipeWire-backed audio state. `mixer` tracks § 2.4's registry lists; `master` holds the pure
+//! PipeWire-backed audio state. `mixer` tracks the registry lists; `master` holds the pure
 //! parsing/resolution logic (ADR-0053 decision 3).
 //!
-//! § 3.2 write actions dispatch here, including source-side volume/mute actions that filled the
+//! Write actions dispatch here, including source-side volume/mute actions that filled the
 //! gap beside `set_muted`; see [`dispatch`] for the two still unbuilt actions.
 //!
-//! BlueZ codec control (§6) lives here as well, because PipeWire, not BlueZ, picks the codec: each
+//! BlueZ codec control lives here as well, because PipeWire, not BlueZ, picks the codec: each
 //! BlueZ device's profiles are its codecs (ADR-0030).
 
 pub mod master;
@@ -44,8 +44,8 @@ pub enum AudioAction {
 /// Unlike every other capability's adapter, this has no controller to call. It dispatches each
 /// action as an [`AudioCommand`] on the PipeWire thread (ADR-0037); no result is awaited here.
 ///
-/// § 3.2 also lists `play_sound(sound)` and `set_event_sounds_enabled(en)`. They need a sound
-/// player, event-sound theme, and toggle storage, none of which exists, so they remain absent.
+/// `play_sound(sound)` and `set_event_sounds_enabled(en)` are not actions: they'd need a sound
+/// player, event-sound theme, and toggle storage, none of which exists.
 pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelope) {
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<AudioAction>(params) else { return };
@@ -79,7 +79,7 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
     }
 }
 
-/// Parses `[vol]`; § 3.2's `[0.0, 1.0]` range is clamped in `master::cubed_channel_volumes`.
+/// Parses `[vol]`; the `[0.0, 1.0]` range is clamped in `master::cubed_channel_volumes`.
 fn parse_volume_arg(arguments: &[serde_json::Value]) -> Option<f32> {
     Some(arguments.first()?.as_f64()? as f32)
 }

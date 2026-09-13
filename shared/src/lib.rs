@@ -12,7 +12,7 @@ pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
 /// The snapshot-hydrated capability roster (ADR-0037; CONTEXT.md). Each [`Capability::as_str`]
-/// name is both the Lua `obelisk.<name>` member (§ 2) and command `capability` field (§ 3.2), so
+/// name is both the Lua `obelisk.<name>` member and command `capability` field, so
 /// one spelling reaches one capability. Reading a name starts its Supervisor controller
 /// (ADR-0070); it remains `nil` until the first `StateSnapshot`, so an unread name costs nothing.
 /// `idle` is event-shaped, not snapshot state (ADR-0032), so the Supervisor's `Startable` covers
@@ -90,7 +90,7 @@ impl std::fmt::Display for Capability {
         f.write_str(self.as_str())
     }
 }
-/// Guarded JSON-RPC 2.0 envelope for a Lua write action (docs/lua-api.md § 7).
+/// Guarded JSON-RPC 2.0 envelope for a Lua write action.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommandEnvelope {
     pub jsonrpc: String,
@@ -226,14 +226,14 @@ pub struct ApplyPendingReload {
     pub sequence: u64,
 }
 
-/// § 14.2 step 4, "Activate Draw". Not a `CommandEnvelope` because its direction and shape differ
-/// (ADR-0019).
+/// Tells the Candidate to compile and draw its first GPU frame. Not a `CommandEnvelope` because its
+/// direction and shape differ (ADR-0019).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivateDraw {
     pub nonce: u64,
 }
 
-/// § 14.2 step 3, "Null-Buffer Staging": the Candidate's one-time report that every tracked
+/// The Candidate's one-time report that every tracked
 /// Wayland surface staged its null buffer and awaits `ActivateDraw`. `surfaces` lists surface IDs,
 /// not monitor IDs (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,23 +241,23 @@ pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
-/// § 14.2 step 5, "Evidence Verification": one message per surface ID after its
+/// One message per surface ID after its
 /// `wp_presentation_feedback` `presented` event (ADR-0019). This is the Candidate's report; the
-/// all-surfaces barrier is § 14.3 in `reload::run_pba`.
+/// all-surfaces barrier is in `reload::run_pba`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
     pub surface_id: String,
 }
 
-/// § 14.3 step 6, "Input Deselection": makes the superseded generation stop treating `surface_id`
+/// Makes the superseded generation stop treating `surface_id`
 /// as authoritative. Per-surface input-region/focus wiring does not exist yet (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,
 }
 
-/// § 14.3 step 6, "Candidate Promotion": gives the new generation ownership of `surface_id`.
+/// Gives the new generation ownership of `surface_id`.
 /// Currently inert for the same reason as `DeselectInput`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromoteGeneration {
@@ -396,7 +396,7 @@ pub enum SupervisorFrame {
     CallResult(CallResult),
 }
 
-/// Renderer -> Supervisor frames, tagged like [`SupervisorFrame`]. `Command` is § 7's Lua-write
+/// Renderer -> Supervisor frames, tagged like [`SupervisorFrame`]. `Command` is the Lua-write
 /// envelope; `ReevaluateReport` is the reload verdict; `ReadySignal`/`PresentationEvidence` are
 /// PBA handshake reports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -468,7 +468,6 @@ mod tests {
 
     #[test]
     fn command_envelope_matches_idl_wire_format() {
-        // Exact example from docs/lua-api.md § 7.
         let wire = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "ExecuteCommand",

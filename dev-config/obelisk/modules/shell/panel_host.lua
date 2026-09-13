@@ -20,7 +20,7 @@
 --   * The catcher handles click-outside instead of compositor `popup_done`, so it knows which panel
 --     closed and resolves `lib/ui_state.lua`'s `toggle_panel` ambiguity.
 --   * Switching panels is one click; no grab needs breaking and re-arming.
---   * `visible` maps/unmaps an existing surface (§ 6), so no armed grab serial is needed
+--   * `visible` maps/unmaps an existing surface, so no armed grab serial is needed
 --   * Cost: popups had `constraint_adjustment`; layers do not, so the clamp is hand-written
 --     `"SlideX"`.
 --
@@ -198,7 +198,7 @@ return panel {
             return showing_notifications and "OnDemand" or "None"
         end
     ),
-    -- One surface, one root node (§ 6): catcher and card share a `rect`. Full-fill visibility also
+    -- One surface, one root node: catcher and card share a `rect`. Full-fill visibility also
     -- sets input: `wl_surface::set_input_region` follows drawn/clickable tree content (ADR-0038
     -- decision 5, ADR-0109). The full-size catcher claims it while mapped, none while `visible` is
     -- false and unmapped.

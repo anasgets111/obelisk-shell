@@ -133,7 +133,7 @@ impl TrayController {
         }
     }
 
-    /// `tray:secondary_activate(id, x, y)`: §2.5 middle-click (ADR-0074). No
+    /// `tray:secondary_activate(id, x, y)`: middle-click (ADR-0074). No
     /// `should_call_activate` gate: `ItemIsMenu` constrains primary clicks only.
     pub async fn secondary_activate(&self, id: &str, x: i32, y: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
@@ -149,7 +149,7 @@ impl TrayController {
         }
     }
 
-    /// `tray:scroll(id, delta, orientation)`: §2.5 icon scroll (ADR-0074). Passes `orientation`
+    /// `tray:scroll(id, delta, orientation)`: icon scroll (ADR-0074). Passes `orientation`
     /// verbatim; the application interprets it, including values beyond the two named orientations.
     pub async fn scroll(&self, id: &str, delta: i32, orientation: &str) {
         let Some((key, _)) = self.find_item_id(id) else {

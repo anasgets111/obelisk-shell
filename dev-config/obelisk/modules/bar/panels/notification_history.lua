@@ -1,4 +1,4 @@
--- The list half of § 2.7: the popup shows the newest few; this shows the whole feed.
+-- The feed's list half: the popup shows the newest few; this shows the whole feed.
 --
 -- A feed needs scrolling; a fixed panel showed four and clipped the rest (ADR-0069).
 --
@@ -151,7 +151,7 @@ local body = {
                 end),
                 slot = "notification-dnd",
             }),
-            -- One `dismiss` per entry; § 3.2 has no `dismiss_all`. The feed cannot push until this
+            -- One `dismiss` per entry; there is no `dismiss_all`. The feed cannot push until this
             -- callback returns, unlike `network_panel.lua`.
             icon_button(icons.clear_all, function()
                 for _, notification in ipairs(feed(obelisk.notifications:get())) do

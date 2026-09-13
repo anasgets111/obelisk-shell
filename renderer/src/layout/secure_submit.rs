@@ -130,7 +130,7 @@ pub(crate) fn lock_stays_authenticatable(
         format!(
             "this evaluation leaves the locked session's `lock` surfaces {locks:?} with no single `textfield` carrying \
              `secure_submit = {{ capability = \"lock\", action = \"authenticate\" }}`, so the locked session would have no way back in \
-             but a VT switch; the reload was refused and the lock screen that is on screen still stands (§ 6.4, ADR-0052 decision 3)"
+             but a VT switch; the reload was refused and the lock screen that is on screen still stands (ADR-0052 decision 3)"
         ),
     ))
 }

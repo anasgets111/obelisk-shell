@@ -133,8 +133,8 @@ impl NetworkController {
         }
     }
 
-    /// Freshly reads every §2.5 field except `scanning`. Each property falls back to `Default` on
-    /// error, so one unreadable field does not abort the snapshot.
+    /// Freshly reads every `NetworkState` field except `scanning`. Each property falls back to
+    /// `Default` on error, so one unreadable field does not abort the snapshot.
     async fn build_state(&self) -> NetworkState {
         let available_networks = self.build_available_networks().await;
         let associated = available_networks.iter().find(|ap| ap.active);
@@ -198,7 +198,7 @@ impl NetworkController {
     }
 
     /// `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
-    /// have setters. Toggle it with `Enable(bool)`, not the spec's literal property write.
+    /// have setters. Toggle it with `Enable(bool)`, not a direct property write.
     pub async fn set_networking_enabled(&self, enabled: bool) {
         if let Err(err) = self.nm.enable(enabled).await {
             eprintln!("network: failed to set networking_enabled={enabled}: {err}");

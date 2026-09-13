@@ -326,7 +326,7 @@ local function detail_line(u, is_dismissed, tool)
         end
         return "finished" .. noted
     end
-    -- A failed check keeps the last good list (§ 2.14), so say which list is shown.
+    -- A failed check keeps the last good list, so say which list is shown.
     if u.check_error ~= nil then
         local failures = u.consecutive_check_failures or 0
         -- Five consecutive failures is the warning threshold.

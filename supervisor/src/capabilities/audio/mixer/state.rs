@@ -12,7 +12,7 @@ use super::devices::{AudioDevice, BluetoothCodecs, BluezCard, DeviceEntry, bluet
 use super::streams::{AppStream, CaptureApp, VideoSourceApp, running};
 use crate::capabilities::audio::master;
 
-/// Full `obelisk.audio` payload (§ 2.4, ADR-0053 decision 3).
+/// Full `obelisk.audio` payload (ADR-0053 decision 3).
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
@@ -23,7 +23,7 @@ pub struct AudioState {
     /// (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or
     /// with no input device.
     pub source_volume: f32,
-    /// Default input mute, the microphone-mute click target for privacy indicators (§ 3.2).
+    /// Default input mute, the microphone-mute click target for privacy indicators.
     pub source_muted: bool,
     /// Every output device; `audio:set_default_sink(id)` takes [`AudioDevice::id`].
     pub sinks: Vec<AudioDevice>,
@@ -45,7 +45,7 @@ pub struct PrivacySources {
     pub screencasts: Vec<CaptureApp>,
 }
 
-/// One § 3.2 write crossing from tokio to the PipeWire loop. A channel is required because the
+/// One audio write crossing from tokio to the PipeWire loop. A channel is required because the
 /// proxies are `!Send`; `pipewire::channel` gives the loop an eventfd, so commands apply between
 /// PipeWire events. Array ids resolve against live maps; stale ids are logged and dropped because
 /// PipeWire recycles them.
@@ -65,7 +65,7 @@ pub enum AudioCommand {
 }
 
 /// Listener-owned state and snapshot channels. Held for the thread lifetime. `sink_*`/`metadata*`
-/// fields track § 2.4 master volume (ADR-0053 decision 3); sink proxies stay separate because
+/// fields track master volume (ADR-0053 decision 3); sink proxies stay separate because
 /// they use `param`, while `nodes` handles stream/video `info`.
 pub(super) struct MixerState {
     /// False until PipeWire has answered for everything the listener asked for at startup, which
@@ -235,10 +235,10 @@ pub(super) enum DefaultDevice {
     Source,
 }
 
-/// Metadata key naming § 2.4's master output device, confirmed in `pw-metadata`.
+/// Metadata key naming the master output device, confirmed in `pw-metadata`.
 pub(super) const DEFAULT_AUDIO_SINK_KEY: &str = "default.audio.sink";
 
-/// Metadata key naming § 2.4's default input device; same JSON shape as the sink key.
+/// Metadata key naming the default input device; same JSON shape as the sink key.
 pub(super) const DEFAULT_AUDIO_SOURCE_KEY: &str = "default.audio.source";
 
 #[cfg(test)]

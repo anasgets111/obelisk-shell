@@ -17,7 +17,7 @@ pub(super) struct IconPixmap {
     pub(super) bytes: Vec<u8>,
 }
 
-/// Validates one raw `IconPixmap` (docs/services.md §2.1): non-empty square,
+/// Validates one raw `IconPixmap`: non-empty square,
 /// at most
 /// [`MAX_PIXMAP_DIMENSION`], with exactly `width * height * 4` ARGB32 bytes.
 fn pixmap_is_valid(width: i32, height: i32, byte_len: usize) -> bool {

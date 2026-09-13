@@ -125,8 +125,8 @@ mod tests {
 
     #[test]
     fn an_absolute_name_is_its_own_path() {
-        // `dbus/shm_icons.rs` spools tray icons here as `icon_path`.
-        let spooled = "/dev/shm/obelisk-1000/tray/telegram.png";
+        // `capabilities/shm_icons.rs` spools tray icons here as `icon_path`.
+        let spooled = "/run/user/1000/obelisk/tray/telegram.png";
         assert_eq!(resolve(spooled, 16), Some(PathBuf::from(spooled)));
         // No stat: nonexistent absolute paths still return themselves.
         assert_eq!(resolve("/nonexistent/x.png", 16), Some(PathBuf::from("/nonexistent/x.png")));

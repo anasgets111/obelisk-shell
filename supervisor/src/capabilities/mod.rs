@@ -84,7 +84,7 @@ pub fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
 /// Truncates to `max_bytes`, backing off to a UTF-8 boundary (bytes, not chars).
 ///
 /// Every capability that copies a string out of a third party's D-Bus reply caps it here, so the
-/// rule lives once: notifications for `Notify`'s properties (§1.1) and tray for the
+/// rule lives once: notifications for `Notify`'s properties and tray for the
 /// `StatusNotifierItem` and DBusMenu text an arbitrary application supplies.
 pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
@@ -466,7 +466,7 @@ impl Capabilities {
                 }
             }
             // UPower DisplayDevice, composite across batteries; no UPower means no push
-            // (ADR-0080, § 2.2).
+            // (ADR-0080).
             Capability::Battery => {
                 if self.battery.is_none() {
                     self.battery = Some(BatteryController::new(self.connection.clone(), self.senders.battery.clone()));
@@ -489,13 +489,13 @@ impl Capabilities {
                 }
             }
             // UPower supplies on_battery/energy_rate; power-profiles-daemon supplies profiles;
-            // either may be missing (§ 2.13, ADR-0053).
+            // either may be missing (ADR-0053).
             Capability::Power => {
                 if self.power.is_none() {
                     self.power = Some(PowerController::new(self.connection.clone(), self.senders.power.clone()));
                 }
             }
-            // 1Hz clock, and nothing else since ADR-0136 (§ 2.11, ADR-0053).
+            // 1Hz clock, and nothing else since ADR-0136 (ADR-0053).
             Capability::System => {
                 if self.system.is_none() {
                     self.system = Some(SystemController::new(self.senders.system.clone()));
@@ -724,7 +724,7 @@ impl Capabilities {
             // Answered in `Supervisor::dispatch_capability_command`, where its controller lives
             // beside the state push that cancel handling needs.
             Capability::Polkit => {}
-            // Read-only (§ 2): no action enum; a named command is malformed Renderer input.
+            // Read-only: no action enum; a named command is malformed Renderer input.
             Capability::Battery | Capability::Privacy | Capability::System => {
                 eprintln!(
                     "{capability}: read-only capability received a command from generation {}; dropping",

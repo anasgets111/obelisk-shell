@@ -18,7 +18,7 @@ pub(super) struct BoundSurface {
 pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt::Display) {
     eprintln!("[obelisk-renderer] {surface_id}: {stage} failed: {err}");
 }
-/// § 6's `visible` state. Three states are required because showing commits without a buffer and
+/// The `visible` state. Three states are required because showing commits without a buffer and
 /// waits for configure before drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MapState {
@@ -38,7 +38,7 @@ impl MapState {
         self != MapState::Unmapped
     }
 }
-/// A tracked `wl_surface`'s role and last-applied spec (§ 6, ADR-0040 decision 1). One enum keeps
+/// A tracked `wl_surface`'s role and last-applied spec (ADR-0040 decision 1). One enum keeps
 /// EGL, paint, input, and PBA paths on the shared `App::surfaces` index. Role objects exist only
 /// while shown (ADR-0049 decision 1, ADR-0088), hence the `Option`s.
 pub(super) enum TrackedRole {
@@ -56,7 +56,7 @@ pub(super) enum TrackedRole {
         spec: PanelSpec,
         /// Output logical size for `SizeMode::Percent`. Do not use `SurfaceInstance::available`:
         /// `set_instance_size` replaces it with the compositor size, which would shrink a panel on
-        /// every push. Panel-only; a window has no `width`/`height` (§ 6).
+        /// every push. Panel-only; a window has no `width`/`height`.
         output_size: layout::LogicalSize,
         /// The box the last layout pass solved for this surface's root, which is what a `Content`
         /// axis asks `set_size` for (`layer::layer_size_for`). Written by
@@ -119,7 +119,7 @@ pub(super) enum TrackedRole {
         refusal_logged: Option<PopupRefusal>,
     },
     Lock {
-        /// Output covered by this lock instance; § 6 gives `lock` no `monitor` property.
+        /// Output covered by this lock instance; `lock` has no `monitor` property.
         output: wl_output::WlOutput,
         /// `None` until the lock is held (ADR-0052 decision 2). Dropping sends
         /// `ext_session_lock_surface_v1.destroy` and exposes a solid color; cleared on output
@@ -138,8 +138,8 @@ impl TrackedRole {
         }
     }
 
-    /// This surface as an `xdg_popup` parent, or `None` if hidden or unsupported (§ 6,
-    /// ADR-0051 decision 1).
+    /// This surface as an `xdg_popup` parent, or `None` if hidden or unsupported
+    /// (ADR-0051 decision 1).
     pub(super) fn as_popup_parent(&self) -> Option<PopupParent> {
         match self {
             TrackedRole::Panel { layer, .. } => layer.as_ref().map(|layer| PopupParent::Layer(layer.clone())),
@@ -159,7 +159,7 @@ pub(super) enum PopupRefusal {
     Unarmed,
     /// `grab = true` but no compositor seat exists.
     Seatless,
-    /// § 6's `parent` names no shown surface, commonly a hidden parent window.
+    /// `parent` names no shown surface, commonly a hidden parent window.
     HiddenParent,
     /// A `Content` axis with nothing measured on it yet, so there is no size to ask the positioner
     /// for. Ordinarily impossible -- the pass that makes a popup visible is the pass that measures
@@ -236,11 +236,11 @@ pub(super) struct TrackedSurface {
     /// this by hand; an implicit drop, reachable when a fatal EGL error unwinds `App`, does not.
     pub(super) bound: Option<BoundSurface>,
     pub(super) role: TrackedRole,
-    /// Supervisor § 14 `surface_id`: `"{id}@{output}"` for panels, bare `id` for windows; shared
+    /// `surface_id`: `"{id}@{output}"` for panels, bare `id` for windows; shared
     /// by Lua, the retained scene, Wayland, and PBA.
     pub(super) surface_id: String,
     pub(super) map_state: MapState,
-    /// Null buffer committed in PBA mode (Supervisor § 14.2); hidden windows never set it because
+    /// Null buffer committed in PBA mode; hidden windows never set it because
     /// they receive no configure. Always false outside candidates.
     pub(super) null_buffered: bool,
     /// Latest configure size for [`App::activate_draw`]'s EGL bind; candidate mode records it
@@ -383,17 +383,17 @@ pub(super) fn surface_state_for_turn(passed: bool, ticked: bool, armed_input: bo
     SurfaceStateWork { scope, popup_latch }
 }
 
-/// Initial § 5.1 `visible`, with a role-aware fallback when startup apply has no tree
+/// Initial `visible`, with a role-aware fallback when startup apply has no tree
 /// (`Scene::apply` rolled back): panels default visible to keep the shell up, painting nothing
 /// until the next re-resolve; windows/popups default hidden (ADR-0049 decision 1), and locks have
-/// no `visible` property (§ 6, ADR-0042).
+/// no `visible` property (ADR-0042).
 fn starting_visible(resolved: Option<bool>, roster: &SurfaceSpec) -> bool {
     resolved.unwrap_or(match roster {
         SurfaceSpec::Panel(_) => true,
         SurfaceSpec::Window(_) | SurfaceSpec::Popup(_) | SurfaceSpec::Lock(_) => false,
     })
 }
-/// Re-derive a surface spec from resolved properties, using `roster` only for the § 6 role and log
+/// Re-derive a surface spec from resolved properties, using `roster` only for the role and log
 /// label (ADR-0049 amendment). `kind` built the roster, so taking the role from properties could
 /// hide a reconcile bug. [`App::create_surfaces`] is the caller; later passes parse inline by role.
 fn resolved_surface_spec(
@@ -416,7 +416,7 @@ fn resolved_surface_spec(
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
     surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
 }
-/// PBA § 14.2 staging gate. It takes `(null_buffered, exists)`: a hidden window has no
+/// PBA staging gate. It takes `(null_buffered, exists)`: a hidden window has no
 /// `xdg_toplevel`, so `null_buffered` stays false forever and a plain `all(null_buffered)` would
 /// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also
 /// attaches a null buffer on its first configure. A `panel` gets a configure once it has a layer
@@ -572,7 +572,7 @@ impl App {
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds
     /// EGL, and paints. PBA mode stops after a null-buffer commit, deferring the real bind to
-    /// [`App::activate_draw`] (Supervisor § 14.2). Layer-shell and xdg-shell share this path
+    /// [`App::activate_draw`]. Layer-shell and xdg-shell share this path
     /// because both require an initial unbuffered commit (ADR-0040 decision 4). The callers differ
     /// only in size source: layer-shell supplies it, while a toplevel's `None` axes may be chosen
     /// by the client (see `xdg_shell::toplevel_size_for`).
@@ -760,7 +760,7 @@ impl App {
         self.apply_visibility(index, visible);
     }
 
-    /// Set the per-surface input region from the resolved tree (§ 5.1, ADR-0038 decision 5): no
+    /// Set the per-surface input region from the resolved tree (ADR-0038 decision 5): no
     /// visible children means pass-through, a full child covers the surface, and intermediate
     /// content gets its visible geometry. Scale is `1.0` because no buffer scale is set. Do not
     /// diff against the last region: the following GPU repaint costs more than one `wl_region`
@@ -788,7 +788,7 @@ impl App {
         // `set_input_region` copies the contents, so dropping the region here is sufficient.
     }
 
-    /// Hand the compositor the region behind this surface it should blur (§ 5.1 `blur`,
+    /// Hand the compositor the region behind this surface it should blur (`blur`,
     /// ADR-0195). The rects come from `layout::blur_regions`, which is where the policy lives; this
     /// is only the push.
     ///
@@ -894,9 +894,9 @@ impl App {
         surface.commit();
     }
 
-    /// Apply § 5.1 `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
+    /// Apply `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
     /// Freeze it for PBA Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the
-    /// same set, or § 14.2 yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`.
+    /// same set, or the PBA protocol yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`.
     ///
     /// A change skipped by that freeze waits for the next full pass. Promotion does not cause one:
     /// `activate_draw` clears the flag as its last statement (`mod.rs` runs it after the turn's
@@ -1308,7 +1308,7 @@ impl App {
             }
             if self.surfaces[index].bound.is_none() {
                 // A panel shown after starting hidden was configured without EGL; bind here because
-                // no further configure is coming. Candidates wait for `ActivateDraw` (§ 14.2).
+                // no further configure is coming. Candidates wait for `ActivateDraw`.
                 if self.is_pba_candidate || !self.ensure_bound(index) {
                     continue;
                 }
@@ -1320,7 +1320,7 @@ impl App {
         }
     }
 
-    /// Once every candidate surface stages, queue one § 14.2 `ReadySignal`. The gate covers every
+    /// Once every candidate surface stages, queue one `ReadySignal`. The gate covers every
     /// tracked surface; the payload covers only presenting surfaces. Called after each candidate
     /// configure because any one may complete the set.
     pub(super) fn maybe_send_ready_signal(&mut self) {
@@ -1336,7 +1336,7 @@ impl App {
         }
     }
 
-    /// Draw the § 14.2 first frame for `ActivateDraw`, requesting presentation feedback and tagging
+    /// Draw the PBA first frame for `ActivateDraw`, requesting presentation feedback and tagging
     /// it with `nonce`. Draw exactly the `ReadySignal` presenting set; Candidates freeze map state,
     /// so any mismatch would hang or abort the handshake.
     pub(super) fn activate_draw(&mut self, nonce: u64) {
@@ -1368,7 +1368,7 @@ impl App {
         }
 
         // Request feedback before `swap_buffers` so it associates with that commit; verify ordering
-        // with `WAYLAND_DEBUG=1` if needed (§ 14.2).
+        // with `WAYLAND_DEBUG=1` if needed.
         if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
             && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
         {

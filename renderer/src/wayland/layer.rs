@@ -1,4 +1,4 @@
-//! The `panel` role: `zwlr_layer_surface_v1` (§ 6), including protocol mappings, per-field diffs,
+//! The `panel` role: `zwlr_layer_surface_v1`, including protocol mappings, per-field diffs,
 //! exclusive zones, creation, updates, and callbacks. Shared bind/paint/(un)map logic is in
 //! `surface`.
 
@@ -16,7 +16,7 @@ fn layer_for(kind: LayerKind) -> Layer {
         LayerKind::Overlay => Layer::Overlay,
     }
 }
-/// § 6's `anchor` edge booleans to protocol bitflags.
+/// `anchor` edge booleans to protocol bitflags.
 pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     let mut flags = Anchor::empty();
     flags.set(Anchor::TOP, anchor.top);
@@ -25,7 +25,7 @@ pub(super) fn anchor_for(anchor: node::Anchor) -> Anchor {
     flags.set(Anchor::RIGHT, anchor.right);
     flags
 }
-/// § 6's `keyboard_interactivity`. Before ADR-0038 each role hardcoded a mode, preventing
+/// `keyboard_interactivity`. Before ADR-0038 each role hardcoded a mode, preventing
 /// `Exclusive` and `None` surfaces from coexisting.
 pub(super) fn keyboard_interactivity_for(mode: node::KeyboardInteractivity) -> KeyboardInteractivity {
     match mode {
@@ -159,7 +159,7 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
     }
 }
 /// Double-buffered layer-shell changes: `margin`, `keyboard_interactivity`, size, and `exclusive`
-/// (ADR-0038 decision 2, § 6). `None` means unchanged. Topology (`id`, `layer`, `anchor`,
+/// (ADR-0038 decision 2). `None` means unchanged. Topology (`id`, `layer`, `anchor`,
 /// `monitor`, `namespace`) is absent because `get_layer_surface` consumes namespace/output and
 /// edits route to a generation swap instead; `crate::socket::handle_reevaluate` owns that handoff.
 /// `is_structural_property` rejects signals there. `output` is the logical output size, not the
@@ -169,7 +169,7 @@ struct SpecUpdate {
     margin: Option<node::EdgeInsets>,
     keyboard_interactivity: Option<node::KeyboardInteractivity>,
     size: Option<(u32, u32)>,
-    /// § 6's mode, not the zone: `Reserve` derives that from [`exclusive_zone_for`].
+    /// The mode, not the zone: `Reserve` derives that from [`exclusive_zone_for`].
     exclusive: Option<node::Exclusive>,
 }
 impl SpecUpdate {
@@ -204,7 +204,7 @@ fn spec_update(
 /// Parameters for [`App::spawn_layer`], bundled for clippy's argument-count limit.
 pub(super) struct LayerSpec<'a> {
     layer_type: Layer,
-    /// Compositor-visible namespace (§ 6, default `"obelisk-{id}"`), matched by `layerrule`.
+    /// Compositor-visible namespace (default `"obelisk-{id}"`), matched by `layerrule`.
     namespace: &'a str,
     /// Always `Some` (ADR-0038 decision 3): one surface per `(surface, output)` pair.
     output: &'a wl_output::WlOutput,
@@ -390,7 +390,7 @@ impl App {
     /// Stages `Reserve`'s configured-size zone, explicit `0` for `Respect`, or `-1` for `Ignore`.
     /// Explicit values matter because signal-bound `exclusive` must withdraw a prior reservation.
     /// The caller commits: committing here would split updates, and a bufferless commit on an
-    /// unmapped surface is the re-map procedure. Windows have no zone (§ 6).
+    /// unmapped surface is the re-map procedure. Windows have no zone.
     pub(super) fn apply_exclusive_zone(&mut self, index: usize) {
         let tracked = &self.surfaces[index];
         let TrackedRole::Panel { layer: Some(layer), spec, .. } = &tracked.role else {
@@ -416,7 +416,7 @@ impl App {
     /// redraws a clock every second hides the bug.
     ///
     /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
-    /// procedure, and Supervisor services § 14.2 keeps Candidates invisible until `ActivateDraw`.
+    /// procedure, and the PBA protocol keeps Candidates invisible until `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec, visible: bool) {
         // [`App::apply_visibility`]'s own unmap test, run before it: a mapped panel going invisible
         // loses its layer object later this pass, so requests sent now die with it. Not just waste --

@@ -1,5 +1,4 @@
-//! `obelisk.idle`: idle-notify thresholds and the logind inhibit pair (ADR-0032,
-//! docs/services.md § 7).
+//! `obelisk.idle`: idle-notify thresholds and the logind inhibit pair (ADR-0032).
 //!
 //! **A roster capability with three extra methods.** Until ADR-0141 it exposed only methods: a
 //! threshold crossing was treated as an event with no idle state. That missed whether anything
@@ -62,7 +61,7 @@ impl IdleRegistry {
         &self.state
     }
 
-    /// `idle:register_threshold(sec, on_idle, on_resume)` (§ 7.1). Queue the start first: `idle`
+    /// `idle:register_threshold(sec, on_idle, on_resume)`. Queue the start first: `idle`
     /// is off the roster, so `lua::namespace`'s `__index` cannot announce it (ADR-0070 decision 1).
     /// `CommandSender` deduplicates both starts, so the second call sends only its command.
     ///

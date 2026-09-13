@@ -7,12 +7,12 @@ local theme = {}
 --
 -- `s(base)` is `Theme.qml`'s function. It scales non-colour tokens from 1080p values so a 4K panel
 -- does not use 1080p pixels.
--- Read once during evaluation: `obelisk.screens` is the only signal available then (§ 2.15), while
+-- Read once during evaluation: `obelisk.screens` is the only signal available then, while
 -- capabilities read nil until the first snapshot, so other module-scope reads would use fallback.
 --
 -- ponytail: hotplug is not followed. Tokens are numbers baked into node maps at evaluation;
 -- moving monitors leaves the old scale until touched. Upgrade `s()` to return a signal, which
--- consumers already accept (§ 5.1), at one `computed` per token when a second monitor matters.
+-- consumers already accept, at one `computed` per token when a second monitor matters.
 local function main_screen()
     -- The only module-scope signal read. Component tests in `renderer/src/lua/mod.rs` load
     -- `components/` through a bare `Loader` with no `obelisk` namespace, so other capabilities are
@@ -124,7 +124,7 @@ end
 
 -- ## Opacity steps
 --
--- `opacity` is a base property (§ 5.1) that multiplies down the subtree, so disabling a control
+-- `opacity` is a base property that multiplies down the subtree, so disabling a control
 -- needs one property rather than dimmer colours on each part.
 theme.opacity                   = {
     subtle   = 0.15,

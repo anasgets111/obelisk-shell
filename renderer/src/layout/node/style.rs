@@ -9,9 +9,9 @@ use mlua::Value;
 use super::*;
 use crate::text::snap::LogicalRect;
 
-/// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax: § 5.1's base
-/// property table only documents integer/`"Fill"` for width/height, though § 3.1 names
-/// `Percent(f32)` as a size class with no literal Lua form given. See ADR-0023.
+/// `"NN%"` (`^\d+(\.\d+)?%$`) as `SizeMode::Percent`. Not a confirmed spec syntax: the base
+/// property table only documents integer/`"Fill"` for width/height, though `Percent(f32)` is
+/// named as a size class with no literal Lua form given. See ADR-0023.
 pub(super) fn parse_percent(s: &str) -> Option<f32> {
     let digits = s.strip_suffix('%')?;
     let mut parts = digits.splitn(2, '.');
@@ -27,11 +27,11 @@ pub(super) fn parse_percent(s: &str) -> Option<f32> {
     digits.parse::<f32>().ok().map(|n| n / 100.0)
 }
 
-/// Numeric sizes use § 5.1's `[0, 8192]` range (ADR-0021). `properties` is already a
+/// Numeric sizes use the `[0, 8192]` range (ADR-0021). `properties` is already a
 /// [`resolve_properties`] result, so an absent key covers both omission and a signal resolving to
 /// `nil`.
 pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
-    // Deferred on the evaluation pass: § 6's `width`/`height` are live layer-shell `set_size`
+    // Deferred on the evaluation pass: `width`/`height` are live layer-shell `set_size`
     // fields (ADR-0038 decision 2), so `App::apply_spec_change` re-derives them each pass.
     if is_deferred_signal(properties, property) {
         return Ok(SizeMode::Content);
@@ -115,7 +115,7 @@ pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) ->
     Ok(EdgeInsets { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// `rect.background` (§ 5.2 item 1). Absent is `None`, not transparent black: `fill_rect` skips
+/// `rect.background`. Absent is `None`, not transparent black: `fill_rect` skips
 /// it, while `#RRGGBBAA` with `AA = 00` remains an explicit transparent fill.
 pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rgba>, LayoutError> {
     let Some(value) = properties.get("background") else {
@@ -128,7 +128,7 @@ pub fn parse_background(properties: &HashMap<String, Value>) -> Result<Option<Rg
     Ok(Some(parse_hex_color("background", &s)?))
 }
 
-/// `rect.radius` (§ 5.2 item 1), defaulting to 0.
+/// `rect.radius`, defaulting to 0.
 pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutError> {
     let Some(value) = properties.get("radius") else {
         return Ok(0.0);
@@ -138,7 +138,7 @@ pub fn parse_radius(properties: &HashMap<String, Value>) -> Result<f32, LayoutEr
     within("radius", n)
 }
 
-/// `scale`, `rotate`, `translate` and `origin` (§ 5.1, ADR-0149): a paint-only affine on the
+/// `scale`, `rotate`, `translate` and `origin` (ADR-0149): a paint-only affine on the
 /// node and its subtree, applied after layout about `origin` (fractions of the node's own box).
 /// CSS's `transform` rather than QML's separate `scale`, `rotation` and `Translate`: one matrix,
 /// one origin, nothing for the solver to see. Every field tweens (numbers and `{ x, y }` tables).
@@ -201,7 +201,7 @@ pub fn invert_affine([a, b, c, d, e, f]: Affine) -> Option<Affine> {
 ///
 /// `margin`, `translate` and `rotate` accept a negative; nothing else does.
 ///
-/// `radius` and `border_width` share the `8192` ceiling with `width`/`height` (§ 5.1). It is
+/// `radius` and `border_width` share the `8192` ceiling with `width`/`height`. It is
 /// femtovg 0.26's: above roughly 8.4e6 `curve_divisions` (`path/cache.rs:911`) divides by
 /// `acos(1.0) == 0.0`, and `inf as u32` becomes `u32::MAX`, so billions of iterations and tens of
 /// GB of vertices land on the Wayland dispatch thread. Below zero, `radius = -4` silently squares
@@ -282,7 +282,7 @@ pub enum ClipShape {
     Rounded,
 }
 
-/// `rect.clip` (§ 5.2 item 1) defaults to [`ClipShape::Box`] and is opt-in because rounded clipping
+/// `rect.clip` defaults to [`ClipShape::Box`] and is opt-in because rounded clipping
 /// needs an offscreen target and composite, while a square clip is a free GPU scissor. QML's
 /// `Item.clip` likewise ignores `radius`; Quickshell's `ClippingRectangle` spends two targets.
 pub fn parse_clip(properties: &HashMap<String, Value>) -> Result<ClipShape, LayoutError> {
@@ -299,10 +299,10 @@ pub fn parse_clip(properties: &HashMap<String, Value>) -> Result<ClipShape, Layo
     }
 }
 
-/// `rect.border_color` (§ 5.2 item 1), one colour per edge. `None` means "not painted", the same
+/// `rect.border_color`, one colour per edge. `None` means "not painted", the same
 /// absence [`parse_background`] returns for a missing fill: an edge at width 0 needs no colour,
 /// and one with a colour at width 0 still paints nothing, so the drawing pass gets the same answer
-/// either way. § 5.2 gives the table form no per-edge default, so an absent edge takes `None`
+/// either way. The table form gives no per-edge default, so an absent edge takes `None`
 /// rather than an invented one.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BorderColor {
@@ -352,7 +352,7 @@ pub fn parse_border_color(properties: &HashMap<String, Value>) -> Result<BorderC
     Ok(BorderColor { top: edge("top")?, right: edge("right")?, bottom: edge("bottom")?, left: edge("left")? })
 }
 
-/// `rect.border_width` (§ 5.2 item 1), adding the range check [`parse_edge_insets`] leaves to its
+/// `rect.border_width`, adding the range check [`parse_edge_insets`] leaves to its
 /// callers. `margin`/`padding` deliberately do not take it.
 pub fn parse_border_width(properties: &HashMap<String, Value>) -> Result<EdgeInsets, LayoutError> {
     let insets = parse_edge_insets(properties, "border_width")?;
@@ -378,7 +378,7 @@ pub fn parse_align(properties: &HashMap<String, Value>, property: &str) -> Resul
     }
 }
 
-/// `list.direction` (§ 5.2 item 7), defaulting to `"Vertical"`; returns the borrowed `row` or
+/// `list.direction`, defaulting to `"Vertical"`; returns the borrowed `row` or
 /// `column` kind rather than adding a third layout arm.
 pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'static str, LayoutError> {
     let Some(value) = properties.get("direction") else {
@@ -394,11 +394,11 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
     }
 }
 
-/// `opacity` (`lua-api.md` § 5.1) belongs to every kind, including non-painting lists,
+/// `opacity` belongs to every kind, including non-painting lists,
 /// and is inherited by multiplication on `ResolvedNode`. It does not replace `visible`: a fully
 /// transparent node still lays out, occupies space, and hit-tests. Values outside `[0, 1]` error
 /// rather than clamp (ADR-0068), matching the reference config's use of this property in 32 files.
-/// `blur` (§ 5.1): ask the compositor to blur the desktop behind this node's box
+/// `blur`: ask the compositor to blur the desktop behind this node's box
 /// (ADR-0195). Opt-in per node and never inferred, because "translucent" is not "wants blur":
 /// a control may be deliberately invisible at `#00000000`, and a border-only or image-backed glass
 /// box has no background alpha to read at all.
@@ -422,7 +422,7 @@ pub fn parse_visible(properties: &HashMap<String, Value>) -> Result<bool, Layout
     content::parse_bool(properties, "visible", true)
 }
 
-/// § 5.1 `cursor`: CSS names such as `"pointer"`, `"text"`, `"grab"`, and resize edges, or `None`
+/// `cursor`: CSS names such as `"pointer"`, `"text"`, `"grab"`, and resize edges, or `None`
 /// for the default rule (ADR-0107; `layout::hit::cursor_under`). `cursor_icon` and
 /// `wp_cursor_shape_v1` use the same names, so the compositor reads the config string directly.
 pub fn parse_cursor(properties: &HashMap<String, Value>) -> Result<Option<CursorIcon>, LayoutError> {

@@ -317,7 +317,7 @@ pub(crate) async fn wait_and_report_exit(
     }
 }
 
-/// Applies Supervisor § 10's SIGTERM/SIGKILL group reap to every process spawned by the superseded
+/// Applies the SIGTERM/SIGKILL group reap to every process spawned by the superseded
 /// generation's Lua, not only its Renderer (`CONTEXT.md` Generation swap). Send no `ProcessExited`;
 /// that generation's connection is torn down in the same swap.
 pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {

@@ -8,7 +8,7 @@ use regex::Regex;
 use super::NotificationSpan;
 
 /// Matches HTML-ish opening, closing, or self-closing tags with double-quoted attributes.
-/// ADR-0033's grammar stays linear-time and non-backtracking, as §1.1 required.
+/// ADR-0033's grammar stays linear-time and non-backtracking.
 static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"</?[a-zA-Z][a-zA-Z0-9]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_:-]*\s*=\s*"[^"]*")*\s*/?>"#)
         .expect("TAG_PATTERN is a valid, hand-checked regex literal")
@@ -37,7 +37,7 @@ enum ClassifiedTag {
     /// `<script>`/`<style>` opening an opaque block discarded through its matching close tag.
     OpaqueOpen(String),
     /// Unrecognized/malformed tags or missing required attributes. Strip only the tag; unlike
-    /// `OpaqueOpen`, preserve surrounding text. Script/style content is dropped (§1.1).
+    /// `OpaqueOpen`, preserve surrounding text. Script/style content is dropped.
     Ignored,
 }
 

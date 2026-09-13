@@ -47,7 +47,7 @@ pub fn run(
     }
 }
 
-/// Channel types for § 3.2 audio writes; `run` attaches the receiver to the PipeWire loop.
+/// Channel types for audio writes; `run` attaches the receiver to the PipeWire loop.
 pub type AudioCommandSender = pw::channel::Sender<AudioCommand>;
 pub type AudioCommandReceiver = pw::channel::Receiver<AudioCommand>;
 
@@ -214,10 +214,10 @@ fn on_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryR
     }
 }
 
-/// `media.class` for output devices. § 2.4 master volume lives here, not on streams.
+/// `media.class` for output devices. Master volume lives here, not on streams.
 const AUDIO_SINK: &str = "Audio/Sink";
 
-/// `media.class` for input devices, tracked like sinks for §2.4 source volume/mute. No monitor
+/// `media.class` for input devices, tracked like sinks for source volume/mute. No monitor
 /// filter: PulseAudio synthesizes `.monitor` sources, native PipeWire does not, and this `pw-dump`
 /// lists one `Audio/Source` beside one `Audio/Sink`.
 const AUDIO_SOURCE: &str = "Audio/Source";

@@ -119,7 +119,7 @@ impl NetworkController {
         *self.saved_ssids.lock().unwrap() = ssids;
     }
 
-    /// Supervisor services §4: deletes every connection profile matching `ssid`.
+    /// Deletes every connection profile matching `ssid`.
     pub async fn forget(&self, ssid: &str) {
         for profile in self.saved_profiles_for_ssid(ssid, "forget").await {
             if let Err(err) = profile.connection.delete().await {

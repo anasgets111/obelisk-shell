@@ -405,7 +405,7 @@ impl BluetoothController {
     }
 
     /// `bluetooth:forget(mac)`: resolves `mac` and calls `Adapter1.RemoveDevice(path)`, clearing
-    /// paired credentials from disk (docs/services.md §5.1).
+    /// paired credentials from disk.
     pub async fn forget(&self, mac: &str) {
         let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: forget({mac:?}) failed: {}", BluetoothActionError::NoAdapter);

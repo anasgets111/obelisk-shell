@@ -1,7 +1,6 @@
-//! NetworkManager D-Bus controller (`obelisk.network`; docs/services.md §4;
-//! ADR-0029). It holds `rusty_network_manager` proxies (ADR-0013) and merges their signal streams
-//! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
-//! thread like `audio::mixer`.
+//! NetworkManager D-Bus controller (`obelisk.network`; ADR-0029). It holds `rusty_network_manager`
+//! proxies (ADR-0013) and merges their signal streams into `main.rs`'s top-level `tokio::select!`,
+//! like `dbus::polkit`, rather than using a dedicated thread like `audio::mixer`.
 //!
 //! Forwarder tasks feed one channel: wireless APs/association, each device's state, the manager's
 //! radio switches/default route, its device list, and saved-profile changes. ADR-0082: scan-only
@@ -11,8 +10,7 @@
 //! restarts its watchers ([`NetworkSignal::DevicesChanged`]).
 //!
 //! ponytail: only the first Wi-Fi device from `GetAllDevices` is tracked. Multiple adapters need a
-//! device selector in `available_networks`/`scan`/`connect`; `docs/lua-api.md §2.5`
-//! has none.
+//! device selector in `available_networks`/`scan`/`connect`; none exists.
 
 use serde::Serialize;
 use zbus::zvariant::ObjectPath;
@@ -25,7 +23,7 @@ mod scan;
 
 pub use controller::NetworkController;
 
-/// One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
+/// One scanned AP, resolved to `network.available_networks`
 /// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
@@ -62,7 +60,7 @@ pub struct NetworkState {
     /// A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms,
     /// so the spinner starts on the click.
     pub scanning: bool,
-    /// A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none,
+    /// A connection carries the default route, from `PrimaryConnection`. `/` means none,
     /// hence offline.
     pub connected: bool,
     /// Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins

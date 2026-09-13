@@ -20,7 +20,7 @@ pub(super) enum FieldTarget {
     },
 }
 
-/// Innermost pressed `textfield` (ADR-0050 decision 4, § 5.2 item 8, ADR-0092). A `secure_submit`
+/// Innermost pressed `textfield` (ADR-0050 decision 4, ADR-0092). A `secure_submit`
 /// table is masked and targets the whole capability/action identity, since that is where its bytes
 /// go; otherwise callbacks make it plain. `paint_style`
 /// parses the destination during `Scene::apply`, so malformed secure targets fail the pass.
@@ -76,7 +76,7 @@ fn autofocus_field_in_scope(scope: &[(&str, &layout::ResolvedNode)]) -> Option<(
     None
 }
 
-/// Focused plain `textfield`, its Lua callbacks, and readable draft (ADR-0092, § 5.2 item 8).
+/// Focused plain `textfield`, its Lua callbacks, and readable draft (ADR-0092).
 /// The `String` outlives keyboard focus while the node exists (ADR-0108); `typing` records whether
 /// a press selected it, while `keyboard_focus` controls current keys and caret drawing.
 #[derive(Debug, Clone)]
@@ -248,7 +248,7 @@ enum KeyAction<'a> {
 /// Convert one `wl_keyboard` key for `secure_submit`. Use xkb, not `zwp_text_input_v3`: without an
 /// IME, text-input-v3 emits no `commit_string`; a dormant binding could also let the compositor
 /// route an IME into the buffer and create two writers (ADR-0027 amendment). The ordinary
-/// Lua-readable `textfield` still needs IME composition (§ 5.2 item 8). No IDL is added: secure
+/// Lua-readable `textfield` still needs IME composition. No IDL is added: secure
 /// bytes go to the native buffer and Supervisor (ADR-0005); misses are [`Ignore`]d.
 ///
 /// [`Ignore`d]: KeyAction::Ignore
@@ -368,7 +368,7 @@ impl KeyboardHandler for App {
         eprintln!("[obelisk-renderer] keyboard focus left {left}");
     }
 
-    // § 5.2 has no key-handler property, and ADR-0050 adds none: `secure_submit` (ADR-0005) sends
+    // There is no key-handler property, and ADR-0050 adds none: `secure_submit` (ADR-0005) sends
     // `KeyEvent` bytes through native `SecureBuffer` to Supervisor, never Lua. See [`key_action`].
     fn press_key(
         &mut self,
@@ -762,7 +762,7 @@ impl App {
         )
     }
 
-    /// Apply one plain `textfield` key (ADR-0092, § 5.2 item 8). Callbacks receive whole text, not
+    /// Apply one plain `textfield` key (ADR-0092). Callbacks receive whole text, not
     /// deltas: state bindings want the snapshot, and reassembling deltas is caller work. Submit
     /// leaves the field focused and empty. Escape clears; without `on_cancel`, focus stays because
     /// config cannot observe focus and a silent key stop has no visible signal. With `on_cancel`,
@@ -885,7 +885,7 @@ mod tests {
     }
 
     /// A `textfield` node carrying whatever the config wrote under `secure_submit`; `None` writes
-    /// nothing, which is § 5.2 item 8's "optional even on a masked field".
+    /// nothing, since `secure_submit` is optional even on a masked field.
     fn textfield(lua: &Lua, secure_submit: Option<Value>) -> layout::ResolvedNode {
         let mut node = hit_node(lua, "textfield", (0.0, 0.0, 40.0, 24.0), false);
         if let Some(value) = secure_submit {
@@ -1015,7 +1015,7 @@ mod tests {
         assert!(focused_field(&[&root, &field]).is_none());
     }
 
-    /// The unmasked half of § 5.2 item 8 (ADR-0092): no `secure_submit`, a callback, so the press
+    /// The unmasked half of `textfield` (ADR-0092): no `secure_submit`, a callback, so the press
     /// focuses it as a plain field carrying the node identity paint will find it by (ADR-0099).
     #[test]
     fn a_textfield_with_a_callback_and_no_secure_submit_focuses_as_a_plain_field() {

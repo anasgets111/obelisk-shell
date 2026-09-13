@@ -66,7 +66,7 @@ fn screen_entry(index: usize, facts: &OutputFacts) -> Option<Screen> {
         refresh: facts.current_mode.map_or(0.0, |(_, rate)| f64::from(rate) / 1000.0),
     })
 }
-/// § 2.9's per-output fields as a JSON array, pushed through the same `Loader::to_lua_value` as
+/// Per-output fields as a JSON array, pushed through the same `Loader::to_lua_value` as
 /// capability `StateSnapshot`s (ADR-0041 decision 2).
 pub(super) fn screens_payload(screens: &[Screen]) -> serde_json::Value {
     serde_json::Value::Array(
@@ -163,7 +163,7 @@ impl App {
             self.destroy_surface_by_id(instance_id);
         }
         // Percent resolves against the output's logical size, not the compositor-configured panel
-        // size. Windows have no output size (§ 6).
+        // size. Windows have no output size.
         for instance in &fresh {
             if let Some(TrackedRole::Panel { output_size, .. }) =
                 self.surfaces.iter_mut().find(|s| s.surface_id == instance.instance_id).map(|s| &mut s.role)
@@ -183,7 +183,7 @@ impl PresentationTimeHandler for App {
         &mut self.presentation_time
     }
 
-    /// § 14.2 evidence: the compositor confirmed `surface`'s committed frame reached the screen;
+    /// Presentation evidence: the compositor confirmed `surface`'s committed frame reached the screen;
     /// queue `shared::PresentationEvidence` for the socket thread.
     fn presented(
         &mut self,

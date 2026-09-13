@@ -113,8 +113,8 @@ fn build_store(lua: &Lua, file: &str, storage: mlua::AnyUserData) -> mlua::Resul
     Ok(store)
 }
 
-/// One file key mapped over `obelisk.storage`. `nil` before first push and for absent keys, so § 3.1
-/// leaves the property's documented default.
+/// One file key mapped over `obelisk.storage`. `nil` before first push and for absent keys,
+/// matching the property's documented default.
 fn key_signal(lua: &Lua, storage: &Signal, file: &str, key: &str) -> mlua::Result<Signal> {
     let file = file.to_string();
     let key = key.to_string();

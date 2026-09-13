@@ -1,17 +1,16 @@
-//! Capability and [`CapabilityHandle`] share the live signal, revision, and § 3.2 write path
+//! Capability and [`CapabilityHandle`] share the live signal, revision, and write path
 //! (ADR-0052 decision 1). [`CommandSender::send`] queues `{capability, action, arguments}` as a
 //! `RendererFrame::Command` on the channel drained by the socket thread's `pump` (ADR-0039), since
 //! Lua runs on the Wayland dispatch thread and has no socket in scope. `Rc`, not `Arc`, is correct
 //! because this state stays on that thread.
 //!
-//! One userdata owns both halves. § 3.2 makes commands methods on the capability, and ADR-0052
-//! decision 4 reads lock state through the name it locks, so `obelisk.lock:get().attempts` and
-//! `obelisk.lock:invoke("lock")` use the same object; [`Capability`] delegates `get`/`map` to its
-//! [`Signal`].
+//! One userdata owns both halves. Commands are invoked as methods via
+//! `capability:invoke("action", ...)`, and ADR-0052 decision 4 reads lock state through the name
+//! it locks, so `obelisk.lock:get().attempts` and `obelisk.lock:invoke("lock")` use the same
+//! object; [`Capability`] delegates `get`/`map` to its [`Signal`].
 //!
-//! ponytail: the API is `capability:invoke("action", ...)`, not § 3.2's
-//! `capability:action(...)`. An § 7.1 `__index` upgrade cannot distinguish `cap.lock()` from
-//! `cap:lock()` (ADR-0052 decision 1 versus § 3.2's spelling).
+//! ponytail: an `__index` upgrade cannot distinguish `cap.lock()` from `cap:lock()`, which is why
+//! commands dispatch through `invoke` instead of bare per-action methods (ADR-0052 decision 1).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -23,12 +22,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::lua::signal::{CpuBudget, DirtyFlag, LiveSignalHandle, Signal};
 
-/// Builds § 7's generation-guarded envelope and queues it for the socket thread. One sender per
+/// Builds the generation-guarded envelope and queues it for the socket thread. One sender per
 /// generation is cloned into every [`Capability`] on `obelisk`.
 #[derive(Clone)]
 pub struct CommandSender {
     generation_id: u32,
-    /// JSON-RPC request id (§ 7's `"id": 105`), shared across clones so capabilities never reuse
+    /// JSON-RPC request id (e.g. `"id": 105`), shared across clones so capabilities never reuse
     /// an id. `Rc<Cell<_>>` is safe here because the sender is single-threaded.
     next_id: Rc<Cell<u64>>,
     /// Capabilities this generation already asked the Supervisor to start. Shared across clones;
@@ -69,7 +68,7 @@ impl CommandSender {
         self.outbound_tx.clone()
     }
 
-    /// Queues § 7's envelope. `expected_revision` is the last hydrated `StateSnapshot` revision,
+    /// Queues the command envelope. `expected_revision` is the last hydrated `StateSnapshot` revision,
     /// kept current by [`CapabilityHandle`]. `0` means "never hydrated": `bump_revision` starts
     /// at `1`, and state-less `lock` capabilities send it forever (ADR-0052 decision 1,
     /// `process.rs`).
@@ -122,7 +121,7 @@ pub struct Capability {
 impl Capability {
     /// Builds an `obelisk.<name>` member and the handle `socket::RendererClient` hydrates. Return
     /// them together: value and revision must move as one, because ordinary dispatch does not
-    /// enforce envelope revision claims (Supervisor services § 13). Pairing them here is the only
+    /// enforce envelope revision claims. Pairing them here is the only
     /// guard against a `set` that stamps a stale read onto the current write.
     pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
         // `nil` until the Supervisor's first push (ADR-0037), paired with revision `0`, which no
@@ -157,7 +156,7 @@ impl Capability {
         &self.commands
     }
 
-    /// Wrapped read signal for `signal::from_userdata`, allowing § 1.2's live forms
+    /// Wrapped read signal for `signal::from_userdata`, allowing live forms
     /// (`content = obelisk.mpris`, `computed({obelisk.audio}, f)`) through a wrapper the engine
     /// otherwise cannot see past.
     pub fn signal(&self) -> Signal {
@@ -273,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn invoke_queues_the_generation_guarded_envelope_section_7_2_specifies() {
+    fn invoke_queues_the_generation_guarded_envelope() {
         let (lua, _handle, mut rx) = lua_with_capability(4);
 
         lua.load(r#"obelisk.probe:invoke("set_volume", 0.75)"#).exec().unwrap();

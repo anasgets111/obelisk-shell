@@ -87,7 +87,7 @@ pub fn spawn_client(
 /// Reload state. `applied_topology` is this generation's topology and is `None` only before any
 /// evaluation. `pending` holds evaluated-but-unapplied output/topology between `Unchanged`
 /// `Reevaluate` and `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve
-/// target (Supervisor services § 14.2), retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef`
+/// target, retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef`
 /// holds `WeakLua`: a retained `mlua::Value` does not keep Lua alive and
 /// `ValueRef::to_pointer` panics after death, so Rust field-drop order must keep `Lua` last (see
 /// [`RendererClient`]).
@@ -105,7 +105,7 @@ struct ReloadState {
 pub enum FrameOutcome {
     /// Fully serviced by [`RendererClient::handle_frame`].
     Handled,
-    /// Supervisor services § 14.2's `ActivateDraw`: draw surfaces and request per-surface
+    /// The PBA protocol's `ActivateDraw`: draw surfaces and request per-surface
     /// presentation feedback tagged with this nonce (`crate::wayland::App::activate_draw`).
     ActivateDraw(u64),
     /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
@@ -194,7 +194,7 @@ impl RendererClient {
         loader
             .register_process(process_registry.clone())
             .map_err(|err| format!("failed to register the process global: {err}"))?;
-        // `ProcessRegistry` uses the same id, so `process.kill` cannot cross generations. § 3.2
+        // `ProcessRegistry` uses the same id, so `process.kill` cannot cross generations. Capability
         // commands all use this write path.
         let commands = CommandSender::new(generation_id, outbound_tx);
         let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
@@ -260,7 +260,7 @@ impl RendererClient {
     fn apply_state_snapshot(&self, snapshot: StateSnapshot) -> mlua::Result<()> {
         let value = self.loader.to_lua_value(&snapshot.payload)?;
         // Revision stamped into later `obelisk.<name>:invoke(...)`; advisory because dispatch does
-        // not enforce it (Supervisor services § 13).
+        // not enforce it.
         let handle = self.capability_handle(&snapshot.capability)?;
         let previous = handle.hydrate(value, snapshot.revision);
         // Run `on_change` handlers (ADR-0115) after hydration and before layout. This is the only
@@ -308,7 +308,7 @@ impl RendererClient {
     /// Evaluates `shell.lua` once at startup without a Supervisor round trip (ADR-0024, "safe to
     /// apply"). `applied_topology` stays `None` only on *evaluation* failure; a failed *apply*
     /// leaves it because surfaces are already bound and later topology changes need a new
-    /// generation (ADR-0038). Runs before layer binding (Supervisor services § 14.2), split so the
+    /// generation (ADR-0038). Runs before layer binding as part of the PBA protocol, split so the
     /// caller expands returned specs via [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         self.clear_change_handlers();
@@ -516,7 +516,7 @@ impl RendererClient {
     }
 
     /// Handles one [`pump`]-decoded frame. Returns [`FrameOutcome`]: `Handled`, or work handed to
-    /// `crate::wayland::App` for EGL/surface draw (Supervisor § 14.2) or SCTK
+    /// `crate::wayland::App` for EGL/surface draw (PBA protocol) or SCTK
     /// `SessionLockState`/lock surfaces (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
@@ -1083,7 +1083,7 @@ mod tests {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
     }
 
-    /// `crate::wayland::run` startup in Supervisor § 14.2 Candidate order: evaluate, expand,
+    /// `crate::wayland::run` startup in PBA Candidate order: evaluate, expand,
     /// store instances, apply.
     fn run_startup(client: &mut RendererClient) -> bool {
         let Some(specs) = client.run_startup_evaluation() else {
@@ -1389,7 +1389,7 @@ mod tests {
         let tip_is_up = |client: &RendererClient| client.scene.surface("tip").expect("the popup resolves").visible;
         assert!(!tip_is_up(&client), "a hover popup is not up before the pointer has been anywhere");
 
-        // Two bugs that happen before the first hover. `grab` defaults true in § 6, but a grabbing
+        // Two bugs that happen before the first hover. `grab` defaults true, but a grabbing
         // popup needs an input serial hover cannot produce, so the compositor refused `visible =
         // true` on every re-resolve. And `anchor_rect` is required non-zero, while its rect signal
         // begins nil, which reads as absent rather than as a rect.
@@ -1432,7 +1432,7 @@ mod tests {
                 let Some(rect) = write.rect else {
                     continue;
                 };
-                // Built here because `crate::wayland::input` is private. This is § 6's
+                // Built here because `crate::wayland::input` is private. This is the popup's
                 // `anchor_rect`; a wrong shape fails the re-resolve below.
                 let table = client.lua().create_table().unwrap();
                 table.set("x", rect.x).unwrap();
@@ -1449,7 +1449,7 @@ mod tests {
         assert_eq!(opened_by, 1, "the slot the popup names opens it, and the other one does not");
 
         // Closing again. `anchor_rect` keeps its last rect rather than clearing, which is what
-        // preserves § 6's non-zero rule on the way out.
+        // preserves the non-zero rule on the way out.
         let bar = client.scene.surface("bar@TEST").unwrap();
         for write in layout::hover::hover_writes(bar, None) {
             write.signal.hover_handle().unwrap().set_changed(mlua::Value::Boolean(false));
@@ -1531,14 +1531,14 @@ mod tests {
         let (client, _outbound_rx) = test_client(&missing);
 
         for capability in shared::Capability::ALL.iter().map(|c| c.as_str()) {
-            // `lock` is § 6's legitimate node constructor.
+            // `lock` is the legitimate node constructor.
             if capability == "lock" {
                 continue;
             }
             let setup = format!("is_nil = {capability} == nil");
             assert!(
                 probe::<bool>(&client.loader, &setup, "is_nil"),
-                "{capability} is still a bare global; § 2 names it obelisk.{capability}"
+                "{capability} is still a bare global; it belongs on obelisk.{capability}"
             );
         }
     }
@@ -1560,7 +1560,7 @@ mod tests {
 
     #[test]
     fn rescue_and_screens_moved_onto_the_same_table_as_the_roster() {
-        // § 2.10 and § 2.15 name both `obelisk.*`, like capabilities.
+        // `rescue` and `screens` both live under `obelisk.*`, like capabilities.
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
         let (client, _outbound_rx) = test_client(&missing);
 
@@ -1600,11 +1600,11 @@ mod tests {
         assert_eq!(dir, "/opt/obelisk-config");
     }
 
-    /// `RendererClient::new` seeds after `Loader::new` registers § 6 constructors. A bare `lock`
-    /// seed would silently overwrite the constructor; `set` over an existing global is silent, so
-    /// `lock { ... }` would report "attempt to call a userdata value" against the config rather
-    /// than the seed. Assert after a full generation, because that registration order is the
-    /// contract.
+    /// `RendererClient::new` seeds after `Loader::new` registers the root-role constructors. A
+    /// bare `lock` seed would silently overwrite the constructor; `set` over an existing global
+    /// is silent, so `lock { ... }` would report "attempt to call a userdata value" against the
+    /// config rather than the seed. Assert after a full generation, because that registration
+    /// order is the contract.
     #[test]
     fn a_full_generation_keeps_lock_as_the_node_constructor_and_puts_the_capability_on_obelisk() {
         let dir = tempfile::tempdir().unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
 
         assert!(run_startup(&mut client), "a config declaring a lock screen must build a scene");
 
-        // The root `lock { ... }` still produced a § 6 surface.
+        // The root `lock { ... }` still produced a root-role surface.
         let setup = r#"
             lock_kind = lock { id = "screen" }.kind
             capability_type = type(obelisk.lock)
@@ -1638,9 +1638,9 @@ mod tests {
         assert_eq!(
             probe::<String>(&client.loader, setup, "lock_kind"),
             "lock",
-            "the global `lock` must still be § 6.4's node constructor"
+            "the global `lock` must still be the node constructor"
         );
-        // The § 2 capability name is reachable and hydrated.
+        // The capability name is reachable and hydrated.
         assert_eq!(probe::<String>(&client.loader, setup, "capability_type"), "userdata");
         assert_eq!(
             probe::<i64>(&client.loader, setup, "attempts"),
@@ -1882,7 +1882,7 @@ mod tests {
         assert!(probe::<bool>(&client.loader, setup, "same"), "the declared name is the identity");
     }
 
-    /// A config `on_click` invoking lock queues a real § 7 envelope.
+    /// A config `on_click` invoking lock queues a real command envelope.
     #[test]
     fn a_config_calling_the_lock_action_queues_a_command_for_the_supervisor() {
         let missing = std::path::PathBuf::from("/no/such/shell.lua");
@@ -1986,7 +1986,7 @@ mod tests {
         assert!(client.state.pending.is_none());
     }
 
-    /// Lock screen whose `child` holds § 6's `secure_submit` field.
+    /// Lock screen whose `child` holds the `secure_submit` field.
     fn lock_config(background: &str) -> String {
         format!(
             r##"return {{
@@ -2121,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_lock_declaration_is_refused_at_evaluation_naming_6_4() {
+    fn a_second_lock_declaration_is_refused_at_evaluation() {
         // `expand_instances` makes one instance per lock spec/output. Two declarations make
         // `ensure_lock_surfaces` send two `get_lock_surface`s for one `wl_output`;
         // `ext-session-lock-v1` calls that `duplicate_output`, and the compositor kills the
@@ -2135,10 +2135,7 @@ mod tests {
         assert!(!run_startup(&mut client), "a config with two `lock` surfaces must not produce a generation");
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue, "the refusal has to be visible somewhere, and rescue is where an evaluation failure goes");
-        assert!(
-            error_log.contains("§ 6.4"),
-            "the message must name the section that says one lock surface per output: {error_log}"
-        );
+        assert!(error_log.contains("`lock` surfaces"), "the message must name what was refused: {error_log}");
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         client.state.applied_topology = Some(
@@ -2191,7 +2188,7 @@ mod tests {
 
     #[test]
     fn a_popup_with_a_zero_anchor_rect_fails_the_evaluation_and_names_the_property_in_rescue() {
-        // § 6's `anchor_rect` feeds `xdg_positioner::set_anchor_rect`; zero size leaves it
+        // `anchor_rect` feeds `xdg_positioner::set_anchor_rect`; zero size leaves it
         // incomplete, so `get_popup` raises `invalid_positioner` and kills Wayland. A config typo
         // must instead be an evaluation `LayoutError` in `rescue.error_log`, naming the property.
         let dir = tempfile::tempdir().unwrap();

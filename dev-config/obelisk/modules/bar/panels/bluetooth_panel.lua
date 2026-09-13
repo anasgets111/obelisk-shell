@@ -17,7 +17,7 @@ local spinner = require("components.spinner")
 local KIND = "bluetooth"
 local SCROLL = scroll("bluetooth_devices")
 
--- One glyph per § 2.6 `category`, from `config/icons.lua`; missing categories use `generic`.
+-- One glyph per `category`, from `config/icons.lua`; missing categories use `generic`.
 local function device_icon(device)
     return icons.device[device.category or "generic"] or icons.device.generic
 end

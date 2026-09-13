@@ -1,5 +1,4 @@
-//! `process` global table and `ProcessHandle` userdata (`lua-api.md` § 3.3,
-//! `docs/services.md` § 10, ADR-0026).
+//! `process` global table and `ProcessHandle` userdata (ADR-0026).
 //!
 //! `process.run(cmd, args, out_cb, exit_cb)` runs on the Wayland dispatch thread during Lua
 //! evaluation, with no socket in scope. [`ProcessRegistry`] queues the outbound `"process"`/`"run"`
@@ -127,7 +126,7 @@ fn stream_name(stream: ProcessStream) -> &'static str {
     }
 }
 
-/// Opaque § 3.3 userdata returned to Lua.
+/// Opaque userdata returned to Lua.
 pub struct ProcessHandle {
     id: u64,
     registry: ProcessRegistry,
@@ -143,7 +142,7 @@ impl UserData for ProcessHandle {
 }
 
 /// Registers `process.run(cmd, args, out_cb, exit_cb)` and `process.detach(cmd, args)`; mlua's
-/// closure signature supplies § 3.2 argument validation.
+/// closure signature supplies argument validation.
 pub fn register(lua: &Lua, registry: ProcessRegistry) -> mlua::Result<()> {
     let table = lua.create_table()?;
     let detach_registry = registry.clone();

@@ -40,7 +40,7 @@ pub(super) struct ParsedActions {
     pub actions: Vec<NotificationAction>,
     /// A `"default"` key was present; the notification is activatable.
     pub has_default: bool,
-    /// An `"inline-reply"` key was present, per §1.2's `x-kde-reply` convention.
+    /// An `"inline-reply"` key was present, per the `x-kde-reply` convention.
     pub has_reply: bool,
 }
 
@@ -99,7 +99,8 @@ impl NotificationsQueueState {
     }
 }
 
-/// `NotificationClosed.reason`: §1 values plus ADR-0033's reserved `4` for FIFO eviction.
+/// `NotificationClosed.reason`: the freedesktop Notifications spec's values plus ADR-0033's
+/// reserved `4` for FIFO eviction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum CloseReason {
@@ -271,7 +272,7 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:dismiss(id)` (§3.2): removes the entry, lets its expiry task no-op on
+    /// `notifications:dismiss(id)` removes the entry, lets its expiry task no-op on
     /// recheck, emits `NotificationClosed(..., Dismissed)`, and pushes state. Unknown ids no-op.
     pub async fn dismiss(&self, id: u32) {
         let removed = {
@@ -580,7 +581,7 @@ impl NotificationsController {
         id
     }
 
-    /// `CloseNotification(id)` (§1): removes the entry (if present) and emits
+    /// `CloseNotification(id)` removes the entry (if present) and emits
     /// `NotificationClosed(id, reason=ClosedByMethod)`. A `dismiss()` write command emits the
     /// same signal with `reason=Dismissed` instead -- distinct wire callers of the same removal
     /// primitive ([`remove_by_id`]).
@@ -637,7 +638,7 @@ impl NotificationsController {
     ) -> zbus::Result<()>;
 }
 
-// Write-command argument parsers (§3.2, ADR-0033); set_dnd calls parse_bool_arg directly.
+// Write-command argument parsers (ADR-0033); set_dnd calls parse_bool_arg directly.
 
 /// Parses `notifications:dismiss(id)`'s `[id]`.
 pub fn parse_dismiss_args(arguments: &[serde_json::Value]) -> Option<u32> {

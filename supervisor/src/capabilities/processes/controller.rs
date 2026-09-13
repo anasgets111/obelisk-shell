@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 
 /// How long a stopping program has after its declared stop signal before `SIGKILL`.
 ///
-/// Deliberately not `process::DEFAULT_REAP_GRACE`. § 10's 100ms suits a `process.run` helper that
+/// Deliberately not `process::DEFAULT_REAP_GRACE`. That 100ms suits a `process.run` helper that
 /// has nothing to finish; a session process is declared precisely because it is doing something
 /// long, and the first thing that will use this writes a video container whose index is appended
 /// on the way out. Killing it at 100ms would leave the file unplayable, which is the failure the
@@ -275,7 +275,7 @@ async fn supervise(
 ///
 /// Signals the group rather than the process so a program that spawned helpers takes them with it,
 /// matching `process::reap_process_group`. That primitive is not reused because it hardcodes
-/// `SIGTERM` and § 10's 100ms, and the declared signal is the entire reason this path exists.
+/// `SIGTERM` and its 100ms, and the declared signal is the entire reason this path exists.
 async fn stop_group(
     name: &str,
     child: &mut Child,

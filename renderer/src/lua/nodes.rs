@@ -1,4 +1,4 @@
-//! Node constructors (`lua-api.md` § 5.2/§ 6) and `VirtualNode`, the loader's shallow
+//! Node constructors and `VirtualNode`, the loader's shallow
 //! table-to-Rust conversion.
 //!
 //! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies other keys unchanged,
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Table, Value};
 
-/// § 5.2's nine geometric nodes plus § 6's four root roles: `panel`, `window`, `popup`, `lock`
+/// Nine geometric nodes plus four root roles: `panel`, `window`, `popup`, `lock`
 /// (ADR-0040). `lock` joined under ADR-0052 decision 2: declaration location is separate from
 /// Wayland object lifetime (ADR-0049); `window`/`popup` wait for `visible`, `lock` for compositor
 /// `locked`.
@@ -29,7 +29,7 @@ const NODE_KINDS: [&str; 13] = [
     "lock",
 ];
 
-/// § 5.1 properties every kind, including surface roles, takes: geometry, identity, and two flags.
+/// Properties every kind, including surface roles, takes: geometry, identity, and two flags.
 /// `layout::scene` reads them without checking kind.
 const COMMON_PROPERTIES: &[&str] = &[
     "align_h",
@@ -57,7 +57,7 @@ const COMMON_PROPERTIES: &[&str] = &[
 ];
 
 /// Box-paint properties beyond [`COMMON_PROPERTIES`]. `node::paint_style`'s first arm paints
-/// `row`, `column`, `button`, `rect`, and all four § 6 roles alike.
+/// `row`, `column`, `button`, `rect`, and all four root roles alike.
 const BOX_PROPERTIES: &[&str] = &["background", "blur", "border_color", "border_width", "clip", "radius"];
 
 /// Which kinds that arm covers.
@@ -245,7 +245,7 @@ mod tests {
         assert!(err.contains("align_v"), "and the ones it accepts, so the typo is visible: {err}");
     }
 
-    /// Per-kind check: `layer` is § 6 topology, not a `rect` property.
+    /// Per-kind check: `layer` is root-role topology, not a `rect` property.
     #[test]
     fn a_property_of_another_kind_is_refused_too() {
         let lua = lua_with_constructors();
@@ -253,7 +253,7 @@ mod tests {
         assert!(deserialize_lua_table(&table).unwrap_err().to_string().contains("layer"));
     }
 
-    /// A surface root takes § 5.1 base and box properties, like `rect` paint.
+    /// A surface root takes the base and box properties, like `rect` paint.
     #[test]
     fn a_surface_root_takes_the_base_properties_and_the_box_ones() {
         let lua = lua_with_constructors();
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn every_section_5_2_and_6_1_to_6_3_node_kind_constructs_and_tags_correctly() {
+    fn every_node_kind_constructs_and_tags_correctly() {
         let lua = lua_with_constructors();
         for kind in NODE_KINDS {
             let table: Table = lua.load(format!("return {kind} {{}}")).eval().unwrap();
@@ -320,8 +320,8 @@ mod tests {
 
     #[test]
     fn image_is_a_constructor() {
-        // ADR-0054 decision 3 added this after § 5.2's original eight; pin the name so dropping it fails
-        // loudly instead of silently removing wallpaper support.
+        // Pin by name (ADR-0054 decision 3); the loop could pass after this entry was dropped,
+        // silently removing wallpaper support.
         let lua = lua_with_constructors();
         assert!(NODE_KINDS.contains(&"image"));
         let table: Table = lua.load(r#"return image { source = "/tmp/wall.png", fit = "cover" }"#).eval().unwrap();

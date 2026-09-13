@@ -128,7 +128,7 @@ pub struct ResolvedNode {
     /// retained node's id and only allocates when there was nothing to match, so an id survives
     /// the node moving, resizing, or gaining siblings ahead of it (ADR-0099).
     ///
-    /// Not addressable from Lua and not the § 5.1 `id` property, which is a reconciliation *hint*
+    /// Not addressable from Lua and not the `id` property, which is a reconciliation *hint*
     /// a config writes and this is the answer the engine reached.
     pub id: NodeId,
     pub kind: String,
@@ -145,7 +145,7 @@ pub struct ResolvedNode {
     /// and everything the solver produced are untransformed. `layout::paint` composes it down
     /// the subtree, `layout::hit` maps the pointer back through its inverse.
     pub transform: node::Transform,
-    /// This node asked for the desktop behind it to be blurred (§ 5.1 `blur`, ADR-0195).
+    /// This node asked for the desktop behind it to be blurred (`blur`, ADR-0195).
     /// [`blur_regions`] turns every one of these in a surface into the one region the compositor
     /// is given; nothing else reads it, and a compositor without the protocol ignores the lot.
     pub blur: bool,
@@ -526,7 +526,7 @@ impl Scene {
     }
 }
 
-/// Admits all four § 6 surface roles as containers with one `child` tree, including a lock tree
+/// Admits all four root roles as containers with one `child` tree, including a lock tree
 /// before the compositor has handed out a surface (ADR-0040 decision 1, ADR-0052 decision 2).
 fn ensure_supported_kind(kind: &str) -> Result<(), LayoutError> {
     match kind {
@@ -551,7 +551,7 @@ fn ensure_node_admissible(kind: &str, depth: u32) -> Result<(), LayoutError> {
 }
 
 /// Selects `child`, `children`, generated list children, or no children. Surface roles share one
-/// `child`; `textfield` is a leaf (§ 5.2 item 8). Its callbacks and secure-submit fields remain in
+/// `child`; `textfield` is a leaf. Its callbacks and secure-submit fields remain in
 /// `ResolvedNode.properties`; the keyboard path reads the latter from the scene while the secret
 /// buffer stays on `App` (ADR-0005).
 fn children_of(kind: &str, properties: &HashMap<String, Value>) -> Result<Vec<VirtualNode>, LayoutError> {
@@ -838,7 +838,7 @@ enum Measure {
         wrap: node::Wrap,
         max_lines: Option<usize>,
     },
-    /// § 5.1's `icon` `size`, the same number on both axes.
+    /// `icon`'s `size`, the same number on both axes.
     Square(f32),
 }
 
@@ -1202,7 +1202,7 @@ fn measure_for(
         "icon" => Some(Measure::Square(node::parse_icon_size(properties)?)),
         // `image` has no intrinsic size, unlike `icon`: knowing a file's own dimensions means
         // decoding it, and this pass has no canvas to decode against and runs on every
-        // `Scene::apply`. So an `image` takes the box § 5.1's `width`/`height` give it, measuring
+        // `Scene::apply`. So an `image` takes the box `width`/`height` give it, measuring
         // nothing without one, the same as an empty `rect`.
         _ => None,
     })
@@ -1565,7 +1565,7 @@ fn solve(
 }
 
 /// The kind whose layout `kind` actually uses. Every kind is itself except `list`, which borrows a
-/// `row`'s or a `column`'s arm depending on its `direction` (§ 5.2 item 7).
+/// `row`'s or a `column`'s arm depending on its `direction`.
 ///
 /// A `list` is a repeater, not a third layout: it reconciles children by key, then stacks them,
 /// and "stacks them" is a `column` or a `row` and nothing else. Routing to the existing arms keeps
@@ -1902,7 +1902,7 @@ fn elide_cut(
     cuts[low]
 }
 
-/// § 4's input-region scan: what this surface draws and what it can click, as surface-local
+/// The input-region scan: what this surface draws and what it can click, as surface-local
 /// physical rects (ADR-0038 decision 5, ADR-0109). Pure; the `wl_region`/
 /// `wl_surface::set_input_region` push it feeds lives in `crate::wayland::App::apply_input_region`,
 /// the only place a Wayland object exists to push to.
@@ -6030,7 +6030,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_popup_root_needs_no_forcing_because_section_6_3_requires_both_of_its_sizes() {
+    fn a_popup_root_with_both_sizes_needs_no_forcing() {
         let mut scene = Scene::new();
         let shaping = ShapingHandle::spawn();
         let (lua, surface) = surface_from(
@@ -6057,7 +6057,7 @@ pub(super) mod tests {
 
         let root = scene.surface("screen-lock@TEST").unwrap();
         assert_eq!(root.kind, "lock");
-        assert_eq!(root.children.len(), 1, "§ 6.4's `child`, read through the same `parse_single_child` a panel's is");
+        assert_eq!(root.children.len(), 1, "a lock's `child`, read through the same `parse_single_child` a panel's is");
         assert_eq!((root.children[0].rect.width, root.children[0].rect.height), (1920.0, 1080.0));
     }
 

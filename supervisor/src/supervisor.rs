@@ -78,7 +78,7 @@ pub(crate) struct Supervisor {
     session_bridge: lock::logind::SessionBridge,
     /// Capability state-version counters by name (ADR-0004).
     revisions: HashMap<String, u32>,
-    /// Last snapshot per capability, seeding a Candidate's first evaluation (§ 14.2, ADR-0029).
+    /// Last snapshot per capability, seeding a Candidate's first evaluation (ADR-0029).
     last_snapshots: HashMap<String, shared::StateSnapshot>,
     /// Most recently sent `Reevaluate` sequence (ADR-0024).
     next_sequence: u64,
@@ -456,7 +456,7 @@ impl Supervisor {
             (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
             ("OBELISK_PBA_CANDIDATE".to_string(), "1".to_string()),
         ];
-        // All latest snapshots hydrate Candidate's first evaluation (§ 14.2, ADR-0029), not just
+        // All latest snapshots hydrate Candidate's first evaluation (ADR-0029), not just
         // audio's.
         let snapshots: Vec<shared::StateSnapshot> = self.last_snapshots.values().cloned().collect();
         let mut link = SocketCandidateLink::new(self.registry.clone(), candidate_generation_id, inbound);

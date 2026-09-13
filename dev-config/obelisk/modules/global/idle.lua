@@ -25,7 +25,7 @@ local compositor = require("lib.compositor")
 
 -- `CompositorService.setDisplaysPowered`, spelled per compositor in `lib.compositor`. Pair it with
 -- `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen means blanking stopped
--- halfway. `backlight_pct` is `-1` without a device (§ 2.8); setting it is a dropped write.
+-- halfway. `backlight_pct` is `-1` without a device; setting it is a dropped write.
 local function set_displays_powered(powered)
     if idle.blanked:get() == (not powered) then
         return

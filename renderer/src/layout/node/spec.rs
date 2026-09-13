@@ -1,5 +1,5 @@
-//! Surface specs, swap fingerprints, child-list parsers, and masked `SecureSubmitTarget` (§ 5.2
-//! item 8). List generation also owns duplicate-key rejection.
+//! Surface specs, swap fingerprints, child-list parsers, and masked `SecureSubmitTarget`.
+//! List generation also owns duplicate-key rejection.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,19 +9,20 @@ use crate::lua::nodes::{VirtualNode, deserialize_lua_table};
 
 use super::*;
 
-/// § 6's `lock` has only `id` and `child` (ADR-0052 decision 2). `child` is walked into the
-/// retained tree, so the spec carries no layout field. It stays a struct rather than
-/// `SurfaceSpec::Lock(String)`, giving [`lock_spec`] a place to attach § 6's four refusals. There
-/// is no `LockTopology`: the protocol exposes only `ack_configure`, with size supplied by
-/// configure, so only declaration existence is fingerprinted.
+/// A `lock` is in `BOX_KINDS` (`crate::lua::nodes`) and accepts the common and box properties;
+/// [`lock_spec`] refuses only `visible`, `monitor`, `anchor`, `width`, and `height` (ADR-0052
+/// decision 2). `child` is walked into the retained tree, so the spec carries no layout field. It
+/// stays a struct rather than `SurfaceSpec::Lock(String)`, giving [`lock_spec`] a place to attach
+/// those refusals. There is no `LockTopology`: the protocol exposes only `ack_configure`, with
+/// size supplied by configure, so only declaration existence is fingerprinted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockSpec {
     pub id: String,
 }
 
-/// Refuses unsupported § 6 properties before reading `id`. Ignoring `visible` could tear down a
+/// Refuses unsupported properties before reading `id`. Ignoring `visible` could tear down a
 /// compositor-owned lock at `locked`/`unlock_and_destroy`, causing ADR-0042's solid-color fallback;
-/// the error reaches `rescue`'s `error_log` (§ 2.10, ADR-0046) while unlocked. `monitor`, `anchor`,
+/// the error reaches `rescue`'s `error_log` (ADR-0046) while unlocked. `monitor`, `anchor`,
 /// `width`, and `height` are inert because configure owns geometry and lock surfaces cover every
 /// output (ADR-0052 decision 2), but silent no-ops are still errors. A `Signal` under a refused key
 /// is refused too; `is_deferred_signal` does not apply to a lock.
@@ -31,7 +32,7 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
             return Err(invalid(
                 property,
                 format!(
-                    "§ 6.4 gives a `lock` no `{property}`: a lock surface covers every connected output, for exactly as long as the compositor holds \
+                    "a `lock` takes no `{property}`: a lock surface covers every connected output, for exactly as long as the compositor holds \
                      the session locked, and none of that is the config's to set (ADR-0042, ADR-0052 decision 2)"
                 ),
             ));
@@ -40,7 +41,7 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
     Ok(LockSpec { id: parse_surface_id(properties)? })
 }
 
-/// One declared top-level surface, parsed by its § 6 role (ADR-0040 decision 1). Declaration order
+/// One declared top-level surface, parsed by its role (ADR-0040 decision 1). Declaration order
 /// remains in the roster and swap fingerprint, so one enum preserves it across roles.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceSpec {
@@ -115,7 +116,7 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     Ok(children)
 }
 
-/// A `list`'s children (§ 5.2 item 7, ADR-0045 decision 3) are generated once per resolved
+/// A `list`'s children (ADR-0045 decision 3) are generated once per resolved
 /// `source` item; it arrives already resolved, so a `Signal` there was read exactly once before
 /// `itemfn` runs. Without `key`, reconciliation is positional. With it, `key(element)`
 /// is called on the source value, not the built node, and overwrites that node's `id`; duplicate
@@ -123,7 +124,7 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
 ///
 /// ponytail: `key` speeds reconciliation, not evaluation. A 30-item tray still runs `itemfn` 30
 /// times and discards 29 fresh nodes on ADR-0044 decision 2's per-poll-turn capability-push
-/// cadence. § 5.2 calls `list` a "fast-reconciling virtual repeater"; skipping unchanged items
+/// cadence. `list` is a "fast-reconciling virtual repeater"; skipping unchanged items
 /// needs retained-side data, which `children_of` does not provide. That is worth about 19% of the
 /// pass (ADR-0132); the whole of it is a viewport, measured at 32us a row by
 /// `layout::scene::tests::list_pass_cost` and designed in ADR-0191.
@@ -185,7 +186,7 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
     Ok(children)
 }
 
-/// `textfield.secure_submit` (§ 5.2 item 8) routes a masked field's committed buffer without Lua
+/// `textfield.secure_submit` routes a masked field's committed buffer without Lua
 /// (ADR-0005, ADR-0027). Enter is read from `wl_keyboard` in `renderer/src/wayland/mod.rs`, not
 /// `zwp_text_input_v3`; the pair keys `RendererFrame::SecureSubmit` (ADR-0050 decision 4). See
 /// `secure_key_action` for why a password must bypass the input-method bridge.
@@ -195,7 +196,7 @@ pub struct SecureSubmitTarget {
     pub action: String,
 }
 
-/// `secure_submit` is optional (§ 5.2 item 8) because an unread mask is unreadable from Lua, and it
+/// `secure_submit` is optional because an unread mask is unreadable from Lua, and it
 /// is non-structural, so signal-bound values arrive resolved. `capability`/`action` reject
 /// non-UTF-8 rather than collapsing distinct bytes onto one Supervisor capability name, as
 /// [`parse_node_id`] does.
@@ -381,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_spec_reads_the_id_and_that_is_the_whole_of_section_6_4() {
+    fn lock_spec_reads_the_id_and_carries_nothing_else() {
         let lua = lua();
         let table: mlua::Table =
             lua.load(r#"return { kind = "lock", id = "screen-lock", child = { kind = "rect" } }"#).eval().unwrap();
@@ -399,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn every_property_section_6_4_denies_a_lock_is_refused_by_name_rather_than_ignored() {
+    fn every_property_a_lock_denies_is_refused_by_name_rather_than_ignored() {
         let lua = lua();
         // `monitor` and `anchor` never reach `lock_spec` from a config any more: they are not on
         // `lock`'s row in `nodes::NODE_PROPERTIES`, so `deserialize_lua_table` refuses them first
@@ -416,7 +417,7 @@ mod tests {
         }
     }
 
-    /// The other half of the § 6 denial, one layer up. A name a `lock` has no row for cannot
+    /// The other half of the lock's denial, one layer up. A name a `lock` has no row for cannot
     /// reach `lock_spec` at all, so the refusal a config author sees is the property gate's.
     #[test]
     fn a_lock_property_that_is_not_even_on_the_kind_is_refused_before_lock_spec_sees_it() {

@@ -7,8 +7,8 @@
 --
 -- ## What is missing, and why it is not a bug
 --
--- The mirror's `SystemInfoService` also reads GPU load, disk usage, uptime, and boot time. § 2.12
--- exposes `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu`, so the GPU
+-- The mirror's `SystemInfoService` also reads GPU load, disk usage, uptime, and boot time. Only
+-- `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu` are exposed, so the GPU
 -- usage tile, per-disk rows, and uptime/boot footer are absent rather than faked. Their space holds
 -- swap under memory and the GPU's temperature where the GPU tile stood.
 --
@@ -31,13 +31,13 @@ local panel_card = require("components.panel_card")
 -- matching the mirror's cadence. Temperatures ride with RAM: they are a tile's second line, not a
 -- number anyone watches move, and the hwmon pass is one read of both `temp_cores` and `temp_gpu`.
 --
--- The mirror ref-counts `SystemInfoService.refCount`, but § 2.12 has no such control: `configure`
+-- The mirror ref-counts `SystemInfoService.refCount`, but there is no such control: `configure`
 -- sets an interval and zero stops a poller for everyone. The choice is polling always or never; two
 -- file reads every couple of seconds is the cheaper mistake.
 obelisk.sysinfo:invoke("configure", { cpu_interval = 2, ram_interval = 5, temp_interval = 5 })
 
 -- `SystemInfoWidget.qml`'s `statusColor(progress, fallback)`: red past 90%, peach past 75%, and the
--- readout's own colour below that. The mirror's `progress` is a fraction; § 3.2 pushes whole
+-- readout's own colour below that. The mirror's `progress` is a fraction; `sysinfo` pushes whole
 -- percents, so the thresholds are 90 and 75 rather than 0.9 and 0.75.
 local function status_color(percent, fallback)
     if percent >= 90 then
@@ -209,7 +209,7 @@ return function(id)
                         -- The mirror's own wording for a machine that exposes no sensor.
                         return celsius > 0 and string.format("%d°C", celsius) or "No temperature"
                     end)),
-                    -- The mirror's second line here is `used / total`; § 2.12 pushes percentages
+                    -- The mirror's second line here is `used / total`; `sysinfo` pushes percentages
                     -- only. Swap is the memory fact it does push, and it has no tile of its own.
                     metric_tile(icons.ram, "Memory", "ram_percent", theme.GREEN, util.label(obelisk.sysinfo, function(s)
                         local swap = percent_of(s, "swap_percent")
@@ -217,7 +217,7 @@ return function(id)
                     end)),
                 },
             },
-            -- `GpuTile` spans both columns. Only its temperature line survives § 2.12, and that
+            -- `GpuTile` spans both columns. Only its temperature line survives, and that
             -- line is already conditional in the mirror (`visible: gpuTemp > 0`); `temp_gpu` is
             -- `-1` with no sensor, so one test covers both.
             tile({ row {

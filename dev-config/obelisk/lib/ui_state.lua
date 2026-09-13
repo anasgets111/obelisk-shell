@@ -29,7 +29,7 @@ local active_modal = state("modal", "")
 -- with no third "stop popping but keep listed" state. The config therefore tracks this view fact.
 -- Key by `util.notification_key`, id plus timestamp, so `replaces_id` content gets a new turn.
 -- Replace the set wholesale, pruning expired/dismissed entries and keeping it within the feed's cap
--- of twenty (§ 2.7).
+-- of twenty.
 local popup_seen = state("notification_popup_seen", {})
 
 local function mark_popups_seen()
@@ -61,7 +61,7 @@ local hidden_ssid = state("network_hidden_ssid", "")
 -- never two at once. `panel_host` reads it for keyboard focus, and the panel reads it for drawing.
 --
 -- A password prompt outranks the hidden steps because it answers a plain click on a secured row,
--- where no name was typed. `password_ssid` names whichever network is being asked about (§ 2.5).
+-- where no name was typed. `password_ssid` names whichever network is being asked about.
 --
 -- The end of a hidden join is *read*, not latched. A `computed` may not have side effects
 -- (ADR-0021), so `n.ssid` reaching the typed name finishes the sheet instead of an

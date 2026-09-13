@@ -1,4 +1,4 @@
-//! `xdg_toplevel`/`xdg_positioner` specs (§ 6), including window and popup field parsers. These
+//! `xdg_toplevel`/`xdg_positioner` specs, including window and popup field parsers. These
 //! describe live `xdg_shell` objects, not layer-shell or session-lock surfaces.
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use super::content::parse_string_property;
 use super::style::table_number;
 use super::*;
 
-/// § 6's live `title`, defaulting to empty rather than exposing the internal `id`. `set_title` is
+/// The live `title`, defaulting to empty rather than exposing the internal `id`. `set_title` is
 /// valid after mapping, so signals update it in place (ADR-0044 decision 1).
 pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, LayoutError> {
     // Deferred on the evaluation pass; `show_window` sends the resolved title.
@@ -21,7 +21,7 @@ pub fn parse_title(properties: &HashMap<String, Value>) -> Result<String, Layout
     parse_string_property(properties, "title", Some(""))
 }
 
-/// § 6's `app_id`, used by compositor window rules, defaulting to `"obelisk-{id}"`. `set_app_id`
+/// `app_id`, used by compositor window rules, defaulting to `"obelisk-{id}"`. `set_app_id`
 /// remains valid after mapping (`xdg-shell.xml`), unlike layer-shell `namespace`; `id` is still
 /// structural because it is reconcile identity (ADR-0045 decision 1).
 pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
@@ -33,7 +33,7 @@ pub fn parse_app_id(properties: &HashMap<String, Value>, id: &str) -> Result<Str
     parse_string_property(properties, "app_id", Some(&default))
 }
 
-/// § 6's advisory `{ width, height }` size hint. Layout does not enforce it; Wayland receives it
+/// The advisory `{ width, height }` size hint. Layout does not enforce it; Wayland receives it
 /// through `set_min_size`/`set_max_size`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizeHint {
@@ -61,7 +61,7 @@ fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Resul
                 format!("`{key}` is required -- a size hint names both axes, or use 0 for an unconstrained one"),
             )
         })?;
-        // Negative values make the request fail (`invalid_size`); § 5.1 supplies the `[0, 8192]`
+        // Negative values make the request fail (`invalid_size`); `[0, 8192]` is the
         // upper bound.
         if !(0.0..=8192.0).contains(&n) {
             return Err(invalid(property, format!("`{key}` must be within [0, 8192], got {n}")));
@@ -72,7 +72,7 @@ fn parse_size_hint(properties: &HashMap<String, Value>, property: &str) -> Resul
 }
 
 /// Checks `set_max_size`'s `max >= min` rule before Wayland sees it. Zero means unset, so it is not
-/// below the minimum; a bad pair becomes a `LayoutError` in `rescue` (§ 2.10), not `invalid_size`
+/// below the minimum; a bad pair becomes a `LayoutError` in `rescue`, not `invalid_size`
 /// on the Wayland connection.
 fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Result<(), LayoutError> {
     let (Some(min), Some(max)) = (min, max) else {
@@ -91,7 +91,7 @@ fn check_max_size_above_min(min: Option<SizeHint>, max: Option<SizeHint>) -> Res
     Ok(())
 }
 
-/// The one live `xdg_toplevel` spec for a top-level `window` (§ 6, ADR-0040 decision 1). There is
+/// The one live `xdg_toplevel` spec for a top-level `window` (ADR-0040 decision 1). There is
 /// no `WindowTopology`: title, app id, and size hints update the live object; `visible` creates and
 /// destroys it rather than swapping the generation. Only `id` changes the declared set and swaps
 /// generation (ADR-0001, ADR-0049 decisions 1-3). A window has one object regardless of outputs
@@ -101,7 +101,7 @@ pub struct WindowSpec {
     pub id: String,
     pub title: String,
     pub app_id: String,
-    /// Advisory (§ 6): parsed and carried, never enforced against the resolved tree.
+    /// Advisory: parsed and carried, never enforced against the resolved tree.
     pub min_size: Option<SizeHint>,
     pub max_size: Option<SizeHint>,
 }
@@ -115,7 +115,7 @@ pub fn window_spec(properties: &HashMap<String, Value>) -> Result<WindowSpec, La
     Ok(WindowSpec { id, title: parse_title(properties)?, app_id, min_size, max_size })
 }
 
-/// § 6's shared `anchor`/`gravity` values. `Center` maps to protocol `none`, which centers an
+/// The shared `anchor`/`gravity` values. `Center` maps to protocol `none`, which centers an
 /// unspecified axis; `crate::wayland` maps this local enum to the positioner protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PopupAnchor {
@@ -132,7 +132,7 @@ pub enum PopupAnchor {
     BottomRight,
 }
 
-/// Parses either § 6 anchor field; `property` names errors. Absent defaults to the protocol's
+/// Parses either anchor field; `property` names errors. Absent defaults to the protocol's
 /// [`PopupAnchor::Center`], unlike constraint adjustments.
 pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -> Result<PopupAnchor, LayoutError> {
     let Some(value) = non_deferred_property(properties, property) else {
@@ -160,7 +160,7 @@ pub fn parse_popup_anchor(properties: &HashMap<String, Value>, property: &str) -
     }
 }
 
-/// § 6's six independent adjustment permissions. Array order is irrelevant because the compositor
+/// The six independent adjustment permissions. Array order is irrelevant because the compositor
 /// applies fixed Flip, Slide, Resize precedence and the request is a bitmask. Default is
 /// `{ "FlipY", "SlideX" }`, not the protocol's empty default (ADR-0040 decision 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +225,7 @@ pub fn parse_constraint_adjustment(properties: &HashMap<String, Value>) -> Resul
     Ok(adjustment)
 }
 
-/// § 6's signed pixel nudge after anchor and gravity; negative values move up or left.
+/// The signed pixel nudge after anchor and gravity; negative values move up or left.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PopupOffset {
     pub x: f32,
@@ -243,7 +243,7 @@ pub fn parse_popup_offset(properties: &HashMap<String, Value>) -> Result<PopupOf
     Ok(PopupOffset { x: axis("x")?, y: axis("y")? })
 }
 
-/// § 6's parent-local `anchor_rect`, reused from `on_click` (ADR-0050 decision 3). `x`/`y` default
+/// The parent-local `anchor_rect`, reused from `on_click` (ADR-0050 decision 3). `x`/`y` default
 /// to 0, but `width`/`height` must be in `(0, 8192]`: negative sizes raise `invalid_input`, zero
 /// leaves the positioner incomplete and raises `invalid_positioner` at `get_popup`. Deferred
 /// signals use a 1x1 placeholder because zero is incomplete; `App::apply_resolved_state` replaces
@@ -320,7 +320,7 @@ fn parse_popup_extent(properties: &HashMap<String, Value>, property: &str) -> Re
     Ok(SizeMode::Pixels(n))
 }
 
-/// § 6's `grab`, defaulting to `true` so outside clicks dismiss a dropdown (ADR-0040 decision 2).
+/// `grab`, defaulting to `true` so outside clicks dismiss a dropdown (ADR-0040 decision 2).
 /// ADR-0040 chose a real `xdg_popup` here over a second `panel`.
 /// Taking the grab needs a real input serial for one poll turn, and the compositor may deny it
 /// (ADR-0049 amendment).
@@ -334,7 +334,7 @@ pub fn parse_grab(properties: &HashMap<String, Value>) -> Result<bool, LayoutErr
     }
 }
 
-/// One top-level popup's `xdg_popup`/`xdg_positioner` fields (§ 6). Its parent is a surface id,
+/// One top-level popup's `xdg_popup`/`xdg_positioner` fields. Its parent is a surface id,
 /// because the protocol roots the popup through `xdg_surface.get_popup` or
 /// `zwlr_layer_surface_v1.get_popup`. The object exists only while shown and the positioner is
 /// consumed at `get_popup`, so all fields re-read on open; only declaration changes topology
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!((spec.anchor, spec.gravity), (PopupAnchor::Center, PopupAnchor::Center));
         assert_eq!(spec.constraint_adjustment, ConstraintAdjustment::default());
         assert_eq!(spec.offset, PopupOffset::default());
-        assert!(spec.grab, "a deferred `grab` takes § 6.3's default, not the signal's current value");
+        assert!(spec.grab, "a deferred `grab` takes its declared default, not the signal's current value");
     }
 
     #[test]

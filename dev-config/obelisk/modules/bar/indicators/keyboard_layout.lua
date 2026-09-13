@@ -25,9 +25,9 @@ local caps = obelisk.keyboard:map(function(k)
     return k ~= nil and k.caps_lock == true
 end)
 
--- No `on_activate`, so `icon_button` returns a readout `row`, not a `button`; § 3.2's keyboard row
--- has no command. The mirror calls `KeyboardLayoutService.nextLayout()`, but no capability action
--- exists.
+-- No `on_activate`, so `icon_button` returns a readout `row`, not a `button`; this indicator just
+-- doesn't call `SwitchLayout`, the capability action behind the mirror's
+-- `KeyboardLayoutService.nextLayout()`.
 return icon_button(obelisk.keyboard:map(layout_short), nil, {
     icon_size = theme.font.md,
     foreground = caps:map(function(on)

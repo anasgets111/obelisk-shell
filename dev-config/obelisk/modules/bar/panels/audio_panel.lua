@@ -5,7 +5,7 @@
 -- pickers and the mixer expand on click through `PanelRow.expandable` and three `state()` signals.
 -- Unlike the mirror, closing the panel leaves an open picker open.
 --
--- Dropped 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`, § 3.2`). Stream
+-- Dropped 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`). Stream
 -- icons use `obelisk.applications` and `app_id`, falling back to a note glyph.
 local theme = require("config.theme")
 local icons = require("config.icons")

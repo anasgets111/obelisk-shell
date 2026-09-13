@@ -118,8 +118,8 @@ fn build_handle(lua: &Lua, name: &str, processes: mlua::AnyUserData) -> mlua::Re
 }
 
 /// One field of one declared program, mapped over `obelisk.processes`. `nil` before the first push
-/// and for a name the Supervisor has not answered for yet, so § 3.1 leaves the property's
-/// documented default.
+/// and for a name the Supervisor has not answered for yet, matching the property's documented
+/// default.
 fn field_signal(lua: &Lua, processes: &Signal, name: &str, key: &str) -> mlua::Result<Signal> {
     let name = name.to_string();
     let key = key.to_string();

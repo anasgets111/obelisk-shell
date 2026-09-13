@@ -36,7 +36,7 @@ return panel {
     -- `"None"` is the engine default (`layout::node::parse_keyboard_interactivity`), written out
     -- because this setting has been wrong twice.
     --
-    -- `"OnDemand"` exercised Phase 21 item 2, but niri focuses an `on_demand` layer surface when it
+    -- `"OnDemand"` was tried, but niri focuses an `on_demand` layer surface when it
     -- *maps*. Starting the shell stole focus with no click and made the session unusable.
     --
     -- It was then bound to `ui_state.panel_open` so the `xdg_popup` network password prompt could

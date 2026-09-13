@@ -40,7 +40,7 @@ pub(super) fn validate_trusted_path(path: &str, trusted_roots: &[PathBuf]) -> Op
     is_trusted.then_some(canonical)
 }
 
-/// Strips `file://` from §1 `image-path`/`app_icon` hints.
+/// Strips `file://` from `image-path`/`app_icon` hints.
 pub(super) fn strip_file_uri(path: &str) -> &str {
     path.strip_prefix("file://").unwrap_or(path)
 }
@@ -130,7 +130,7 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     })
 }
 
-/// Validates `docs/services.md §1.1`'s image-data bounds and its "ARGB icon
+/// Validates image-data bounds and the "ARGB icon
 /// rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit samples only, channels
 /// matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length. ponytail: no 16-bit/float
 /// support until a real sender needs it.
@@ -193,7 +193,7 @@ pub(super) fn delete_icon_file(path: &str) {
     }
 }
 
-/// Attached-picture precedence from §1: `image-data`/`image_data` > `image-path`/`image_path` >
+/// Attached-picture precedence: `image-data`/`image_data` > `image-path`/`image_path` >
 /// `icon_data`.
 ///
 /// The three spellings accumulated across spec versions. `app_icon` no longer competes with this
@@ -225,7 +225,7 @@ pub(super) fn resolve_image_input(
 
 /// Splits `image-path`/`image_path` into `(picture, theme name)` (ADR-0096).
 ///
-/// §1.2 allows a `file://` URI or a freedesktop theme name; `file://` is the only URI schema
+/// A `file://` URI or a freedesktop theme name is allowed; `file://` is the only URI schema
 /// supported right now. Paths use [`validate_trusted_path`]; names have no path to validate.
 /// Leaving names in the picture chain caused ADR-0091's `app_icon` bug, so they move to the
 /// application-icon path.

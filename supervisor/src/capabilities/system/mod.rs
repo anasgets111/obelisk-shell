@@ -1,4 +1,4 @@
-//! `obelisk.system` provides reactive wall-clock time (docs/lua-api.md §2.11).
+//! `obelisk.system` provides reactive wall-clock time.
 //!
 //! Read-only. ADR-0136 moved the former persisted `state.json` and `system:write_state` to
 //! `obelisk.storage`, where config names the file.

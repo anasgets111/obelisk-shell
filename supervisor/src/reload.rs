@@ -1,5 +1,4 @@
-//! Presentation-Before-Authority (PBA) hot-reload orchestration
-//! (`docs/services.md` § 14).
+//! Presentation-Before-Authority (PBA) hot-reload orchestration.
 //!
 //! Ordering/gating only for six steps: spawn, hydrate, null-buffer stage, activate draw, verify
 //! evidence, swap/reap. [`process`] owns spawn/reap; [`CandidateLink`] is the control-socket trait
@@ -25,44 +24,41 @@ use tokio::time::timeout;
 
 use crate::process;
 
-/// § 14.2 control-socket operations from Supervisor to Candidate.
+/// Control-socket operations from Supervisor to Candidate.
 pub trait CandidateLink {
     /// Control-link failure.
     type Error: std::fmt::Debug;
 
-    /// § 14.2 step 1: names the pid the just-spawned Candidate will connect from, so the listener
+    /// Names the pid the just-spawned Candidate will connect from, so the listener
     /// can refuse anyone else claiming its generation id (`socket::GenerationRegistry`). Called
     /// before the Candidate can have connected. `None` releases the binding instead, for a
     /// Candidate that is about to be aborted or whose pid could not be read; either way the id is
     /// left unclaimable rather than open.
     fn expect_candidate_pid(&mut self, pid: Option<u32>);
 
-    /// § 14.2 step 2: push every cached capability snapshot so Candidate hydration needs no system
+    /// Pushes every cached capability snapshot so Candidate hydration needs no system
     /// query (ADR-0029).
     async fn push_state_snapshot(&mut self, snapshots: &[shared::StateSnapshot]) -> Result<(), Self::Error>;
 
-    /// § 14.2 step 3: wait for Wayland layer-shell handshake and null-buffer commit, then return
+    /// Waits for Wayland layer-shell handshake and null-buffer commit, then returns
     /// staged `surface_id`s as the evidence set (ADR-0025).
     async fn recv_ready_signal(&mut self) -> Result<Vec<String>, Self::Error>;
 
-    /// § 14.2 step 4: send nonce-bound `ActivateDraw` to compile and draw the first GPU frame.
+    /// Sends nonce-bound `ActivateDraw` to compile and draw the first GPU frame.
     async fn send_activate_draw(&mut self, nonce: u64) -> Result<(), Self::Error>;
 
-    /// § 14.2 step 5: wait for `wp_presentation_feedback`'s `presented` evidence for `nonce` and
-    /// return its `surface_id`; called once per surface.
+    /// Waits for `wp_presentation_feedback`'s `presented` evidence for `nonce` and
+    /// returns its `surface_id`; called once per surface.
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error>;
 }
 
-/// Step of § 14.2-14.3 where [`PbaFailure`] occurred.
+/// Step in the handshake where [`PbaFailure`] occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// § 14.2 step 2.
     StateHydration,
-    /// § 14.2 step 3.
     NullBufferStaging,
-    /// § 14.2 step 4.
     ActivateDraw,
-    /// § 14.3 step 5: barrier over every expected surface, not one receipt.
+    /// A barrier over every expected surface, not one receipt.
     EvidenceVerification,
 }
 
@@ -100,7 +96,7 @@ impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
 }
 
 /// Completed reload: `N+1` is presented on every expected surface; `promoted_surfaces` follows
-/// `ReadySignal` order. `run_pba` neither reaps nor takes `N`: § 14.3 orders deselection,
+/// `ReadySignal` order. `run_pba` neither reaps nor takes `N`: the swap orders deselection,
 /// promotion, reap, with messages on two connections while the link reaches only Candidate.
 /// [`swap_and_reap`] sends them, then reaps `superseded` via [`process::reap_process_group`].
 #[derive(Debug)]
@@ -166,7 +162,7 @@ async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: Pba
 
 /// [`run_pba`] deadlines: ready, evidence, and process reap grace (`SIGTERM` to `SIGKILL`, passed
 /// to [`process::reap_process_group`]). Ready bounds hydration+ready-wait; evidence bounds activate
-/// through the § 14.3 barrier. Grouped only to limit parameters; no shared invariant.
+/// through the evidence-verification barrier. Grouped only to limit parameters; no shared invariant.
 #[derive(Debug, Clone, Copy)]
 pub struct PbaTimings {
     pub ready_timeout: Duration,
@@ -174,7 +170,7 @@ pub struct PbaTimings {
     pub reap_grace: Duration,
 }
 
-/// Runs PBA steps 1-5 (D-Bus § 14):
+/// Runs PBA steps 1-5:
 ///
 /// 1. **Overlapping Spawn**: [`process::spawn_group_leader`], passing `candidate_envs` unchanged
 ///    (for example `OBELISK_GENERATION_ID`/`OBELISK_PBA_CANDIDATE`).
@@ -206,7 +202,7 @@ pub async fn run_pba<L: CandidateLink>(
     }
 }
 
-/// Builds § 14.3 Swap messages in wire order: per surface, superseded stops input before Candidate
+/// Builds Swap messages in wire order: per surface, superseded stops input before Candidate
 /// starts. A value makes that order testable; disconnected `send_frame_logged` only logs/drops and
 /// cannot prove ordering.
 fn swap_frames(
@@ -247,11 +243,11 @@ pub(crate) fn replay_deferred_frames(
 }
 
 /// Owns everything after [`run_pba`] verifies evidence, which previously lived in `main.rs`'s
-/// `TopologyChanged` arm. It implements § 14.3 Swap & Reap. Rules: deselect each
-/// surface before promotion (§ 14.3), and reassign `authoritative` last. Deselect/reap read its
+/// `TopologyChanged` arm. It implements Swap & Reap. Rules: deselect each
+/// surface before promotion, and reassign `authoritative` last. Deselect/reap read its
 /// generation id, so promoting first would target Candidate and sweep its `process.run` children
 /// while leaving superseded ones. Reap order is irrelevant: each generation's children are their
-/// own group leaders (§ 10, ADR-0026), so Renderer reap cannot reach them and either sweep collects
+/// own group leaders (ADR-0026), so Renderer reap cannot reach them and either sweep collects
 /// them. Consume [`PbaOutcome`] because Candidate becomes authoritative and must have one owner.
 pub(crate) async fn swap_and_reap(
     registry: &GenerationRegistry,
@@ -295,7 +291,7 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    /// § 14.3 rule 1: deselect superseded before promoting Candidate on every surface, so no
+    /// Deselect superseded before promoting Candidate on every surface, so no
     /// surface is live on both. Two frames per surface target opposite generations in that order.
     #[test]
     fn every_surface_is_deselected_on_the_superseded_generation_before_the_candidate_is_promoted() {
@@ -338,7 +334,7 @@ mod tests {
         assert!(swap_frames(1, 2, &[]).is_empty());
     }
 
-    /// § 14.3 step 6: superseded has nothing running; `authoritative` names Candidate.
+    /// After the swap, superseded has nothing running; `authoritative` names Candidate.
     /// It pins reassignment last; promoting first sweeps generation 2 instead of generation 1, so
     /// the registered `sleep` outlives reload. Hoisting the assignment fails this test.
     #[tokio::test]
@@ -543,8 +539,10 @@ mod tests {
                 "send_activate_draw",
                 "recv_presentation_evidence"
             ],
-            "the handshake must run in § 15.2-15.3's order, and the Candidate's generation id must be bound to its \
-             pid before step 2 pushes it anything"
+            "expect_candidate_pid must precede push_state_snapshot, recv_ready_signal, \
+             send_activate_draw and recv_presentation_evidence, in that order, so the \
+             Candidate's generation id is bound to its pid before the state-snapshot push \
+             sends it anything"
         );
 
         // Clean up the newly-promoted candidate rather than leaking the sleep.

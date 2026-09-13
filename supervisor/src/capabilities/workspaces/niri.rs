@@ -5,7 +5,7 @@
 //!
 //! ADR-0056 decision 1 still applies: one implementor needs no trait. A second compositor is a
 //! sibling plus two `WorkspacesController` arms, inheriting `derive_state`, `StatePublisher`, and
-//! their tests instead of predicting § 2.9 from one implementation.
+//! their tests instead of predicting the payload from one implementation.
 
 use std::collections::HashMap;
 
@@ -45,7 +45,7 @@ fn workspace_rows(
 /// niri flags focus on each window, so search here rather than in `derive_state`. Clone only the
 /// winner; even a fifty-window session builds one `FocusedWindow` per event.
 ///
-/// Wire `title`/`app_id` are `Option` but § 2.9 makes them non-nullable, so default to empty. A
+/// Wire `title`/`app_id` are `Option` but the payload makes them non-nullable, so default to empty. A
 /// window reporting neither is still a real toplevel.
 fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWindow> {
     windows.values().find(|window| window.is_focused).map(|window| FocusedWindow {
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn focused_window_defaults_a_null_title_or_app_id_to_empty_rather_than_dropping_the_window() {
-        // § 2.9 declares both non-nullable, while niri's wire uses `Option` for both.
+        // The payload declares both non-nullable, while niri's wire uses `Option` for both.
         let mut bare = window(2, "", "", true, false);
         bare.title = None;
         bare.app_id = None;

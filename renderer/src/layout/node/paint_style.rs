@@ -44,7 +44,7 @@ pub enum PaintStyle {
     /// and display-list building.
     Icon {
         name: String,
-        /// § 5.1's `foreground` for `currentColor` fills (ADR-0072); `None` preserves file colours.
+        /// `foreground` for `currentColor` fills (ADR-0072); `None` preserves file colours.
         color: Option<Rgba>,
     },
     Image {
@@ -75,7 +75,7 @@ pub enum PaintStyle {
 /// Parses an already-resolved kind. `Ok(None)` means the kind draws nothing; an error fails apply.
 pub fn paint_style(kind: &str, properties: &HashMap<String, Value>) -> Result<Option<PaintStyle>, LayoutError> {
     let style = match kind {
-        // All containers and surface roles use the base box properties (§ 5.2; § 6).
+        // All containers and surface roles paint as a box.
         "rect" | "row" | "column" | "button" | "panel" | "window" | "popup" | "lock" => PaintStyle::Box {
             background: parse_background(properties)?,
             radius: parse_radius(properties)?,

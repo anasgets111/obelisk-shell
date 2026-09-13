@@ -1,4 +1,4 @@
-//! `Signal` (`lua-api.md` § 1.2): `get`, `map`, `set`, `computed(dependencies, fn)`,
+//! `Signal`: `get`, `map`, `set`, `computed(dependencies, fn)`,
 //! and `state(name, initial)` (ADR-0044 decision 5). Rust owns the userdata; `computed` calls `fn`
 //! with dependency values, not handles, so its body does not call `:get()` on declared deps.
 //!
@@ -15,7 +15,7 @@ use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value};
 
 use crate::lua::marshal;
 
-/// § 1.2: "CPU runtime is capped at 5ms per evaluation."
+/// CPU runtime is capped at 5ms per evaluation.
 const CPU_CAP: Duration = Duration::from_millis(5);
 
 /// Whole-`Scene::apply` cap, not per getter. It must exceed legitimate passes that run every getter
@@ -29,7 +29,7 @@ const CPU_CAP: Duration = Duration::from_millis(5);
 /// frames at ADR-0044's push cadence. Upgrade to a cost-sized per-pass budget.
 const LAYOUT_PASS_CAP: Duration = Duration::from_secs(2);
 
-/// One evaluation's wall pre-filter and thread-CPU deadline. CPU is § 1.2's authority; an unexpired
+/// One evaluation's wall pre-filter and thread-CPU deadline. CPU is authoritative; an unexpired
 /// wall deadline proves CPU is unexpired, avoiding a syscall. `Instant::now()` costs 23.6ns versus
 /// `CLOCK_THREAD_CPUTIME_ID`'s 170.4ns. Wall alone charged descheduled work: on 12 threads it fired
 /// 5 times in 53 suite runs for configs a quiet machine evaluates in microseconds. A parked thread
@@ -55,7 +55,7 @@ impl Deadline {
     }
 }
 
-/// CPU used by the calling thread, as § 1.2 requires. Per thread, not process: Lua runs start to
+/// CPU used by the calling thread. Per thread, not process: Lua runs start to
 /// finish on the entering Wayland thread (ADR-0039); process-wide time would charge shaping.
 /// `crate::wayland::idle_profile` charges blocks of its loop against the same per-thread scope.
 pub(crate) fn thread_cpu_time() -> Option<Duration> {
@@ -220,7 +220,7 @@ impl SignalKind {
     }
 }
 
-/// Applies `marshal.rs`/§ 1.1 checks to Lua-authored `Number`/`Integer`/`String`; other shapes pass
+/// Applies `marshal.rs` checks to Lua-authored `Number`/`Integer`/`String`; other shapes pass
 /// unchanged. Shared by `try_new_direct`, `new_state`, and `set`; `new_live` receives Rust data.
 fn check_lua_authored(value: &Value) -> Result<(), marshal::MarshalError> {
     match value {
@@ -301,7 +301,7 @@ impl Signal {
 
     /// Boolean written by `wl_pointer`, read-only to Lua (ADR-0062 decision 2). Starts `false`, not
     /// nil, because `visible` treats nil as absent (ADR-0044 decision 1 amendment). `initial_rect`
-    /// must be a real non-zero 1x1 table: § 6 requires non-zero tooltip `anchor_rect` before any
+    /// must be a real non-zero 1x1 table: tooltips require a non-zero `anchor_rect` before any
     /// pointer event, and this constructor lacks a Lua to build the table.
     pub fn new_hover(dirty: DirtyFlag, initial_rect: Value) -> (Self, Self) {
         let over = Rc::new(RefCell::new(Value::Boolean(false)));
@@ -802,7 +802,7 @@ struct PassDeadline(Option<Deadline>);
 /// after [`CpuBudget`] drops its hook (a `while true` `margin.__index` once hung Wayland), and
 /// stops a margined tree buying one 5ms budget per `get_value` under ADR-0021. Runs beside
 /// [`CpuBudget`]; the earlier
-/// [`expired_budget`] wins, preserving § 1.2's 5ms and adding a pass ceiling.
+/// [`expired_budget`] wins, preserving the 5ms cap and adding a pass ceiling.
 pub(crate) struct LayoutPassBudget<'lua> {
     lua: &'lua Lua,
 }
@@ -890,7 +890,7 @@ fn expired_budget(lua: &Lua) -> Option<&'static str> {
 }
 
 /// Shared answer for signal-like userdata and the `Signal` to resolve. It accepts [`Signal`],
-/// `capability::Capability`, and wrapped `IdleMember`; every § 2 capability uses one, so live
+/// `capability::Capability`, and wrapped `IdleMember`; every capability uses one, so live
 /// bindings stay live instead of becoming literals.
 ///
 /// This clone runs for every signal-valued property of every node, on every whole-scene resolve,
@@ -915,7 +915,7 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
     ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>() || ud.is::<crate::lua::idle::IdleMember>()
 }
 
-/// Registers `computed` (§ 1.2), `delay` and `pulse` (ADR-0146, ADR-0153), `state`
+/// Registers `computed`, `delay` and `pulse` (ADR-0146, ADR-0153), `state`
 /// (ADR-0044 decision 5), `hover`, `hover_rect`, and `scroll`.
 /// Dependencies are signal-like userdata. Pass the shared dirty flag explicitly, not via
 /// `app_data`: a hidden coupling failing inside a config author's `state()` call is worse than
@@ -948,7 +948,7 @@ pub fn register(lua: &Lua, dirty: DirtyFlag) -> mlua::Result<()> {
                 .map(|dep| {
                     // Name the expected type; `borrow`'s error does not.
                     from_userdata(&dep?).ok_or_else(|| {
-                        mlua::Error::runtime("computed() dependencies must be Signals or `obelisk` capabilities, § 1.2")
+                        mlua::Error::runtime("computed() dependencies must be Signals or `obelisk` capabilities")
                     })
                 })
                 .collect::<mlua::Result<Vec<_>>>()?;
@@ -1092,8 +1092,8 @@ fn hover_slot(lua: &Lua, dirty: &DirtyFlag, name: String) -> mlua::Result<(Signa
     Ok(slot)
 }
 
-/// Pre-pointer `hover_rect(name)`: real 1x1 origin table. Non-zero because § 6 rejects zero
-/// `anchor_rect`; `visible = hover(name)` stays false, so a tooltip waits invisibly at origin until
+/// Pre-pointer `hover_rect(name)`: real 1x1 origin table. Non-zero because zero `anchor_rect` is
+/// rejected; `visible = hover(name)` stays false, so a tooltip waits invisibly at origin until
 /// the pointer event supplies the real rect.
 fn unhovered_rect(lua: &Lua) -> mlua::Result<mlua::Table> {
     let rect = lua.create_table()?;
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn hover_rect_reads_a_real_non_zero_rect_before_anything_has_been_hovered() {
         // Live-session bug: nil rect means absent (ADR-0044 decision 1 amendment), while tooltip
-        // `anchor_rect` must be non-zero (§ 6), so from the first frame each capability push made
+        // `anchor_rect` must be non-zero, so from the first frame each capability push made
         // every resolve refuse the popup until something hovered.
         let (lua, _dirty) = lua_with_state();
         let rect: mlua::Table = lua.load(r#"return hover_rect("volume"):get()"#).eval().unwrap();
@@ -1987,7 +1987,7 @@ mod tests {
     fn a_computed_descheduled_past_its_deadline_is_not_charged_for_time_it_did_not_run() {
         // Before the fix: 5 failures in 53 renderer-suite runs, a different test each time, across
         // 630 tests/12 threads, each falsely raising the 5ms error while a quiet-machine config
-        // was descheduled. `park` burns no CPU, so § 1.2's CPU cap must not fire; the later loop
+        // was descheduled. `park` burns no CPU, so the CPU cap must not fire; the later loop
         // exercises both hook and return gates.
         let lua = lua_with_signal("a", Value::Integer(7));
         let park = lua

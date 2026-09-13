@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::{DEFAULT_EXPIRE_MS, NOTIFICATION_FEED_VIEW, NOTIFICATION_QUEUE_CAP, Notification, Urgency};
 
 /// Whether a notification auto-expires, and when.
-/// Resolves `expire_timeout` (§1; ADR-0033): critical never expires; otherwise `0` means never,
+/// Resolves `expire_timeout` (ADR-0033): critical never expires; otherwise `0` means never,
 /// negative means [`DEFAULT_EXPIRE_MS`] (mako/dunst convention), and positive means milliseconds.
 pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> Option<Duration> {
     if urgency == Urgency::Critical {

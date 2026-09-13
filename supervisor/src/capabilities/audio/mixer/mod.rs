@@ -25,7 +25,7 @@
 //! ponytail: filtering runs once at `global`; a later class change is missed. Real clients set it
 //! at creation. Upgrade path: bind every `ObjectType::Node` and filter in `info` if that changes.
 //!
-//! Master/source tracking (§ 2.4, ADR-0053 decision 3) is a second, mostly independent tracking
+//! Master/source tracking (ADR-0053 decision 3) is a second, mostly independent tracking
 //! job on the same registry listener. It reads `Audio/Sink`/`Audio/Source` `Props` in `param`
 //! events and resolves them through `default.audio.sink`/`source` metadata names.
 //! This file wires events; [`super::master`] owns parsing, resolution, and linear/cubic conversion.

@@ -1,4 +1,4 @@
-//! Applies § 3.2 `AudioCommand`s against live `MixerState` maps. Writes are not optimistic:
+//! Applies `AudioCommand`s against live `MixerState` maps. Writes are not optimistic:
 //! success returns through `registry`'s `param`/`property` listener, like `wpctl` or a headset
 //! button change.
 
@@ -202,7 +202,7 @@ fn with_pod(object: &pw::spa::pod::Value, what: std::fmt::Arguments, send: impl 
 }
 
 /// Writes `audio:set_default_sink/source(id)`. Metadata names devices by `node.name`, so an id
-/// read from § 2.4's array is translated through its tracked entry. System-wide defaults use `0`
+/// read from the device array is translated through its tracked entry. System-wide defaults use `0`
 /// (`pw-metadata` shows `update: id:0 key:'default.audio.sink'`).
 fn write_default_device(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, id: u32) {
     let state = state.borrow();

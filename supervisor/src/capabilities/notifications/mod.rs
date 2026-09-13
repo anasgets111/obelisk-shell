@@ -1,5 +1,4 @@
-//! Notifications capability (`obelisk.notifications`, `docs/services.md` §1;
-//! `docs/lua-api.md` §2.7/§3.2, ADR-0033).
+//! Notifications capability (`obelisk.notifications`, ADR-0033).
 //! Hosts `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view,
 //! global DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a
 //! tier default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
@@ -102,7 +101,7 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
 pub const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
 pub const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 
-/// §1.1 property caps (ADR-0033), measured in bytes and truncated at UTF-8 boundaries.
+/// Property caps (ADR-0033), measured in bytes and truncated at UTF-8 boundaries.
 const MAX_APP_NAME_BYTES: usize = 64;
 const MAX_SUMMARY_BYTES: usize = 128;
 const MAX_BODY_BYTES: usize = 512;
@@ -146,7 +145,7 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "inline-reply",
 ];
 
-// Wire-facing types (docs/lua-api.md §2.7, ADR-0033).
+// Wire-facing types (ADR-0033).
 
 /// One allowlisted body-markup run (CONTEXT.md, ADR-0033). Text carries styling and link target;
 /// images carry only a spooled/validated path. `alt` is parsed but not carried.
@@ -233,13 +232,13 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
     }
 }
 
-/// Queued `notifications.feed[]` object (idl §2.7; ADR-0033, ADR-0090). `expire_timeout` and
+/// Queued `notifications.feed[]` object (ADR-0033, ADR-0090). `expire_timeout` and
 /// `replaces_id` affect processing but are not feed data.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Notification {
     /// Server id, starting at `1`; used by dismiss/reply/action and reused by replacement.
     pub id: u32,
-    /// Arrival time in Unix epoch seconds, matching `obelisk.system.time` (§2.11); age is
+    /// Arrival time in Unix epoch seconds, matching `obelisk.system.time`; age is
     /// `system.time - timestamp`. Replacements get fresh timestamps; carried because configs
     /// cannot recover history inside ADR-0021 side-effect-free `computed`s.
     pub timestamp: i64,
@@ -266,11 +265,11 @@ pub struct Notification {
     /// feed history (ADR-0100), after `NotificationClosed(id, reason=1)`; replacements reset it.
     /// Never true for critical or `expire_timeout = 0` notifications.
     pub expired: bool,
-    /// `hints["transient"]`: popup-only (§1). Expired transient entries are removed, not retired,
+    /// `hints["transient"]`: popup-only. Expired transient entries are removed, not retired,
     /// so history never sees them (ADR-0100).
     pub transient: bool,
     /// `hints["desktop-entry"]` id, e.g. `"org.telegram.desktop"`, used by
-    /// `obelisk.applications.by_app_id` (§ 2.13) instead of the mutable/non-unique `app_name`.
+    /// `obelisk.applications.by_app_id` instead of the mutable/non-unique `app_name`.
     /// `nil` when absent; slashed values are dropped (ADR-0101).
     pub desktop_entry: Option<String>,
     /// Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.
