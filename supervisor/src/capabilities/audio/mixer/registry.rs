@@ -1,6 +1,6 @@
 //! PipeWire registry plumbing for stream/video nodes, `Audio/Sink`/`Source`, default metadata,
-//! and ALSA devices. `run` is the thread entry point; callbacks run in its blocking
-//! `main_loop.run()`.
+//! ALSA devices, and BlueZ devices' codec profiles. `run` is the thread entry point; callbacks run
+//! in its blocking `main_loop.run()`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -18,8 +18,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::capabilities::audio::master;
 
 use super::state::{
-    AudioApps, AudioCommand, AudioState, CaptureApps, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice,
-    DeviceEntry, DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, VideoSourceApps,
+    AudioApps, AudioCommand, AudioState, BluezCard, CaptureApps, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY,
+    DefaultDevice, DeviceEntry, DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, VideoSourceApps,
     apply_capture_info_event, apply_info_event, apply_video_info_event, classify, device_names,
 };
 use super::write::apply_command;
@@ -82,6 +82,8 @@ fn run_inner(
         source_nodes: HashMap::new(),
         devices: HashMap::new(),
         device_routes: HashMap::new(),
+        bluez_cards: HashMap::new(),
+        bluez_devices: HashMap::new(),
         app_props: HashMap::new(),
         default_sink_name: None,
         default_source_name: None,
@@ -151,6 +153,8 @@ fn run_inner(
             state.sources.remove(&id);
             state.source_nodes.remove(&id);
             state.app_props.remove(&id);
+            state.bluez_cards.remove(&id);
+            state.bluez_devices.remove(&id);
             if state.devices.remove(&id).is_some() {
                 // Remove all route indices keyed by this device id, so a reused id inherits none.
                 state.device_routes.retain(|&(device_id, _), _| device_id != id);
@@ -457,8 +461,10 @@ fn bind_default_metadata(
 /// is called, and a `Route` appearing later is pushed to nobody. A shell started before its card
 /// settles, which is every login, then dropped every write for the session (ADR-0200).
 fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::RegistryRc, obj: &GlobalObject<&DictRef>) {
-    if obj.props.and_then(|props| props.get_prop(*keys::DEVICE_API)) != Some("alsa") {
-        return;
+    match obj.props.and_then(|props| props.get_prop(*keys::DEVICE_API)) {
+        Some("alsa") => {}
+        Some("bluez5") => return bind_bluez_device(state, registry, obj),
+        _ => return,
     }
     let device_id = obj.id;
     let device: pw::device::Device = match registry.bind(obj) {
@@ -502,4 +508,77 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
         .register();
 
     state.borrow_mut().devices.insert(device_id, (device, listener));
+}
+
+/// Binds a BlueZ `Device` for its codec profiles, keyed by the MAC in `api.bluez5.address` so the
+/// Bluetooth panel can join it to `obelisk.bluetooth`. Its `Route` is never read, so Bluetooth
+/// volume keeps the node-owned write path it had before this binding existed.
+///
+/// Enumerated from `info` like [`bind_device`], for ADR-0200's reason. Publishes on `Profile`,
+/// which PipeWire answers after the `EnumProfile` requested just before it, so one enumeration
+/// pushes one snapshot rather than one per profile.
+fn bind_bluez_device(
+    state: &Rc<RefCell<MixerState>>,
+    registry: &pw::registry::RegistryRc,
+    obj: &GlobalObject<&DictRef>,
+) {
+    // `api.bluez5.address` may be missing from a global's props. The card name WirePlumber gives
+    // every BlueZ device holds the same address, so it stands in.
+    let props = obj.props;
+    let Some(mac) = props
+        .and_then(|props| props.get_prop("api.bluez5.address").map(str::to_string))
+        .or_else(|| props.and_then(|props| props.get_prop(*keys::DEVICE_NAME)).and_then(master::mac_from_card_name))
+    else {
+        eprintln!("audio: Bluetooth device {} names no address; its codecs are not tracked", obj.id);
+        return;
+    };
+    let device_id = obj.id;
+    let device: pw::device::Device = match registry.bind(obj) {
+        Ok(device) => device,
+        Err(err) => {
+            eprintln!("audio: failed to bind Bluetooth device {device_id} ({mac}): {err}");
+            return;
+        }
+    };
+
+    // `Rc`/`Weak` for the same reason as `bind_device`: the `info` handler needs the proxy it is
+    // registered on without a cycle through the listener.
+    let device = Rc::new(device);
+    let device_for_info = Rc::downgrade(&device);
+    let state_for_param = Rc::clone(state);
+    let listener = device
+        .add_listener_local()
+        .param(move |_seq, param_type, _index, _next, param| {
+            let Some(pod) = param else { return };
+            let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
+                return;
+            };
+            let Some(profile) = master::extract_profile(&value) else { return };
+            let mut state = state_for_param.borrow_mut();
+            let Some(card) = state.bluez_cards.get_mut(&device_id) else { return };
+            match param_type {
+                pw::spa::param::ParamType::EnumProfile => {
+                    card.profiles.insert(profile.index, profile);
+                }
+                pw::spa::param::ParamType::Profile => {
+                    card.active = Some(profile.index);
+                    state.publish_audio();
+                }
+                _ => {}
+            }
+        })
+        .info(move |info| {
+            if !info.change_mask().contains(pw::device::DeviceChangeMask::PARAMS) {
+                return;
+            }
+            if let Some(device) = device_for_info.upgrade() {
+                device.enum_params(0, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
+                device.enum_params(0, Some(pw::spa::param::ParamType::Profile), 0, u32::MAX);
+            }
+        })
+        .register();
+
+    let mut state = state.borrow_mut();
+    state.bluez_cards.insert(device_id, BluezCard { mac, ..BluezCard::default() });
+    state.bluez_devices.insert(device_id, (device, listener));
 }

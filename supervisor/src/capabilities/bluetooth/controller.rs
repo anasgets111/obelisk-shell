@@ -232,7 +232,7 @@ impl BluetoothController {
                 Some(battery) => battery.percentage().await.map(i32::from).unwrap_or(-1),
                 None => -1,
             };
-            connected.push(ConnectedDevice { mac, name, battery: battery_percent, codec: None, category, busy });
+            connected.push(ConnectedDevice { mac, name, battery: battery_percent, category, busy });
         }
         (connected, paired_only, discovered)
     }

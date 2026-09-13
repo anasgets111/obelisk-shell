@@ -43,6 +43,7 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
         AudioCommand::SetAppMuted { id, muted } => write_node_props(state, id, None, Some(muted)),
         AudioCommand::SetDefaultSink(id) => write_default_device(state, DefaultDevice::Sink, id),
         AudioCommand::SetDefaultSource(id) => write_default_device(state, DefaultDevice::Source, id),
+        AudioCommand::SetBluetoothProfile { device, index } => write_bluetooth_profile(state, device, index),
     }
 }
 
@@ -163,6 +164,26 @@ fn write_device_route(
         return;
     };
     device.set_param(pw::spa::param::ParamType::Route, 0, pod);
+}
+
+/// Sends `SPA_PARAM_Profile` to a BlueZ device, which is how its codec changes. The new active
+/// profile returns through `registry::bind_bluez_device`'s listener. Keeps the serialized bytes
+/// local for the reason [`write_node_props`] gives.
+fn write_bluetooth_profile(state: &Rc<RefCell<MixerState>>, device_id: u32, index: i32) {
+    let Some(bytes) = master::serialize_props(&master::profile_object(index)) else {
+        eprintln!("audio: failed to serialize a Profile object for device {device_id}; ignored");
+        return;
+    };
+    let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+        eprintln!("audio: serialized Profile for device {device_id} did not read back as a pod; ignored");
+        return;
+    };
+    let state = state.borrow();
+    let Some((device, _listener)) = state.bluez_devices.get(&device_id) else {
+        eprintln!("audio: set_bluetooth_profile({device_id}, {index}) names no bound Bluetooth device; ignored");
+        return;
+    };
+    device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
 }
 
 /// Sends `SPA_PARAM_Props` to a stream or a node-owned sink/source. Keep serialized bytes local:

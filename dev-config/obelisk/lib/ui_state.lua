@@ -127,9 +127,14 @@ local function set_bluetooth_discovery(on)
     end
 end
 
+-- The MAC whose codec list is open in the bluetooth panel, or `""` for none. It is the mirror's
+-- `showCodecFor`, cleared when the panel goes away as the mirror clears it on close.
+local bluetooth_codec_for = state("bluetooth_codec_for", "")
+
 local function leave_bluetooth_panel()
     if panel_open:get() and panel_kind:get() == "bluetooth" then
         set_bluetooth_discovery(false)
+        bluetooth_codec_for:set("")
     end
 end
 
@@ -318,6 +323,7 @@ return {
     toggle_panel = toggle_panel,
     close_panel = close_panel,
     set_bluetooth_discovery = set_bluetooth_discovery,
+    bluetooth_codec_for = bluetooth_codec_for,
     hidden_prompt = hidden_prompt,
     hidden_draft = hidden_draft,
     hidden_ssid = hidden_ssid,

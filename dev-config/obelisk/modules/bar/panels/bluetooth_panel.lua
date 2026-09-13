@@ -4,8 +4,9 @@
 -- Connected rows show battery, disconnect and forget. Paired rows reconnect on click and show
 -- forget. Available rows fall back to MAC and show pair.
 --
--- Dropped: the codec picker (`codec` is always `nil`, ADR-0030). Discovery runs while the panel
--- shows (`lib/ui_state.lua`); the scan tile still stops or restarts it.
+-- A connected audio device's codecs come from `obelisk.audio`'s `bluetooth`, joined by MAC.
+-- Clicking its row lists them, the mirror's codec picker. Discovery runs while the panel shows
+-- (`lib/ui_state.lua`); the scan tile still stops or restarts it.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -121,18 +122,52 @@ local function pair_button(device)
     }
 end
 
+-- The `obelisk.audio` entry for `mac`, or `nil` when PipeWire has no codec to offer for it.
+local function codec_card(a, mac)
+    for _, card in ipairs((a and a.bluetooth) or {}) do
+        if card.mac == mac and #card.codecs > 0 then
+            return card
+        end
+    end
+    return nil
+end
+
+local function active_codec(card)
+    for _, option in ipairs((card and card.codecs) or {}) do
+        if option.index == card.active then
+            return option.codec
+        end
+    end
+    return nil
+end
+
 -- Paired and available rows share one list so neither section must guess the other's extent. It is
 -- empty while the radio is off, matching the mirror's `visible: root.active && ...`. Connected
 -- devices lead the paired section, as the mirror's sort puts them. A row keeps its key across
 -- connect and disconnect, so it changes in place rather than leaving and arriving.
-local rows = obelisk.bluetooth:map(function(b)
+local rows = computed({ obelisk.bluetooth, obelisk.audio, ui.bluetooth_codec_for }, function(b, a, open_for)
     local out = {}
     if not enabled(b) then
         return out
     end
+    -- An open codec list follows its device row as rows of its own, so the list keeps one flat
+    -- source rather than a row that grows.
     local function add(devices, status)
         for _, device in ipairs(devices) do
-            out[#out + 1] = { kind = "device", device = device, status = status, key = "device-" .. tostring(device.mac) }
+            local card = status == "connected" and codec_card(a, device.mac) or nil
+            out[#out + 1] =
+            { kind = "device", device = device, status = status, card = card, key = "device-" .. tostring(device.mac) }
+            if card and open_for == device.mac then
+                for _, option in ipairs(card.codecs) do
+                    out[#out + 1] = {
+                        kind = "codec",
+                        device = device,
+                        card = card,
+                        option = option,
+                        key = "codec-" .. tostring(device.mac) .. "-" .. option.index,
+                    }
+                end
+            end
         end
     end
     local joined, known, found = connected(b), paired(b), discovered(b)
@@ -166,9 +201,29 @@ local function busy_row(device)
     }
 end
 
+-- One codec under its device, the mirror's codec `PanelRow`: the codec as the title, PipeWire's
+-- description under it, the active one selected. Picking another switches and closes the list.
+local function codec_row(item)
+    local option = item.option
+    local active = option.index == item.card.active
+    return panel_row {
+        slot = "bluetooth-codec-" .. tostring(item.device.mac) .. "-" .. option.index,
+        title = option.codec,
+        subtitle = option.description,
+        selected = active,
+        on_activate = not active and function()
+            obelisk.audio:invoke("set_bluetooth_profile", item.card.device, option.index)
+            ui.bluetooth_codec_for:set("")
+        end or nil,
+    }
+end
+
 local function device_row(item)
     if item.kind == "header" then
         return section_header(item.label)
+    end
+    if item.kind == "codec" then
+        return codec_row(item)
     end
     local device = item.device
     if device.busy ~= nil then
@@ -193,14 +248,27 @@ local function device_row(item)
             obelisk.bluetooth:invoke("forget", device.mac)
         end, { slot = "bluetooth-forget-" .. tostring(device.mac), tint = theme.RED })
     end
-    -- Only an unblocked paired row is a button, the mirror's `canConnect`. Connected and available
-    -- rows act through their icons and the word "pair". A blocked row says so, the mirror's
-    -- `statusText`, and offers nothing BlueZ would refuse.
+    -- Two rows are buttons. An unblocked paired row connects, the mirror's `canConnect`, and a
+    -- connected row with codecs opens its codec list, the mirror's `canPickCodec`. Other rows act
+    -- through their icons and the word "pair". A blocked row says so, the mirror's `statusText`,
+    -- and offers nothing BlueZ would refuse.
     local subtitle = nil
     if item.status == "connected" then
-        subtitle = device.codec and ("connected · " .. device.codec) or "connected"
+        local codec = active_codec(item.card)
+        subtitle = codec and ("connected · " .. codec) or "connected"
     elseif device.blocked then
         subtitle = "blocked"
+    end
+    local on_activate = nil
+    if item.status == "paired" and not device.blocked then
+        on_activate = function()
+            obelisk.bluetooth:invoke("connect", device.mac)
+        end
+    elseif item.card ~= nil then
+        on_activate = function()
+            local open_for = ui.bluetooth_codec_for:get()
+            ui.bluetooth_codec_for:set(open_for == device.mac and "" or device.mac)
+        end
     end
     return panel_row {
         slot = "bluetooth-device-" .. tostring(device.mac),
@@ -209,9 +277,7 @@ local function device_row(item)
         subtitle = subtitle,
         selected = item.status == "connected",
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
-        on_activate = (item.status == "paired" and not device.blocked) and function()
-            obelisk.bluetooth:invoke("connect", device.mac)
-        end or nil,
+        on_activate = on_activate,
     }
 end
 

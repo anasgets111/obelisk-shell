@@ -112,11 +112,23 @@
 ---Serialized by name, so Lua compares `b.state == "PendingCharge"`; `mpris.play_state` uses the
 ---same boundary shape.
 
+---@class BluetoothCodecs
+---One BlueZ audio device's codec choices, joined to `obelisk.bluetooth` by MAC.
+---@field active? integer `index` of the active profile, or `nil` before PipeWire reports it or when it names no codec.
+---@field codecs CodecProfile[] Available profiles that name a codec, in profile index order.
+---@field device integer PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device, index)`.
+---@field mac string MAC address from `api.bluez5.address`, spelled as `obelisk.bluetooth` spells it.
+
+---@class CodecProfile
+---One entry of [`BluetoothCodecs::codecs`].
+---@field codec string The codec the description names, e.g. `"AAC"`, `"LDAC"`, `"mSBC"`.
+---@field description string PipeWire's description, e.g. `"High Fidelity Playback (A2DP Sink, codec AAC)"`.
+---@field index integer Profile index, the second argument of `audio:set_bluetooth_profile(device, index)`.
+
 ---@class ConnectedDevice
 ---@field battery integer Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed), per the IDL.
 ---@field busy? string Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a capability.
----@field codec? string Always `None` for now; codec query/control is deferred (ADR-0030) to an `audio` capability with a live PipeWire `Device` proxy.
 ---@field mac string Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
 ---@field name string The device's advertised name.
 
@@ -295,6 +307,7 @@
 ---@class AudioState
 ---Full `obelisk.audio` payload (§ 2.4, ADR-0053 decision 3).
 ---@field apps AppStream[] One entry per app playing audio; empty is normal.
+---@field bluetooth BluetoothCodecs[] One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device; `audio:set_default_sink(id)` takes [`AudioDevice::id`].
 ---@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators (§ 3.2).

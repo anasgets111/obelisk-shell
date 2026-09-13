@@ -204,6 +204,8 @@ pub struct AudioState {
     pub sources: Vec<AudioDevice>,
     /// One entry per app playing audio; empty is normal.
     pub apps: Vec<AppStream>,
+    /// One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
+    pub bluetooth: Vec<BluetoothCodecs>,
 }
 
 /// One § 2.4 `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
@@ -220,6 +222,67 @@ pub struct AudioDevice {
     /// `None` means the node carried no hint, as with a virtual sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+}
+
+/// One BlueZ audio device's codec choices, joined to `obelisk.bluetooth` by MAC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct BluetoothCodecs {
+    /// PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device, index)`.
+    pub device: u32,
+    /// MAC address from `api.bluez5.address`, spelled as `obelisk.bluetooth` spells it.
+    pub mac: String,
+    /// Available profiles that name a codec, in profile index order.
+    pub codecs: Vec<CodecProfile>,
+    /// `index` of the active profile, or `nil` before PipeWire reports it or when it names no codec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<i32>,
+}
+
+/// One entry of [`BluetoothCodecs::codecs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct CodecProfile {
+    /// Profile index, the second argument of `audio:set_bluetooth_profile(device, index)`.
+    pub index: i32,
+    /// The codec the description names, e.g. `"AAC"`, `"LDAC"`, `"mSBC"`.
+    pub codec: String,
+    /// PipeWire's description, e.g. `"High Fidelity Playback (A2DP Sink, codec AAC)"`.
+    pub description: String,
+}
+
+/// What the mixer tracks for one bound BlueZ device. Proxies live in `bluez_devices`, keeping this
+/// plain test data like [`DeviceEntry`].
+#[derive(Debug, Clone, Default)]
+pub(super) struct BluezCard {
+    pub(super) mac: String,
+    /// Every profile from `EnumProfile`, keyed by index.
+    pub(super) profiles: std::collections::BTreeMap<i32, master::Profile>,
+    /// The index `Profile` reports.
+    pub(super) active: Option<i32>,
+}
+
+/// Builds [`AudioState::bluetooth`], ordered by device id for deterministic publishes.
+fn bluetooth_codecs(cards: &HashMap<u32, BluezCard>) -> Vec<BluetoothCodecs> {
+    let mut out: Vec<BluetoothCodecs> = cards
+        .iter()
+        .map(|(&device, card)| {
+            let codecs: Vec<CodecProfile> = card
+                .profiles
+                .values()
+                .filter(|profile| profile.available)
+                .filter_map(|profile| {
+                    Some(CodecProfile {
+                        index: profile.index,
+                        codec: master::codec_of(&profile.description)?,
+                        description: profile.description.clone(),
+                    })
+                })
+                .collect();
+            let active = card.active.filter(|index| codecs.iter().any(|codec| codec.index == *index));
+            BluetoothCodecs { device, mac: card.mac.clone(), codecs, active }
+        })
+        .collect();
+    out.sort_by_key(|entry| entry.device);
+    out
 }
 
 /// Device routing name and display description; metadata routes by `node_name`.
@@ -480,6 +543,7 @@ pub enum AudioCommand {
     ToggleSourceMute,
     SetAppVolume { id: u32, volume: f32 },
     SetAppMuted { id: u32, muted: bool },
+    SetBluetoothProfile { device: u32, index: i32 },
 }
 
 /// Listener-owned state and snapshot channels. Held for the thread lifetime. `sink_*`/`metadata*`
@@ -514,6 +578,10 @@ pub(super) struct MixerState {
     pub(super) devices: HashMap<u32, (Rc<pw::device::Device>, pw::device::DeviceListener)>,
     /// `(device global id, card.profile.device)` -> active `Route` index from the device.
     pub(super) device_routes: HashMap<(u32, i32), i32>,
+    /// BlueZ `Device` id -> its MAC and profiles, for [`AudioState::bluetooth`].
+    pub(super) bluez_cards: HashMap<u32, BluezCard>,
+    /// Bound BlueZ `Device` proxies/listeners, separate from `bluez_cards` so state stays plain.
+    pub(super) bluez_devices: HashMap<u32, (Rc<pw::device::Device>, pw::device::DeviceListener)>,
     /// `Stream/Output/Audio` id -> raw `Props`, using the sink's pod shape and parser.
     pub(super) app_props: HashMap<u32, master::RawSinkProps>,
     /// Names selected by `default.audio.sink`/`default.audio.source`, or `None` before arrival.
@@ -595,6 +663,7 @@ impl MixerState {
                 self.default_source_name.as_deref(),
             ),
             apps,
+            bluetooth: bluetooth_codecs(&self.bluez_cards),
         };
         let _ = self.updates.send(state);
     }
@@ -1151,6 +1220,16 @@ mod tests {
                 icon: None,
             }],
             apps: vec![stream.clone()],
+            bluetooth: vec![BluetoothCodecs {
+                device: 80,
+                mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                codecs: vec![CodecProfile {
+                    index: 2,
+                    codec: "AAC".to_string(),
+                    description: "High Fidelity Playback (A2DP Sink, codec AAC)".to_string(),
+                }],
+                active: Some(2),
+            }],
         };
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(
@@ -1169,6 +1248,12 @@ mod tests {
                     "process_name": stream.process_name,
                     "volume": stream.volume,
                     "muted": stream.muted,
+                }],
+                "bluetooth": [{
+                    "device": 80,
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "codecs": [{ "index": 2, "codec": "AAC", "description": "High Fidelity Playback (A2DP Sink, codec AAC)" }],
+                    "active": 2,
                 }],
             })
         );
@@ -1205,6 +1290,8 @@ mod tests {
             source_nodes: HashMap::new(),
             devices: HashMap::new(),
             device_routes: HashMap::new(),
+            bluez_cards: HashMap::new(),
+            bluez_devices: HashMap::new(),
             app_props: HashMap::new(),
             default_sink_name: None,
             default_source_name: None,
@@ -1271,6 +1358,40 @@ mod tests {
         assert!(published.apps.is_empty());
         assert!(published.sinks.is_empty());
         assert!(published.sources.is_empty());
+    }
+
+    #[test]
+    fn publish_audio_lists_only_the_bluetooth_profiles_that_offer_a_codec_now() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = mixer_state(updates, privacy_updates);
+        let profile = |index: i32, description: &str, available: bool| {
+            (index, master::Profile { index, description: description.to_string(), available })
+        };
+        state.bluez_cards = HashMap::from([(
+            80,
+            BluezCard {
+                mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                profiles: [
+                    profile(0, "Off", true),
+                    profile(1, "High Fidelity Playback (A2DP Sink, codec SBC)", true),
+                    profile(2, "High Fidelity Playback (A2DP Sink, codec AAC)", true),
+                    profile(3, "High Fidelity Playback (A2DP Sink, codec LDAC)", false),
+                ]
+                .into_iter()
+                .collect(),
+                active: Some(2),
+            },
+        )]);
+
+        state.publish_audio();
+
+        let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
+        let card = &published.bluetooth[0];
+        assert_eq!(card.mac, "AA:BB:CC:DD:EE:FF");
+        let codecs: Vec<&str> = card.codecs.iter().map(|codec| codec.codec.as_str()).collect();
+        assert_eq!(codecs, ["SBC", "AAC"], "Off names no codec and LDAC is unavailable");
+        assert_eq!(card.active, Some(2));
     }
 
     #[test]

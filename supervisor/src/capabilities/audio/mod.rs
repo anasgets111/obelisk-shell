@@ -4,7 +4,8 @@
 //! § 3.2 write actions dispatch here, including source-side volume/mute actions that filled the
 //! gap beside `set_muted`; see [`dispatch`] for the two still unbuilt actions.
 //!
-//! BlueZ codec control (§6) belongs to later `bluetooth` work.
+//! BlueZ codec control (§6) lives here as well, because PipeWire, not BlueZ, picks the codec: each
+//! BlueZ device's profiles are its codecs (ADR-0030).
 
 pub mod master;
 pub mod mixer;
@@ -35,6 +36,9 @@ pub enum AudioAction {
     SetAppVolume,
     /// Set the per-app stream mute by PipeWire registry id.
     SetAppMuted,
+    /// Switch a Bluetooth audio device's codec, given a `bluetooth[].device` id and one of its
+    /// `codecs[].index`.
+    SetBluetoothProfile,
 }
 
 /// Unlike every other capability's adapter, this has no controller to call. It dispatches each
@@ -64,6 +68,8 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
         AudioAction::SetAppMuted => {
             parse_id_and_bool_args(&params.arguments).map(|(id, muted)| AudioCommand::SetAppMuted { id, muted })
         }
+        AudioAction::SetBluetoothProfile => parse_id_and_index_args(&params.arguments)
+            .map(|(device, index)| AudioCommand::SetBluetoothProfile { device, index }),
     };
     let Some(command) = command else {
         return crate::log_malformed_command(params);
@@ -91,6 +97,12 @@ fn parse_id_and_volume_args(arguments: &[serde_json::Value]) -> Option<(u32, f32
 fn parse_id_and_bool_args(arguments: &[serde_json::Value]) -> Option<(u32, bool)> {
     let id = parse_id_arg(arguments)?;
     Some((id, arguments.get(1)?.as_bool()?))
+}
+
+/// Parses `[device, index]`; an index outside `i32` is rejected rather than wrapped.
+fn parse_id_and_index_args(arguments: &[serde_json::Value]) -> Option<(u32, i32)> {
+    let id = parse_id_arg(arguments)?;
+    Some((id, i32::try_from(arguments.get(1)?.as_i64()?).ok()?))
 }
 
 #[cfg(test)]
@@ -123,5 +135,12 @@ mod tests {
         assert_eq!(parse_id_and_volume_args(&[serde_json::json!(7)]), None);
         assert_eq!(parse_id_and_bool_args(&[serde_json::json!(7), serde_json::json!(true)]), Some((7, true)));
         assert_eq!(parse_id_and_bool_args(&[serde_json::json!(7), serde_json::json!(1)]), None);
+    }
+
+    #[test]
+    fn parse_id_and_index_args_reads_a_device_and_a_profile_index() {
+        assert_eq!(parse_id_and_index_args(&[serde_json::json!(80), serde_json::json!(2)]), Some((80, 2)));
+        assert_eq!(parse_id_and_index_args(&[serde_json::json!(80)]), None);
+        assert_eq!(parse_id_and_index_args(&[serde_json::json!(80), serde_json::json!(i64::from(i32::MAX) + 1)]), None);
     }
 }

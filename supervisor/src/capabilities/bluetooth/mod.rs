@@ -45,9 +45,6 @@ pub struct ConnectedDevice {
     /// Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed),
     /// per the IDL.
     pub battery: i32,
-    /// Always `None` for now; codec query/control is deferred (ADR-0030) to an `audio` capability
-    /// with a live PipeWire `Device` proxy.
-    pub codec: Option<String>,
     /// Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`,
     /// `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a
     /// capability.

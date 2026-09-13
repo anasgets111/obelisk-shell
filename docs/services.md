@@ -100,8 +100,9 @@ Missing Bluetooth hardware/service degrades to an inert controller.
 
 ### 5.3 Codec coverage
 
-`connected_devices[].codec` is currently nil. There is no accepted codec-selection action.
-See [Bluetooth dispatch](../supervisor/src/capabilities/bluetooth/mod.rs).
+Codecs come from PipeWire, not BlueZ. `obelisk.audio`'s `bluetooth` lists each BlueZ device's
+codec profiles by MAC, and `audio:set_bluetooth_profile(device, index)` switches one. See
+[audio dispatch](../supervisor/src/capabilities/audio/mod.rs).
 
 ## 6. PipeWire and privacy
 
