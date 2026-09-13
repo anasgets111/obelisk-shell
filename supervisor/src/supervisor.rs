@@ -296,7 +296,7 @@ impl Supervisor {
 
     /// Reports authoritative Renderer death and spawns a replacement (ADR-0058); `Some` stops the
     /// loop and carries the reason.
-    pub(crate) fn replace_departed_renderer(
+    pub(crate) async fn replace_departed_renderer(
         &mut self,
         status: std::io::Result<std::process::ExitStatus>,
     ) -> Option<Shutdown> {
@@ -340,11 +340,19 @@ impl Supervisor {
                     self.registry.expect_generation(replacement_generation_id, pid);
                 }
                 // The departed generation's id must not stay claimable by whatever inherits its pid.
-                self.registry.forget_generation(self.authoritative.generation_id);
+                let departed = self.authoritative.generation_id;
+                self.registry.forget_generation(departed);
                 self.authoritative = Authoritative { generation_id: replacement_generation_id, child };
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
                 self.capabilities.forget_panels();
+                // What the swap arms release too: without it the dead id kept its idle fan-out entry
+                // (a failed push per idle transition, and any inhibit it held) and its `process.run`
+                // children.
+                if let Some(idle) = self.capabilities.idle() {
+                    idle.reset_registrations(departed).await;
+                }
+                crate::process::registry::reap_generations_processes(&mut self.processes, departed).await;
                 // Registration replays every `last_snapshots` entry via `hydrate`.
                 if was_locked {
                     // ADR-0058 decision 4: the lock object died; `active` is stale. `RendererLost`

@@ -337,7 +337,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             // ADR-0058 decision 1: dead and healthy-idle Renderers both send no frames; without
             // this arm `select!` cannot distinguish them.
             status = supervisor.authoritative.child.wait() => {
-                if let Some(reason) = supervisor.replace_departed_renderer(status) {
+                if let Some(reason) = supervisor.replace_departed_renderer(status).await {
                     shutdown = reason;
                     break;
                 }
