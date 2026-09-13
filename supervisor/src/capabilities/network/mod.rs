@@ -369,12 +369,14 @@ impl NetworkController {
         let settings = SettingsProxy::new(&connection).await?;
 
         // Subscribed before the first device scan, so an adapter plugged in during it is not missed.
-        spawn_device_list_forwarder(nm.clone(), events.clone()).await;
+        let device_list = tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed());
+        forward(device_list, NetworkSignal::DevicesChanged, events.clone());
         let (wifi, ethernet) = resolve_devices(&connection, &nm).await?;
         let watchers = watch_devices(&connection, wifi.as_ref(), &ethernet, &events);
         spawn_manager_forwarder(nm.clone(), events.clone());
         // Subscribed before the first fill below, so a profile saved in between is not missed.
-        spawn_settings_forwarder(settings.clone(), events.clone()).await;
+        let profiles = tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed());
+        forward(profiles, NetworkSignal::SavedChanged, events.clone());
 
         let controller = Self {
             connection,
@@ -431,8 +433,6 @@ impl NetworkController {
         let ethernet = self.activated_ethernet().await;
         let wifi_ip = read_ipv4(&self.connection, wifi.as_ref().map(|wifi| &wifi.device)).await;
         let ethernet_ip = read_ipv4(&self.connection, ethernet.as_ref().map(|ethernet| &ethernet.device)).await;
-        // Its own statement: a guard inside the literal below would live across the awaits after it.
-        let ethernet_present = !self.devices.lock().unwrap().ethernet.is_empty();
         NetworkState {
             scanning: false,
             connected,
@@ -440,7 +440,8 @@ impl NetworkController {
             strength: associated.map_or(0, |ap| ap.strength),
             wifi_enabled: self.nm.wireless_enabled().await.unwrap_or_default(),
             wifi_present: wifi.is_some(),
-            ethernet_present,
+            // `ethernet()` clones out, so no guard lives across the awaits below.
+            ethernet_present: !self.ethernet().is_empty(),
             networking_enabled: self.nm.networking_enabled().await.unwrap_or_default(),
             ethernet_enabled: ethernet.is_some(),
             wifi_ip,
@@ -1389,32 +1390,21 @@ fn watch_devices(
     watchers
 }
 
-/// Forwards `DeviceAdded` and `DeviceRemoved` as [`NetworkSignal::DevicesChanged`]; subscribes first.
-async fn spawn_device_list_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
-    match tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed()) {
-        Ok((added, removed)) => {
-            forward(added.map(drop).merge(removed.map(drop)), NetworkSignal::DevicesChanged, events)
-        }
+/// Sends `signal` for each item of an added/removed subscription pair, such as `DeviceAdded` and
+/// `DeviceRemoved`, until both end or the receiver does. A failed subscription is logged: changes
+/// it would have reported need a restart.
+fn forward<A, B>(subscribed: zbus::Result<(A, B)>, signal: NetworkSignal, events: UnboundedSender<NetworkSignal>)
+where
+    A: Stream + Unpin + Send + 'static,
+    B: Stream + Unpin + Send + 'static,
+{
+    let (added, removed) = match subscribed {
+        Ok(streams) => streams,
         Err(err) => {
-            eprintln!("network: failed to subscribe to device changes; an adapter added later needs a restart: {err}")
+            return eprintln!("network: failed to subscribe for {signal:?}; those changes need a restart: {err}");
         }
-    }
-}
-
-/// Forwards profile additions and removals as [`NetworkSignal::SavedChanged`]; subscribes first.
-async fn spawn_settings_forwarder(settings: SettingsProxy<'static>, events: UnboundedSender<NetworkSignal>) {
-    match tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed()) {
-        Ok((added, removed)) => forward(added.map(drop).merge(removed.map(drop)), NetworkSignal::SavedChanged, events),
-        Err(err) => eprintln!("network: failed to subscribe to saved-profile changes: {err}"),
-    }
-}
-
-/// Sends `signal` for each item of `changes` until the stream or the receiver ends.
-fn forward(
-    mut changes: impl Stream<Item = ()> + Unpin + Send + 'static,
-    signal: NetworkSignal,
-    events: UnboundedSender<NetworkSignal>,
-) {
+    };
+    let mut changes = added.map(drop).merge(removed.map(drop));
     tokio::spawn(async move { while changes.next().await.is_some() && events.send(signal).is_ok() {} });
 }
 
