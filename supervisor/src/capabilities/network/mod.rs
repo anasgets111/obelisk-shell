@@ -26,19 +26,18 @@ use serde::Serialize;
 use shared::Zeroize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::{Stream, StreamExt};
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::capabilities::bind;
 
 pub mod connection;
+mod profiles;
 mod scan;
 
 use connection::ConnectError;
-use connection::{
-    ConnectionIntent, activation_verdict, build_connection_dict, connection_intent, connection_wants_autoconnect,
-    merge_psk, profile_ssid,
-};
+use connection::{ConnectionIntent, activation_verdict, build_connection_dict, connection_intent};
 pub use connection::{parse_connect_args, parse_ssid_arg};
+use profiles::merge_psk;
 use scan::resolve_ssid;
 
 /// One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
@@ -236,14 +235,6 @@ struct EthernetDevice {
     path: OwnedObjectPath,
     device: DeviceProxy<'static>,
     wired: WiredProxy<'static>,
-}
-
-/// One saved profile matched by SSID: the path for `ActivateConnection`, its proxy, and the
-/// settings already read by both callers.
-struct SavedProfile {
-    path: OwnedObjectPath,
-    connection: SettingsConnectionProxy<'static>,
-    settings: HashMap<String, HashMap<String, OwnedValue>>,
 }
 
 /// A join NM has accepted: the activation that reports its verdict, and the profile it created.
@@ -640,33 +631,6 @@ impl NetworkController {
         }
     }
 
-    async fn activate_autoconnect_profile(&self, device: &DeviceProxy<'_>, device_path: &OwnedObjectPath) {
-        let profile = match self.find_autoconnect_profile(device).await {
-            Ok(profile) => profile,
-            Err(err) => {
-                eprintln!("network: failed to inspect connections for ethernet device {device_path}: {err}");
-                return;
-            }
-        };
-        let Some(conn_path) = profile else {
-            // No profile exists; D-Bus cannot create one here (ADR-0029).
-            return;
-        };
-        if let Err(err) = self.nm.activate_connection(&conn_path, device_path, &root_object_path()).await {
-            eprintln!("network: failed to activate ethernet profile {conn_path} on {device_path}: {err}");
-        }
-    }
-
-    /// ponytail: reads every profile the device lists before picking the first autoconnect one; a
-    /// wired port lists one or two.
-    async fn find_autoconnect_profile(&self, device: &DeviceProxy<'_>) -> zbus::Result<Option<OwnedObjectPath>> {
-        let profiles = self.read_profiles(device.available_connections().await?, "autoconnect").await;
-        Ok(profiles
-            .into_iter()
-            .find(|profile| connection_wants_autoconnect(&profile.settings))
-            .map(|profile| profile.path))
-    }
-
     /// Supervisor services §4: turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
     /// `AddAndActivateConnection2`'s dict. The caller `mem::take`s `secret` from the wire frame,
     /// making this function its owner (ADR-0005/ADR-0014).
@@ -869,60 +833,6 @@ impl NetworkController {
         Ok(InFlight { active, created: None, unsaved })
     }
 
-    /// Every saved Wi-Fi profile for `ssid`, paired with the settings dict that matched it.
-    /// `context` identifies the caller in logs. Plural because §4.3 `forget` deletes all while
-    /// `connect` takes the first; one `ListConnections` walk serves both.
-    async fn saved_profiles_for_ssid(&self, ssid: &str, context: &str) -> Vec<SavedProfile> {
-        let mut profiles = self.wifi_profiles(&format!("{context}({ssid:?})")).await;
-        profiles.retain(|profile| profile_ssid(&profile.settings).is_some_and(|bytes| bytes == ssid.as_bytes()));
-        profiles
-    }
-
-    /// Every saved Wi-Fi profile. Unreadable profiles are logged under `context` and skipped.
-    async fn wifi_profiles(&self, context: &str) -> Vec<SavedProfile> {
-        let paths = match self.settings.list_connections().await {
-            Ok(paths) => paths,
-            Err(err) => {
-                eprintln!("network: {context} failed to list connections: {err}");
-                return Vec::new();
-            }
-        };
-        let mut profiles = self.read_profiles(paths, context).await;
-        profiles.retain(|profile| profile_ssid(&profile.settings).is_some());
-        profiles
-    }
-
-    /// Binds and reads each profile at `paths`. Unreadable profiles are logged under `context` and
-    /// skipped.
-    async fn read_profiles(&self, paths: Vec<OwnedObjectPath>, context: &str) -> Vec<SavedProfile> {
-        let mut profiles = Vec::new();
-        for path in paths {
-            let connection = match bind::<SettingsConnectionProxy>(&self.connection, path.clone()).await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    eprintln!("network: {context} failed to bind connection {path}: {err}");
-                    continue;
-                }
-            };
-            match connection.get_settings().await {
-                Ok(settings) => profiles.push(SavedProfile { path, connection, settings }),
-                Err(err) => eprintln!("network: {context} failed to read settings for {path}: {err}"),
-            }
-        }
-        profiles
-    }
-
-    /// Replaces the saved-SSID cache with one fresh `ListConnections` walk.
-    async fn refresh_saved_ssids(&self) {
-        let ssids = self
-            .wifi_profiles("saved networks")
-            .await
-            .iter()
-            .filter_map(|profile| profile_ssid(&profile.settings))
-            .collect();
-        *self.saved_ssids.lock().unwrap() = ssids;
-    }
-
     /// `network:disconnect_wifi()`: `Device.Disconnect` on the Wi-Fi device. NetworkManager also stops
     /// autoconnect there until the user joins again, so the radio does not rejoin behind the click.
     pub async fn disconnect_wifi(&self) {
@@ -932,15 +842,6 @@ impl NetworkController {
         };
         if let Err(err) = wifi.device.disconnect().await {
             eprintln!("network: failed to disconnect the Wi-Fi device: {err}");
-        }
-    }
-
-    /// Supervisor services §4: deletes every connection profile matching `ssid`.
-    pub async fn forget(&self, ssid: &str) {
-        for profile in self.saved_profiles_for_ssid(ssid, "forget").await {
-            if let Err(err) = profile.connection.delete().await {
-                eprintln!("network: forget({ssid:?}) failed to delete profile {}: {err}", profile.path);
-            }
         }
     }
 }
