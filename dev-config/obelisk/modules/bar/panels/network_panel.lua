@@ -282,6 +282,26 @@ local function retry_hidden()
     obelisk.network:invoke("connect", ui.hidden_ssid:get(), true)
 end
 
+-- `NetworkService.startWifiScan` sets `scannerEnabled` for as long as the panel is open. Scan now,
+-- then again every `RESCAN_MS` until the panel closes; the first tick after a close ends the chain.
+-- Cancelling the previous chain first keeps a quick close and reopen from running two.
+local RESCAN_MS = 10000
+local rescan = nil
+
+local function scan_while_open()
+    if rescan ~= nil then
+        rescan:cancel()
+    end
+    if radio_on(obelisk.network:get()) then
+        obelisk.network:invoke("scan")
+    end
+    rescan = timer(RESCAN_MS, function()
+        if ui.panel_open:get() and ui.panel_kind:get() == KIND then
+            scan_while_open()
+        end
+    end)
+end
+
 local body = {
     panel_header {
         title = "network",
@@ -552,4 +572,4 @@ local body = {
     ),
 }
 
-return { kind = KIND, body = body }
+return { kind = KIND, body = body, scan_while_open = scan_while_open }
