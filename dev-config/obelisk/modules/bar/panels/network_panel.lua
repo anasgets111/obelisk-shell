@@ -48,6 +48,14 @@ local function detail_line(parts)
     return table.concat(shown, " · ")
 end
 
+-- `formatEthernetSpeed`. NetworkManager reports Mb/s, with `0` for unknown.
+local function speed_text(mbps)
+    if mbps == nil or mbps <= 0 then
+        return nil
+    end
+    return mbps >= 1000 and string.format("%g Gb/s", mbps / 1000) or string.format("%d Mb/s", mbps)
+end
+
 local function radio_on(n)
     return n ~= nil and n.networking_enabled and n.wifi_enabled
 end
@@ -305,7 +313,8 @@ local body = {
                 icon = icons.ethernet,
                 label = "ethernet",
                 detail = util.label(obelisk.network, function(n)
-                    return n.ethernet_enabled and detail_line(table.pack(n.ethernet_ip)) or ""
+                    return n.ethernet_enabled and detail_line(table.pack(n.ethernet_ip, speed_text(n.ethernet_speed)))
+                        or ""
                 end),
                 signal = obelisk.network,
                 read = function(n)

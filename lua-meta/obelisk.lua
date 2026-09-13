@@ -363,6 +363,7 @@
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and clears when the attempt reaches either verdict.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
 ---@field ethernet_ip? string The first activated wired device's IPv4 address without its prefix, or `nil`.
+---@field ethernet_speed integer Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown or no wired link is activated.
 ---@field networking_enabled boolean Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the other fields describe a switched-off stack.
 ---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
 ---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.

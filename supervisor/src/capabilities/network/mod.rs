@@ -22,7 +22,7 @@ use rusty_network_manager::dbus_interface_types::{
 };
 use rusty_network_manager::{
     AccessPointProxy, DeviceProxy, IP4ConfigProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy,
-    WirelessProxy,
+    WiredProxy, WirelessProxy,
 };
 use serde::Serialize;
 use shared::Zeroize;
@@ -90,6 +90,9 @@ pub struct NetworkState {
     /// The first activated wired device's IPv4 address without its prefix, or `nil`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ethernet_ip: Option<String>,
+    /// Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown or no
+    /// wired link is activated.
+    pub ethernet_speed: u32,
     /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and
     /// clears when the attempt reaches either verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +161,10 @@ async fn bind_device(connection: &zbus::Connection, path: OwnedObjectPath) -> zb
 
 async fn bind_wireless(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<WirelessProxy<'static>> {
     WirelessProxy::builder(connection).path(path)?.build().await
+}
+
+async fn bind_wired(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<WiredProxy<'static>> {
+    WiredProxy::builder(connection).path(path)?.build().await
 }
 
 async fn bind_access_point(
@@ -256,12 +263,13 @@ struct WifiDevice {
     wireless: WirelessProxy<'static>,
 }
 
-/// One resolved Ethernet device. Its path feeds `ActivateConnection`; its proxy feeds state and
-/// `ethernet_enabled`.
+/// One resolved Ethernet device. Its path feeds `ActivateConnection`, its `Device` proxy feeds
+/// `ethernet_enabled` and the address, and its `Device.Wired` proxy feeds the link speed.
 #[derive(Clone)]
 struct EthernetDevice {
     path: OwnedObjectPath,
     device: DeviceProxy<'static>,
+    wired: WiredProxy<'static>,
 }
 
 /// One saved profile matched by SSID: the path for `ActivateConnection`, its proxy, and the
@@ -323,7 +331,10 @@ impl NetworkController {
                 }
             };
             match NMDeviceType::try_from(device_type) {
-                Ok(NMDeviceType::ETHERNET) => ethernet.push(EthernetDevice { path, device }),
+                Ok(NMDeviceType::ETHERNET) => match bind_wired(&connection, path.clone()).await {
+                    Ok(wired) => ethernet.push(EthernetDevice { path, device, wired }),
+                    Err(err) => eprintln!("network: failed to bind wired device {path}: {err}"),
+                },
                 Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind_wireless(&connection, path.clone()).await {
                     Ok(wireless) => wifi = Some(WifiDevice { device_path: path, device, wireless }),
                     Err(err) => eprintln!("network: failed to bind wireless device {path}: {err}"),
@@ -411,6 +422,10 @@ impl NetworkController {
             ethernet_enabled: ethernet.is_some(),
             wifi_ip,
             ethernet_ip,
+            ethernet_speed: match ethernet {
+                Some(ethernet) => ethernet.wired.speed().await.unwrap_or(0),
+                None => 0,
+            },
             // All three are owned by the connect path and reinstated by the caller; see
             // `handle_signal`.
             connecting_ssid: None,
