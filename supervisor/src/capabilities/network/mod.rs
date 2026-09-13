@@ -21,7 +21,8 @@ use rusty_network_manager::dbus_interface_types::{
     NMActiveConnectionState, NMActiveConnectionStateReason, NMDeviceState, NMDeviceType,
 };
 use rusty_network_manager::{
-    AccessPointProxy, DeviceProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy, WirelessProxy,
+    AccessPointProxy, DeviceProxy, IP4ConfigProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy,
+    WirelessProxy,
 };
 use serde::Serialize;
 use shared::Zeroize;
@@ -83,6 +84,12 @@ pub struct NetworkState {
     /// A wired device is activated. This is the setter's read-back; carrier stays up when a cable
     /// is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
     pub ethernet_enabled: bool,
+    /// The Wi-Fi device's IPv4 address without its prefix, or `nil` while it holds none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wifi_ip: Option<String>,
+    /// The first activated wired device's IPv4 address without its prefix, or `nil`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ethernet_ip: Option<String>,
     /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and
     /// clears when the attempt reaches either verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +224,27 @@ async fn read_access_point(ap: &AccessPointProxy<'static>, active: bool) -> Opti
         band: resolve_band(frequency).unwrap_or_default().to_string(),
         active,
     })
+}
+
+/// `device`'s first IPv4 address without its prefix. `Ip4Config` is `/` until the device holds one.
+///
+/// The config proxy skips the property cache. Its path changes with every activation, so a cached
+/// proxy would be bound and torn down per rebuild, and one `Get` is cheaper.
+///
+/// ponytail: rebuilds follow device state, so a DHCP renewal that changes the address without a
+/// state change shows the old one until the next rebuild. Upgrade path: watch the config's
+/// `AddressData`.
+async fn read_ipv4(connection: &zbus::Connection, device: &DeviceProxy<'static>) -> Option<String> {
+    let path = device.ip4_config().await.ok().filter(|path| path.as_str() != "/")?;
+    let config = IP4ConfigProxy::builder(connection)
+        .path(path)
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let addresses = config.address_data().await.ok()?;
+    String::try_from(addresses.first()?.get("address")?.clone()).ok()
 }
 
 /// One resolved Wi-Fi device: its path for `AddAndActivateConnection2`, plus the `Device` and
@@ -364,6 +392,15 @@ impl NetworkController {
         // wired.
         let connected = self.nm.primary_connection().await.is_ok_and(|path| path.as_str() != "/");
         let wired = connected && self.nm.primary_connection_type().await.is_ok_and(|kind| kind == "802-3-ethernet");
+        let ethernet = self.activated_ethernet().await;
+        let wifi_ip = match &self.wifi {
+            Some(wifi) => read_ipv4(&self.connection, &wifi.device).await,
+            None => None,
+        };
+        let ethernet_ip = match ethernet {
+            Some(ethernet) => read_ipv4(&self.connection, &ethernet.device).await,
+            None => None,
+        };
         NetworkState {
             scanning: false,
             connected,
@@ -371,7 +408,9 @@ impl NetworkController {
             strength: associated.map_or(0, |ap| ap.strength),
             wifi_enabled: self.nm.wireless_enabled().await.unwrap_or_default(),
             networking_enabled: self.nm.networking_enabled().await.unwrap_or_default(),
-            ethernet_enabled: self.ethernet_is_activated().await,
+            ethernet_enabled: ethernet.is_some(),
+            wifi_ip,
+            ethernet_ip,
             // All three are owned by the connect path and reinstated by the caller; see
             // `handle_signal`.
             connecting_ssid: None,
@@ -381,20 +420,20 @@ impl NetworkController {
         }
     }
 
-    /// Whether any wired device reached `ACTIVATED`. One active cable is enough for the Ethernet
-    /// row, regardless of the number of ports.
-    async fn ethernet_is_activated(&self) -> bool {
+    /// The first wired device that reached `ACTIVATED`. One active cable is enough for the Ethernet
+    /// tile, regardless of the number of ports.
+    async fn activated_ethernet(&self) -> Option<&EthernetDevice> {
         for ethernet in &self.ethernet {
             match ethernet.device.state().await {
                 Ok(state) => {
                     if NMDeviceState::try_from(state) == Ok(NMDeviceState::ACTIVATED) {
-                        return true;
+                        return Some(ethernet);
                     }
                 }
                 Err(err) => eprintln!("network: failed to read state for ethernet device {}: {err}", ethernet.path),
             }
         }
-        false
+        None
     }
 
     /// Queues [`NetworkSignal::ScanStarted`] so `scanning` flips on initiation, before

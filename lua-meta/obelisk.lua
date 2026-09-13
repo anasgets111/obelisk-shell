@@ -362,12 +362,14 @@
 ---@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and clears when the attempt reaches either verdict.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
+---@field ethernet_ip? string The first activated wired device's IPv4 address without its prefix, or `nil`.
 ---@field networking_enabled boolean Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the other fields describe a switched-off stack.
 ---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
 ---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.
 ---@field ssid? string Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins when both are up. An association negotiating DHCP has an `ssid` but `connected == false`.
 ---@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged entry the panel draws, so the bar and list agree.
 ---@field wifi_enabled boolean Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no association.
+---@field wifi_ip? string The Wi-Fi device's IPv4 address without its prefix, or `nil` while it holds none.
 
 ---@class NotificationsState
 ---`notifications.feed`/`notifications.dnd` `StateSnapshot` payload (ADR-0033).

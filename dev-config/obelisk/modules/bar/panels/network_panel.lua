@@ -10,8 +10,8 @@
 -- `layout::secure_submit` now counts only reachable fields, so an `autofocus` name field arms
 -- normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
 --
--- Still dropped: the IP address (`NetworkState` lacks it) and Saved/Available sections (no `saved`
--- flag). A connected network is saved by construction, so its forget action is offered there.
+-- Still dropped: Saved/Available sections (no `saved` flag). A connected network is saved by
+-- construction, so its forget action is offered there.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -34,6 +34,18 @@ local SCROLL = scroll("network_aps")
 -- Payload order is connected-first, then descending signal (§ 2.5); reading it straight is enough.
 local function access_points(n)
     return (n and n.available_networks) or {}
+end
+
+-- A tile's second line, the mirror's `[address, band].filter(Boolean).join(" · ")`. Takes a
+-- `table.pack` because a missing address is a `nil` hole that `ipairs` would stop at.
+local function detail_line(parts)
+    local shown = {}
+    for index = 1, parts.n do
+        if parts[index] ~= nil and parts[index] ~= "" then
+            shown[#shown + 1] = parts[index]
+        end
+    end
+    return table.concat(shown, " · ")
 end
 
 local function radio_on(n)
@@ -259,7 +271,7 @@ local body = {
             end),
         },
     },
-    -- Two radio tiles. Wi-Fi shows joined strength and band; `NetworkState` has no address.
+    -- Two radio tiles, each with its address under the label; Wi-Fi adds the joined band.
     row {
         width = "Fill",
         spacing = theme.spacing.xs,
@@ -271,17 +283,14 @@ local body = {
                 slot = "network-wifi-tile",
                 icon = icons.wifi[4],
                 label = "wi-fi",
+                -- Keyed on the association, not `ssid`. A docked laptop's joined radio still has an
+                -- address while `ssid` names the cable.
                 detail = util.label(obelisk.network, function(n)
-                    if not n.wifi_enabled or n.ssid == nil or n.ssid == "Ethernet" then
-                        return ""
-                    end
                     local ap = util.active_access_point(n)
                     if ap == nil then
                         return ""
                     end
-                    local band = util.band_of(ap)
-                    return band and string.format("%d%% · %s", ap.strength or 0, band)
-                        or string.format("%d%%", ap.strength or 0)
+                    return detail_line(table.pack(n.wifi_ip, (util.band_of(ap))))
                 end),
                 signal = obelisk.network,
                 read = function(n)
@@ -295,6 +304,9 @@ local body = {
                 slot = "network-ethernet-tile",
                 icon = icons.ethernet,
                 label = "ethernet",
+                detail = util.label(obelisk.network, function(n)
+                    return n.ethernet_enabled and detail_line(table.pack(n.ethernet_ip)) or ""
+                end),
                 signal = obelisk.network,
                 read = function(n)
                     return n.ethernet_enabled
