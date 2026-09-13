@@ -151,49 +151,26 @@ pub(super) async fn track_interfaces(
 /// [`BluetoothSignal::DeviceRegistryChanged`] until the connection drops. One per device,
 /// aborted on `InterfacesRemoved`.
 ///
-/// The battery branch shares the same `select!`, so this returns the registry's single
-/// `JoinHandle`. Absent `battery` uses `std::future::pending()` instead of unifying two stream
-/// types behind an `Option<Stream>` guard.
+/// An absent `battery` merges an empty stream, so the registry still holds one `JoinHandle`.
 fn spawn_device_signal_forwarder(
     device: Device1Proxy<'static>,
     battery: Option<Battery1Proxy<'static>>,
     events: UnboundedSender<BluetoothSignal>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut connected_changed = device.receive_connected_changed().await;
-        let mut paired_changed = device.receive_paired_changed().await;
-        let mut name_changed = device.receive_name_changed().await;
-        let mut blocked_changed = device.receive_blocked_changed().await;
-        let mut percentage_changed = match &battery {
-            Some(battery) => Some(battery.receive_percentage_changed().await),
+        let percentage = match &battery {
+            Some(battery) => Some(battery.receive_percentage_changed().await.map(drop)),
             None => None,
         };
-
-        loop {
-            tokio::select! {
-                Some(_) = connected_changed.next() => {
-                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                }
-                Some(_) = paired_changed.next() => {
-                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                }
-                Some(_) = name_changed.next() => {
-                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                }
-                Some(_) = blocked_changed.next() => {
-                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                }
-                Some(_) = async {
-                    match &mut percentage_changed {
-                        Some(stream) => stream.next().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                }
-                else => break,
-            }
-        }
+        let mut changes = device
+            .receive_connected_changed()
+            .await
+            .map(drop)
+            .merge(device.receive_paired_changed().await.map(drop))
+            .merge(device.receive_name_changed().await.map(drop))
+            .merge(device.receive_blocked_changed().await.map(drop))
+            .merge(futures_util::StreamExt::flatten(futures_util::stream::iter(percentage)));
+        while changes.next().await.is_some() && events.send(BluetoothSignal::DeviceRegistryChanged).is_ok() {}
     })
 }
 
