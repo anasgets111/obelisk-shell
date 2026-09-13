@@ -98,6 +98,10 @@ pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32)
 /// it, an association weaker than 20 neighbours is truncated and an online machine reports no
 /// association. Dense apartment RF reaches 20 SSIDs easily.
 ///
+/// `saved` sorts next, so a saved network weaker than 20 neighbours still reaches the panel's saved
+/// section. `NetworkPanel.qml` has no cap. ponytail: more than 20 saved networks in range still
+/// truncate by strength. Upgrade path: exempt saved rows from the cap.
+///
 /// Merge `active` rather than carrying the winner's flag. NetworkManager once exposed two AP
 /// objects for one SSID at the same BSSID, strengths 62 and 58, with `ActiveAccessPoint` naming the
 /// 58. Keeping the stronger object dropped the flag and showed a connected machine as "offline".
@@ -122,7 +126,12 @@ pub(super) fn dedup_and_top20(aps: Vec<AccessPointInfo>) -> Vec<AccessPointInfo>
     }
     let mut deduped: Vec<AccessPointInfo> = best.into_values().collect();
     deduped.sort_by(|left, right| {
-        right.active.cmp(&left.active).then(right.strength.cmp(&left.strength)).then_with(|| left.ssid.cmp(&right.ssid))
+        right
+            .active
+            .cmp(&left.active)
+            .then(right.saved.cmp(&left.saved))
+            .then(right.strength.cmp(&left.strength))
+            .then_with(|| left.ssid.cmp(&right.ssid))
     });
     deduped.truncate(MAX_AVAILABLE_NETWORKS);
     deduped
@@ -382,6 +391,18 @@ mod tests {
         assert_eq!(merged.len(), 20);
         assert!(merged[0].active, "the connected network leads the list");
         assert_eq!(merged[0].ssid, "home");
+    }
+
+    #[test]
+    fn dedup_and_top20_keeps_a_saved_network_even_when_20_neighbours_are_stronger() {
+        let mut aps: Vec<AccessPointInfo> = (0..25).map(|i| ap(&format!("neighbour{i}"), 50 + i as u8)).collect();
+        let mut office = ap("office", 20);
+        office.saved = true;
+        aps.push(office);
+
+        let merged = dedup_and_top20(aps);
+        assert_eq!(merged.len(), 20);
+        assert_eq!(merged[0].ssid, "office", "a saved network outranks every unsaved one");
     }
 
     #[test]

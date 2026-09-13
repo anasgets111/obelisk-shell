@@ -29,7 +29,7 @@ local ui = require("lib.ui_state")
 local KIND = "network"
 local SCROLL = scroll("network_aps")
 
--- Payload order is connected-first, then descending raw signal (§ 2.5). The list re-sorts by tier.
+-- Payload order is connected, saved, then descending raw signal (§ 2.5). The list re-sorts by tier.
 local function access_points(n)
     return (n and n.available_networks) or {}
 end

@@ -77,8 +77,8 @@ changes, rebuilding published state from those events.
 Global networking toggles via `Enable`; Wi-Fi toggles via `WirelessEnabled`. Disabling Ethernet
 disconnects wired devices; enabling activates existing autoconnect profiles.
 
-Scanning is asynchronous. Results merge duplicate SSIDs and retain the connected AP plus the
-strongest alternatives, capped at 20. Frequency supplies the band. Scan progress is published.
+Scanning is asynchronous. Results merge duplicate SSIDs and retain the connected AP, then saved
+networks, then the strongest alternatives, capped at 20. Frequency supplies the band. Scan progress is published.
 
 Saved profiles activate without duplication. Open networks need no credential. Secured connections
 request native secure submission; credentials never enter Lua.

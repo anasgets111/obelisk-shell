@@ -127,9 +127,9 @@ pub struct NetworkState {
     /// network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_ssid: Option<String>,
-    /// Last completed scan: SSID-deduplicated, connected first, then strongest, capped at 20. Kept
-    /// while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready
-    /// to draw.
+    /// Last completed scan: SSID-deduplicated, connected, then saved, then strongest, capped at 20.
+    /// Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is
+    /// ready to draw.
     pub available_networks: Vec<AccessPointInfo>,
 }
 
