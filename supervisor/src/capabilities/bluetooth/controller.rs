@@ -2,6 +2,7 @@
 //! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -29,6 +30,9 @@ pub struct BluetoothController {
     state: Arc<Mutex<BluetoothState>>,
     /// MAC to the action this Supervisor is running for it, drawn as each device's `busy`.
     busy: Arc<Mutex<HashMap<String, DeviceAction>>>,
+    /// Whether the config wants discovery, from `start_discovery`/`stop_discovery`; see
+    /// [`reconcile_discovery`](Self::reconcile_discovery).
+    discovery_wanted: Arc<AtomicBool>,
     /// The pairing prompt, shared with the agent that fills it.
     prompts: PromptSlot,
     /// Signal sender used by [`clear_discovered`](Self::clear_discovered) to share the forwarders'
@@ -107,6 +111,7 @@ impl BluetoothController {
             devices,
             state: Arc::new(Mutex::new(BluetoothState::default())),
             busy: Arc::default(),
+            discovery_wanted: Arc::default(),
             prompts: PromptSlot::default(),
             events,
         };
@@ -141,6 +146,8 @@ impl BluetoothController {
     pub async fn handle_signal(&self, signal: BluetoothSignal) -> BluetoothState {
         match signal {
             BluetoothSignal::AdapterChanged => {
+                // A start that landed after its stop, or a radio switched back on, shows up here.
+                self.spawn_reconcile_discovery();
                 let enabled = self.read_enabled().await;
                 let discovering = self.read_discovering().await;
                 let discoverable = self.read_discoverable().await;
@@ -323,44 +330,70 @@ impl BluetoothController {
         }
     }
 
-    /// D-Bus half of `bluetooth:start_discovery()`. [`clear_discovered`](Self::clear_discovered)
-    /// clears `discovered_devices` before this task is spawned (ADR-0030).
-    pub async fn start_discovery(&self) {
-        let Some(adapter) = self.adapter() else {
-            eprintln!("bluetooth: start_discovery() failed: {}", BluetoothActionError::NoAdapter);
-            return;
-        };
-        if let Err(err) = adapter.start_discovery().await {
-            eprintln!("bluetooth: StartDiscovery failed: {err}");
-        }
+    /// `bluetooth:start_discovery()` and `stop_discovery()`: records the intent, then matches BlueZ
+    /// to it. Intent, not a call: a stop that lands before BlueZ reports the start would find
+    /// nothing to stop, and the scan would run for the session. A stop leaves the last
+    /// `discovered_devices` snapshot (ADR-0030).
+    pub fn set_discovery(&self, wanted: bool) {
+        self.discovery_wanted.store(wanted, Ordering::Relaxed);
+        self.spawn_reconcile_discovery();
     }
 
-    /// `bluetooth:stop_discovery()`: no local mutation; the last `discovered_devices` snapshot
-    /// stays visible (ADR-0030).
-    pub async fn stop_discovery(&self) {
-        let Some(adapter) = self.adapter() else {
-            eprintln!("bluetooth: stop_discovery() failed: {}", BluetoothActionError::NoAdapter);
+    /// Whether discovery should run now: wanted, and no pairing call of this Supervisor running.
+    /// KDE and GNOME both pause discovery while pairing, which a scanning radio slows down.
+    fn discovery_due(&self) -> bool {
+        self.discovery_wanted.load(Ordering::Relaxed)
+            && !self.busy.lock().unwrap().values().any(|action| *action == DeviceAction::Pairing)
+    }
+
+    fn spawn_reconcile_discovery(&self) {
+        let controller = self.clone();
+        tokio::spawn(async move { controller.reconcile_discovery().await });
+    }
+
+    /// Starts or stops discovery so BlueZ's `Discovering` matches
+    /// [`discovery_due`](Self::discovery_due). Runs on each intent and each adapter property change,
+    /// so a late start is stopped, and a radio switched back on resumes the scan, once BlueZ
+    /// reports it.
+    ///
+    /// ponytail: `Discovering` is adapter-wide. Another client scanning while this one wants none
+    /// makes `StopDiscovery` fail with "No discovery started", logged once per property change.
+    async fn reconcile_discovery(&self) {
+        let Some(adapter) = self.adapter() else { return };
+        if !adapter.powered().await.unwrap_or(false) {
             return;
+        }
+        let due = self.discovery_due();
+        if adapter.discovering().await.unwrap_or(false) == due {
+            return;
+        }
+        let (call, result) = if due {
+            ("StartDiscovery", adapter.start_discovery().await)
+        } else {
+            ("StopDiscovery", adapter.stop_discovery().await)
         };
-        if let Err(err) = adapter.stop_discovery().await {
-            eprintln!("bluetooth: StopDiscovery failed: {err}");
+        if let Err(err) = result {
+            eprintln!("bluetooth: {call} failed: {err}");
         }
     }
 
     /// `bluetooth:pair(mac)`, then [`connect`](Self::connect), as `BluetoothService.qml`'s
     /// `connectAfterPairAddress` does. `Pair` returns when pairing ends, so no `Paired` watch is
-    /// needed. An unresolvable `mac` is logged and dropped, never guessed (ADR-0030).
+    /// needed. An unresolvable `mac` is logged and dropped, never guessed (ADR-0030). Discovery
+    /// pauses for the whole call; see [`discovery_due`](Self::discovery_due).
     pub async fn pair(&self, mac: &str) {
         let Some((_, device)) = self.resolve_device(mac) else {
             eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
-        let _busy = self.mark_busy(mac, DeviceAction::Pairing);
-        if let Err(err) = device.pair().await {
-            eprintln!("bluetooth: pair({mac:?}) failed: {err}");
-            return;
+        let busy = self.mark_busy(mac, DeviceAction::Pairing);
+        self.reconcile_discovery().await;
+        match device.pair().await {
+            Ok(()) => self.connect(mac).await,
+            Err(err) => eprintln!("bluetooth: pair({mac:?}) failed: {err}"),
         }
-        self.connect(mac).await;
+        drop(busy);
+        self.reconcile_discovery().await;
     }
 
     /// `bluetooth:connect(mac)`. Sets `Trusted` first, as `BluetoothService.qml` does, so the device
@@ -443,10 +476,25 @@ mod tests {
             devices: Arc::default(),
             state: Arc::default(),
             busy: Arc::default(),
+            discovery_wanted: Arc::default(),
             prompts: Arc::default(),
             events,
         };
         (controller, receiver)
+    }
+
+    #[test]
+    fn discovery_is_due_while_wanted_and_paused_while_pairing() {
+        let (controller, _receiver) = controller();
+        assert!(!controller.discovery_due(), "nothing wants it yet");
+
+        controller.discovery_wanted.store(true, Ordering::Relaxed);
+        assert!(controller.discovery_due());
+
+        let pairing = controller.mark_busy("AA", DeviceAction::Pairing);
+        assert!(!controller.discovery_due(), "a pairing call pauses it");
+        drop(pairing);
+        assert!(controller.discovery_due(), "and it resumes when the call ends");
     }
 
     #[test]

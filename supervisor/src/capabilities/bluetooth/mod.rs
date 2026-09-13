@@ -261,25 +261,19 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
             }
             None => crate::log_malformed_command(params),
         },
+        // Not spawned: the intent is stored in dispatch order, so a quick start then stop ends
+        // wanting none. The reconcile they trigger is spawned.
         BluetoothAction::StartDiscovery => {
             controller.clear_discovered();
-            let controller = controller.clone();
-            tokio::spawn(async move {
-                controller.start_discovery().await;
-            });
+            controller.set_discovery(true);
         }
+        BluetoothAction::StopDiscovery => controller.set_discovery(false),
         // Not spawned: it only answers a waiting agent call, and a late answer could land on the
         // next prompt.
         BluetoothAction::AnswerPairing => match parse_mac_and_bool_args(&params.arguments) {
             Some((mac, accept)) => controller.answer_pairing(&mac, accept),
             None => crate::log_malformed_command(params),
         },
-        BluetoothAction::StopDiscovery => {
-            let controller = controller.clone();
-            tokio::spawn(async move {
-                controller.stop_discovery().await;
-            });
-        }
         // The four device actions differ only in the method they call. The outer match stays
         // exhaustive over `BluetoothAction`, so a new variant is still a compile error here.
         BluetoothAction::Pair | BluetoothAction::Connect | BluetoothAction::Disconnect | BluetoothAction::Forget => {

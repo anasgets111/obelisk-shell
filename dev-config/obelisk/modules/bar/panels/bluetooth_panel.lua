@@ -58,13 +58,6 @@ local function discovered(b)
     return util.sorted_devices(b and b.discovered_devices)
 end
 
--- Switching the radio on with the panel up starts the scan the open would have (`shouldDiscover`).
-obelisk.bluetooth:on_change(function(b, previous)
-    if previous ~= nil and b.enabled and not previous.enabled and ui.panel_open:get() and ui.panel_kind:get() == KIND then
-        ui.set_bluetooth_discovery(true)
-    end
-end)
-
 local function enabled(b)
     return b ~= nil and b.enabled
 end
