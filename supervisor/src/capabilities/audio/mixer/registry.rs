@@ -3,7 +3,6 @@
 //! in its blocking `main_loop.run()`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use pipewire as pw;
@@ -18,9 +17,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::capabilities::audio::master;
 
 use super::state::{
-    AudioApps, AudioCommand, AudioState, BluezCard, CaptureApps, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY,
-    DefaultDevice, DeviceEntry, DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, VideoSourceApps,
-    apply_capture_info_event, apply_info_event, apply_video_info_event, classify, device_names,
+    AudioCommand, AudioState, BluezCard, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceEntry,
+    DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, apply_capture_info_event, apply_info_event,
+    apply_video_info_event, classify, device_names,
 };
 use super::write::apply_command;
 
@@ -67,29 +66,7 @@ fn run_inner(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let state = Rc::new(RefCell::new(MixerState {
-        hydrated: false,
-        apps: AudioApps::new(),
-        video_sources: VideoSourceApps::new(),
-        microphones: CaptureApps::new(),
-        screencasts: CaptureApps::new(),
-        nodes: HashMap::new(),
-        updates,
-        privacy_updates,
-        sinks: HashMap::new(),
-        sink_nodes: HashMap::new(),
-        sources: HashMap::new(),
-        source_nodes: HashMap::new(),
-        devices: HashMap::new(),
-        device_routes: HashMap::new(),
-        bluez_cards: HashMap::new(),
-        bluez_devices: HashMap::new(),
-        app_props: HashMap::new(),
-        default_sink_name: None,
-        default_source_name: None,
-        metadata: None,
-        metadata_id: None,
-    }));
+    let state = Rc::new(RefCell::new(MixerState::new(updates, privacy_updates)));
 
     // Weak: the listener is stored on registry's C object, so a captured strong RegistryRc would
     // keep itself alive forever.

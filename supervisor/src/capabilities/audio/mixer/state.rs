@@ -614,6 +614,33 @@ pub(super) struct MixerState {
 }
 
 impl MixerState {
+    /// Empty maps, not yet hydrated.
+    pub(super) fn new(updates: UnboundedSender<AudioState>, privacy_updates: UnboundedSender<PrivacySources>) -> Self {
+        Self {
+            hydrated: false,
+            apps: AudioApps::new(),
+            video_sources: VideoSourceApps::new(),
+            microphones: CaptureApps::new(),
+            screencasts: CaptureApps::new(),
+            nodes: HashMap::new(),
+            updates,
+            privacy_updates,
+            sinks: HashMap::new(),
+            sink_nodes: HashMap::new(),
+            sources: HashMap::new(),
+            source_nodes: HashMap::new(),
+            devices: HashMap::new(),
+            device_routes: HashMap::new(),
+            bluez_cards: HashMap::new(),
+            bluez_devices: HashMap::new(),
+            app_props: HashMap::new(),
+            default_sink_name: None,
+            default_source_name: None,
+            metadata: None,
+            metadata_id: None,
+        }
+    }
+
     /// Entry map for one direction, shared by binding and writing.
     pub(super) fn device_entries_mut(&mut self, kind: DefaultDevice) -> &mut HashMap<u32, DeviceEntry> {
         match kind {
@@ -1295,29 +1322,7 @@ mod tests {
         updates: UnboundedSender<AudioState>,
         privacy_updates: UnboundedSender<PrivacySources>,
     ) -> MixerState {
-        MixerState {
-            hydrated: true,
-            apps: AudioApps::new(),
-            video_sources: VideoSourceApps::new(),
-            microphones: CaptureApps::new(),
-            screencasts: CaptureApps::new(),
-            nodes: HashMap::new(),
-            updates,
-            privacy_updates,
-            sinks: HashMap::new(),
-            sink_nodes: HashMap::new(),
-            sources: HashMap::new(),
-            source_nodes: HashMap::new(),
-            devices: HashMap::new(),
-            device_routes: HashMap::new(),
-            bluez_cards: HashMap::new(),
-            bluez_devices: HashMap::new(),
-            app_props: HashMap::new(),
-            default_sink_name: None,
-            default_source_name: None,
-            metadata: None,
-            metadata_id: None,
-        }
+        MixerState { hydrated: true, ..MixerState::new(updates, privacy_updates) }
     }
 
     /// The startup gate. A sink whose `Props` have not arrived reads as volume zero, and a config
