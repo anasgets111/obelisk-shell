@@ -693,31 +693,14 @@ impl NetworkController {
         }
     }
 
+    /// ponytail: reads every profile the device lists before picking the first autoconnect one; a
+    /// wired port lists one or two.
     async fn find_autoconnect_profile(&self, device: &DeviceProxy<'_>) -> zbus::Result<Option<OwnedObjectPath>> {
-        for conn_path in device.available_connections().await? {
-            let conn = match bind::<SettingsConnectionProxy>(&self.connection, conn_path.clone()).await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    eprintln!(
-                        "network: failed to bind connection {conn_path} while searching for an autoconnect profile: {err}"
-                    );
-                    continue;
-                }
-            };
-            let settings = match conn.get_settings().await {
-                Ok(settings) => settings,
-                Err(err) => {
-                    eprintln!(
-                        "network: failed to read settings for {conn_path} while searching for an autoconnect profile: {err}"
-                    );
-                    continue;
-                }
-            };
-            if connection_wants_autoconnect(&settings) {
-                return Ok(Some(conn_path));
-            }
-        }
-        Ok(None)
+        let profiles = self.read_profiles(device.available_connections().await?, "autoconnect").await;
+        Ok(profiles
+            .into_iter()
+            .find(|profile| connection_wants_autoconnect(&profile.settings))
+            .map(|profile| profile.path))
     }
 
     /// § 4.2: dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
@@ -1004,7 +987,14 @@ impl NetworkController {
                 return Vec::new();
             }
         };
+        let mut profiles = self.read_profiles(paths, context).await;
+        profiles.retain(|profile| profile_ssid(&profile.settings).is_some());
+        profiles
+    }
 
+    /// Binds and reads each profile at `paths`. Unreadable profiles are logged under `context` and
+    /// skipped.
+    async fn read_profiles(&self, paths: Vec<OwnedObjectPath>, context: &str) -> Vec<SavedProfile> {
         let mut profiles = Vec::new();
         for path in paths {
             let connection = match bind::<SettingsConnectionProxy>(&self.connection, path.clone()).await {
@@ -1014,15 +1004,9 @@ impl NetworkController {
                     continue;
                 }
             };
-            let settings = match connection.get_settings().await {
-                Ok(settings) => settings,
-                Err(err) => {
-                    eprintln!("network: {context} failed to read settings for {path}: {err}");
-                    continue;
-                }
-            };
-            if profile_ssid(&settings).is_some() {
-                profiles.push(SavedProfile { path, connection, settings });
+            match connection.get_settings().await {
+                Ok(settings) => profiles.push(SavedProfile { path, connection, settings }),
+                Err(err) => eprintln!("network: {context} failed to read settings for {path}: {err}"),
             }
         }
         profiles
