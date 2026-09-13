@@ -230,7 +230,7 @@
 ---What a [`PairingRequest`] asks; see [`PairingRequest::kind`].
 
 ---@class PairingRequest
----What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
+---What the pairing agent is asking the user.
 ---@field code? string Six-digit passkey or legacy PIN for `"confirm"` and `"display"`, else `nil`.
 ---@field kind PairingKind `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair. `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the device, with nothing to answer.
 ---@field mac string The device's MAC address.
@@ -397,7 +397,7 @@
 ---
 ---The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
 ---down radio from a powered radio with no association.
----@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected, then saved, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready to draw.
+---@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected, then saved, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so a drawn list does not blank; payload order is ready to draw.
 ---@field connect_error? JoinError The last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the Wi-Fi device's `StateChanged` reason, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`. It names its network, so a sheet opened for another one does not read a leftover failure as its own.
 ---@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and clears when the attempt reaches a verdict or `network:abort_connect` stops it.
@@ -409,7 +409,7 @@
 ---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
 ---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.
 ---@field ssid? string Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins when both are up. An association negotiating DHCP has an `ssid` but `connected == false`.
----@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged entry the panel draws, so the bar and list agree.
+---@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged `available_networks` entry, so an indicator and the list agree.
 ---@field wifi_enabled boolean Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no association.
 ---@field wifi_ip? string The Wi-Fi device's IPv4 address without its prefix, or `nil` while it holds none.
 ---@field wifi_present boolean A Wi-Fi device exists; NetworkManager reports `wifi_enabled` even with no hardware behind it.
@@ -577,7 +577,7 @@ local SystemCapability = {}
 ---@field name string The connector name, e.g. `"eDP-1"`. What a surface's `monitor` takes, and what an `obelisk.workspaces` output entry is keyed by.
 ---@field width integer Logical pixels, already divided by `scale`. Not the mode's pixel count.
 ---@field height integer Logical pixels, on the same terms as `width`.
----@field scale integer The compositor's integer scale factor for this output, `1` on an ordinary display and `2` on a HiDPI one. Not a divisor: `width` and `height` above are already logical. Read it to pick sizes, the way `theme.s(hidpi, normal)` does.
+---@field scale integer The compositor's integer scale factor for this output, `1` on an ordinary display and `2` on a HiDPI one. Not a divisor: `width` and `height` above are already logical. Read it to pick sizes.
 ---@field refresh number Hz. `0` for an output with no current mode, such as a virtual one.
 
 ---@class RescueState

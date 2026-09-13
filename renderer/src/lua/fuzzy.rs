@@ -5,7 +5,7 @@
 //! JavaScript port of fzf: BSD-3-Clause, copyright 2021 Ajit. Constants are unchanged, so fzf's
 //! thresholds read across.
 //!
-//! The scorer only: iterate, sort, tiebreak and cap stay in `launcher.lua`'s `filter`. No backtrack
+//! The scorer only: iterate, sort, tiebreak and cap stay in the config. No backtrack
 //! pass, since the mirror computes no match positions either; `start` is returned for its tiebreak.
 
 use mlua::Lua;
@@ -298,7 +298,7 @@ pub fn score(haystack: &str, needle: &str) -> Option<(i32, usize)> {
 /// and this is read inside `computed`s, which must be pure and synchronous (ADR-0021).
 ///
 /// Bytes that are not UTF-8 score as no match rather than raising, since a desktop entry's name is
-/// whatever was on disk and one bad file must not take the launcher's whole list with it.
+/// whatever was on disk and one bad file must not take a whole list with it.
 pub fn register(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "fuzzy",

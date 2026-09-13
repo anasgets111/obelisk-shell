@@ -1939,9 +1939,9 @@ pub fn overlay_input_regions(surface_root: &ResolvedNode, scale: f32) -> Vec<Phy
 ///
 /// Opt-in, never inferred. The sibling walk above answers "what can be clicked", which has one
 /// correct answer and so needs no config input; "what should be blurred" is an aesthetic with no
-/// correct answer, and inferring it from `background` alpha would have been a guess: `dev-config`
-/// writes `background = "#00000000"` on eight deliberately invisible controls, and border-only or
-/// image-backed glass carries no background alpha to read.
+/// correct answer, and inferring it from `background` alpha would have been a guess: a control may
+/// be deliberately invisible at `#00000000`, and border-only or image-backed glass carries no
+/// background alpha to read.
 ///
 /// Three things this does that [`overlay_input_regions`] does not, each because blur is about
 /// where a node is *painted* rather than where it can be pressed:
@@ -3956,7 +3956,7 @@ pub(super) mod tests {
         assert_eq!(ys, vec![0.0, 100.0], "a `state()` signal holding 120 scrolls nothing");
     }
 
-    /// Found live against `dev-config`: a content-sized `column` with 8px of padding reported the
+    /// Found live: a content-sized `column` with 8px of padding reported the
     /// bare height of its one child, and reported the same height with 50px of padding. Padding
     /// insets the box children are laid out in (they are offset by exactly this
     /// much), so a content-sized container that does not also grow by it positions its children

@@ -492,7 +492,7 @@ mod meta_stub_tests {
     /// Feeds every `lua-meta` type through a real `Scene::apply`. Names are checked elsewhere; this
     /// catches type claims that the engine rejects, the ADR-0081 gap that once affected 21
     /// properties. One-way by design: `just types` catches engine-accepted fields missing from the
-    /// stub by checking `dev-config`. All 455 types are sampled; missing `sample` rows fail.
+    /// stub by type-checking configs against it. All 455 types are sampled; missing `sample` rows fail.
     /// ponytail: checks, does not derive. The node schema remains hand-written: 49 parse functions
     /// and 45 `properties.get` calls across ten files. Upgrade to per-kind props structs, making
     /// `nodes.lua` generable like `obelisk.lua`; that rewrites parsing and trades property-specific

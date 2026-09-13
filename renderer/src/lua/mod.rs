@@ -231,9 +231,8 @@ fn loaded_module_names(lua: &Lua) -> mlua::Result<std::collections::HashSet<Stri
         .collect()
 }
 
-/// Explains the "surface N is a X" case a config author cannot see by reading the file. Running
-/// the shipped config after splitting it across 32 files found `return { require(a), require(b) }`
-/// became a three-element list ending in a string.
+/// Explains the "surface N is a X" case a config author cannot see by reading the file:
+/// `return { require(a), require(b) }` is a three-element list ending in a string.
 const REQUIRE_RETURNS_TWO_VALUES: &str = ". If that element came from a `require` in the last \
 position of this table, note that Lua 5.4's `require` returns the module *and* its file path, and a \
 call in last position expands to both: bind it to a local first";
@@ -456,7 +455,7 @@ mod tests {
         );
     }
 
-    /// Shipped config once produced a seventh surface element that was a path string, reported as
+    /// A config once produced a surface element that was a path string, reported as
     /// `shell.lua failed to evaluate: error converting Lua string to table`, naming neither element
     /// nor value. Lua 5.4 `require` returns module and path; in final table position
     /// `return { require(a), require(b) }` expands to three elements, the last a string.
@@ -701,7 +700,7 @@ mod tests {
 
     /// Trade-off: null-to-nil leaves an array hole; `ipairs` stops there, while `#` and direct
     /// indexing see past it. No capability payload has a null element today, only optional fields,
-    /// but `dev-config/obelisk/shell.lua` iterates capability lists with `ipairs`.
+    /// but configs iterate capability lists with `ipairs`.
     #[test]
     fn to_lua_value_a_null_array_element_leaves_a_hole_ipairs_stops_at() {
         let loader = test_loader();

@@ -13,8 +13,8 @@
 //! lock; wiring it to `LockController::unlock` would let any bus caller bypass PAM. The way back
 //! in remains the password prompt or a VT switch.
 //!
-//! Both halves degrade to inert, logged once; a shell unable to reach logind still locks from its
-//! own bar.
+//! Both halves degrade to inert, logged once; a shell unable to reach logind still locks when its
+//! config asks.
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};

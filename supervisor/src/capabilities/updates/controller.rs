@@ -98,7 +98,7 @@ pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesCo
     };
     let packages = match table.get("packages") {
         // An empty Lua table has no shape, and mlua sends it as `{}`. That is the empty list
-        // `store.lua` writes before any check, so read it as one rather than drop the call and
+        // a config's store writes before any check, so read it as one rather than drop the call and
         // leave the scheduler dormant.
         None => Vec::new(),
         Some(serde_json::Value::Object(map)) if map.is_empty() => Vec::new(),

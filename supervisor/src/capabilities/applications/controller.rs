@@ -326,7 +326,7 @@ mod tests {
     }
 
     /// Unchanged `refresh` must not push: every snapshot repaints the whole scene (ADR-0044), and
-    /// the dev config calls it whenever its launcher opens.
+    /// a launcher may call it every time it opens.
     #[tokio::test]
     async fn refreshing_an_unchanged_directory_pushes_nothing() {
         let dir = tempfile::tempdir().unwrap();

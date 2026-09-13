@@ -345,7 +345,7 @@ impl Supervisor {
                 self.authoritative = Authoritative { generation_id: replacement_generation_id, child };
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
-                self.capabilities.forget_panels();
+                self.capabilities.forget_departed_requests();
                 // What the swap arms release too: without it the dead id kept its idle fan-out entry
                 // (a failed push per idle transition, and any inhibit it held) and its `process.run`
                 // children.
@@ -503,7 +503,7 @@ impl Supervisor {
                 if let Some(idle) = self.capabilities.idle() {
                     idle.reset_registrations(superseded_generation_id).await;
                 }
-                self.capabilities.forget_panels();
+                self.capabilities.forget_departed_requests();
             }
             Err(failure) => {
                 // The candidate was reaped before this branch. Its deferred StartCapability and

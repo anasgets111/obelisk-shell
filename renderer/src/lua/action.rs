@@ -3,7 +3,7 @@
 //! The outward direction of [`capability`](super::capability), and the only way anything outside
 //! this process runs config code with an effect. A keybind writes a `state` when it wants the shell
 //! to *look* different and calls an action when it wants the shell to *do* something; rendering may
-//! not have effects, so a `state` write could never have reached `screen_recording.lua`'s `stop`.
+//! not have effects, so a `state` write could never stop a recording.
 //!
 //! `name` is one opaque string. `"rec.toggle"` groups for a reader the way a Lua module path does,
 //! and nothing splits it, so an action may contain any character its config wrote and no delimiter

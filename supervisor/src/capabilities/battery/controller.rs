@@ -197,8 +197,8 @@ async fn run_battery_task(
     // five real `Get` round trips per event, only a few times an hour.
     //
     // `power::controller` wakes on zbus's cache-backed `receive_*_changed`, so its cache is current
-    // when the stream yields. That is why its charger OSD was instant while this bar glyph lagged
-    // by a full change.
+    // when the stream yields. That is why `power.on_battery` was instant while `battery.charging`
+    // lagged by a full change.
     let device =
         match DisplayDeviceProxy::builder(&system_bus).cache_properties(zbus::proxy::CacheProperties::No).build().await
         {

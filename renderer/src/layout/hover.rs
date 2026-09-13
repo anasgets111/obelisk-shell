@@ -166,9 +166,8 @@ mod tests {
 
     #[test]
     fn an_ancestor_of_the_node_under_the_pointer_is_hovered_too() {
-        // ADR-0062 decision 5, and the case every module in `dev-config` is: a `pill` is a
-        // `row` wrapping a `button` wrapping a `text`, and the signal a config binds hangs off the
-        // outermost of the three. Innermost-only hover would report false for all of them.
+        // ADR-0062 decision 5: a pill is a `row` wrapping a `button` wrapping a `text`, and the
+        // signal a config binds hangs off the outermost of the three. Innermost-only hover would report false for all of them.
         let lua = Lua::new();
         let (_outer_signal, outer) = hover_userdata(&lua);
         let (_inner_signal, inner) = hover_userdata(&lua);

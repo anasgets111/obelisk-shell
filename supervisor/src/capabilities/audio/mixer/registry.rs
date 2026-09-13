@@ -489,7 +489,7 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
     state.borrow_mut().devices.insert(device_id, (device, listener));
 }
 
-/// Binds a BlueZ `Device` for its codec profiles, keyed by MAC for the Bluetooth panel's join; its
+/// Binds a BlueZ `Device` for its codec profiles, keyed by MAC for a Bluetooth join; its
 /// `Route` is never read. Enumerated from `info` (ADR-0200). `Profile` is asked after `EnumProfile`,
 /// so its answer ends the enumeration and publishes only on a change. Answers are matched by that
 /// order, not by seq: protocol-native's `device_marshal_enum_params` sends

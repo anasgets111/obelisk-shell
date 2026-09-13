@@ -1222,8 +1222,7 @@ mod tests {
         assert_eq!(format!("#{:06x}", packed_rgb(Rgba { r: 0.0, g: 0.0, b: 1.0, a: 1.0 })), "#0000ff");
     }
 
-    /// `#cdd6f4`, the dev config's `theme.FG`, so a test asserting on the hex asserts on a value it
-    /// can read.
+    /// `#cdd6f4`, so a test asserting on the hex asserts on a value it can read.
     fn tint() -> Rgba {
         Rgba { r: 0xcd as f32 / 255.0, g: 0xd6 as f32 / 255.0, b: 0xf4 as f32 / 255.0, a: 1.0 }
     }

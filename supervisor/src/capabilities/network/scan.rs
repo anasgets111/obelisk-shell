@@ -40,8 +40,8 @@ pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32)
 /// it, an association weaker than 20 neighbours is truncated and an online machine reports no
 /// association. Dense apartment RF reaches 20 SSIDs easily.
 ///
-/// `saved` sorts next, so a saved network weaker than 20 neighbours still reaches the panel's saved
-/// section. `NetworkPanel.qml` has no cap. ponytail: more than 20 saved networks in range still
+/// `saved` sorts next, so a saved network weaker than 20 neighbours still makes the
+/// list. `NetworkPanel.qml` has no cap. ponytail: more than 20 saved networks in range still
 /// truncate by strength. Upgrade path: exempt saved rows from the cap.
 ///
 /// Merge `active` rather than carrying the winner's flag. NetworkManager once exposed two AP
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn dedup_and_top20_cuts_a_boundary_tie_by_ssid_rather_than_by_luck() {
         // Nineteen strong entries and two tied for slot 20 must yield the same row on every
-        // rebuild; otherwise the panel flickers without a radio change.
+        // rebuild; otherwise a drawn list flickers without a radio change.
         let mut aps: Vec<AccessPointInfo> = (0..19).map(|i| ap(&format!("strong{i}"), 90)).collect();
         aps.push(ap("zulu", 40));
         aps.push(ap("kilo", 40));

@@ -69,8 +69,8 @@ pub(super) async fn register_item(
     // path out of and can only guess `DEFAULT_ITEM_OBJECT_PATH`, while Chromium exports its item
     // one level down (ADR-0168). Slack was therefore registered twice from one connection -- the
     // phantom at the guessed path and the real one at `/StatusNotifierItem/1` -- and since
-    // `TrayItem::id` is the unique name alone, both reached Lua as one id. The bar's `list` refused
-    // the duplicate key and every re-resolve was dropped, freezing the whole bar.
+    // `TrayItem::id` is the unique name alone, both reached Lua as one id. A keyed `list` refused
+    // the duplicate key and every re-resolve was dropped, freezing the surface.
     //
     // `Status` because SNI makes it mandatory and it is the one property whose absence is
     // unambiguous: a live item always answers it.

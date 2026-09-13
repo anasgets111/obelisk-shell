@@ -280,15 +280,13 @@ impl NetworkController {
     ///
     /// The prompt's way out. Escape in a `secure_submit` field only clears its text and stays in
     /// the field (`wayland::input`'s `SecureKeyAction::Clear`), so without this a mis-click would
-    /// hold bar keyboard focus.
+    /// hold keyboard focus.
     ///
-    /// An activation already in flight is left alone. Every panel close calls this, and closing the
-    /// panel should not undo a join the user started; [`abort_connect`](Self::abort_connect) is the
-    /// sheet's explicit Cancel.
+    /// An activation already in flight is left alone: closing a prompt should not undo a join the
+    /// user started; [`abort_connect`](Self::abort_connect) is the explicit Cancel.
     ///
-    /// No-op without a pending prompt, so `modules/shell/panel_host.lua` can call it on any panel
-    /// close. Without the guard, closing another panel would clear `connect_error` and push a
-    /// misleading `Changed`.
+    /// No-op without a pending prompt, so a config can call it on any close. Without the guard, an
+    /// unrelated close would clear `connect_error` and push a misleading `Changed`.
     pub fn cancel_connect(&self) {
         let pending = self.pending_connect.lock().unwrap().take();
         if pending.is_none() && self.state.lock().unwrap().password_ssid.is_none() {
@@ -393,7 +391,7 @@ impl NetworkController {
             state.connecting_ssid = Some(ssid.to_string());
             state.connect_error = None;
             // The attempt answers the prompt. Clear here, not only in `secure_submit`, so direct
-            // connects also drop bar keyboard focus on Enter.
+            // connects also drop the prompt's keyboard focus on Enter.
             state.password_ssid = None;
             let mut attempt = self.attempt.lock().unwrap();
             attempt.id += 1;

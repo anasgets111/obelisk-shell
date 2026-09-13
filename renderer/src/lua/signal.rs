@@ -245,8 +245,8 @@ fn is_comparable_literal(value: &Value) -> bool {
 }
 
 /// Whether the `state` literal changed. `None` means no edit per ADR-0044's amendment. This keeps
-/// `lib/ui_state.lua`'s table `popup_anchor` from looking edited on every reload and snapping a
-/// popup to the corner. `Value`'s own `PartialEq` compares an `Integer` against a `Number` the way
+/// a table literal, such as a popup's anchor rect, from looking edited on every reload and snapping
+/// the popup to the corner. `Value`'s own `PartialEq` compares an `Integer` against a `Number` the way
 /// Lua `==` does, so `0` and `0.0` match; scalar types differing do not.
 fn literal_was_edited(current: &Value, seeded: &Value) -> Option<bool> {
     if !is_comparable_literal(current) || !is_comparable_literal(seeded) {
@@ -646,7 +646,7 @@ struct StateRegistry(HashMap<String, (Signal, Value)>);
 
 /// `hover(name)` registry (ADR-0062 decision 2), name-keyed across reloads so a tooltip stays open
 /// through
-/// `config/theme.lua` edits. Separate from [`StateRegistry`], or `state("volume", 0)` and
+/// config edits. Separate from [`StateRegistry`], or `state("volume", 0)` and
 /// `hover("volume")` would collide and confuse `signal:set()`.
 #[derive(Default)]
 struct HoverRegistry(HashMap<String, (Signal, Signal)>);
@@ -704,9 +704,9 @@ fn next_computed_id() -> MemoKey {
 struct MemoTable(HashMap<MemoKey, Value>);
 
 /// One evaluation's memo, closing ADR-0044 decision 3's ceiling: without it a shared dependency is
-/// re-run once per path that reaches it, so `dev-config`'s launcher ran its whole application
-/// filter twice for every row's `background` (`results` directly and again through `web_shown`),
-/// and a diamond of depth N evaluated its root 2^N times.
+/// re-run once per path that reaches it, so a launcher ran its whole application filter twice for
+/// every row's `background` (once directly, once through a computed reading it), and a diamond of
+/// depth N evaluated its root 2^N times.
 ///
 /// Scoped to one layout pass, never across them: between two passes a `state`/`Live` cell may have
 /// changed, and nothing here observes that. Within the scope the memo also makes an impure closure
@@ -714,7 +714,7 @@ struct MemoTable(HashMap<MemoKey, Value>);
 /// dependency edge reached it.
 ///
 /// [`LayoutPassBudget`] opens the table, so one pass is the scope whenever a pass is running
-/// (ADR-0157): the launcher's `results` answers once for the pass rather than once for
+/// (ADR-0157): a shared `results` answers once for the pass rather than once for
 /// `background`, once for `border_color`, and once for the label colour of every row. Outside a
 /// pass -- startup evaluation, a `capability::CapabilityHandle::notify_change` handler -- the
 /// outermost `Computed` still owns it, which is what keeps a handler that `:set()`s between its
@@ -1115,7 +1115,7 @@ mod tests {
         lua
     }
 
-    /// `dev-config`'s launcher shape, the one that spent its whole 5ms budget in the field:
+    /// A launcher shape that once spent its whole 5ms budget in the field:
     /// `results` filters every application, `web_shown` reads `results`, `effective_selected` reads
     /// both, and each row's `background` reads that. One read of `background` used to run the
     /// filter twice; the memo makes the second reach `results` a lookup.
@@ -1602,8 +1602,8 @@ mod tests {
 
     #[test]
     fn a_table_initial_never_counts_as_edited() {
-        // `lib/ui_state.lua`'s `popup_anchor`: fresh table pointers would make every reload an edit
-        // and snap the popup to the corner.
+        // A popup's anchor rect: fresh table pointers would make every reload an edit and snap the
+        // popup to the corner.
         let (lua, _dirty) = lua_with_state();
         let result: i64 = lua
             .load(

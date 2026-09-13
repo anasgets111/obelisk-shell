@@ -522,9 +522,8 @@ fn run(painter: &mut TextPainter, walk: &mut Walk<'_, '_>, commands: &[DrawCmd],
 /// Draws `commands` into an offscreen image, then fills the node's rounded path with that image.
 /// femtovg 0.26's `intersect_rounded_scissor` carries one rounded rectangle; on an 80x32 pill at
 /// radius 16 with a 30px child it re-rounded the child and leaked the ground 8% through the pill's
-/// straight top edge. `dev-config`'s battery indicator worked around the same lozenge by rounding
-/// the child, which would only move the bug. Quickshell's `ClippingRectangle` uses a mask texture
-/// and two targets; femtovg's image-painted path needs one.
+/// straight top edge. Giving the child the pill's radius instead draws a lozenge. Quickshell's
+/// `ClippingRectangle` uses a mask texture and two targets; femtovg's image-painted path needs one.
 ///
 /// ponytail: one image allocated and freed per clipping node per repaint. Upgrade path: a pool
 /// keyed by size next to `ImageCache`, once a config repaints a rounded clip at pointer rate.
@@ -543,8 +542,7 @@ fn draw_clipped(
     let (width, height) = ((clip.x1 - clip.x0) as usize, (clip.y1 - clip.y0) as usize);
     // A box with no area shows nothing, and asking for a 0xN render target leaves GL with an
     // incomplete framebuffer that the next composite on this canvas paints as a full square. A
-    // pill cell tweening its width through zero (`components/expanding_pill.lua`) hit this on the
-    // first and last frame of every expansion.
+    // cell tweening its width through zero hits this on its first and last frame.
     if width == 0 || height == 0 {
         return;
     }
@@ -714,8 +712,8 @@ fn draw_for(
                     }
                 }
                 // Empty focused fields also show the placeholder (ADR-0135). The old caret-only
-                // rule made prompts unreachable in `launcher.lua` and `wallpaper_picker.lua`,
-                // whose `autofocus` keeps the keyboard from the first frame. With no arrow-key
+                // rule hid the prompt of every `autofocus` field, which holds the keyboard from
+                // the first frame. With no arrow-key
                 // movement, the caret stays at the end. Keep `target.is_none()` beside the id:
                 // the same node may gain `secure_submit`, and a masked field must never draw plain
                 // text.
@@ -810,8 +808,8 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 /// clamps radius with `rad.min(halfw)`; near that clamp, `rounded_rect` fails in two bands. At
 /// exactly half, its zero-length straight segments collapse the fill to a square. Just below,
 /// `path::cache`'s half-pixel `woff` bevel inset folds the fill fan back at each join: opaque fill
-/// hides it, translucent fill blends folded slivers twice (a one-pixel chord at 1.6x alpha on the
-/// dev bar's 42%-alpha controls).
+/// hides it, translucent fill blends folded slivers twice (a one-pixel chord at 1.6x alpha on a
+/// 42%-alpha ground).
 ///
 /// A sweep of square boxes from 24 to 43.5 logical pixels, at two sub-pixel offsets and 80
 /// geometries per row, found:
@@ -826,9 +824,8 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 /// `qMin(w, h) * 0.4999f` (`qsgbasicinternalrectanglenode.cpp`) did too at every size. More
 /// epsilon is still a constant tuned to one tessellator, so this builds the shape instead.
 ///
-/// Half the smaller side is how config spells a pill: `components/icon_button.lua` writes
-/// `side / 2` for a circle, while independently scaled `theme.item_radius` can exceed half of
-/// `item_height`. Equal sides use femtovg's circle (four beziers, no straight segments); unequal
+/// Half the smaller side is how config spells a pill (`radius = side / 2`), and a radius scaled
+/// apart from the height can exceed half of it. Equal sides use femtovg's circle (four beziers, no straight segments); unequal
 /// sides use two semicircular caps joined by `|width - height|`. Both wind like `rounded_rect`
 /// (left, bottom, right, top), which controls the fill-fan inset.
 ///
@@ -837,7 +834,7 @@ fn physical_edge(logical: f32, scale: f32) -> u32 {
 /// fill fan folds over and paints the whole bounding square (`a_box_a_hair_narrower_than_tall_is_
 /// still_a_circle`). Tweens produce exactly that: a `width = "Fill"` circle inside a cell whose
 /// width and padding both ease lands a rounding error either side of its height on different
-/// frames (`components/expanding_pill.lua`), and the narrow frames flashed as squares.
+/// frames, and the narrow frames flashed as squares.
 /// Below this the two sides of a box count as equal (`box_path`): the 0.05 px band the sweep in
 /// its doc comment found clear of femtovg's bevel fold, and far above any layout rounding error.
 const HAIR: f32 = 0.05;
@@ -1586,7 +1583,7 @@ mod tests {
         node::SecureSubmitTarget { capability: "lock".to_string(), action: "authenticate".to_string() }
     }
 
-    /// One surface holding the dev config's own password field.
+    /// One surface holding a password field.
     fn password_surface(lua: &Lua) -> ResolvedNode {
         let src = r##"return panel { id = "bar", width = 200, height = 40,
             child = textfield { width = "Fill", height = 28, placeholder = "password",
@@ -2113,12 +2110,11 @@ mod tests {
         );
     }
 
-    /// The bar's own shape, and the bug it hid. `components/icon_button.lua` asks for
-    /// `radius = side / 2`, while independently scaled `theme.item_radius` can exceed half the
-    /// item height. Both reached femtovg's half-box clamp, whose fill tessellation collapses to a
-    /// rectangle: every bar pill and circle had a square ground under a round border.
+    /// A pill's shape, and the bug it hid. `radius = side / 2`, and a radius over half the side,
+    /// both reached femtovg's half-box clamp, whose fill tessellation collapses to a rectangle:
+    /// every pill and circle had a square ground under a round border.
     ///
-    /// 32x32 at radius 16 is the live dev-bar case. 40x40 at 20 rounded before the fix while
+    /// 40x40 at 20 rounded before the fix while
     /// 32x32 did not, showing size-dependent degeneracy rather than a clean threshold; keep both
     /// so one passing size cannot hide it. Both use [`box_path`]'s stadium branch: this catches an
     /// exact half radius, while the companion test catches the just-below-half fill-fold case.
@@ -2133,8 +2129,8 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         let Some(mut painter) = text_painter(&instance, &shaping, 64, 64) else { return };
 
-        // side, radius. The third is the over-asked radius `theme.item_radius` produces against
-        // `theme.item_height`, which must clamp to the same stadium rather than square off.
+        // side, radius. The third asks for more than half, which must clamp to the same stadium
+        // rather than square off.
         for (side, radius) in [(32.0_f32, 16.0_f32), (40.0, 20.0), (32.0, 17.0)] {
             let src = format!(
                 r##"return panel {{ id = "bar", width = 64, height = 64, background = "#FF0000FF", padding = {{ top = 4, left = 4 }}, child = rect {{
@@ -2172,8 +2168,7 @@ mod tests {
     /// [`a_radius_of_half_the_box_fills_a_stadium_not_a_square`]: `rounded_rect` at exactly half
     /// draws a correct outline and then folds its fill fan over itself at each of the four
     /// collapsed straight segments, so a translucent ground gets a second helping of itself along
-    /// a one-pixel chord out of each cap. Opaque fills hide it. Every control on the dev bar is at
-    /// 42% alpha, so none of them did.
+    /// a one-pixel chord out of each cap. Opaque fills hide it; a 42%-alpha ground does not.
     ///
     /// 33x33 at offset 20 rather than a round 32, because the fold is erratic in the size: a sweep
     /// of square boxes from 24 to 43.5 at radius exactly half found seams at 30 of the 80
@@ -2517,9 +2512,8 @@ mod tests {
     /// is not the whole story: a 4px band must stay exactly four rows, neither growing to five
     /// nor losing one, which is what pins `snap_border_band` rounding both edges independently
     /// rather than rounding the near edge and adding an unrounded thickness. `padding.top =
-    /// 31.3` is deliberately close to the dev config's own fractional geometry --
-    /// `notification_area` resolves to a height of 31.6 -- so this is the real shape of the
-    /// bug, not a contrived one.
+    /// 31.3` is the fractional geometry a content-sized surface resolves to, so this is the real
+    /// shape of the bug, not a contrived one.
     ///
     /// Note this is the filled-edge branch, not the stroke: `border_width = { top = 4 }` leaves
     /// the other three edges at zero, so `paint_border`'s `uniform_width` test fails and it
@@ -2650,9 +2644,9 @@ mod tests {
         }
     }
 
-    /// The shape `dev-config`'s battery indicator is: a pill with a child filling its left third.
-    /// Without the rounded clip that child is a square-cornered block poking out of the left cap,
-    /// which is why the config gave it the pill's own radius and got a lozenge instead.
+    /// A pill with a child filling its left third. Without the rounded clip that child is a
+    /// square-cornered block poking out of the left cap, and giving it the pill's radius draws a
+    /// lozenge instead.
     #[test]
     fn a_rounded_clip_cuts_a_child_by_the_parents_arc() {
         let Some(instance) = init_headless_egl(96, 48) else { return };

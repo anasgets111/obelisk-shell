@@ -342,11 +342,10 @@ impl Capabilities {
         self.network.as_ref()
     }
 
-    /// Drops what a departed generation's open panels asked for. Its replacement starts with every
-    /// panel closed (named state survives only an in-place reload), so nothing would send the
-    /// Bluetooth discovery stop or the Wi-Fi prompt cancel the old one owed, and discovery ran for
-    /// the rest of the session.
-    pub fn forget_panels(&self) {
+    /// Drops what a departed generation asked for. Its replacement starts with fresh state (named
+    /// state survives only an in-place reload), so nothing would send the Bluetooth discovery stop
+    /// or the Wi-Fi prompt cancel the old one owed, and discovery ran for the rest of the session.
+    pub fn forget_departed_requests(&self) {
         if let Some(bluetooth) = &self.bluetooth {
             bluetooth.set_discovery(false);
         }

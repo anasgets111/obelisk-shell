@@ -103,7 +103,7 @@ pub struct DiscoveredDevice {
     pub busy: Option<DeviceAction>,
 }
 
-/// What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
+/// What the pairing agent is asking the user.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PairingRequest {
     /// `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair.

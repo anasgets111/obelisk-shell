@@ -4,8 +4,8 @@
 use super::keyboard::{FieldTarget, focused_field};
 use super::*;
 
-/// Mouse-wheel notch size in logical pixels (ADR-0069 decision 6): flat 39, approximating three
-/// lines of the shipped config's 13px text. A per-container step would need a font size; touchpads
+/// Mouse-wheel notch size in logical pixels (ADR-0069 decision 6): flat 39, about three
+/// lines of 13px text. A per-container step would need a font size; touchpads
 /// report pixels and never use it.
 const WHEEL_STEP_PIXELS: f32 = 39.0;
 

@@ -410,10 +410,10 @@ impl App {
     /// Commits its own changes because `paint_surface` skips byte-identical display lists. Without
     /// this, double-buffered requests could sit pending until an unrelated repaint.
     ///
-    /// Measured incident: `panel_host` raised `keyboard_interactivity` to `Exclusive` after its
-    /// unchanged card was drawn, but niri never gave it the keyboard. An unrelated border-width
-    /// edit changed the display list and `swap_buffers` delivered focus immediately. The bar hid
-    /// the bug by redrawing its clock once a second.
+    /// Measured incident: a panel raised `keyboard_interactivity` to `Exclusive` after its
+    /// unchanged content was drawn, but niri never gave it the keyboard. An unrelated border-width
+    /// edit changed the display list and `swap_buffers` delivered focus immediately. A surface that
+    /// redraws a clock every second hides the bug.
     ///
     /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
     /// procedure, and Supervisor services § 14.2 keeps Candidates invisible until `ActivateDraw`.

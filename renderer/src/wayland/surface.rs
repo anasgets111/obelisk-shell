@@ -1541,7 +1541,7 @@ mod tests {
     fn a_window_declared_invisible_has_nothing_to_stage_and_must_not_hold_the_ready_signal() {
         // ADR-0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
         // `null_buffered` would stay false forever -- a `ready_timeout` hang under a plain gate, on
-        // any config declaring a hidden window (the dev config does).
+        // any config declaring a hidden window.
         assert!(candidate_has_staged(
             [("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))
         ));

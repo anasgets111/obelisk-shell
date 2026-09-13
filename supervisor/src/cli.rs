@@ -275,16 +275,16 @@ mod tests {
 
     #[test]
     fn a_config_directory_is_made_absolute() {
-        let args = parse_args(&["-c", "dev-config/obelisk"]).unwrap();
+        let args = parse_args(&["-c", "some/config"]).unwrap();
         let dir = args.config_dir.expect("-c sets a directory");
         assert!(dir.is_absolute(), "a relative -c must be resolved before any Renderer inherits it");
-        assert!(dir.ends_with("dev-config/obelisk"));
+        assert!(dir.ends_with("some/config"));
     }
 
     #[test]
     fn the_long_form_and_the_equals_form_agree() {
-        let a = parse_args(&["--config", "dev-config/obelisk"]).unwrap();
-        let b = parse_args(&["--config=dev-config/obelisk"]).unwrap();
+        let a = parse_args(&["--config", "some/config"]).unwrap();
+        let b = parse_args(&["--config=some/config"]).unwrap();
         assert_eq!(a, b);
     }
 
@@ -292,8 +292,7 @@ mod tests {
     fn a_path_to_shell_lua_resolves_to_its_directory() {
         // Accommodate the common `-c ~/.config/obelisk/shell.lua` after editing that file.
         //
-        // A file this test makes, not the shipped config: the rule under test is "a path to a file
-        // resolves to its parent", which has nothing to do with what the sample happens to contain.
+        // The rule under test is "a path to a file resolves to its parent".
         // Absolute, because `is_file()` has to see it and tests run from the crate root.
         let dir = tempfile::tempdir().unwrap();
         let shell_lua = dir.path().join("shell.lua");

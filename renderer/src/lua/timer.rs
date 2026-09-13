@@ -17,8 +17,7 @@ use mlua::{Function, Lua, UserData, UserDataMethods};
 use super::signal::CpuBudget;
 
 /// Range of `ms`, one millisecond to one day. Deliberately not `delay`/`pulse`'s 60-second ceiling:
-/// `lib/idle.lua` offers a two-hour suspend delay, so a timer capped at a minute could not express
-/// the one consumer that wanted timers.
+/// an idle suspend delay is measured in hours.
 const MIN_MS: u64 = 1;
 const MAX_MS: u64 = 24 * 60 * 60 * 1000;
 

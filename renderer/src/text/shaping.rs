@@ -164,15 +164,14 @@ enum Request {
 }
 
 /// How many measured strings [`ShapingHandle`] remembers before it drops the lot. Sized against
-/// the working set (the shipped dev config resolves about twenty text nodes, the largest list
-/// this engine carries is a few hundred) with room for churn: a clock shapes a string nobody asks
-/// for again, so an unbounded map would grow for the life of the session. Full, the map holds on
+/// the working set (a bar resolves about twenty text nodes, a long list a few hundred) with room
+/// for churn: a clock shapes a string nobody asks for again, so an unbounded map would grow for the life of the session. Full, the map holds on
 /// the order of 400KB (4096 short `String` entries plus four integers and two floats, plus
 /// `HashMap` overhead), under one percent of ADR-0043's 50MB-per-monitor budget.
 ///
-/// Measured 2026-09-06 against the shipped dev config, idle: **3.2 to 4.3 new entries a minute**,
+/// Measured 2026-09-06 against a live shell, idle: **3.2 to 4.3 new entries a minute**,
 /// so the cap is reached in roughly **sixteen hours**, not the hour an earlier draft of this
-/// comment claimed. That estimate assumed a clock ticking seconds; this config's shows minutes, and
+/// comment claimed. That estimate assumed a clock ticking seconds; that shell's shows minutes, and
 /// the churn that does exist comes from elsewhere. Nothing about the sizing changes -- a cache that
 /// turns over daily rather than hourly holds fewer dead entries, not more -- but the number is
 /// worth stating correctly, because it is the one that says whether 4096 is generous or tight.
@@ -958,21 +957,25 @@ mod tests {
         );
     }
 
+    /// An installed family other than `primary`, so a declared chain has something to move to.
+    fn another_family(primary: &str) -> Option<String> {
+        ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]
+            .into_iter()
+            .find(|family| *family != primary && fonts::family_installed(family))
+            .map(str::to_string)
+    }
+
     /// The chain a config declares has to reach the worker, or `fonts { ... }` is a no-op that
-    /// looks like it worked. Uses the two families the shipped dev config names, and skips rather
-    /// than fails on a machine that has neither installed.
+    /// looks like it worked. Skips rather than fails on a machine with no second family installed.
     #[test]
     fn a_declared_chain_replaces_the_one_the_worker_started_with() {
         let handle = ShapingHandle::spawn();
-        let before = handle.resolved_primary_family();
-        let wanted = "CaskaydiaCove Nerd Font Propo".to_string();
-        handle.set_chain(std::slice::from_ref(&wanted));
-        let after = handle.resolved_primary_family();
-        if after == before {
-            eprintln!("skip: {wanted} is not installed, so the chain could not change");
+        let Some(wanted) = another_family(&handle.resolved_primary_family()) else {
+            eprintln!("skip: no second family installed, so the chain could not change");
             return;
-        }
-        assert_eq!(after, wanted, "the worker measures against what the config asked for");
+        };
+        handle.set_chain(std::slice::from_ref(&wanted));
+        assert_eq!(handle.resolved_primary_family(), wanted, "the worker measures against what the config asked for");
     }
 
     /// `font_chain_data` is what `TextPainter::new` loads into femtovg, so a `set_chain` that moved
@@ -981,13 +984,13 @@ mod tests {
     #[test]
     fn a_declared_chain_reaches_the_faces_femtovg_paints_with_too() {
         let handle = ShapingHandle::spawn();
-        let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
-        handle.set_chain(&["CaskaydiaCove Nerd Font Propo".to_string()]);
-        let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
-        if handle.resolved_primary_family() != "CaskaydiaCove Nerd Font Propo" {
-            eprintln!("skip: the family is not installed, so nothing could change");
+        let Some(wanted) = another_family(&handle.resolved_primary_family()) else {
+            eprintln!("skip: no second family installed, so nothing could change");
             return;
-        }
+        };
+        let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
+        handle.set_chain(&[wanted]);
+        let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
         // One family, but up to four faces of it: the regular and whichever of bold, italic and
         // bold italic fontconfig found for it (ADR-0104). Every one of them is the primary's.
         assert!(

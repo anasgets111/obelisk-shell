@@ -211,7 +211,7 @@ fn render_trim(uptime: Duration, before: Malloc, after: Malloc) -> String {
 }
 
 /// The heaviest trees on their own line, so a growing total can be attributed without re-running.
-/// Five is enough: the shipped config's remaining surfaces are single-digit node stubs.
+/// Five, because past the heaviest few a surface is usually a handful of nodes.
 fn render_surfaces(uptime: Duration, surfaces: &Surfaces) -> String {
     let listed: Vec<String> = surfaces.0.iter().take(5).map(|(name, nodes)| format!("{name}={nodes}")).collect();
     format!("memory t={:.0}s: top surfaces {}", uptime.as_secs_f64(), listed.join(" "))

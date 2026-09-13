@@ -70,7 +70,7 @@ pub struct NetworkState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssid: Option<String>,
     /// Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged
-    /// entry the panel draws, so the bar and list agree.
+    /// `available_networks` entry, so an indicator and the list agree.
     pub strength: u8,
     /// Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no
     /// association.
@@ -116,7 +116,7 @@ pub struct NetworkState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_ssid: Option<String>,
     /// Last completed scan: SSID-deduplicated, connected, then saved, then strongest, capped at 20.
-    /// Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is
+    /// Kept while [`NetworkState::scanning`] is true so a drawn list does not blank; payload order is
     /// ready to draw.
     pub available_networks: Vec<AccessPointInfo>,
 }

@@ -729,10 +729,10 @@ impl RendererClient {
     }
 }
 
-/// `OBELISK_DUMP_LAYOUT=<instance id>` (e.g. `panel_host@eDP-1`) prints each visible node's kind,
+/// `OBELISK_DUMP_LAYOUT=<instance id>` (e.g. `bar@eDP-1`) prints each visible node's kind,
 /// rect, and text after every pass. Off unless asked. It answers which node has the wrong geometry
-/// in a live session, including layouts the test harness did not build (a card at the bell's
-/// output scale with the Supervisor's current feed).
+/// in a live session, including layouts the test harness did not build (a card at a live output's
+/// scale with the Supervisor's current feed).
 fn dump_layout_if_asked(scene: &Scene) {
     let Ok(wanted) = std::env::var("OBELISK_DUMP_LAYOUT") else { return };
     let Some(surface) = scene.surface(&wanted) else { return };
@@ -1351,9 +1351,7 @@ mod tests {
     #[test]
     fn a_popup_bound_to_a_hover_slot_opens_for_that_slot_alone_and_closes_when_the_pointer_leaves() {
         // The other half of ADR-0062: `hover(name)` -> pill `hover`, `hover_rect(name)` ->
-        // popup `anchor_rect`, and the popup's `visible`. A fixture rather than the shipped
-        // config, so a bar module moving cannot break an engine contract, and so the pass costs
-        // microseconds instead of racing the 5ms evaluation budget under a parallel test run.
+        // popup `anchor_rect`, and the popup's `visible`.
         //
         // Two slots, because the contract is that a point inside one region is outside the other:
         // one region alone could not tell "opens when hovered" from "always open".
@@ -1464,8 +1462,7 @@ mod tests {
     fn a_surface_whose_visible_reads_a_capability_goes_up_and_down_with_the_payload() {
         // Regression: a card with no `visible` binding sat in the corner saying "no notifications"
         // for ever. The engine contract under it is that a surface's `visible` may be a signal over
-        // a capability, and that a snapshot re-resolve moves the surface -- a fixture, so a
-        // rearranged dev-config cannot fail an engine test.
+        // a capability, and that a snapshot re-resolve moves the surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),

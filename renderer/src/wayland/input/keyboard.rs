@@ -430,9 +430,8 @@ struct PlainCallbacks {
 ///
 /// `on_submit` before `on_change`. A submit clears the buffer, and the `on_change` that reports the
 /// clearing carries the empty string; delivering it first hands a config the empty field before the
-/// text that filled it. `dev-config`'s launcher derives its selection from its query, so that order
-/// wiped the query, resolved the rows against an empty needle, and launched the first entry of the
-/// unfiltered list rather than the row on screen. Submit carries the user's intent and goes first;
+/// text that filled it. A list that derives its selection from the query then resolves against an
+/// empty needle and submits the first unfiltered row rather than the one on screen. Submit carries the user's intent and goes first;
 /// the clear is bookkeeping and follows.
 ///
 /// Free rather than a method so the ordering can be tested with recording closures; the dispatch it
@@ -486,12 +485,10 @@ impl App {
     /// keyboard, or when the compositor's focus names a surface this process no longer tracks.
     ///
     /// The popups are the point. `wl_keyboard` focus is one surface, but an `xdg_popup` is only
-    /// handed it by niri when its parent already held the keyboard at the moment the popup mapped
-    /// -- and `modules/bar/init.lua` raises the bar's `keyboard_interactivity` in response to
-    /// `network.password_ssid`, which is set by a click *inside* the already-open panel popup. So
-    /// the keys land on the bar while the field that wants them is on `panel_host`. Asking the
-    /// parent alone made the prompt untypable until the panel was closed and reopened, which is
-    /// what a second map fixed by accident.
+    /// handed it by niri when its parent already held the keyboard at the moment the popup mapped.
+    /// A config that raises a surface's `keyboard_interactivity` from a click inside a popup already
+    /// shown under it gets the keys on that surface while the field that wants them is on the popup.
+    /// Asking the parent alone left the field untypable until the popup was closed and reopened.
     ///
     /// Reuses `xdg_shell`'s [`App::shown_popups_under`], the same walk `hide_popup` destroys by, so
     /// "shown under this surface" has one definition. Ids rather than trees: the per-keystroke
@@ -1179,19 +1176,17 @@ mod tests {
 
     #[test]
     fn keyboard_focus_on_a_panel_takes_the_field_on_the_popup_shown_under_it() {
-        // The network password prompt. `modules/bar/init.lua` raises the bar's
-        // `keyboard_interactivity` when `network.password_ssid` appears, but that appears from a
-        // click inside the panel popup that is already open, and niri only hands a popup the
-        // keyboard if its parent held it when the popup mapped. So the keys arrive on the bar while
-        // the only field in reach is on `panel_host`. Scoped to the entering surface alone this
-        // armed nothing, and the prompt stayed dead until the panel was closed and reopened.
+        // A config raises the parent's `keyboard_interactivity` from a click inside a popup that is
+        // already open, and niri only hands a popup the keyboard if its parent held it when the
+        // popup mapped. So the keys arrive on the parent while the only field in reach is on the
+        // popup. Scoped to the entering surface alone this armed nothing.
         let lua = Lua::new();
         let bar = tree_with(&lua, vec![]);
         let panel = tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "network", "connect")))]);
 
         assert_eq!(
-            focus_on_enter(&[("bar@TEST", &bar), ("panel_host@TEST", &panel)], None),
-            Some(field("panel_host@TEST", "network", "connect")),
+            focus_on_enter(&[("bar@TEST", &bar), ("panel@TEST", &panel)], None),
+            Some(field("panel@TEST", "network", "connect")),
             "the field is armed on the surface that declares it, not on the one holding the keyboard"
         );
 
@@ -1199,7 +1194,7 @@ mod tests {
         // one field on the bar and one on its popup is still two destinations to guess between.
         let typable_bar =
             tree_with(&lua, vec![textfield(&lua, Some(secure_submit_table(&lua, "lock", "authenticate")))]);
-        assert_eq!(focus_on_enter(&[("bar@TEST", &typable_bar), ("panel_host@TEST", &panel)], None), None);
+        assert_eq!(focus_on_enter(&[("bar@TEST", &typable_bar), ("panel@TEST", &panel)], None), None);
     }
 
     #[test]
@@ -1220,8 +1215,8 @@ mod tests {
         // The half `keyboard_focus_scope` buys: the keyboard sits on the bar, the field is on the
         // popup shown under it, and a keystroke reaches it. Without this clause every key pruned
         // the focus `enter` had just armed.
-        let on_popup = field("panel_host@TEST", "network", "connect");
-        assert!(focus_is_still_armed(&on_popup, &scope(&["bar@TEST", "panel_host@TEST"]), true));
+        let on_popup = field("panel@TEST", "network", "connect");
+        assert!(focus_is_still_armed(&on_popup, &scope(&["bar@TEST", "panel@TEST"]), true));
         assert!(!focus_is_still_armed(&on_popup, &scope(&["bar@TEST"]), true), "the popup is no longer shown");
     }
 
