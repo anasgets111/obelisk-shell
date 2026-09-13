@@ -1424,6 +1424,7 @@ mod tests {
                 ("modal_host", "panel"),
                 ("lock_screen", "lock"),
                 ("polkit_dialog", "panel"),
+                ("bluetooth_pairing", "panel"),
             ]
         );
     }

@@ -87,6 +87,22 @@ pub struct DiscoveredDevice {
     pub busy: Option<String>,
 }
 
+/// What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct PairingRequest {
+    /// `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair.
+    /// `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the
+    /// device, with nothing to answer.
+    pub kind: String,
+    /// The device's MAC address.
+    pub mac: String,
+    /// The device's advertised name, or empty.
+    pub name: String,
+    /// Six-digit passkey or legacy PIN for `"confirm"` and `"display"`, else `nil`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothState {
     /// An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is
@@ -103,6 +119,9 @@ pub struct BluetoothState {
     pub paired_devices: Vec<PairedDevice>,
     /// Unpaired devices seen by the running scan; empties when discovery stops.
     pub discovered_devices: Vec<DiscoveredDevice>,
+    /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(accept)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing_request: Option<PairingRequest>,
 }
 
 /// What signal forwarders report to `main.rs`'s top-level `select!`.
@@ -118,6 +137,8 @@ pub enum BluetoothSignal {
     /// `StartDiscovery` returns (ADR-0030); a distinct variant prevents registry re-derivation
     /// from immediately undoing the clear.
     DiscoveryCleared,
+    /// The agent put up or took down a pairing request.
+    PairingChanged,
 }
 
 /// `bluetooth:*` write failures before reaching BlueZ; displayed only in call-site logs.
@@ -182,6 +203,7 @@ pub enum BluetoothAction {
     Connect,
     Disconnect,
     Forget,
+    AnswerPairing,
 }
 
 /// `obelisk.bluetooth` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
@@ -207,6 +229,12 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
                 controller.start_discovery().await;
             });
         }
+        // Not spawned: it only answers a waiting agent call, and a late answer could land on the
+        // next prompt.
+        BluetoothAction::AnswerPairing => match parse_bool_arg(&params.arguments) {
+            Some(accept) => controller.answer_pairing(accept),
+            None => crate::log_malformed_command(params),
+        },
         BluetoothAction::StopDiscovery => {
             let controller = controller.clone();
             tokio::spawn(async move {

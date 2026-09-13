@@ -63,6 +63,7 @@ local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
 local updates_tooltip = require("modules.bar.indicators.updates").tooltip
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
+local bluetooth_pairing = require("modules.global.bluetooth_pairing")
 -- Not a surface. Registers the battery's OSD, low-battery notification and suspend effects once;
 -- it returns nothing to the surface list.
 require("modules.global.power_events")
@@ -91,4 +92,5 @@ return {
     modal_host,
     lock_screen,
     polkit_dialog,
+    bluetooth_pairing,
 }

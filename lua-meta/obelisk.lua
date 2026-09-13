@@ -206,6 +206,13 @@
 ---@field mac string Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
 ---@field name string The device's advertised name.
 
+---@class PairingRequest
+---What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
+---@field code? string Six-digit passkey or legacy PIN for `"confirm"` and `"display"`, else `nil`.
+---@field kind string `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair. `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the device, with nothing to answer.
+---@field mac string The device's MAC address.
+---@field name string The device's advertised name, or empty.
+
 ---@class PlayerState
 ---@field album_art_path string Absolute artwork path, or empty. `mpris:artUrl` must be a `file://` URL canonicalizing to an existing file; remote/stale URLs become empty. Held across same-track updates so covers do not blink.
 ---@field artist string `xesam:artist`, joined with `", "`; empty when absent.
@@ -316,6 +323,7 @@
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered, so always `false` without one.
 ---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
+---@field pairing_request? PairingRequest The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(accept)`.
 
 ---@class BrightnessState
 ---`obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
@@ -476,7 +484,7 @@ local BatteryCapability = {}
 ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
 
 ---@class BluetoothCapability: Capability<BluetoothState>
----@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget", ...: any)
+---@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"|"answer_pairing", ...: any)
 
 ---@class BrightnessCapability: Capability<BrightnessState>
 ---@field invoke fun(self: BrightnessCapability, command: "set", ...: any)

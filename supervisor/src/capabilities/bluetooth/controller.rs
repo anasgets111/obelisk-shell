@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
 
-use super::agent::register_agent_best_effort;
+use super::agent::{self, PromptSlot, register_agent_best_effort};
 use super::proxies::{
     Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_object_manager, subscribe_object_manager,
 };
@@ -30,6 +30,8 @@ pub struct BluetoothController {
     state: Arc<Mutex<BluetoothState>>,
     /// MAC to the action this Supervisor is running for it, drawn as each device's `busy`.
     busy: Arc<Mutex<HashMap<String, &'static str>>>,
+    /// The pairing prompt, shared with the agent that fills it.
+    prompts: PromptSlot,
     /// Signal sender used by [`clear_discovered`](Self::clear_discovered) to share the forwarders'
     /// FIFO.
     events: UnboundedSender<BluetoothSignal>,
@@ -38,7 +40,7 @@ pub struct BluetoothController {
 impl BluetoothController {
     /// Binds `org.bluez`'s `ObjectManager`, hydrates devices and the first adapter from one
     /// `GetManagedObjects()` call (ADR-0030), starts signal forwarders, and registers the
-    /// Just-Works agent. `events` is passed in because hydration starts each device forwarder.
+    /// pairing agent. `events` is passed in because hydration starts each device forwarder.
     pub async fn new(connection: zbus::Connection, events: UnboundedSender<BluetoothSignal>) -> Self {
         let object_manager = match bind_object_manager(&connection).await {
             Ok(object_manager) => Some(object_manager),
@@ -99,13 +101,15 @@ impl BluetoothController {
             spawn_object_manager_forwarder(connection.clone(), added, removed, devices.clone(), events.clone());
         }
 
-        register_agent_best_effort(&connection).await;
+        let prompts = PromptSlot::default();
+        register_agent_best_effort(&connection, prompts.clone(), devices.clone(), events.clone()).await;
 
         let controller = Self {
             adapter,
             devices,
             state: Arc::new(Mutex::new(BluetoothState::default())),
             busy: Arc::default(),
+            prompts,
             events,
         };
         // Hydrate before returning, because the forwarders above are already queueing and zbus
@@ -136,6 +140,7 @@ impl BluetoothController {
             }
             BluetoothSignal::DeviceRegistryChanged => {
                 let (connected_devices, paired_devices, discovered_devices) = self.build_device_lists().await;
+                self.clear_finished_display(&connected_devices, &paired_devices);
                 let mut state = self.state.lock().unwrap();
                 state.connected_devices = connected_devices;
                 state.paired_devices = paired_devices;
@@ -145,6 +150,12 @@ impl BluetoothController {
             BluetoothSignal::DiscoveryCleared => {
                 let mut state = self.state.lock().unwrap();
                 state.discovered_devices = Vec::new();
+                state.clone()
+            }
+            BluetoothSignal::PairingChanged => {
+                let request = self.prompts.lock().unwrap().as_ref().map(|prompt| prompt.request.clone());
+                let mut state = self.state.lock().unwrap();
+                state.pairing_request = request;
                 state.clone()
             }
         }
@@ -224,6 +235,35 @@ impl BluetoothController {
     fn resolve_device(&self, mac: &str) -> Option<(OwnedObjectPath, Device1Proxy<'static>)> {
         let guard = self.devices.lock().unwrap();
         guard.iter().find(|(_, entry)| entry.mac == mac).map(|(path, entry)| (path.clone(), entry.device.clone()))
+    }
+
+    /// `bluetooth:answer_pairing(accept)`: answers the prompt on screen. `false` on a code display
+    /// only takes it down.
+    pub fn answer_pairing(&self, accept: bool) {
+        if agent::answer(&self.prompts, accept) {
+            let _ = self.events.send(BluetoothSignal::PairingChanged);
+        }
+    }
+
+    /// Takes down a code display once its device is paired. BlueZ ends a successful passkey entry
+    /// without calling `Cancel`, so nothing else would. Checked and taken under one lock, so a
+    /// request that replaced the display in between is not the one removed.
+    fn clear_finished_display(&self, connected: &[ConnectedDevice], paired: &[PairedDevice]) {
+        let finished = {
+            let mut slot = self.prompts.lock().unwrap();
+            let done = slot.as_ref().is_some_and(|prompt| {
+                prompt.request.kind == "display"
+                    && connected
+                        .iter()
+                        .map(|d| &d.mac)
+                        .chain(paired.iter().map(|d| &d.mac))
+                        .any(|mac| *mac == prompt.request.mac)
+            });
+            if done { slot.take() } else { None }
+        };
+        if finished.is_some() {
+            let _ = self.events.send(BluetoothSignal::PairingChanged);
+        }
     }
 
     /// `bluetooth:set_enabled(en)`: writes `Adapter1.Powered`. The adapter signal forwarder
@@ -353,6 +393,7 @@ mod tests {
             devices: Arc::default(),
             state: Arc::default(),
             busy: Arc::default(),
+            prompts: Arc::default(),
             events,
         };
         (controller, receiver)
