@@ -3,12 +3,12 @@
 //! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
 //! thread like `audio::mixer`.
 //!
-//! Five forwarder tasks feed one channel: wireless APs/association, each device's state, the
-//! manager's radio switches/default route, and saved-profile changes. ADR-0082: scan-only watching
-//! left connected machines reading offline for minutes.
+//! Forwarder tasks feed one channel: wireless APs/association, each device's state, the manager's
+//! radio switches/default route, its device list, and saved-profile changes. ADR-0082: scan-only
+//! watching left connected machines reading offline for minutes.
 //!
-//! ponytail: Wi-Fi/Ethernet devices resolve once at [`NetworkController::new`]; a USB dongle added
-//! later needs a restart. Upgrade path: watch `device_added`/`device_removed` and rescan.
+//! A device added or removed after startup, such as a USB adapter, rescans the device set and
+//! restarts its watchers ([`NetworkSignal::DevicesChanged`]).
 //!
 //! ponytail: only the first Wi-Fi device from `GetAllDevices` is tracked. Multiple adapters need a
 //! device selector in `available_networks`/`scan`/`connect`; `docs/lua-api.md §2.5`
@@ -151,6 +151,8 @@ pub enum NetworkSignal {
     ScanStarted,
     /// A saved profile was added or removed, so the saved-SSID cache is stale.
     SavedChanged,
+    /// NetworkManager added or removed a device, so the device set is stale.
+    DevicesChanged,
 }
 
 /// [`NetworkController::watch_activation`]'s backstop timeout. NetworkManager normally gives up
@@ -302,8 +304,8 @@ pub struct NetworkController {
     connection: zbus::Connection,
     nm: NetworkManagerProxy<'static>,
     settings: SettingsProxy<'static>,
-    wifi: Option<WifiDevice>,
-    ethernet: Vec<EthernetDevice>,
+    /// The devices NetworkManager has now; see [`Devices`].
+    devices: Arc<Mutex<Devices>>,
     /// AP proxies kept between rebuilds, keyed by object path. They retain zbus property caches fed
     /// by `PropertiesChanged`, avoiding a match rule, `GetAll`, and unsubscribe per AP per pass.
     /// At 10 APs, rebuild time fell from 11.25ms to 0.84ms (ADR-0082).
@@ -338,46 +340,10 @@ impl NetworkController {
         let nm = NetworkManagerProxy::new(&connection).await?;
         let settings = SettingsProxy::new(&connection).await?;
 
-        let mut wifi = None;
-        let mut ethernet = Vec::new();
-        for path in nm.get_all_devices().await? {
-            let device = match bind_device(&connection, path.clone()).await {
-                Ok(device) => device,
-                Err(err) => {
-                    eprintln!("network: failed to bind device {path}: {err}");
-                    continue;
-                }
-            };
-            let device_type = match device.device_type().await {
-                Ok(device_type) => device_type,
-                Err(err) => {
-                    eprintln!("network: failed to read device_type for {path}: {err}");
-                    continue;
-                }
-            };
-            match NMDeviceType::try_from(device_type) {
-                Ok(NMDeviceType::ETHERNET) => match bind_wired(&connection, path.clone()).await {
-                    Ok(wired) => ethernet.push(EthernetDevice { path, device, wired }),
-                    Err(err) => eprintln!("network: failed to bind wired device {path}: {err}"),
-                },
-                Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind_wireless(&connection, path.clone()).await {
-                    Ok(wireless) => wifi = Some(WifiDevice { device_path: path, device, wireless }),
-                    Err(err) => eprintln!("network: failed to bind wireless device {path}: {err}"),
-                },
-                _ => {}
-            }
-        }
-
-        match &wifi {
-            Some(wifi) => {
-                spawn_wifi_forwarder(connection.clone(), wifi.wireless.clone(), events.clone());
-                spawn_device_state_forwarder(wifi.device.clone(), events.clone());
-            }
-            None => eprintln!("network: no Wi-Fi device found; scan/access-point events are disabled for this session"),
-        }
-        for device in &ethernet {
-            spawn_device_state_forwarder(device.device.clone(), events.clone());
-        }
+        // Subscribed before the first device scan, so an adapter plugged in during it is not missed.
+        spawn_device_list_forwarder(nm.clone(), events.clone()).await;
+        let (wifi, ethernet) = resolve_devices(&connection, &nm).await?;
+        let watchers = watch_devices(&connection, wifi.as_ref(), &ethernet, &events);
         spawn_manager_forwarder(nm.clone(), events.clone());
         // Subscribed before the first fill below, so a profile saved in between is not missed.
         spawn_settings_forwarder(settings.clone(), events.clone()).await;
@@ -386,8 +352,7 @@ impl NetworkController {
             connection,
             nm,
             settings,
-            wifi,
-            ethernet,
+            devices: Arc::new(Mutex::new(Devices { wifi, ethernet, watchers })),
             access_points: Arc::new(Mutex::new(HashMap::new())),
             saved_ssids: Arc::default(),
             state: Arc::new(Mutex::new(NetworkState::default())),
@@ -409,9 +374,14 @@ impl NetworkController {
                 state.scanning = true;
                 state.clone()
             }
-            NetworkSignal::ScanCompleted | NetworkSignal::Changed | NetworkSignal::SavedChanged => {
-                if signal == NetworkSignal::SavedChanged {
-                    self.refresh_saved_ssids().await;
+            NetworkSignal::ScanCompleted
+            | NetworkSignal::Changed
+            | NetworkSignal::SavedChanged
+            | NetworkSignal::DevicesChanged => {
+                match signal {
+                    NetworkSignal::SavedChanged => self.refresh_saved_ssids().await,
+                    NetworkSignal::DevicesChanged => self.refresh_devices().await,
+                    _ => {}
                 }
                 // Read D-Bus before taking the plain mutex; never hold it across an await.
                 let mut next = self.build_state().await;
@@ -437,28 +407,31 @@ impl NetworkController {
         // wired.
         let connected = self.nm.primary_connection().await.is_ok_and(|path| path.as_str() != "/");
         let wired = connected && self.nm.primary_connection_type().await.is_ok_and(|kind| kind == "802-3-ethernet");
+        let wifi = self.wifi();
         let ethernet = self.activated_ethernet().await;
-        let wifi_ip = match &self.wifi {
+        let wifi_ip = match &wifi {
             Some(wifi) => read_ipv4(&self.connection, &wifi.device).await,
             None => None,
         };
-        let ethernet_ip = match ethernet {
+        let ethernet_ip = match &ethernet {
             Some(ethernet) => read_ipv4(&self.connection, &ethernet.device).await,
             None => None,
         };
+        // Its own statement: a guard inside the literal below would live across the awaits after it.
+        let ethernet_present = !self.devices.lock().unwrap().ethernet.is_empty();
         NetworkState {
             scanning: false,
             connected,
             ssid: resolve_ssid(wired, associated),
             strength: associated.map_or(0, |ap| ap.strength),
             wifi_enabled: self.nm.wireless_enabled().await.unwrap_or_default(),
-            wifi_present: self.wifi.is_some(),
-            ethernet_present: !self.ethernet.is_empty(),
+            wifi_present: wifi.is_some(),
+            ethernet_present,
             networking_enabled: self.nm.networking_enabled().await.unwrap_or_default(),
             ethernet_enabled: ethernet.is_some(),
             wifi_ip,
             ethernet_ip,
-            ethernet_speed: match ethernet {
+            ethernet_speed: match &ethernet {
                 Some(ethernet) => ethernet.wired.speed().await.unwrap_or(0),
                 None => 0,
             },
@@ -473,8 +446,8 @@ impl NetworkController {
 
     /// The first wired device that reached `ACTIVATED`. One active cable is enough for the Ethernet
     /// tile, regardless of the number of ports.
-    async fn activated_ethernet(&self) -> Option<&EthernetDevice> {
-        for ethernet in &self.ethernet {
+    async fn activated_ethernet(&self) -> Option<EthernetDevice> {
+        for ethernet in self.ethernet() {
             match ethernet.device.state().await {
                 Ok(state) => {
                     if NMDeviceState::try_from(state) == Ok(NMDeviceState::ACTIVATED) {
@@ -487,11 +460,40 @@ impl NetworkController {
         None
     }
 
+    /// The Wi-Fi device now, cloned out so no await holds the device lock.
+    fn wifi(&self) -> Option<WifiDevice> {
+        self.devices.lock().unwrap().wifi.clone()
+    }
+
+    /// The wired devices now, cloned out like [`wifi`](Self::wifi).
+    fn ethernet(&self) -> Vec<EthernetDevice> {
+        self.devices.lock().unwrap().ethernet.clone()
+    }
+
+    /// Rescans the device set after NetworkManager added or removed a device, and restarts the
+    /// watchers. The new watchers start before the old ones are aborted, so no state change falls
+    /// in a gap; the overlap costs at most one extra rebuild.
+    async fn refresh_devices(&self) {
+        let (wifi, ethernet) = match resolve_devices(&self.connection, &self.nm).await {
+            Ok(found) => found,
+            Err(err) => {
+                eprintln!("network: failed to rescan devices: {err}");
+                return;
+            }
+        };
+        eprintln!("network: device set changed: wifi={} ethernet={}", wifi.is_some(), ethernet.len());
+        let watchers = watch_devices(&self.connection, wifi.as_ref(), &ethernet, &self.events);
+        let previous = std::mem::replace(&mut *self.devices.lock().unwrap(), Devices { wifi, ethernet, watchers });
+        for watcher in previous.watchers {
+            watcher.abort();
+        }
+    }
+
     /// Queues [`NetworkSignal::ScanStarted`] so `scanning` flips on initiation, before
     /// `RequestScan`. Only does so with Wi-Fi hardware; otherwise [`scan`](Self::scan) no-ops and
     /// `scanning` would stick at `true`.
     pub fn mark_scanning(&self) {
-        if self.wifi.is_some() {
+        if self.devices.lock().unwrap().wifi.is_some() {
             let _ = self.events.send(NetworkSignal::ScanStarted);
         }
     }
@@ -643,7 +645,7 @@ impl NetworkController {
     /// § 4.1 / ADR-0029: `false` disconnects every wired device; `true` activates each existing
     /// autoconnect profile. A device with none is a no-op; NM cannot fabricate a connection.
     pub async fn set_ethernet_enabled(&self, enabled: bool) {
-        for ethernet in &self.ethernet {
+        for ethernet in self.ethernet() {
             if enabled {
                 self.activate_autoconnect_profile(&ethernet.device, &ethernet.path).await;
             } else if let Err(err) = ethernet.device.disconnect().await {
@@ -698,7 +700,7 @@ impl NetworkController {
 
     /// § 4.2: dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
     pub async fn scan(&self) {
-        let Some(wifi) = &self.wifi else {
+        let Some(wifi) = self.wifi() else {
             eprintln!("network: scan() requested but no Wi-Fi device is present");
             return;
         };
@@ -713,7 +715,7 @@ impl NetworkController {
     /// § 4.2: re-queries, deduplicates, and caps the current AP list at 20 by strength (ADR-0029:
     /// no debounce). Returns empty, not an error, without Wi-Fi hardware.
     pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
-        let Some(wifi) = &self.wifi else {
+        let Some(wifi) = self.wifi() else {
             return Vec::new();
         };
         let active_path = wifi.wireless.active_access_point().await.ok();
@@ -909,9 +911,9 @@ impl NetworkController {
         pending: &PendingNetworkConnect,
         secret: &[u8],
     ) -> Result<OwnedObjectPath, ConnectError> {
-        let wifi = self.wifi.as_ref().ok_or(ConnectError::NoWifiDevice)?;
+        let wifi = self.wifi().ok_or(ConnectError::NoWifiDevice)?;
         let mut intent = connection_intent(&pending.ssid, pending.hidden, secret)?;
-        let result = self.activate_intent(&intent, wifi).await;
+        let result = self.activate_intent(&intent, &wifi).await;
         // Dicts borrow this plaintext PSK and are consumed now, so zeroize it explicitly
         // (ADR-0005/ADR-0014) rather than relying on Drop.
         if let Some(psk) = intent.psk.as_mut() {
@@ -1008,7 +1010,7 @@ impl NetworkController {
     /// `NetworkService.qml`'s `disconnectWifi`. NetworkManager also stops autoconnect on that
     /// device until the user joins again, so the radio does not rejoin behind the click.
     pub async fn disconnect_wifi(&self) {
-        let Some(wifi) = &self.wifi else {
+        let Some(wifi) = self.wifi() else {
             eprintln!("network: disconnect_wifi() requested but no Wi-Fi device is present");
             return;
         };
@@ -1129,7 +1131,7 @@ fn spawn_wifi_forwarder(
     connection: zbus::Connection,
     wireless: WirelessProxy<'static>,
     events: UnboundedSender<NetworkSignal>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ap_added = match wireless.receive_access_point_added().await {
             Ok(stream) => stream,
@@ -1149,7 +1151,7 @@ fn spawn_wifi_forwarder(
         let mut active_ap_changed = wireless.receive_active_access_point_changed().await;
         // The first `active_ap_changed` emission fills the property cache, so an existing
         // association is watched without a startup read.
-        let mut strength: Option<tokio::task::JoinHandle<()>> = None;
+        let mut strength: Option<AbortOnDrop> = None;
 
         loop {
             tokio::select! {
@@ -1160,9 +1162,9 @@ fn spawn_wifi_forwarder(
                     if events.send(NetworkSignal::Changed).is_err() { break; }
                 }
                 Some(change) = active_ap_changed.next() => {
-                    if let Some(handle) = strength.take() { handle.abort(); }
+                    drop(strength.take());
                     if let Ok(path) = change.get().await {
-                        strength = spawn_strength_forwarder(&connection, path, events.clone());
+                        strength = spawn_strength_forwarder(&connection, path, events.clone()).map(AbortOnDrop);
                     }
                     if events.send(NetworkSignal::Changed).is_err() { break; }
                 }
@@ -1172,7 +1174,7 @@ fn spawn_wifi_forwarder(
                 else => break,
             }
         }
-    });
+    })
 }
 
 /// Forwards the associated AP's `Strength` as [`NetworkSignal::Changed`], keeping bars current
@@ -1211,7 +1213,10 @@ fn spawn_strength_forwarder(
 /// Forwards each device's `State` as [`NetworkSignal::Changed`]. Per-device tasks cover
 /// `ethernet_enabled` and announce Wi-Fi disconnects before `ActiveAccessPoint` catches up.
 /// zbus emits the cached current value once, priming the first snapshot without a startup read.
-fn spawn_device_state_forwarder(device: DeviceProxy<'static>, events: UnboundedSender<NetworkSignal>) {
+fn spawn_device_state_forwarder(
+    device: DeviceProxy<'static>,
+    events: UnboundedSender<NetworkSignal>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state_changed = device.receive_state_changed().await;
         while state_changed.next().await.is_some() {
@@ -1219,7 +1224,7 @@ fn spawn_device_state_forwarder(device: DeviceProxy<'static>, events: UnboundedS
                 break;
             }
         }
-    });
+    })
 }
 
 /// Forwards manager-wide properties used by `NetworkState`: radio switches and the default route.
@@ -1241,6 +1246,114 @@ fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSe
                 }
                 Some(_) = primary_connection.next() => {
                     if events.send(NetworkSignal::Changed).is_err() { break; }
+                }
+                else => break,
+            }
+        }
+    });
+}
+
+/// The Wi-Fi and wired devices NetworkManager has now, with the tasks watching them. Replaced whole
+/// on [`NetworkSignal::DevicesChanged`]; callers clone devices out, so no await holds the lock.
+#[derive(Default)]
+struct Devices {
+    wifi: Option<WifiDevice>,
+    ethernet: Vec<EthernetDevice>,
+    /// Aborted when the set is replaced, so a removed device's watchers stop with it.
+    watchers: Vec<tokio::task::AbortHandle>,
+}
+
+/// Binds every Wi-Fi and wired device from `GetAllDevices`. Unreadable devices are logged and
+/// skipped.
+async fn resolve_devices(
+    connection: &zbus::Connection,
+    nm: &NetworkManagerProxy<'static>,
+) -> zbus::Result<(Option<WifiDevice>, Vec<EthernetDevice>)> {
+    let mut wifi = None;
+    let mut ethernet = Vec::new();
+    for path in nm.get_all_devices().await? {
+        let device = match bind_device(connection, path.clone()).await {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("network: failed to bind device {path}: {err}");
+                continue;
+            }
+        };
+        let device_type = match device.device_type().await {
+            Ok(device_type) => device_type,
+            Err(err) => {
+                eprintln!("network: failed to read device_type for {path}: {err}");
+                continue;
+            }
+        };
+        match NMDeviceType::try_from(device_type) {
+            Ok(NMDeviceType::ETHERNET) => match bind_wired(connection, path.clone()).await {
+                Ok(wired) => ethernet.push(EthernetDevice { path, device, wired }),
+                Err(err) => eprintln!("network: failed to bind wired device {path}: {err}"),
+            },
+            Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind_wireless(connection, path.clone()).await {
+                Ok(wireless) => wifi = Some(WifiDevice { device_path: path, device, wireless }),
+                Err(err) => eprintln!("network: failed to bind wireless device {path}: {err}"),
+            },
+            _ => {}
+        }
+    }
+    Ok((wifi, ethernet))
+}
+
+/// Starts the per-device watchers for one device set and returns their abort handles.
+fn watch_devices(
+    connection: &zbus::Connection,
+    wifi: Option<&WifiDevice>,
+    ethernet: &[EthernetDevice],
+    events: &UnboundedSender<NetworkSignal>,
+) -> Vec<tokio::task::AbortHandle> {
+    let mut watchers = Vec::new();
+    match wifi {
+        Some(wifi) => {
+            watchers
+                .push(spawn_wifi_forwarder(connection.clone(), wifi.wireless.clone(), events.clone()).abort_handle());
+            watchers.push(spawn_device_state_forwarder(wifi.device.clone(), events.clone()).abort_handle());
+        }
+        None => eprintln!("network: no Wi-Fi device found; scan and access-point events wait for one to appear"),
+    }
+    for device in ethernet {
+        watchers.push(spawn_device_state_forwarder(device.device.clone(), events.clone()).abort_handle());
+    }
+    watchers
+}
+
+/// Aborts its task when dropped. The Wi-Fi watcher holds its strength watch in one, so aborting the
+/// watcher on a device rescan stops the strength watch too; dropping a bare `JoinHandle` detaches
+/// the task instead.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Forwards NetworkManager's `DeviceAdded` and `DeviceRemoved` as
+/// [`NetworkSignal::DevicesChanged`]. Subscribes before returning, so [`NetworkController::new`]'s
+/// first device scan cannot miss an adapter plugged in during it. Its own task, so a failed
+/// subscription here leaves the radio and route watches running.
+async fn spawn_device_list_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
+    let (mut added, mut removed) = match tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed()) {
+        Ok(streams) => streams,
+        Err(err) => {
+            eprintln!("network: failed to subscribe to device changes; an adapter added later needs a restart: {err}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(_) = added.next() => {
+                    if events.send(NetworkSignal::DevicesChanged).is_err() { break; }
+                }
+                Some(_) = removed.next() => {
+                    if events.send(NetworkSignal::DevicesChanged).is_err() { break; }
                 }
                 else => break,
             }
@@ -1290,8 +1403,7 @@ mod tests {
             nm: NetworkManagerProxy::new(&connection).await.expect("binding makes no call"),
             settings: SettingsProxy::new(&connection).await.expect("binding makes no call"),
             connection,
-            wifi: None,
-            ethernet: Vec::new(),
+            devices: Arc::default(),
             access_points: Arc::default(),
             saved_ssids: Arc::default(),
             state: Arc::new(Mutex::new(NetworkState {
