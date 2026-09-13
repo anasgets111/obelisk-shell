@@ -528,10 +528,15 @@ impl App {
         // `khronos_egl::Surface` has no `Drop`; destroy it before `wl_egl_window`, or each
         // unplugged monitor/closed window leaks an EGL surface. `ensure_bound` creates both, but
         // keep the guard so a mismatch leaks rather than panics.
-        if let Some(egl) = self.egl.as_ref()
-            && let Err(err) = egl.instance.destroy_surface(egl.display, bound.egl_surface)
-        {
-            log_bind_failure(&self.surfaces[index].surface_id, "eglDestroySurface", err);
+        if let Some(egl) = self.egl.as_ref() {
+            // Unbind first. egl-wayland2 frees a destroyed surface even while current, the next
+            // `eglCreateWindowSurface` can get the same handle back, and `eglMakeCurrent` then keeps
+            // the dead one bound: the next swap failed with EGL_BAD_SURFACE and quit the Renderer.
+            // Every paint makes its own surface current again.
+            let _ = egl.instance.make_current(egl.display, None, None, None);
+            if let Err(err) = egl.instance.destroy_surface(egl.display, bound.egl_surface) {
+                log_bind_failure(&self.surfaces[index].surface_id, "eglDestroySurface", err);
+            }
         }
         // `BoundSurface`'s drop sends `wl_egl_window_destroy`.
         drop(bound);
