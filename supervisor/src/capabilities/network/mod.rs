@@ -522,9 +522,13 @@ impl NetworkController {
         *self.pending_connect.lock().unwrap() = Some(pending);
     }
 
-    /// Takes the pending intent for the `secure_submit(network, connect)` consumer.
-    pub fn take_connect_intent(&self) -> Option<PendingNetworkConnect> {
-        self.pending_connect.lock().unwrap().take()
+    /// Takes the pending intent for `secure_submit(network, connect)`, only while the prompt names
+    /// it. The frame carries no SSID, so a click that replaced the intent under an open prompt
+    /// would otherwise join, and save the key into, a network the key was never typed for.
+    pub fn take_prompted_intent(&self) -> Option<PendingNetworkConnect> {
+        let state = self.state.lock().unwrap();
+        let prompted = state.password_ssid.as_deref();
+        self.pending_connect.lock().unwrap().take_if(|pending| prompted == Some(pending.ssid.as_str()))
     }
 
     /// Decides whether a stashed `network:connect` can complete or needs a password.
@@ -563,22 +567,28 @@ impl NetworkController {
             // Log the fork: saved-profile and security facts come from different sources, so a
             // missing prompt otherwise leaves three plausible causes.
             eprintln!("network: connect {:?}: saved={saved} secure={secure}, asking for a password", pending.ssid);
-            self.request_password(&pending.ssid);
+            self.request_password(&pending);
             return;
         }
         eprintln!("network: connect {:?}: saved={saved} secure={secure}, connecting directly", pending.ssid);
-        // Re-take it because another connect may have replaced it while the lookup was on the wire.
-        if let Some(pending) = self.take_connect_intent() {
+        // Only this click's intent: another connect may have replaced it while the lookup was on the
+        // wire, and that one resolves itself.
+        let taken = self.pending_connect.lock().unwrap().take_if(|current| *current == pending);
+        if let Some(pending) = taken {
             self.connect(pending, shared::Zeroizing::new(Vec::new())).await;
         }
     }
 
-    /// Shows the password prompt and pushes it immediately. The intent stays stashed for
+    /// Shows the password prompt for `pending` and pushes it immediately, unless a newer click or a
+    /// rejected join replaced the intent during the lookup. The intent stays stashed for
     /// `secure_submit(network, connect)`.
-    fn request_password(&self, ssid: &str) {
+    fn request_password(&self, pending: &PendingNetworkConnect) {
         {
             let mut state = self.state.lock().unwrap();
-            state.password_ssid = Some(ssid.to_string());
+            if self.pending_connect.lock().unwrap().as_ref() != Some(pending) {
+                return;
+            }
+            state.password_ssid = Some(pending.ssid.clone());
             state.connect_error = None;
         }
         let _ = self.events.send(NetworkSignal::Changed);
@@ -845,7 +855,8 @@ impl NetworkController {
 
     /// Records and pushes `attempt`'s verdict, only while `attempt` is the latest, so an aborted or
     /// older join's verdict cannot land on a newer spinner. `ask_password` parks the intent again and
-    /// raises the prompt, keeping `connect_error` as the reason.
+    /// raises the prompt, keeping `connect_error` as the reason, unless a click made while the join
+    /// ran already holds the slot.
     fn finish_connect(&self, attempt: u64, pending: &PendingNetworkConnect, error: Option<String>, ask_password: bool) {
         {
             let mut state = self.state.lock().unwrap();
@@ -856,9 +867,10 @@ impl NetworkController {
             state.connecting_ssid = None;
             state.connect_error = error.map(|message| JoinError { ssid: pending.ssid.clone(), message });
             current.joined = None;
-            if ask_password {
+            let mut slot = self.pending_connect.lock().unwrap();
+            if ask_password && slot.is_none() {
                 state.password_ssid = Some(pending.ssid.clone());
-                self.stash_connect_intent(pending.clone());
+                *slot = Some(pending.clone());
             }
         }
         let _ = self.events.send(NetworkSignal::Changed);
@@ -1462,8 +1474,30 @@ mod tests {
             Some(JoinError { ssid: "home".to_string(), message: "wrong password".to_string() }),
             "the prompt says why it is back, and for which network"
         );
-        assert_eq!(controller.take_connect_intent(), Some(home()), "the typed key needs an intent to pair with");
+        assert_eq!(controller.take_prompted_intent(), Some(home()), "the typed key needs an intent to pair with");
         assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
+    }
+
+    #[tokio::test]
+    async fn a_key_typed_for_one_network_never_joins_another() {
+        let (controller, _receiver, _peer) = attempting("home", Ok).await;
+        let office = PendingNetworkConnect { ssid: "office".to_string(), hidden: false };
+
+        // The sheet asks for home, then a click on office takes the slot before Enter.
+        controller.stash_connect_intent(home());
+        controller.request_password(&home());
+        controller.stash_connect_intent(office.clone());
+        assert_eq!(controller.take_prompted_intent(), None, "the key was typed for home");
+
+        // Home's lookup finishing late raises no prompt over office's intent.
+        controller.state.lock().unwrap().password_ssid = None;
+        controller.request_password(&home());
+        assert_eq!(controller.state.lock().unwrap().password_ssid, None);
+
+        // Nor does a key rejected for home while office was clicked.
+        controller.finish_connect(0, &home(), Some("wrong password".to_string()), true);
+        assert_eq!(controller.take_prompted_intent(), None);
+        assert_eq!(*controller.pending_connect.lock().unwrap(), Some(office));
     }
 
     #[tokio::test]

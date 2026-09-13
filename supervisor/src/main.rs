@@ -454,7 +454,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == "network" && submit.action == "connect" => {
                     // ADR-0029: empty secret means open network; non-empty is the WPA-PSK password.
                     // Before the catch-all for the same ordering reason as polkit.
-                    match supervisor.capabilities.network().and_then(NetworkController::take_connect_intent) {
+                    match supervisor.capabilities.network().and_then(NetworkController::take_prompted_intent) {
                         Some(pending) => {
                             // `mem::take` gives plaintext to `NetworkController::connect`,
                             // wrapped so the spawned task scrubs it on cancellation too.
@@ -463,12 +463,12 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                                 .capabilities
                                 .network()
                                 .cloned()
-                                .expect("take_connect_intent above only answers from a live controller");
+                                .expect("take_prompted_intent above only answers from a live controller");
                             tokio::spawn(async move { controller.connect(pending, secret).await; });
                         }
                         None => {
                             eprintln!(
-                                "generation {}'s secure_submit(network, connect) arrived with no pending network connect intent; dropping",
+                                "generation {}'s secure_submit(network, connect) arrived with no intent for the network the prompt names; dropping",
                                 submit.generation_id
                             );
                             submit.secret.zeroize();
