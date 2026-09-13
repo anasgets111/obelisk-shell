@@ -65,25 +65,22 @@ fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volu
 /// Sets or toggles one direction's mute. `None` toggles using resolved `Props`; a set needs no
 /// channel count because mute carries no `channelVolumes`.
 fn set_default_muted(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, muted: Option<bool>) {
-    let Some((node_id, current)) = resolve_default(state, kind) else {
-        // A toggle needs the current value; an explicit set does not, so only the toggle waits for
-        // the first `Props`. Requiring it for both dropped a mute keypress during startup.
-        //
-        // Not a total fix: a hardware sink whose `Route` has not arrived yet still looks node-owned
-        // here, and `write_node_props` addresses the node rather than the device. That window is
-        // narrower than the one this closes, and the write is attempted rather than refused.
-        let Some(muted) = muted else {
-            eprintln!("audio: a {kind:?} mute toggle has no resolved default device to read; ignored");
-            return;
-        };
-        let Some(node_id) = resolve_default_node(state, kind) else {
-            eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
-            return;
-        };
-        write_device_volume(state, kind, node_id, None, Some(muted));
+    let Some(node_id) = resolve_default_node(state, kind) else {
+        eprintln!("audio: a {kind:?} mute has no resolved default device to write to; ignored");
         return;
     };
-    write_device_volume(state, kind, node_id, None, Some(muted.unwrap_or(!current.mute)));
+    // A toggle needs the current value; an explicit set does not, so only the toggle waits for
+    // the first `Props`. Requiring it for both dropped a mute keypress during startup.
+    //
+    // Not a total fix: a hardware sink whose `Route` has not arrived yet still looks node-owned
+    // here, and `write_node_props` addresses the node rather than the device. That window is
+    // narrower than the one this closes, and the write is attempted rather than refused.
+    let current = || state.borrow().device_entries(kind).get(&node_id)?.props.as_ref().map(|props| !props.mute);
+    let Some(muted) = muted.or_else(current) else {
+        eprintln!("audio: a {kind:?} mute toggle has no Props on node {node_id} to read; ignored");
+        return;
+    };
+    write_device_volume(state, kind, node_id, None, Some(muted));
 }
 
 /// The default node id alone, without waiting for its `Props`. A mute carries no `channelVolumes`,
@@ -102,13 +99,8 @@ fn resolve_default_node(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) ->
 /// window [`master::compute_master`] falls back to its default. Clones them out before writing
 /// because the write borrows the same `RefCell` again.
 fn resolve_default(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Option<(u32, master::RawSinkProps)> {
-    let state = state.borrow();
-    let entries = state.device_entries(kind);
-    let node_id = master::resolve_default_device(
-        state.default_name(kind),
-        entries.iter().map(|(&id, entry)| (id, entry.names.node_name.as_str())),
-    )?;
-    let current = entries.get(&node_id)?.props.clone()?;
+    let node_id = resolve_default_node(state, kind)?;
+    let current = state.borrow().device_entries(kind).get(&node_id)?.props.clone()?;
     Some((node_id, current))
 }
 
@@ -148,71 +140,66 @@ fn write_device_route(
         );
         return;
     };
-    let Some(bytes) =
-        master::serialize_props(&master::route_object(index, route.profile_device, channel_volumes, muted))
-    else {
-        eprintln!("audio: failed to serialize a Route object for device {}; ignored", route.device_id);
-        return;
-    };
-    let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
-        eprintln!("audio: serialized Route for device {} did not read back as a pod; ignored", route.device_id);
-        return;
-    };
-    let state = state.borrow();
-    let Some((device, _listener)) = state.devices.get(&route.device_id) else {
-        eprintln!("audio: device {} is not bound; cannot write its Route", route.device_id);
-        return;
-    };
-    device.set_param(pw::spa::param::ParamType::Route, 0, pod);
+    let object = master::route_object(index, route.profile_device, channel_volumes, muted);
+    with_pod(&object, format_args!("a Route object for device {}", route.device_id), |pod| {
+        let state = state.borrow();
+        let Some((device, _listener)) = state.devices.get(&route.device_id) else {
+            eprintln!("audio: device {} is not bound; cannot write its Route", route.device_id);
+            return;
+        };
+        device.set_param(pw::spa::param::ParamType::Route, 0, pod);
+    });
 }
 
 /// Sends `SPA_PARAM_Profile`, which changes a BlueZ device's codec; the new profile returns through
-/// `bind_bluez_device`'s listener. The bytes stay local for [`write_node_props`]'s reason.
+/// `bind_bluez_device`'s listener.
 fn write_bluetooth_profile(state: &Rc<RefCell<MixerState>>, device_id: u32, index: i32) {
-    let Some(bytes) = master::serialize_props(&master::profile_object(index)) else {
-        eprintln!("audio: failed to serialize a Profile object for device {device_id}; ignored");
-        return;
-    };
-    let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
-        eprintln!("audio: serialized Profile for device {device_id} did not read back as a pod; ignored");
-        return;
-    };
-    let state = state.borrow();
-    let Some((device, _listener)) = state.bluez_devices.get(&device_id) else {
-        eprintln!("audio: set_bluetooth_profile({device_id}, {index}) names no bound Bluetooth device; ignored");
-        return;
-    };
-    device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
+    with_pod(&master::profile_object(index), format_args!("a Profile object for device {device_id}"), |pod| {
+        let state = state.borrow();
+        let Some((device, _listener)) = state.bluez_devices.get(&device_id) else {
+            eprintln!("audio: set_bluetooth_profile({device_id}, {index}) names no bound Bluetooth device; ignored");
+            return;
+        };
+        device.set_param(pw::spa::param::ParamType::Profile, 0, pod);
+    });
 }
 
-/// Sends `SPA_PARAM_Props` to a stream or a node-owned sink/source. Keep serialized bytes local:
-/// `Pod::from_bytes` borrows them and `set_param` reads that borrow into C; dropping the `Vec`
-/// early would hand PipeWire a dangling pointer.
+/// Sends `SPA_PARAM_Props` to a stream or a node-owned sink/source.
 fn write_node_props(
     state: &Rc<RefCell<MixerState>>,
     node_id: u32,
     channel_volumes: Option<Vec<f32>>,
     muted: Option<bool>,
 ) {
-    let Some(bytes) = master::serialize_props(&master::props_object(channel_volumes, muted)) else {
-        eprintln!("audio: failed to serialize a Props object for node {node_id}; ignored");
+    let object = master::props_object(channel_volumes, muted);
+    with_pod(&object, format_args!("a Props object for node {node_id}"), |pod| {
+        let state = state.borrow();
+        let Some((node, _listener)) = state
+            .sink_nodes
+            .get(&node_id)
+            .or_else(|| state.source_nodes.get(&node_id))
+            .or_else(|| state.nodes.get(&node_id))
+        else {
+            eprintln!("audio: no bound node {node_id} to write Props to; ignored");
+            return;
+        };
+        node.set_param(pw::spa::param::ParamType::Props, 0, pod);
+    });
+}
+
+/// Serializes `object` and hands the pod to `send`, logging `what` when either step fails. The
+/// bytes live only in this frame: `Pod::from_bytes` borrows them and `set_param` reads that borrow
+/// into C, so dropping the `Vec` before the send would hand PipeWire a dangling pointer.
+fn with_pod(object: &pw::spa::pod::Value, what: std::fmt::Arguments, send: impl FnOnce(&pw::spa::pod::Pod)) {
+    let Some(bytes) = master::serialize_props(object) else {
+        eprintln!("audio: failed to serialize {what}; ignored");
         return;
     };
     let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
-        eprintln!("audio: serialized Props for node {node_id} did not read back as a pod; ignored");
+        eprintln!("audio: serialized {what} did not read back as a pod; ignored");
         return;
     };
-    let state = state.borrow();
-    let Some((node, _listener)) = state
-        .sink_nodes
-        .get(&node_id)
-        .or_else(|| state.source_nodes.get(&node_id))
-        .or_else(|| state.nodes.get(&node_id))
-    else {
-        eprintln!("audio: no bound node {node_id} to write Props to; ignored");
-        return;
-    };
-    node.set_param(pw::spa::param::ParamType::Props, 0, pod);
+    send(pod);
 }
 
 /// Writes `audio:set_default_sink/source(id)`. Metadata names devices by `node.name`, so an id

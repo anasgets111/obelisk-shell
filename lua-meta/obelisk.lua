@@ -64,7 +64,7 @@
 ---@class AppStream
 ---A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
 ---§ 2.4 names `id`/`name` (ADR-0053 decision 3), while ADR-0016's `pid`/`process_name` remain.
----@field id integer PipeWire registry id, the [`AudioApps`] key.
+---@field id integer PipeWire registry id, the `MixerState::apps` key.
 ---@field muted boolean § 2.4 per-app mute, from the same `Props` as `volume`.
 ---@field name? string `application.name`, if the client set one.
 ---@field pid integer `application.process.id` recorded for the owning process.
