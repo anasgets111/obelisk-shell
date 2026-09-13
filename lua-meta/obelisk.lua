@@ -127,14 +127,17 @@
 
 ---@class ConnectedDevice
 ---@field battery integer Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed), per the IDL.
----@field busy? string Same as [`DiscoveredDevice::busy`].
+---@field busy? DeviceAction Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a capability.
 ---@field mac string Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
 ---@field name string The device's advertised name.
 
+---@alias DeviceAction "pairing"|"connecting"|"disconnecting"
+---The call this Supervisor is running for a device, drawn as its `busy`.
+
 ---@class DiscoveredDevice
 ---@field blocked boolean BlueZ refuses to pair with or connect to the device until it is unblocked.
----@field busy? string `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ has no property for a call in flight, so a pair or connect started by another client or by the device itself never shows here.
+---@field busy? DeviceAction `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ has no property for a call in flight, so a pair or connect started by another client or by the device itself never shows here.
 ---@field mac string Canonical MAC address accepted by `bluetooth:pair(mac)`.
 ---@field name string Advertised name, often empty when the device broadcasts only an address.
 ---@field paired boolean Always `false`; every entry in this pool is unpaired (IDL contract).
@@ -218,15 +221,18 @@
 
 ---@class PairedDevice
 ---@field blocked boolean BlueZ refuses every connection to or from the device until it is unblocked.
----@field busy? string Same as [`DiscoveredDevice::busy`].
+---@field busy? DeviceAction Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint, the same set as [`ConnectedDevice::category`].
 ---@field mac string Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
 ---@field name string The device's advertised name.
 
+---@alias PairingKind "confirm"|"authorize"|"service"|"display"
+---What a [`PairingRequest`] asks; see [`PairingRequest::kind`].
+
 ---@class PairingRequest
 ---What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
 ---@field code? string Six-digit passkey or legacy PIN for `"confirm"` and `"display"`, else `nil`.
----@field kind string `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair. `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the device, with nothing to answer.
+---@field kind PairingKind `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair. `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the device, with nothing to answer.
 ---@field mac string The device's MAC address.
 ---@field name string The device's advertised name, or empty.
 

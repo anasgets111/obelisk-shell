@@ -11,7 +11,7 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use super::proxies::bind_agent_manager;
 use super::registry::DeviceRegistry;
-use super::{AGENT_OBJECT_PATH, BluetoothSignal, PairingRequest};
+use super::{AGENT_OBJECT_PATH, BluetoothSignal, PairingKind, PairingRequest};
 
 /// How long a newly shown request ignores a yes. A request can replace another between the user
 /// reading the card and clicking it; without the wait, a click meant for the first device accepts
@@ -39,7 +39,8 @@ pub(super) struct PendingPrompt {
 impl PendingPrompt {
     /// A code display for `mac`, shown now.
     pub(super) fn display(mac: &str) -> Self {
-        let request = PairingRequest { kind: "display".to_string(), mac: mac.to_string(), ..PairingRequest::default() };
+        let request =
+            PairingRequest { kind: PairingKind::Display, mac: mac.to_string(), name: String::new(), code: None };
         Self { request, reply: None, shown_at: Instant::now() }
     }
 }
@@ -113,7 +114,7 @@ struct BluetoothAgent {
 
 impl BluetoothAgent {
     /// Shows `kind` for an invited `device` and waits for the user.
-    async fn ask(&self, kind: &str, device: &OwnedObjectPath, code: Option<String>) -> Result<(), AgentError> {
+    async fn ask(&self, kind: PairingKind, device: &OwnedObjectPath, code: Option<String>) -> Result<(), AgentError> {
         let (reply, answered) = oneshot::channel();
         if !self.show(kind, device, code, Some(reply)).await {
             return Err(AgentError::Rejected("the device is not invited, or another request is on screen".to_string()));
@@ -132,14 +133,14 @@ impl BluetoothAgent {
     /// challenge: one dialog cannot answer two devices.
     async fn show(
         &self,
-        kind: &str,
+        kind: PairingKind,
         device: &OwnedObjectPath,
         code: Option<String>,
         reply: Option<oneshot::Sender<bool>>,
     ) -> bool {
         let mac = mac_from_path(device.as_str());
-        if kind != "service" && !(self.invited)(&mac) {
-            eprintln!("bluetooth: refused a {kind} request from {mac}: not visible and not pairing it");
+        if kind != PairingKind::Service && !(self.invited)(&mac) {
+            eprintln!("bluetooth: refused a {kind:?} request from {mac}: not visible and not pairing it");
             return false;
         }
         let proxy = self.devices.lock().unwrap().get(device).map(|entry| entry.device.clone());
@@ -147,7 +148,7 @@ impl BluetoothAgent {
             Some(proxy) => proxy.name().await.unwrap_or_default(),
             None => String::new(),
         };
-        let request = PairingRequest { kind: kind.to_string(), mac, name, code };
+        let request = PairingRequest { kind, mac, name, code };
         {
             let mut slot = self.prompts.lock().unwrap();
             let free = slot.as_ref().is_none_or(|current| current.reply.is_none() && reply.is_some());
@@ -173,7 +174,7 @@ impl BluetoothAgent {
 
     /// An error here cancels the pairing, which is right when nobody was shown the PIN.
     async fn display_pin_code(&self, device: OwnedObjectPath, pincode: String) -> Result<(), AgentError> {
-        if self.show("display", &device, Some(pincode), None).await {
+        if self.show(PairingKind::Display, &device, Some(pincode), None).await {
             Ok(())
         } else {
             Err(AgentError::Rejected("the PIN could not be shown".to_string()))
@@ -181,21 +182,21 @@ impl BluetoothAgent {
     }
 
     async fn request_confirmation(&self, device: OwnedObjectPath, passkey: u32) -> Result<(), AgentError> {
-        self.ask("confirm", &device, Some(format!("{passkey:06}"))).await
+        self.ask(PairingKind::Confirm, &device, Some(format!("{passkey:06}"))).await
     }
 
     /// BlueZ repeats this for every key typed on the device. The first call shows the code, and the
     /// rest find the slot taken by that same code.
     async fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, _entered: u16) {
-        self.show("display", &device, Some(format!("{passkey:06}")), None).await;
+        self.show(PairingKind::Display, &device, Some(format!("{passkey:06}")), None).await;
     }
 
     async fn authorize_service(&self, device: OwnedObjectPath, _uuid: String) -> Result<(), AgentError> {
-        self.ask("service", &device, None).await
+        self.ask(PairingKind::Service, &device, None).await
     }
 
     async fn request_authorization(&self, device: OwnedObjectPath) -> Result<(), AgentError> {
-        self.ask("authorize", &device, None).await
+        self.ask(PairingKind::Authorize, &device, None).await
     }
 
     async fn cancel(&self) {
@@ -331,7 +332,7 @@ mod tests {
             signal = signals.recv() => assert_eq!(signal, Some(BluetoothSignal::PairingChanged)),
         }
         let request = prompts.lock().unwrap().as_ref().expect("the request is on screen").request.clone();
-        assert_eq!(request.kind, "confirm");
+        assert_eq!(request.kind, PairingKind::Confirm);
         assert_eq!(request.code.as_deref(), Some("001234"), "a passkey keeps its leading zeros");
         assert_eq!(request.mac, MAC);
 
@@ -417,10 +418,7 @@ mod tests {
             _ = signals.recv() => {}
         }
 
-        assert_eq!(
-            prompts.lock().unwrap().as_ref().map(|prompt| prompt.request.kind.clone()).as_deref(),
-            Some("confirm")
-        );
+        assert_eq!(prompts.lock().unwrap().as_ref().map(|prompt| prompt.request.kind), Some(PairingKind::Confirm));
         assert!(answer(&prompts, Some(MAC), false, Instant::now()));
         assert!(rejected(call.await));
     }

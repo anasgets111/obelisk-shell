@@ -37,6 +37,25 @@ pub use controller::BluetoothController;
 // State shape pushed as `obelisk.bluetooth`'s StateSnapshot (docs/lua-api.md §2.6).
 // ---------------------------------------------------------------------------------------------
 
+/// The call this Supervisor is running for a device, drawn as its `busy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceAction {
+    Pairing,
+    Connecting,
+    Disconnecting,
+}
+
+/// What a [`PairingRequest`] asks; see [`PairingRequest::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingKind {
+    Confirm,
+    Authorize,
+    Service,
+    Display,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct ConnectedDevice {
     /// Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
@@ -52,7 +71,7 @@ pub struct ConnectedDevice {
     pub category: String,
     /// Same as [`DiscoveredDevice::busy`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub busy: Option<String>,
+    pub busy: Option<DeviceAction>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -67,7 +86,7 @@ pub struct PairedDevice {
     pub blocked: bool,
     /// Same as [`DiscoveredDevice::busy`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub busy: Option<String>,
+    pub busy: Option<DeviceAction>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
@@ -85,16 +104,16 @@ pub struct DiscoveredDevice {
     /// has no property for a call in flight, so a pair or connect started by another client or by
     /// the device itself never shows here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub busy: Option<String>,
+    pub busy: Option<DeviceAction>,
 }
 
 /// What the pairing agent is asking the user, drawn by `modules/global/bluetooth_pairing.lua`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PairingRequest {
     /// `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair.
     /// `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the
     /// device, with nothing to answer.
-    pub kind: String,
+    pub kind: PairingKind,
     /// The device's MAC address.
     pub mac: String,
     /// The device's advertised name, or empty.

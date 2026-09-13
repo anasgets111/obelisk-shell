@@ -12,8 +12,8 @@ use super::agent::{self, Invited, PromptSlot, register_agent_best_effort};
 use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_object_manager, subscribe_object_manager};
 use super::registry::{AdapterSlot, DeviceRegistry, adopt_adapter, register_device, spawn_object_manager_forwarder};
 use super::{
-    BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, PairedDevice,
-    class_to_category,
+    BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DeviceAction, DiscoveredDevice,
+    PairedDevice, PairingKind, class_to_category,
 };
 
 /// Proxies needed by `obelisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
@@ -28,7 +28,7 @@ pub struct BluetoothController {
     /// never held across an await.
     state: Arc<Mutex<BluetoothState>>,
     /// MAC to the action this Supervisor is running for it, drawn as each device's `busy`.
-    busy: Arc<Mutex<HashMap<String, &'static str>>>,
+    busy: Arc<Mutex<HashMap<String, DeviceAction>>>,
     /// The pairing prompt, shared with the agent that fills it.
     prompts: PromptSlot,
     /// Signal sender used by [`clear_discovered`](Self::clear_discovered) to share the forwarders'
@@ -103,14 +103,14 @@ impl BluetoothController {
         }
 
         let state = Arc::new(Mutex::new(BluetoothState::default()));
-        let busy: Arc<Mutex<HashMap<String, &'static str>>> = Arc::default();
+        let busy: Arc<Mutex<HashMap<String, DeviceAction>>> = Arc::default();
         let prompts = PromptSlot::default();
         // A device raises a prompt only while the adapter is visible or this Supervisor is pairing
         // it, so nothing in range can put cards on screen at will.
         let invited: Invited = {
             let (state, busy) = (Arc::clone(&state), Arc::clone(&busy));
             Arc::new(move |mac: &str| {
-                state.lock().unwrap().discoverable || busy.lock().unwrap().get(mac) == Some(&"pairing")
+                state.lock().unwrap().discoverable || busy.lock().unwrap().get(mac) == Some(&DeviceAction::Pairing)
             })
         };
         register_agent_best_effort(&connection, prompts.clone(), devices.clone(), invited, events.clone()).await;
@@ -220,7 +220,7 @@ impl BluetoothController {
             let paired = device.paired().await.unwrap_or(false);
             let is_connected = device.connected().await.unwrap_or(false);
             let name = device.name().await.unwrap_or_default();
-            let busy = running.get(&mac).map(|action| action.to_string());
+            let busy = running.get(&mac).copied();
             if !paired {
                 let blocked = device.blocked().await.unwrap_or(false);
                 discovered.push(DiscoveredDevice { mac, name, paired: false, blocked, busy });
@@ -244,7 +244,7 @@ impl BluetoothController {
     /// Marks `mac` as running `action` until the guard drops, pushing a rebuild on both edges so
     /// the row spins on the click. A later action replaces the label, which is how `pair` hands the
     /// row to its `connect`; the earlier guard then finds its label gone and leaves it.
-    fn mark_busy(&self, mac: &str, action: &'static str) -> BusyGuard<'_> {
+    fn mark_busy(&self, mac: &str, action: DeviceAction) -> BusyGuard<'_> {
         self.busy.lock().unwrap().insert(mac.to_string(), action);
         let _ = self.events.send(BluetoothSignal::DeviceRegistryChanged);
         BusyGuard { controller: self, mac: mac.to_string(), action }
@@ -272,7 +272,7 @@ impl BluetoothController {
         let finished = {
             let mut slot = self.prompts.lock().unwrap();
             let done = slot.as_ref().is_some_and(|prompt| {
-                prompt.request.kind == "display"
+                prompt.request.kind == PairingKind::Display
                     && connected
                         .iter()
                         .map(|d| &d.mac)
@@ -342,7 +342,7 @@ impl BluetoothController {
             eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
-        let _busy = self.mark_busy(mac, "pairing");
+        let _busy = self.mark_busy(mac, DeviceAction::Pairing);
         if let Err(err) = device.pair().await {
             eprintln!("bluetooth: pair({mac:?}) failed: {err}");
             return;
@@ -357,7 +357,7 @@ impl BluetoothController {
             eprintln!("bluetooth: connect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
-        let _busy = self.mark_busy(mac, "connecting");
+        let _busy = self.mark_busy(mac, DeviceAction::Connecting);
         if let Err(err) = device.set_trusted(true).await {
             eprintln!("bluetooth: failed to set Trusted on {mac:?}: {err}");
         }
@@ -372,7 +372,7 @@ impl BluetoothController {
             eprintln!("bluetooth: disconnect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
         };
-        let _busy = self.mark_busy(mac, "disconnecting");
+        let _busy = self.mark_busy(mac, DeviceAction::Disconnecting);
         if let Err(err) = device.disconnect().await {
             eprintln!("bluetooth: disconnect({mac:?}) failed: {err}");
         }
@@ -400,7 +400,7 @@ impl BluetoothController {
 struct BusyGuard<'a> {
     controller: &'a BluetoothController,
     mac: String,
-    action: &'static str,
+    action: DeviceAction,
 }
 
 impl Drop for BusyGuard<'_> {
@@ -413,7 +413,7 @@ impl Drop for BusyGuard<'_> {
         let _ = self.controller.events.send(BluetoothSignal::DeviceRegistryChanged);
         // A code display has no answer and BlueZ sends no `Cancel` for it, so the pairing call
         // ending, either way, is what takes it down.
-        if self.action == "pairing" && agent::clear_display(&self.controller.prompts, &self.mac) {
+        if self.action == DeviceAction::Pairing && agent::clear_display(&self.controller.prompts, &self.mac) {
             let _ = self.controller.events.send(BluetoothSignal::PairingChanged);
         }
     }
@@ -441,10 +441,10 @@ mod tests {
         let (controller, mut receiver) = controller();
         let running = |c: &BluetoothController| c.busy.lock().unwrap().get("AA").copied();
 
-        let pairing = controller.mark_busy("AA", "pairing");
-        assert_eq!(running(&controller), Some("pairing"));
-        let connecting = controller.mark_busy("AA", "connecting");
-        assert_eq!(running(&controller), Some("connecting"));
+        let pairing = controller.mark_busy("AA", DeviceAction::Pairing);
+        assert_eq!(running(&controller), Some(DeviceAction::Pairing));
+        let connecting = controller.mark_busy("AA", DeviceAction::Connecting);
+        assert_eq!(running(&controller), Some(DeviceAction::Connecting));
 
         drop(connecting);
         assert_eq!(running(&controller), None, "the connect ending clears the row");
@@ -460,7 +460,7 @@ mod tests {
         let (controller, mut receiver) = controller();
         *controller.prompts.lock().unwrap() = Some(agent::PendingPrompt::display("AA"));
 
-        drop(controller.mark_busy("AA", "pairing"));
+        drop(controller.mark_busy("AA", DeviceAction::Pairing));
 
         assert!(controller.prompts.lock().unwrap().is_none());
         let signals: Vec<BluetoothSignal> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
