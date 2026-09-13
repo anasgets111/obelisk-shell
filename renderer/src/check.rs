@@ -60,15 +60,15 @@ pub fn run(config_dir: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    /// The shipped dev config spans thirty-odd files joined by `require`, so this checks that
-    /// `obelisk check` sees what a real boot sees.
+    /// A config split across `require`d files, so `obelisk check` resolves modules as a real boot does.
     #[test]
-    fn checking_the_shipped_dev_config_reports_its_surfaces() {
-        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/obelisk");
-        let report = super::run(&config).expect("the shipped dev config must evaluate");
-        assert!(report.contains("ok,"), "{report}");
+    fn a_config_that_evaluates_reports_each_surface_it_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("modules")).unwrap();
+        std::fs::write(dir.path().join("modules/bar.lua"), "return panel { id = \"bar\", layer = \"Top\" }\n").unwrap();
+        std::fs::write(dir.path().join("shell.lua"), "local bar = require(\"modules.bar\")\nreturn { bar }\n").unwrap();
+        let report = super::run(dir.path()).expect("the config must evaluate");
+        assert!(report.contains("ok, 1 surface(s)"), "{report}");
         assert!(report.contains("panel   bar"), "the bar must be in the report:\n{report}");
     }
 

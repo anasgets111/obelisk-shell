@@ -217,9 +217,7 @@ return panel {
                 cursor = "default",
                 on_click = ui_state.close_panel,
             },
-            -- No `height`: the card is its content. `renderer/src/socket.rs`'s
-            -- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` checks
-            -- fit.
+            -- No `height`: the card is its content.
             -- A stacking child starts at its parent origin (`parse_align` defaults to `Start`); the
             -- wrapper's margin is the full horizontal placement, the card's the vertical.
             column {

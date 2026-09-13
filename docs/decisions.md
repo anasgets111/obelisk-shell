@@ -2769,6 +2769,8 @@ because replacing them seemed to require a Lua runner.
 This gives up a guard on four components exercised by a live shell. If one moves into `share/starter`,
 it becomes product and decision 3's runner is justified. Until then, engine tests test the engine.
 
+Amendment, ADR-0208: decision 4 is withdrawn; no engine test loads `dev-config`.
+
 ## 0156. A swap handshake hands back every frame it is not the reader of, because the Candidate asks for its capabilities before it signals ready
 
 On 2026-09-07 a live session locked with no PAM worker behind the lock screen. It rendered and took
@@ -4655,3 +4657,18 @@ and cursor, and keyboard focus with the `secure_submit` buffer.
 
 Rejected: splitting by size alone. A file whose tests drive only the whole pipeline gains file names
 and loses the one place its tests and its code meet.
+
+## 0208. No Rust test or comment depends on `dev-config`, because the crates are the framework and `dev-config` is one shell built on it
+
+ADR-0155 removed six component tests but kept a `require` test and the Renderer still carried six
+tests that loaded `dev-config/obelisk` and asserted its surface list, bar zones, history card and
+lock screen. A restyle of that shell failed the engine's build.
+
+1. Engine tests use inline fixtures. The seven loading tests are deleted: `check.rs` and
+   `lua/mod.rs` already cover nested `require` with tempdir fixtures, `layout/paint.rs` covers the
+   mask glyphs, and `layout/scene.rs` covers the taffy margin workaround.
+2. Comments state engine reasons. A config module, theme token or surface id from `dev-config` is
+   not a rationale for engine behaviour.
+
+Rejected: keeping the loads as smoke tests. `just check` already type-checks `dev-config` against
+`lua-meta`, and whether that shell's layout fits belongs to running it.

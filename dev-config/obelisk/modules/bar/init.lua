@@ -26,8 +26,7 @@ local right = require("modules.bar.right_side")
 -- restore the midpoint while borrowing space from each other.
 --
 -- `row` still does not shrink children to fit siblings, so an overfull left zone paints past its
--- edge. The budget follows content; `socket.rs`'s
--- `the_shipped_dev_configs_bar_zones_hold_their_modules_without_overflowing` catches it.
+-- edge. The budget follows content.
 return panel {
     id = "bar",
     layer = "Top",

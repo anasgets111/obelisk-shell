@@ -414,25 +414,6 @@ mod tests {
         output.surfaces[0].properties.get("background").unwrap().as_string().unwrap().to_string_lossy().to_string()
     }
 
-    /// Uses shipped `dev-config/obelisk/shell.lua`, split across directories. Dotted `config.theme`
-    /// requires `?` substitution with a directory component, unlike a flat fixture.
-    #[test]
-    fn require_resolves_the_nested_modules_the_shipped_dev_config_actually_splits_out() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dev-config/obelisk");
-        let loader = Loader::new(signal::DirtyFlag::new(), &dir).unwrap();
-
-        let accent: String = loader.lua().load(r#"return require("config.theme").ACCENT"#).eval().unwrap();
-        assert!(
-            accent.starts_with('#') && accent.len() == 9,
-            "the palette entry has to be a #rrggbbaa string, got `{accent}`"
-        );
-
-        // Also proves `components.panel_card` can require `config.theme` before returning.
-        let is_builder: bool =
-            loader.lua().load(r#"return type(require("components.panel_card")) == "function""#).eval().unwrap();
-        assert!(is_builder, "a component has to come back as the builder it returns");
-    }
-
     /// Because `forget_config_modules` reads `package.loaded` before every evaluation, deleting
     /// `package` affects the next reload. That failure must be reported, not silently ignored.
     #[test]
