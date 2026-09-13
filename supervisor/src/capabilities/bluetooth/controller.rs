@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
@@ -16,6 +16,12 @@ use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DeviceAction, DiscoveredDevice,
     PairedDevice, class_to_category,
 };
+
+/// How long [`BluetoothController::pair`] retries a refused `Connect`, and how often. Many headsets
+/// refuse the first one while they finish pairing. GNOME's `bluetooth-settings-widget.c` uses the
+/// same numbers (`CONNECT_TIMEOUT 3.0`, `g_timeout_add (500, ...)`).
+const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(3);
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Proxies needed by `obelisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
 /// proxy or `Arc`, so a clone can move into a `tokio::spawn` task.
@@ -362,16 +368,25 @@ impl BluetoothController {
         let busy = self.mark_busy(mac, DeviceAction::Pairing);
         self.reconcile_discovery().await;
         match device.pair().await {
-            Ok(()) => self.connect(mac).await,
+            Ok(()) => self.connect_within(mac, CONNECT_RETRY_WINDOW).await,
             Err(err) => eprintln!("bluetooth: pair({mac:?}) failed: {err}"),
         }
         drop(busy);
         self.reconcile_discovery().await;
     }
 
-    /// `bluetooth:connect(mac)`. Sets `Trusted` first, as `BluetoothService.qml` does, so the device
-    /// can reconnect on its own later without the agent authorizing each service.
+    /// `bluetooth:connect(mac)`, one attempt. A click is its own retry.
     pub async fn connect(&self, mac: &str) {
+        self.connect_within(mac, Duration::ZERO).await;
+    }
+
+    /// Connects `mac`, retrying a refused `Connect` every [`CONNECT_RETRY_INTERVAL`] until `window`
+    /// has passed. Sets `Trusted` first, as `BluetoothService.qml` does, so the device can reconnect
+    /// on its own later without the agent authorizing each service. One guard spans the retries,
+    /// so the row keeps spinning between them. ponytail: retries every error, as GNOME does, so a
+    /// device that walked out of range spins for the whole window. Upgrade path: retry only
+    /// `org.bluez.Error.Failed`.
+    async fn connect_within(&self, mac: &str, window: Duration) {
         let Some((_, device)) = self.resolve_device(mac) else {
             eprintln!("bluetooth: connect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
             return;
@@ -380,8 +395,14 @@ impl BluetoothController {
         if let Err(err) = device.set_trusted(true).await {
             eprintln!("bluetooth: failed to set Trusted on {mac:?}: {err}");
         }
-        if let Err(err) = device.connect().await {
-            eprintln!("bluetooth: connect({mac:?}) failed: {err}");
+        let deadline = tokio::time::Instant::now() + window;
+        while let Err(err) = device.connect().await {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!("bluetooth: connect({mac:?}) failed: {err}");
+                return;
+            }
+            eprintln!("bluetooth: connect({mac:?}) refused, retrying: {err}");
+            tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
         }
     }
 
@@ -440,6 +461,7 @@ impl Drop for BusyGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::registry::DeviceEntry;
     use super::*;
 
     fn controller() -> (BluetoothController, tokio::sync::mpsc::UnboundedReceiver<BluetoothSignal>) {
@@ -528,5 +550,63 @@ mod tests {
 
         controller.state.lock().unwrap().discoverable = true;
         assert!(controller.invited("BB"), "a visible adapter invites any device");
+    }
+
+    /// A `Device1` that refuses its first `refusals` `Connect` calls, counting every call.
+    struct Headset {
+        connects: Arc<std::sync::atomic::AtomicUsize>,
+        refusals: usize,
+    }
+
+    #[zbus::interface(name = "org.bluez.Device1")]
+    impl Headset {
+        async fn pair(&self) {}
+
+        async fn connect(&self) -> zbus::fdo::Result<()> {
+            if self.connects.fetch_add(1, Ordering::SeqCst) < self.refusals {
+                return Err(zbus::fdo::Error::Failed("br-connection-page-timeout".into()));
+            }
+            Ok(())
+        }
+
+        #[zbus(property)]
+        async fn trusted(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        async fn set_trusted(&mut self, _trusted: bool) {}
+    }
+
+    /// A controller tracking one [`Headset`] as `AA`, plus its `Connect` count.
+    async fn with_headset(
+        refusals: usize,
+    ) -> (BluetoothController, Arc<std::sync::atomic::AtomicUsize>, zbus::Connection, zbus::Connection) {
+        let connects = Arc::default();
+        let headset = Headset { connects: Arc::clone(&connects), refusals };
+        const PATH: &str = "/org/bluez/hci0/dev_AA";
+        let (caller, served) =
+            crate::capabilities::test_support::p2p_pair_serving(|peer| peer.serve_at(PATH, headset)).await;
+        let path = OwnedObjectPath::try_from(PATH).unwrap();
+        let device = Device1Proxy::builder(&caller).path(path.clone()).unwrap().build().await.unwrap();
+        let (controller, _receiver) = controller();
+        let entry = DeviceEntry { mac: "AA".into(), device, battery: None, forwarder: tokio::spawn(async {}) };
+        controller.devices.lock().unwrap().insert(path, entry);
+        (controller, connects, caller, served)
+    }
+
+    #[tokio::test]
+    async fn a_pair_retries_the_connect_a_headset_refuses_right_after_pairing() {
+        let (controller, connects, _caller, _served) = with_headset(1).await;
+        controller.pair("AA").await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "one refusal, then the retry connects");
+        assert!(controller.busy.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plain_connect_tries_once() {
+        let (controller, connects, _caller, _served) = with_headset(usize::MAX).await;
+        controller.connect("AA").await;
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
     }
 }

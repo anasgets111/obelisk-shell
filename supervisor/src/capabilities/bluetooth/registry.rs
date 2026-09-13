@@ -20,7 +20,7 @@ pub(super) struct DeviceEntry {
     pub(super) mac: String,
     pub(super) device: Device1Proxy<'static>,
     pub(super) battery: Option<Battery1Proxy<'static>>,
-    forwarder: JoinHandle<()>,
+    pub(super) forwarder: JoinHandle<()>,
 }
 
 pub(super) type DeviceRegistry = Arc<Mutex<HashMap<OwnedObjectPath, DeviceEntry>>>;
