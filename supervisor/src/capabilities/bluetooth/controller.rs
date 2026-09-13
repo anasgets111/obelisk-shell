@@ -102,20 +102,27 @@ impl BluetoothController {
             );
         }
 
-        let state = Arc::new(Mutex::new(BluetoothState::default()));
-        let busy: Arc<Mutex<HashMap<String, DeviceAction>>> = Arc::default();
-        let prompts = PromptSlot::default();
-        // A device raises a prompt only while the adapter is visible or this Supervisor is pairing
-        // it, so nothing in range can put cards on screen at will.
-        let invited: Invited = {
-            let (state, busy) = (Arc::clone(&state), Arc::clone(&busy));
-            Arc::new(move |mac: &str| {
-                state.lock().unwrap().discoverable || busy.lock().unwrap().get(mac) == Some(&DeviceAction::Pairing)
-            })
+        let controller = Self {
+            adapter,
+            devices,
+            state: Arc::new(Mutex::new(BluetoothState::default())),
+            busy: Arc::default(),
+            prompts: PromptSlot::default(),
+            events,
         };
-        register_agent_best_effort(&connection, prompts.clone(), devices.clone(), invited, events.clone()).await;
+        let invited: Invited = {
+            let controller = controller.clone();
+            Arc::new(move |mac: &str| controller.invited(mac))
+        };
+        register_agent_best_effort(
+            &connection,
+            controller.prompts.clone(),
+            controller.devices.clone(),
+            invited,
+            controller.events.clone(),
+        )
+        .await;
 
-        let controller = Self { adapter, devices, state, busy, prompts, events };
         // Hydrate before returning, because the forwarders above are already queueing and zbus
         // yields a cached property's current value as its stream's first item: one of them writes
         // the first snapshot a config ever sees. Each signal re-derives only its own half, so
@@ -248,6 +255,12 @@ impl BluetoothController {
         self.busy.lock().unwrap().insert(mac.to_string(), action);
         let _ = self.events.send(BluetoothSignal::DeviceRegistryChanged);
         BusyGuard { controller: self, mac: mac.to_string(), action }
+    }
+
+    /// Whether `mac` may raise a pairing prompt: the adapter is visible, or this Supervisor is
+    /// pairing that device, so nothing in range can put cards on screen at will.
+    fn invited(&self, mac: &str) -> bool {
+        self.state.lock().unwrap().discoverable || self.busy.lock().unwrap().get(mac) == Some(&DeviceAction::Pairing)
     }
 
     /// Synchronously resolves `mac` to its tracked path and `Device1` proxy. No `.await`, so the
@@ -478,5 +491,21 @@ mod tests {
 
         controller.clear_finished_display(&[], &[paired("AA")]);
         assert!(controller.prompts.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn only_a_visible_adapter_or_this_supervisors_own_pairing_invites_a_prompt() {
+        let (controller, _receiver) = controller();
+        assert!(!controller.invited("AA"), "a hidden adapter invites nobody");
+
+        let _connecting = controller.mark_busy("AA", DeviceAction::Connecting);
+        assert!(!controller.invited("AA"), "connecting is not pairing");
+
+        let _pairing = controller.mark_busy("AA", DeviceAction::Pairing);
+        assert!(controller.invited("AA"));
+        assert!(!controller.invited("BB"), "pairing one device invites only that one");
+
+        controller.state.lock().unwrap().discoverable = true;
+        assert!(controller.invited("BB"), "a visible adapter invites any device");
     }
 }
