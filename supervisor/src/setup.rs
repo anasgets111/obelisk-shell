@@ -127,7 +127,7 @@ pub fn check(config_dir: &Path) -> Result<String, String> {
         crate::generation::renderer_binary_path().map_err(|err| format!("cannot find the renderer: {err}"))?;
     let output = std::process::Command::new(&renderer)
         .env(shared::CHECK_ENV, "1")
-        .env(shared::CONFIG_DIR_ENV, config_dir)
+        .env(shared::CONFIG_ARG_ENV, config_dir)
         .output()
         .map_err(|err| format!("cannot run {}: {err}", renderer.display()))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

@@ -4672,3 +4672,10 @@ lock screen. A restyle of that shell failed the engine's build.
 
 Rejected: keeping the loads as smoke tests. `just check` already type-checks `dev-config` against
 `lua-meta`, and whether that shell's layout fits belongs to running it.
+
+## 0209. A debug build boots `dev-config` over every configured directory but `-c`
+
+Debug order: `-c`, `dev-config/obelisk`, `$OBELISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/obelisk`, then
+`$HOME/.config/obelisk`; release drops `dev-config`. `-c` sets its own `OBELISK_CONFIG_ARG`, since
+sharing `$OBELISK_CONFIG_DIR` could not tell it from the session's variable. This is ADR-0208's one
+exception, and release builds never see the path.

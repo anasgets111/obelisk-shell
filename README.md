@@ -43,7 +43,8 @@ obelisk check    # evaluate the config and exit, taking no surface
 ```
 
 The config is a directory, not a file: `require` resolves inside it, and any `.lua` file changing
-triggers a reload. `-c DIR` beats `$OBELISK_CONFIG_DIR`, which beats `$XDG_CONFIG_HOME/obelisk`.
+triggers a reload. `-c DIR` beats `$OBELISK_CONFIG_DIR`, which beats `$XDG_CONFIG_HOME/obelisk`. A debug build
+tries this repo's `dev-config/obelisk` right after `-c`.
 
 ## A config
 

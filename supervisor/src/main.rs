@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // and every Renderer, including later swap generations, read it.
     if let Some(dir) = &args.config_dir {
         // SAFETY: no runtime or thread exists yet; the PAM worker branch above returns.
-        unsafe { std::env::set_var(shared::CONFIG_DIR_ENV, dir) };
+        unsafe { std::env::set_var(shared::CONFIG_ARG_ENV, dir) };
     }
 
     match args.command {
