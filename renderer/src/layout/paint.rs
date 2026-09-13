@@ -1769,7 +1769,7 @@ mod tests {
 
     /// Focus is a `{ capability, action }` pair, so a field addressed somewhere else must not
     /// fill just because some other field is focused on the same surface. This is the same
-    /// routing rule `input::retarget_secure_submit` enforces for the bytes themselves.
+    /// routing rule `input::keyboard::retarget_secure_submit` enforces for the bytes themselves.
     #[test]
     fn a_field_addressed_to_another_capability_does_not_draw_the_focused_fields_characters() {
         let lua = Lua::new();

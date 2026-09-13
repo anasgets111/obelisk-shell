@@ -156,7 +156,7 @@ pub struct App {
     /// Advertised keyboard, kept alive and single-seat. Used only for `enter`/`leave`, the only
     /// client-visible result of `keyboard_interactivity`.
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    /// Focused surface instance id (ADR-0050); `input::focus_is_still_armed` requires a
+    /// Focused surface instance id (ADR-0050); `input::keyboard::focus_is_still_armed` requires a
     /// `secure_submit` field's declaring surface to match it.
     ///
     /// ponytail: nothing else consumes it (§ 5.2 has no `on_key`; ADR-0050 declines to invent

@@ -1,6 +1,7 @@
 //! Pointer input: `on_click` (ADR-0050), `on_drag` and `on_wheel` (ADR-0116), links, hover and the
 //! cursor.
 
+use super::keyboard::{FieldTarget, focused_field};
 use super::*;
 
 /// Mouse-wheel notch size in logical pixels (ADR-0069 decision 6): flat 39, approximating three
