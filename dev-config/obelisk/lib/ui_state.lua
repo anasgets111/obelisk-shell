@@ -128,8 +128,7 @@ local function set_bluetooth_discovery(on)
     obelisk.bluetooth:invoke(on and "start_discovery" or "stop_discovery")
 end
 
--- The MAC whose codec list is open in the bluetooth panel, or `""` for none. It is the mirror's
--- `showCodecFor`, cleared when the panel goes away as the mirror clears it on close.
+-- The MAC whose codec list is open in the bluetooth panel, or `""`; cleared when the panel closes.
 local bluetooth_codec_for = state("bluetooth_codec_for", "")
 
 local function leave_bluetooth_panel()

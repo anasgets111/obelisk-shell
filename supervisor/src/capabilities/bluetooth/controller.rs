@@ -21,8 +21,7 @@ use super::{
 /// proxy or `Arc`, so a clone can move into a `tokio::spawn` task.
 #[derive(Clone)]
 pub struct BluetoothController {
-    /// The adapter in use, filled at startup or when BlueZ adds one later and emptied when BlueZ
-    /// removes it; see `registry::adopt_adapter`.
+    /// The adapter in use, filled and emptied as BlueZ adds and removes it; see `registry::adopt_adapter`.
     adapter: AdapterSlot,
     devices: DeviceRegistry,
     /// Push state (ADR-0037), mutated only by [`handle_signal`](Self::handle_signal). The mutex is
@@ -352,10 +351,9 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:pair(mac)`, then [`connect`](Self::connect), as `BluetoothService.qml`'s
-    /// `connectAfterPairAddress` does. `Pair` returns when pairing ends, so no `Paired` watch is
-    /// needed. An unresolvable `mac` is logged and dropped, never guessed (ADR-0030). Discovery
-    /// pauses for the whole call; see [`discovery_due`](Self::discovery_due).
+    /// `bluetooth:pair(mac)`, then [`connect`](Self::connect). `Pair` returns when pairing ends, so no
+    /// `Paired` watch is needed. An unknown `mac` is logged and dropped (ADR-0030). Discovery pauses
+    /// for the call; see [`discovery_due`](Self::discovery_due).
     pub async fn pair(&self, mac: &str) {
         let Some((_, device)) = self.resolve_device(mac) else {
             eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);

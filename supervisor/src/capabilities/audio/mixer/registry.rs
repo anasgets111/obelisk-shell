@@ -510,14 +510,9 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
     state.borrow_mut().devices.insert(device_id, (device, listener));
 }
 
-/// Binds a BlueZ `Device` for its codec profiles, keyed by the MAC in `api.bluez5.address` so the
-/// Bluetooth panel can join it to `obelisk.bluetooth`. Its `Route` is never read, so Bluetooth
-/// volume keeps the node-owned write path it had before this binding existed.
-///
-/// Enumerated from `info` like [`bind_device`], for ADR-0200's reason. `Profile` is asked for after
-/// `EnumProfile` with the same sequence number, so its answer closes the enumeration and pushes one
-/// snapshot, and only when the profiles or the active one changed. A route change on every
-/// Bluetooth volume step also lands in `info`, and publishes nothing new.
+/// Binds a BlueZ `Device` for its codec profiles, keyed by MAC for the Bluetooth panel's join; its
+/// `Route` is never read. Enumerated from `info` (ADR-0200). `Profile` is asked after `EnumProfile`
+/// with the same seq, so its answer ends the enumeration and publishes only on a change.
 fn bind_bluez_device(
     state: &Rc<RefCell<MixerState>>,
     registry: &pw::registry::RegistryRc,

@@ -1,11 +1,5 @@
--- The pairing prompt for the Supervisor's `org.bluez.Agent1`. BluetoothService.qml had none: its
--- `bluetoothctl --agent NoInputNoOutput` accepted every request, which let any nearby device pair
--- while the adapter was visible.
---
--- A card at the top of the screen, sized to itself, with no scrim. A device in range can raise it,
--- so it must not cover the desktop or hold the pointer. Buttons only, so it never takes the
--- keyboard. A code to type on the device has nothing to answer, and its one button only takes the
--- prompt down.
+-- Pairing prompt for the Supervisor's `org.bluez.Agent1`. A device in range can raise it, so it is a
+-- top card with no scrim, no pointer grab and no keyboard. A code display's button only dismisses.
 local theme = require("config.theme")
 local cell = require("components.cell")
 local panel_card = require("components.panel_card")
@@ -45,9 +39,7 @@ local DETAILS = {
     display = "then press enter on the device",
 }
 
--- Answers the request showing when the click lands, by its MAC. The Supervisor ignores a yes in the
--- first moments after a request appears, so one that replaced another cannot take a click meant
--- for the first.
+-- Answers by MAC; the Supervisor ignores a yes in a request's first moments (`ACCEPT_GRACE`).
 local function answer(accept)
     return function()
         local r = request(obelisk.bluetooth:get())

@@ -126,9 +126,9 @@
 ---@field index integer Profile index, the second argument of `audio:set_bluetooth_profile(device, index)`.
 
 ---@class ConnectedDevice
----@field battery integer Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed), per the IDL.
+---@field battery integer Battery percentage, or `-1` when the device reports none.
 ---@field busy? DeviceAction Same as [`DiscoveredDevice::busy`].
----@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a capability.
+---@field category string Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`, `"phone"`, `"computer"` or `"generic"`.
 ---@field mac string Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
 ---@field name string The device's advertised name.
 
@@ -137,7 +137,7 @@
 
 ---@class DiscoveredDevice
 ---@field blocked boolean BlueZ refuses to pair with or connect to the device until it is unblocked.
----@field busy? DeviceAction `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ has no property for a call in flight, so a pair or connect started by another client or by the device itself never shows here.
+---@field busy? DeviceAction The call this Supervisor is running for the device, or `nil`. Any list can carry it, and a pair or connect started by another client never shows.
 ---@field mac string Canonical MAC address accepted by `bluetooth:pair(mac)`.
 ---@field name string Advertised name, often empty when the device broadcasts only an address.
 ---@field paired boolean Always `false`; every entry in this pool is unpaired (IDL contract).
@@ -341,14 +341,14 @@
 ---@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell. A Wayland holder has an empty `who`, because no protocol names one (ADR-0160).
 
 ---@class BluetoothState
----@field available boolean An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is inert and every write is a logged no-op.
+---@field available boolean An adapter is bound; without one every other field is inert and every write a logged no-op.
 ---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
----@field discoverable boolean Other devices can find this adapter and ask to pair; the agent asks the user before any of them does. BlueZ turns it off after `DiscoverableTimeout` (180s by default), and that change reaches this field like any other.
+---@field discoverable boolean Other devices can find this adapter and ask to pair; the agent asks first. BlueZ turns it off after `DiscoverableTimeout` (180s by default).
 ---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered, so always `false` without one.
 ---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
----@field pairing_request? PairingRequest The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(accept)`.
+---@field pairing_request? PairingRequest The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
 
 ---@class BrightnessState
 ---`obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
@@ -404,7 +404,7 @@
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
 ---@field ethernet_ip? string The first activated wired device's IPv4 address without its prefix, or `nil`.
 ---@field ethernet_present boolean At least one wired device exists, cable or not.
----@field ethernet_speed integer Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown or no wired link is activated.
+---@field ethernet_speed integer Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown.
 ---@field networking_enabled boolean Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the other fields describe a switched-off stack.
 ---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
 ---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.
@@ -412,7 +412,7 @@
 ---@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged entry the panel draws, so the bar and list agree.
 ---@field wifi_enabled boolean Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no association.
 ---@field wifi_ip? string The Wi-Fi device's IPv4 address without its prefix, or `nil` while it holds none.
----@field wifi_present boolean A Wi-Fi device exists. `wifi_enabled` alone cannot say so, because NetworkManager reports the radio switch with no hardware behind it.
+---@field wifi_present boolean A Wi-Fi device exists; NetworkManager reports `wifi_enabled` even with no hardware behind it.
 
 ---@class NotificationsState
 ---`notifications.feed`/`notifications.dnd` `StateSnapshot` payload (ADR-0033).

@@ -62,12 +62,10 @@ pub struct ConnectedDevice {
     pub mac: String,
     /// The device's advertised name.
     pub name: String,
-    /// Battery percentage, or `-1` if unsupported/unknown (no `Battery1`, or `Percentage` failed),
-    /// per the IDL.
+    /// Battery percentage, or `-1` when the device reports none.
     pub battery: i32,
-    /// Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`,
-    /// `"headset"`, `"phone"`, `"computer"`, or `"generic"`. Choose an icon; it is not a
-    /// capability.
+    /// Drawing hint from the class of device: `"keyboard"`, `"mouse"`, `"headphones"`, `"headset"`,
+    /// `"phone"`, `"computer"` or `"generic"`.
     pub category: String,
     /// Same as [`DiscoveredDevice::busy`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,10 +97,8 @@ pub struct DiscoveredDevice {
     pub paired: bool,
     /// BlueZ refuses to pair with or connect to the device until it is unblocked.
     pub blocked: bool,
-    /// `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device
-    /// runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ
-    /// has no property for a call in flight, so a pair or connect started by another client or by
-    /// the device itself never shows here.
+    /// The call this Supervisor is running for the device, or `nil`. Any list can carry it, and a
+    /// pair or connect started by another client never shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub busy: Option<DeviceAction>,
 }
@@ -125,16 +121,14 @@ pub struct PairingRequest {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothState {
-    /// An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is
-    /// inert and every write is a logged no-op.
+    /// An adapter is bound; without one every other field is inert and every write a logged no-op.
     pub available: bool,
     /// Whether the adapter is powered, so always `false` without one.
     pub enabled: bool,
     /// Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
     pub discovering: bool,
-    /// Other devices can find this adapter and ask to pair; the agent asks the user before any of
-    /// them does. BlueZ turns it off after `DiscoverableTimeout` (180s by default), and that change
-    /// reaches this field like any other.
+    /// Other devices can find this adapter and ask to pair; the agent asks first. BlueZ turns it off
+    /// after `DiscoverableTimeout` (180s by default).
     pub discoverable: bool,
     /// Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change
     /// on any rebuild. Sort before drawing.
@@ -143,7 +137,7 @@ pub struct BluetoothState {
     pub paired_devices: Vec<PairedDevice>,
     /// Unpaired devices seen by the running scan; empties when discovery stops.
     pub discovered_devices: Vec<DiscoveredDevice>,
-    /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(accept)`.
+    /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pairing_request: Option<PairingRequest>,
 }

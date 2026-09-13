@@ -166,9 +166,8 @@ fn write_device_route(
     device.set_param(pw::spa::param::ParamType::Route, 0, pod);
 }
 
-/// Sends `SPA_PARAM_Profile` to a BlueZ device, which is how its codec changes. The new active
-/// profile returns through `registry::bind_bluez_device`'s listener. Keeps the serialized bytes
-/// local for the reason [`write_node_props`] gives.
+/// Sends `SPA_PARAM_Profile`, which changes a BlueZ device's codec; the new profile returns through
+/// `bind_bluez_device`'s listener. The bytes stay local for [`write_node_props`]'s reason.
 fn write_bluetooth_profile(state: &Rc<RefCell<MixerState>>, device_id: u32, index: i32) {
     let Some(bytes) = master::serialize_props(&master::profile_object(index)) else {
         eprintln!("audio: failed to serialize a Profile object for device {device_id}; ignored");

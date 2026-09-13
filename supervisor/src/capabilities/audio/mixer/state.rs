@@ -280,9 +280,8 @@ impl BluezCard {
         }
     }
 
-    /// Ends enumeration `seq` with its `Profile` answer: the collected profiles replace the old
-    /// list, so one PipeWire stopped listing leaves it, and `index` becomes active. Returns whether
-    /// either changed, so a re-enumeration that finds the same card publishes nothing.
+    /// Ends enumeration `seq` with its `Profile` answer, replacing the list and making `index` active.
+    /// Returns whether either changed, so re-enumerating the same card publishes nothing.
     pub(super) fn finish_enumeration(&mut self, seq: i32, index: i32) -> bool {
         if seq != self.enumeration {
             return false;

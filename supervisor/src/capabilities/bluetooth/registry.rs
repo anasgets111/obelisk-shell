@@ -32,8 +32,7 @@ pub(super) struct BoundAdapter {
     forwarder: tokio::task::AbortHandle,
 }
 
-/// The one adapter slot, shared by the controller and the `ObjectManager` forwarder that fills and
-/// empties it.
+/// The one adapter slot, filled and emptied by the `ObjectManager` forwarder.
 pub(super) type AdapterSlot = Arc<Mutex<Option<BoundAdapter>>>;
 
 /// Binds `path` as the adapter unless one is already in use, starts its property forwarder, and

@@ -87,8 +87,7 @@ pub struct NetworkState {
     /// Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no
     /// association.
     pub wifi_enabled: bool,
-    /// A Wi-Fi device exists. `wifi_enabled` alone cannot say so, because NetworkManager reports
-    /// the radio switch with no hardware behind it.
+    /// A Wi-Fi device exists; NetworkManager reports `wifi_enabled` even with no hardware behind it.
     pub wifi_present: bool,
     /// At least one wired device exists, cable or not.
     pub ethernet_present: bool,
@@ -104,8 +103,7 @@ pub struct NetworkState {
     /// The first activated wired device's IPv4 address without its prefix, or `nil`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ethernet_ip: Option<String>,
-    /// Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown or no
-    /// wired link is activated.
+    /// Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown.
     pub ethernet_speed: u32,
     /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and
     /// clears when the attempt reaches a verdict or `network:abort_connect` stops it.
@@ -267,14 +265,9 @@ async fn read_access_point(
     })
 }
 
-/// `device`'s first IPv4 address without its prefix. `Ip4Config` is `/` until the device holds one.
-///
-/// The config proxy skips the property cache. Its path changes with every activation, so a cached
-/// proxy would be bound and torn down per rebuild, and one `Get` is cheaper.
-///
-/// ponytail: rebuilds follow device state, so a DHCP renewal that changes the address without a
-/// state change shows the old one until the next rebuild. Upgrade path: watch the config's
-/// `AddressData`.
+/// `device`'s first IPv4 address without its prefix, read uncached because `Ip4Config`'s path
+/// changes per activation. ponytail: a DHCP renewal without a state change shows the old address
+/// until the next rebuild. Upgrade path: watch `AddressData`.
 async fn read_ipv4(connection: &zbus::Connection, device: Option<&DeviceProxy<'static>>) -> Option<String> {
     let path = device?.ip4_config().await.ok().filter(|path| path.as_str() != "/")?;
     let config = IP4ConfigProxy::builder(connection)
@@ -348,11 +341,9 @@ pub struct NetworkController {
     ///
     /// Pruned against the live path list on each rebuild; `AccessPointRemoved` already requests it.
     access_points: Arc<Mutex<HashMap<OwnedObjectPath, AccessPointProxy<'static>>>>,
-    /// SSID bytes of every saved Wi-Fi profile, for [`AccessPointInfo::saved`]. Refreshed on
-    /// [`NetworkSignal::SavedChanged`], so a rebuild never walks `ListConnections`.
-    ///
-    /// ponytail: editing a saved profile's SSID fires neither watched signal, so the flag stays
-    /// stale until the next add or remove. Upgrade path: watch each profile's `Updated`.
+    /// Saved Wi-Fi SSIDs for [`AccessPointInfo::saved`], refreshed on
+    /// [`NetworkSignal::SavedChanged`]. ponytail: an edited profile's SSID stays stale until the next
+    /// add or remove. Upgrade path: watch each profile's `Updated`.
     saved_ssids: Arc<Mutex<HashSet<Vec<u8>>>>,
     /// `obelisk.network` push state (ADR-0037), mutated only by
     /// [`handle_signal`](Self::handle_signal).
@@ -489,12 +480,9 @@ impl NetworkController {
         self.devices.lock().unwrap().ethernet.clone()
     }
 
-    /// Rescans the device set after NetworkManager added or removed a device, and restarts the
-    /// watchers. The new watchers start before the old ones are aborted, so no state change falls
-    /// in a gap; the overlap costs at most one extra rebuild.
-    ///
-    /// Returns early when the Wi-Fi and wired devices are the ones already watched. Most additions
-    /// are veth, bridge or VPN devices, and restarting every watcher for them only costs rebuilds.
+    /// Rescans devices and restarts their watchers, new before old so no change falls in a gap.
+    /// Skips the restart when the Wi-Fi and wired paths are unchanged, as for most veth, bridge and
+    /// VPN additions.
     async fn refresh_devices(&self) {
         let (wifi, ethernet) = match resolve_devices(&self.connection, &self.nm).await {
             Ok(found) => found,
@@ -623,15 +611,9 @@ impl NetworkController {
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// `network:abort_connect()`: stops the join in flight, as `NetworkService.qml`'s
-    /// `cancelConnect` does. Clears `connecting_ssid` and advances the [`Attempt`], so the join's
-    /// late acceptance or verdict matches nothing, then stops that one join with [`stop`](Self::stop).
-    ///
-    /// The mirror called `Device.Disconnect`, guarded by `wifiOnline` because it would also tear
-    /// down a live session. Stopping only the attempt's own join needs no guard.
-    ///
-    /// No-op without an attempt. An abort that lands before NM accepts the request finds no join
-    /// yet; [`accept`](Self::accept) refuses it and `connect` stops it there.
+    /// `network:abort_connect()`: clears `connecting_ssid` and advances the [`Attempt`], so the join's
+    /// late acceptance or verdict matches nothing, then [`stop`](Self::stop)s that join. No-op without
+    /// an attempt. Before NM accepts, [`accept`](Self::accept) refuses the join and `connect` stops it.
     pub fn abort_connect(&self) {
         let in_flight = {
             let mut state = self.state.lock().unwrap();
@@ -653,9 +635,8 @@ impl NetworkController {
         }
     }
 
-    /// Stops an aborted join. A profile the join created is deleted, which NM also takes as the end
-    /// of its activation, so a cancelled first join leaves no saved key behind. A join through an
-    /// existing profile is only deactivated.
+    /// Stops an aborted join. It deletes a profile the join created, which also ends the activation
+    /// and leaves no half-typed key saved; a join through an existing profile is only deactivated.
     async fn stop(&self, in_flight: &InFlight) {
         let result = match &in_flight.created {
             Some(created) => match bind_settings_connection(&self.connection, created.clone()).await {
@@ -862,12 +843,9 @@ impl NetworkController {
         live
     }
 
-    /// Records and pushes `attempt`'s verdict. It counts only while `attempt` is the latest, so a
-    /// verdict from an aborted or older join cannot land on a newer spinner; `connect` need not
-    /// refuse overlap.
-    ///
-    /// `ask_password` parks the intent again and raises the prompt, keeping `connect_error` so the
-    /// prompt can say why it is back.
+    /// Records and pushes `attempt`'s verdict, only while `attempt` is the latest, so an aborted or
+    /// older join's verdict cannot land on a newer spinner. `ask_password` parks the intent again and
+    /// raises the prompt, keeping `connect_error` as the reason.
     fn finish_connect(&self, attempt: u64, pending: &PendingNetworkConnect, error: Option<String>, ask_password: bool) {
         {
             let mut state = self.state.lock().unwrap();
@@ -886,14 +864,9 @@ impl NetworkController {
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// Watches one activation in the background.
-    ///
-    /// A rejected key reopens the password prompt, as `NetworkService.qml`'s `connectFailed`
-    /// re-expands the row. Without it every later click reuses the saved profile's bad key, because
-    /// a saved profile connects without asking, and forget is the only way out.
-    ///
-    /// 802.1X profiles are left out: `activate_intent` never merges a typed PSK into one, so the
-    /// prompt would loop.
+    /// Watches one activation in the background. A rejected key reopens the password prompt, or every
+    /// later click would reuse the saved bad key. Not for 802.1X, whose profile never takes a typed
+    /// PSK, so the prompt would loop.
     fn watch_activation(&self, attempt: u64, active: OwnedObjectPath, pending: PendingNetworkConnect) {
         let controller = self.clone();
         tokio::spawn(async move {
@@ -1059,9 +1032,8 @@ impl NetworkController {
         *self.saved_ssids.lock().unwrap() = ssids;
     }
 
-    /// `network:disconnect_wifi()`: `Device.Disconnect` on the Wi-Fi device, as
-    /// `NetworkService.qml`'s `disconnectWifi`. NetworkManager also stops autoconnect on that
-    /// device until the user joins again, so the radio does not rejoin behind the click.
+    /// `network:disconnect_wifi()`: `Device.Disconnect` on the Wi-Fi device. NetworkManager also stops
+    /// autoconnect there until the user joins again, so the radio does not rejoin behind the click.
     pub async fn disconnect_wifi(&self) {
         let Some(wifi) = self.wifi() else {
             eprintln!("network: disconnect_wifi() requested but no Wi-Fi device is present");
@@ -1377,10 +1349,7 @@ fn watch_devices(
     watchers
 }
 
-/// Forwards NetworkManager's `DeviceAdded` and `DeviceRemoved` as
-/// [`NetworkSignal::DevicesChanged`]. Subscribes before returning, so [`NetworkController::new`]'s
-/// first device scan cannot miss an adapter plugged in during it. Its own task, so a failed
-/// subscription here leaves the radio and route watches running.
+/// Forwards `DeviceAdded` and `DeviceRemoved` as [`NetworkSignal::DevicesChanged`]; subscribes first.
 async fn spawn_device_list_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     match tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed()) {
         Ok((added, removed)) => {
@@ -1392,9 +1361,7 @@ async fn spawn_device_list_forwarder(nm: NetworkManagerProxy<'static>, events: U
     }
 }
 
-/// Forwards `Settings`' `NewConnection` and `ConnectionRemoved` as [`NetworkSignal::SavedChanged`].
-/// Subscribes before returning, so [`NetworkController::new`]'s first cache fill cannot race a
-/// profile saved in the gap.
+/// Forwards profile additions and removals as [`NetworkSignal::SavedChanged`]; subscribes first.
 async fn spawn_settings_forwarder(settings: SettingsProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     match tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed()) {
         Ok((added, removed)) => forward(added.map(drop).merge(removed.map(drop)), NetworkSignal::SavedChanged, events),

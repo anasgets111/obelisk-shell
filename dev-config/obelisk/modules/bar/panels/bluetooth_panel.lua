@@ -1,12 +1,5 @@
--- Mirrors BluetoothPanel.qml: radio switch, then paired and discovered devices in named sections.
---
--- Discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` keeps an empty string.
--- Connected rows show battery, disconnect and forget. Paired rows reconnect on click and show
--- forget. Available rows fall back to MAC and show pair.
---
--- A connected audio device's codecs come from `obelisk.audio`'s `bluetooth`, joined by MAC.
--- Clicking its row lists them, the mirror's codec picker. Discovery runs while the panel shows
--- (`lib/ui_state.lua`); the scan tile still stops or restarts it.
+-- Mirrors BluetoothPanel.qml. A connected audio device's codecs come from `obelisk.audio`'s
+-- `bluetooth`, joined by MAC. Discovery runs while the panel shows (`lib/ui_state.lua`).
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -132,17 +125,14 @@ local function active_codec(card)
     end
 end
 
--- Paired and available rows share one list so neither section must guess the other's extent. It is
--- empty while the radio is off, matching the mirror's `visible: root.active && ...`. Connected
--- devices lead the paired section, as the mirror's sort puts them. A row keeps its key across
--- connect and disconnect, so it changes in place rather than leaving and arriving.
+-- Paired and available rows share one list, empty while the radio is off. A row keeps its key
+-- across connect and disconnect, so it changes in place rather than leaving and arriving.
 local rows = computed({ obelisk.bluetooth, obelisk.audio, ui.bluetooth_codec_for }, function(b, a, open_for)
     local out = {}
     if not enabled(b) then
         return out
     end
-    -- An open codec list follows its device row as rows of its own, so the list keeps one flat
-    -- source rather than a row that grows.
+    -- An open codec list follows its device as rows of its own, keeping one flat source.
     local function add(devices, status)
         for _, device in ipairs(devices) do
             local card = status == "connected" and codec_card(a, device.mac) or nil
@@ -179,14 +169,12 @@ local rows = computed({ obelisk.bluetooth, obelisk.audio, ui.bluetooth_codec_for
     return out
 end)
 
--- One shared always-on signal for every busy row's spinner. `itemfn` runs on each push, and a
--- signal minted per row there would grow the registry for the life of the session.
+-- One always-on signal for every busy spinner; one minted per row in `itemfn` would leak.
 local SPINNING = obelisk.bluetooth:map(function()
     return true
 end)
 
--- The mirror's `busy` row: a spinner in place of the actions, the action as the subtitle, and no
--- click, so a second pair or connect cannot start over the first.
+-- The mirror's `busy` row. No click, so a second pair or connect cannot start over the first.
 local function busy_row(device)
     return panel_row {
         slot = "bluetooth-device-" .. tostring(device.mac),
@@ -197,8 +185,7 @@ local function busy_row(device)
     }
 end
 
--- One codec under its device, the mirror's codec `PanelRow`: the codec as the title, PipeWire's
--- description under it, the active one selected. Picking another switches and closes the list.
+-- One codec under its device; picking another switches to it and closes the list.
 local function codec_row(item)
     local option = item.option
     local active = option.index == item.card.active
@@ -244,10 +231,7 @@ local function device_row(item)
             obelisk.bluetooth:invoke("forget", device.mac)
         end, { slot = "bluetooth-forget-" .. tostring(device.mac), tint = theme.RED })
     end
-    -- Two rows are buttons. An unblocked paired row connects, the mirror's `canConnect`, and a
-    -- connected row with codecs opens its codec list, the mirror's `canPickCodec`. Other rows act
-    -- through their icons and the word "pair". A blocked row says so, the mirror's `statusText`,
-    -- and offers nothing BlueZ would refuse.
+    -- A blocked row offers nothing BlueZ would refuse.
     local subtitle = nil
     if item.status == "connected" then
         local codec = active_codec(item.card)
@@ -302,8 +286,7 @@ local body = {
             },
         },
     },
-    -- The mirror's two tiles. "visible" lets other devices find this one, and the agent asks before
-    -- any of them pairs (`modules/global/bluetooth_pairing.lua`). "scan" is discovery.
+    -- "visible" lets devices find this one, and the agent asks before any pairs. "scan" is discovery.
     row {
         width = "Fill",
         spacing = theme.spacing.xs,

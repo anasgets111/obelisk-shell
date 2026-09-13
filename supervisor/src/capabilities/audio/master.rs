@@ -236,9 +236,8 @@ pub fn extract_profile(value: &Value) -> Option<Profile> {
     Some(Profile { index: index?, name, description: description?, available })
 }
 
-/// The codec a BlueZ profile name carries after its role, e.g. `"AAC"` from `a2dp-sink-aac`, or
-/// `None` for a name with no codec, such as `off` or a bare `a2dp-sink`. Read first because the
-/// name is never translated, where the description is.
+/// The codec after a BlueZ profile name's role, e.g. `"AAC"` from `a2dp-sink-aac`, or `None` for
+/// `off` or a bare `a2dp-sink`. Read before the description because the name is never translated.
 pub fn codec_from_name(name: &str) -> Option<String> {
     let codec = ["a2dp-sink-", "a2dp-duplex-", "headset-head-unit-", "bap-sink-", "bap-duplex-"]
         .iter()

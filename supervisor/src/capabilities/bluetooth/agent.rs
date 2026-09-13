@@ -1,5 +1,4 @@
-//! Hand-written `org.bluez.Agent1`. Pairing waits for the user's answer through
-//! `obelisk.bluetooth`'s `pairing_request`, where ADR-0030's agent accepted every request itself.
+//! Hand-written `org.bluez.Agent1`; pairing waits for the user's answer in `pairing_request`.
 //! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::sync::{Arc, Mutex};
@@ -13,9 +12,8 @@ use super::proxies::bind_agent_manager;
 use super::registry::DeviceRegistry;
 use super::{AGENT_OBJECT_PATH, BluetoothSignal, PairingKind, PairingRequest};
 
-/// How long a newly shown request ignores a yes. A request can replace another between the user
-/// reading the card and clicking it; without the wait, a click meant for the first device accepts
-/// the second.
+/// How long a newly shown request ignores a yes, so a click meant for a request that was just
+/// replaced cannot accept the one that replaced it.
 pub(super) const ACCEPT_GRACE: Duration = Duration::from_millis(750);
 
 /// `org.bluez.Error.Rejected` as the D-Bus error reply; `zbus::fdo::Error::Failed` has the wrong
@@ -37,7 +35,6 @@ pub(super) struct PendingPrompt {
 
 #[cfg(test)]
 impl PendingPrompt {
-    /// A code display for `mac`, shown now.
     pub(super) fn display(mac: &str) -> Self {
         let request =
             PairingRequest { kind: PairingKind::Display, mac: mac.to_string(), name: String::new(), code: None };
@@ -48,8 +45,7 @@ impl PendingPrompt {
 /// One prompt at a time. The agent fills it; [`answer`] and [`clear_display`] empty it.
 pub(super) type PromptSlot = Arc<Mutex<Option<PendingPrompt>>>;
 
-/// Whether a device may raise a prompt now, keyed by MAC. The controller answers it from the
-/// adapter's `discoverable` and its own pairing calls.
+/// Whether the device with this MAC may raise a prompt now; `BluetoothController::invited` answers.
 pub(super) type Invited = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Answers and takes down the prompt on screen. `mac` must name the device it is for; `None`, from
@@ -91,20 +87,14 @@ fn mac_from_path(path: &str) -> String {
     path.rsplit('/').next().and_then(|leaf| leaf.strip_prefix("dev_")).unwrap_or(path).replace('_', ":")
 }
 
-/// `org.bluez.Agent1`, the sole pairing agent for this session.
+/// `org.bluez.Agent1`, this session's only pairing agent. Only an invited device (the adapter is
+/// visible, or this Supervisor is pairing it) raises a prompt; a paired device's `"service"` request
+/// always asks.
 ///
-/// Numeric comparison and an incoming pairing wait for the user, and a code to type on the device
-/// is shown with nothing to answer, but only for an invited device: the adapter is visible, or this
-/// Supervisor is pairing it. A service request from an already paired, untrusted device always
-/// asks.
-///
-/// ponytail: `RequestPinCode` and `RequestPasskey` are rejected. Answering them needs a text field
-/// this prompt does not have, so a legacy device that makes the user type a PIN on the host cannot
-/// pair. Upgrade path: a `secure_submit` field like the network sheet's.
-///
-/// ponytail: pairing started by another client that registered no agent of its own is refused
-/// while the adapter is hidden, because only this Supervisor's own calls count as an invitation.
-/// Upgrade path: invite a device whose `Device1.Pairing` property is already true.
+/// ponytail: `RequestPinCode` and `RequestPasskey` are rejected, since the card has no text field.
+/// Upgrade path: a `secure_submit` field. ponytail: pairing by another client with no agent of its
+/// own is refused while the adapter is hidden. Upgrade path: invite a device whose `Device1.Pairing`
+/// is already true.
 struct BluetoothAgent {
     prompts: PromptSlot,
     devices: DeviceRegistry,
@@ -125,12 +115,9 @@ impl BluetoothAgent {
         }
     }
 
-    /// Puts the request on screen and returns whether it went up. It does not go up for an
-    /// uninvited device, except a `"service"` request, whose device is already paired.
-    ///
-    /// A request BlueZ waits on replaces a code display, which has no answer to lose and gets no
-    /// `Cancel`. Anything else already showing keeps the screen, as polkit's agent refuses a second
-    /// challenge: one dialog cannot answer two devices.
+    /// Puts the request on screen and returns whether it went up. An uninvited device's request
+    /// stays down unless it is `"service"`. Nothing replaces a prompt already showing, except that a
+    /// request BlueZ waits on replaces a code display, which has no answer to lose.
     async fn show(
         &self,
         kind: PairingKind,
@@ -208,13 +195,9 @@ impl BluetoothAgent {
     async fn release(&self) {}
 }
 
-/// Exports [`BluetoothAgent`], registers it as `"DisplayYesNo"`, and requests it as the system
-/// default, so pairing started elsewhere (e.g. `bluetoothctl`) asks here too. `"NoInputNoOutput"`
-/// made BlueZ downgrade every pairing to Just Works; `"DisplayYesNo"` lets it run numeric
-/// comparison.
-///
-/// Logs and continues every step: absent `bluetoothd` must not take down the Supervisor. The object
-/// is exported before `RegisterAgent`, so an immediate callback finds a live object.
+/// Exports [`BluetoothAgent`] and registers it as the system default `"DisplayYesNo"` agent, so
+/// pairing started elsewhere asks here too and BlueZ runs numeric comparison, not Just Works. Each
+/// step logs and continues, since a missing `bluetoothd` must not take down the Supervisor.
 pub(super) async fn register_agent_best_effort(
     connection: &zbus::Connection,
     prompts: PromptSlot,

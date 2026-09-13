@@ -111,11 +111,8 @@ obelisk.network:on_change(function(n, previous)
     end
 end)
 
--- The mirror's `section.property: "group"`. Saved networks come first, then the rest. The joined
--- network is saved by construction and leads its section.
---
--- Within a section, `wifiAps`' sort. Tiers, not raw strength, so scan-to-scan jitter cannot swap
--- rows under the pointer.
+-- Saved networks (the joined one included) first, then the rest. Within each, `wifiAps`' sort by
+-- tier, not raw strength, so scan jitter cannot swap rows under the pointer.
 local function before(left, right)
     if left.ap.active ~= right.ap.active then
         return left.ap.active
