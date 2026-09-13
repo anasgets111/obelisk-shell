@@ -48,13 +48,26 @@ impl From<zbus::Error> for ConnectError {
 ///
 /// Other reasons are wired, modem, or dependency failures. A Wi-Fi row cannot act on them, so they
 /// collapse to "connection failed".
-pub(super) fn connect_error_text(reason: u32) -> &'static str {
+fn connect_error_text(reason: u32) -> &'static str {
     match NMDeviceStateReason::try_from(reason) {
         Ok(NMDeviceStateReason::NO_SECRETS) => "wrong password",
         Ok(NMDeviceStateReason::SUPPLICANT_TIMEOUT) => "connection timed out",
         Ok(NMDeviceStateReason::SSID_NOT_FOUND) => "network not found",
         Ok(NMDeviceStateReason::USER_REQUESTED) => "disconnected",
         _ => "connection failed",
+    }
+}
+
+/// An activation's verdict: the error text, and whether NM rejected the key. `outcome` is `None`
+/// when the Supervisor's own ceiling ran out, else `activation_outcome`'s result.
+pub(super) fn activation_verdict(outcome: Option<Result<(), Option<u32>>>) -> (Option<String>, bool) {
+    match outcome {
+        None => (Some("connection timed out".to_string()), false),
+        Some(Ok(())) => (None, false),
+        Some(Err(reason)) => (
+            Some(reason.map_or("connection failed", connect_error_text).to_string()),
+            reason == Some(NMDeviceStateReason::NO_SECRETS as u32),
+        ),
     }
 }
 
@@ -569,12 +582,17 @@ mod tests {
     }
 
     #[test]
-    fn connect_error_text_names_the_device_reason_a_wrong_password_arrives_as() {
+    fn only_the_device_reason_for_a_bad_key_reopens_the_prompt() {
         // NM fails the device with `NO_SECRETS` for a bad PSK; the active connection only says
         // `DEVICE_DISCONNECTED`.
-        assert_eq!(connect_error_text(NMDeviceStateReason::NO_SECRETS as u32), "wrong password");
-        assert_eq!(connect_error_text(NMDeviceStateReason::SUPPLICANT_TIMEOUT as u32), "connection timed out");
-        assert_eq!(connect_error_text(NMDeviceStateReason::SSID_NOT_FOUND as u32), "network not found");
+        let failed = |reason: NMDeviceStateReason| activation_verdict(Some(Err(Some(reason as u32))));
+        let verdict = |error: &str, rejected_key| (Some(error.to_string()), rejected_key);
+        assert_eq!(failed(NMDeviceStateReason::NO_SECRETS), verdict("wrong password", true));
+        assert_eq!(failed(NMDeviceStateReason::SUPPLICANT_TIMEOUT), verdict("connection timed out", false));
+        assert_eq!(failed(NMDeviceStateReason::SSID_NOT_FOUND), verdict("network not found", false));
+        assert_eq!(activation_verdict(Some(Err(None))), verdict("connection failed", false));
+        assert_eq!(activation_verdict(None), verdict("connection timed out", false));
+        assert_eq!(activation_verdict(Some(Ok(()))), (None, false));
     }
 
     #[test]
