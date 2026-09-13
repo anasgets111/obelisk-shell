@@ -277,7 +277,8 @@ pub fn profile_object(index: i32) -> Value {
 }
 
 /// The MAC in WirePlumber's BlueZ card name, `bluez_card.AA_BB_CC_DD_EE_FF` to
-/// `AA:BB:CC:DD:EE:FF`, for a device whose global props do not carry `api.bluez5.address`.
+/// `AA:BB:CC:DD:EE:FF`. The card's global props never carry `api.bluez5.address`: `impl-device.c`
+/// copies only its `global_keys` (`device.name` among them) onto a device global.
 pub fn mac_from_card_name(name: &str) -> Option<String> {
     let address = name.strip_prefix("bluez_card.")?;
     (address.len() == 17).then(|| address.replace('_', ":"))

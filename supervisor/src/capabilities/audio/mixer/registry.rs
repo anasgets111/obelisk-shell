@@ -521,12 +521,7 @@ fn bind_bluez_device(
     registry: &pw::registry::RegistryRc,
     obj: &GlobalObject<&DictRef>,
 ) {
-    // `api.bluez5.address` may be missing from a global's props. The card name WirePlumber gives
-    // every BlueZ device holds the same address, so it stands in.
-    let props = obj.props;
-    let Some(mac) = props
-        .and_then(|props| props.get_prop("api.bluez5.address").map(str::to_string))
-        .or_else(|| props.and_then(|props| props.get_prop(*keys::DEVICE_NAME)).and_then(master::mac_from_card_name))
+    let Some(mac) = obj.props.and_then(|props| props.get_prop(*keys::DEVICE_NAME)).and_then(master::mac_from_card_name)
     else {
         eprintln!("audio: Bluetooth device {} names no address; its codecs are not tracked", obj.id);
         return;

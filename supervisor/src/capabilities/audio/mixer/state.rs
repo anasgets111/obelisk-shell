@@ -229,7 +229,7 @@ pub struct AudioDevice {
 pub struct BluetoothCodecs {
     /// PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device, index)`.
     pub device: u32,
-    /// MAC address from `api.bluez5.address`, spelled as `obelisk.bluetooth` spells it.
+    /// MAC address from WirePlumber's `bluez_card.` name, spelled as `obelisk.bluetooth` spells it.
     pub mac: String,
     /// Available profiles that name a codec, in profile index order.
     pub codecs: Vec<CodecProfile>,

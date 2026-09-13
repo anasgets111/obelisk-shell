@@ -117,7 +117,7 @@
 ---@field active? integer `index` of the active profile, or `nil` before PipeWire reports it or when it names no codec.
 ---@field codecs CodecProfile[] Available profiles that name a codec, in profile index order.
 ---@field device integer PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device, index)`.
----@field mac string MAC address from `api.bluez5.address`, spelled as `obelisk.bluetooth` spells it.
+---@field mac string MAC address from WirePlumber's `bluez_card.` name, spelled as `obelisk.bluetooth` spells it.
 
 ---@class CodecProfile
 ---One entry of [`BluetoothCodecs::codecs`].
