@@ -344,6 +344,7 @@ impl Supervisor {
                 self.authoritative = Authoritative { generation_id: replacement_generation_id, child };
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
+                self.capabilities.forget_panels();
                 // Registration replays every `last_snapshots` entry via `hydrate`.
                 if was_locked {
                     // ADR-0058 decision 4: the lock object died; `active` is stale. `RendererLost`
@@ -494,6 +495,7 @@ impl Supervisor {
                 if let Some(idle) = self.capabilities.idle() {
                     idle.reset_registrations(superseded_generation_id).await;
                 }
+                self.capabilities.forget_panels();
             }
             Err(failure) => {
                 // The candidate was reaped before this branch. Its deferred StartCapability and

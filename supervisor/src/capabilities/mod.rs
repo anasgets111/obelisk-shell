@@ -332,6 +332,19 @@ impl Capabilities {
         self.network.as_ref()
     }
 
+    /// Drops what a departed generation's open panels asked for. Its replacement starts with every
+    /// panel closed (named state survives only an in-place reload), so nothing would send the
+    /// Bluetooth discovery stop or the Wi-Fi prompt cancel the old one owed, and discovery ran for
+    /// the rest of the session.
+    pub fn forget_panels(&self) {
+        if let Some(bluetooth) = &self.bluetooth {
+            bluetooth.set_discovery(false);
+        }
+        if let Some(network) = &self.network {
+            network.cancel_connect();
+        }
+    }
+
     /// ADR-0070 lazy start: inline await (decision 4), re-entrant across generation swaps (decision
     /// 3), with each arm a no-op after construction.
     pub async fn start(&mut self, capability: Capability) {
