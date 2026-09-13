@@ -276,10 +276,6 @@ pub(super) fn merge_psk<'a>(
     Some(merged)
 }
 
-/// `network:set_networking_enabled(en)`'s `arguments: [en]`. Defined once in `dbus` (shared with
-/// `bluetooth::parse_bool_arg`) and re-exported here.
-pub use crate::capabilities::parse_bool_arg;
-
 /// `network:connect(ssid, hidden)`'s `arguments: [ssid, hidden]`.
 pub fn parse_connect_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
     let ssid = arguments.first()?.as_str()?.to_string();
@@ -631,18 +627,6 @@ mod tests {
         // `MODEM_FAILED` is a modem reason; 255 is not a reason at all.
         assert_eq!(connect_error_text(NMDeviceStateReason::MODEM_FAILED as u32), "connection failed");
         assert_eq!(connect_error_text(255), "connection failed");
-    }
-
-    #[test]
-    fn parse_bool_arg_reads_the_first_argument() {
-        assert_eq!(parse_bool_arg(&[serde_json::json!(true)]), Some(true));
-        assert_eq!(parse_bool_arg(&[serde_json::json!(false)]), Some(false));
-    }
-
-    #[test]
-    fn parse_bool_arg_rejects_a_malformed_shape() {
-        assert_eq!(parse_bool_arg(&[]), None);
-        assert_eq!(parse_bool_arg(&[serde_json::json!("yes")]), None);
     }
 
     #[test]

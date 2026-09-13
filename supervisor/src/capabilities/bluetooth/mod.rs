@@ -200,10 +200,6 @@ fn class_to_category(class: u32) -> &'static str {
     }
 }
 
-/// `bluetooth:set_enabled(en)`'s `arguments: [en]`, shared with `network::parse_bool_arg` and
-/// re-exported so existing `bluetooth::parse_bool_arg` callers stay unchanged.
-pub use crate::capabilities::parse_bool_arg;
-
 /// `bluetooth:pair`/`connect`/`disconnect`/`forget`'s `arguments: [mac]`.
 pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
@@ -237,18 +233,20 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<BluetoothAction>(params) else { return };
     match action {
-        BluetoothAction::SetEnabled | BluetoothAction::SetDiscoverable => match parse_bool_arg(&params.arguments) {
-            Some(on) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    match action {
-                        BluetoothAction::SetEnabled => controller.set_enabled(on).await,
-                        _ => controller.set_discoverable(on).await,
-                    }
-                });
+        BluetoothAction::SetEnabled | BluetoothAction::SetDiscoverable => {
+            match crate::capabilities::parse_bool_arg(&params.arguments) {
+                Some(on) => {
+                    let controller = controller.clone();
+                    tokio::spawn(async move {
+                        match action {
+                            BluetoothAction::SetEnabled => controller.set_enabled(on).await,
+                            _ => controller.set_discoverable(on).await,
+                        }
+                    });
+                }
+                None => crate::log_malformed_command(params),
             }
-            None => crate::log_malformed_command(params),
-        },
+        }
         // Not spawned: the intent is stored in dispatch order, so a quick start then stop ends
         // wanting none. The reconcile they trigger is spawned.
         BluetoothAction::StartDiscovery => {
@@ -354,18 +352,6 @@ mod tests {
     }
 
     // ---- arg parsers ----
-
-    #[test]
-    fn parse_bool_arg_reads_the_first_argument() {
-        assert_eq!(parse_bool_arg(&[serde_json::json!(true)]), Some(true));
-        assert_eq!(parse_bool_arg(&[serde_json::json!(false)]), Some(false));
-    }
-
-    #[test]
-    fn parse_bool_arg_rejects_a_malformed_shape() {
-        assert_eq!(parse_bool_arg(&[]), None);
-        assert_eq!(parse_bool_arg(&[serde_json::json!("yes")]), None);
-    }
 
     #[test]
     fn parse_mac_arg_reads_the_first_argument() {

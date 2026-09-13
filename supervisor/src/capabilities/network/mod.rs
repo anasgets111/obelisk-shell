@@ -37,7 +37,7 @@ use connection::{
     ConnectionIntent, access_point_is_secure, activation_verdict, build_connection_dict, connection_intent,
     connection_wants_autoconnect, dedup_and_top20, merge_psk, profile_ssid, resolve_band, resolve_ssid,
 };
-pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
+pub use connection::{parse_connect_args, parse_ssid_arg};
 
 /// One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
 /// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
@@ -1068,33 +1068,21 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<NetworkAction>(params) else { return };
     match action {
-        NetworkAction::SetNetworkingEnabled => match parse_bool_arg(&params.arguments) {
-            Some(enabled) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set_networking_enabled(enabled).await;
-                });
+        NetworkAction::SetNetworkingEnabled | NetworkAction::SetWifiEnabled | NetworkAction::SetEthernetEnabled => {
+            match crate::capabilities::parse_bool_arg(&params.arguments) {
+                Some(enabled) => {
+                    let controller = controller.clone();
+                    tokio::spawn(async move {
+                        match action {
+                            NetworkAction::SetNetworkingEnabled => controller.set_networking_enabled(enabled).await,
+                            NetworkAction::SetWifiEnabled => controller.set_wifi_enabled(enabled).await,
+                            _ => controller.set_ethernet_enabled(enabled).await,
+                        }
+                    });
+                }
+                None => crate::log_malformed_command(params),
             }
-            None => crate::log_malformed_command(params),
-        },
-        NetworkAction::SetWifiEnabled => match parse_bool_arg(&params.arguments) {
-            Some(enabled) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set_wifi_enabled(enabled).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        NetworkAction::SetEthernetEnabled => match parse_bool_arg(&params.arguments) {
-            Some(enabled) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set_ethernet_enabled(enabled).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        }
         NetworkAction::Scan => {
             controller.mark_scanning();
             let controller = controller.clone();
