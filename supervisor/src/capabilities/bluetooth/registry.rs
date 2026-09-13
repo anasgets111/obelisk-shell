@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::BluetoothSignal;
-use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_battery, bind_device};
+use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_battery, bind_device};
 
 /// One tracked `Device1`. Cache `mac` at registration so write actions resolve it with a
 /// synchronous `HashMap` scan, without `.await` in the hot path. Abort `forwarder` on
@@ -24,6 +24,58 @@ pub(super) struct DeviceEntry {
 }
 
 pub(super) type DeviceRegistry = Arc<Mutex<HashMap<OwnedObjectPath, DeviceEntry>>>;
+
+/// The adapter in use and the task watching its properties.
+pub(super) struct BoundAdapter {
+    path: OwnedObjectPath,
+    pub(super) proxy: Adapter1Proxy<'static>,
+    forwarder: tokio::task::AbortHandle,
+}
+
+/// The one adapter slot, shared by the controller and the `ObjectManager` forwarder that fills and
+/// empties it.
+pub(super) type AdapterSlot = Arc<Mutex<Option<BoundAdapter>>>;
+
+/// Binds `path` as the adapter unless one is already in use, starts its property forwarder, and
+/// pushes [`BluetoothSignal::AdapterChanged`]. The first adapter wins, as it did at startup.
+pub(super) async fn adopt_adapter(
+    connection: &zbus::Connection,
+    slot: &AdapterSlot,
+    path: OwnedObjectPath,
+    events: &UnboundedSender<BluetoothSignal>,
+) {
+    if slot.lock().unwrap().is_some() {
+        return;
+    }
+    let proxy = match bind_adapter(connection, path.clone()).await {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            eprintln!("bluetooth: failed to bind adapter {path}: {err}");
+            return;
+        }
+    };
+    eprintln!("bluetooth: using adapter {path}");
+    let forwarder = spawn_adapter_signal_forwarder(proxy.clone(), events.clone()).abort_handle();
+    *slot.lock().unwrap() = Some(BoundAdapter { path, proxy, forwarder });
+    let _ = events.send(BluetoothSignal::AdapterChanged);
+}
+
+/// Empties the slot when BlueZ removes the adapter in use, stops its forwarder, and pushes
+/// [`BluetoothSignal::AdapterChanged`]. Removing any other adapter changes nothing.
+///
+/// ponytail: a second adapter already present does not take over; it is adopted only when BlueZ
+/// adds it again. Upgrade path: rerun `GetManagedObjects` here and adopt the first `Adapter1`.
+pub(super) fn release_adapter(slot: &AdapterSlot, path: &OwnedObjectPath, events: &UnboundedSender<BluetoothSignal>) {
+    let released = {
+        let mut bound = slot.lock().unwrap();
+        if bound.as_ref().is_some_and(|adapter| &adapter.path == path) { bound.take() } else { None }
+    };
+    if let Some(adapter) = released {
+        adapter.forwarder.abort();
+        eprintln!("bluetooth: adapter {path} was removed");
+        let _ = events.send(BluetoothSignal::AdapterChanged);
+    }
+}
 
 /// Binds `path` as `Device1`, caches `Address`, optionally binds `Battery1`, starts its forwarder,
 /// and inserts it into `devices`. Logs and skips any D-Bus failure without a partial entry.
@@ -119,9 +171,11 @@ fn spawn_device_signal_forwarder(
     })
 }
 
-/// Mutates `devices` until `added`/`removed` end, registering on `InterfacesAdded`, removing and
-/// aborting on `InterfacesRemoved`, then forwarding [`BluetoothSignal::DeviceRegistryChanged`].
-/// This task owns mutation so a write command's `mac` lookup sees an up-to-date registry.
+/// Mutates `devices` and `adapter` until `added`/`removed` end. Devices register on
+/// `InterfacesAdded` and are removed and aborted on `InterfacesRemoved`, forwarding
+/// [`BluetoothSignal::DeviceRegistryChanged`]; an `Adapter1` goes through [`adopt_adapter`] and
+/// [`release_adapter`]. This task owns mutation so a write command's lookup sees an up-to-date
+/// registry.
 ///
 /// Takes already-subscribed streams, not the bare proxy: subscription must finish before
 /// `GetManagedObjects()` hydration, or a change in that window is permanently missed.
@@ -130,6 +184,7 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
     mut added: A,
     mut removed: R,
     devices: DeviceRegistry,
+    adapter: AdapterSlot,
     events: UnboundedSender<BluetoothSignal>,
 ) where
     A: tokio_stream::Stream<Item = zbus::fdo::InterfacesAdded> + Unpin + Send + 'static,
@@ -142,6 +197,9 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
                     let Ok(args) = signal.args() else { continue; };
                     let has_device = args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Device1");
                     let has_battery = args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Battery1");
+                    if args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Adapter1") {
+                        adopt_adapter(&connection, &adapter, args.object_path().to_owned().into(), &events).await;
+                    }
                     if has_device {
                         register_device(&connection, &devices, args.object_path().to_owned().into(), has_battery, events.clone()).await;
                         if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
@@ -160,6 +218,10 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
                 }
                 Some(signal) = removed.next() => {
                     let Ok(args) = signal.args() else { continue; };
+                    if args.interfaces().iter().any(|i| i.as_str() == "org.bluez.Adapter1") {
+                        let path: OwnedObjectPath = args.object_path().to_owned().into();
+                        release_adapter(&adapter, &path, &events);
+                    }
                     let has_device = args.interfaces().iter().any(|i| i.as_str() == "org.bluez.Device1");
                     if has_device {
                         let path: OwnedObjectPath = args.object_path().to_owned().into();
@@ -176,12 +238,13 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
     });
 }
 
-/// Forwards adapter `Powered`/`Discovering`/`Discoverable` changes as [`BluetoothSignal::AdapterChanged`], so
-/// state follows BlueZ's own writes as well as this controller's.
-pub(super) fn spawn_adapter_signal_forwarder(
+/// Forwards adapter `Powered`/`Discovering`/`Discoverable` changes as
+/// [`BluetoothSignal::AdapterChanged`], so state follows BlueZ's own writes as well as this
+/// controller's.
+fn spawn_adapter_signal_forwarder(
     adapter: Adapter1Proxy<'static>,
     events: UnboundedSender<BluetoothSignal>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut powered_changed = adapter.receive_powered_changed().await;
         let mut discovering_changed = adapter.receive_discovering_changed().await;
@@ -200,5 +263,41 @@ pub(super) fn spawn_adapter_signal_forwarder(
                 else => break,
             }
         }
-    });
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+    use crate::capabilities::test_support::p2p_pair;
+
+    fn path(leaf: &str) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/org/bluez/{leaf}")).expect("valid object path")
+    }
+
+    #[tokio::test]
+    async fn the_first_adapter_is_kept_until_bluez_removes_that_one() {
+        let (connection, _peer) = p2p_pair().await;
+        let (events, mut signals) = unbounded_channel();
+        let slot = AdapterSlot::default();
+        let in_use = |slot: &AdapterSlot| slot.lock().unwrap().as_ref().map(|bound| bound.path.clone());
+
+        adopt_adapter(&connection, &slot, path("hci0"), &events).await;
+        assert_eq!(in_use(&slot), Some(path("hci0")));
+        assert_eq!(signals.try_recv(), Ok(BluetoothSignal::AdapterChanged));
+
+        adopt_adapter(&connection, &slot, path("hci1"), &events).await;
+        assert_eq!(in_use(&slot), Some(path("hci0")), "a second adapter does not replace the one in use");
+        assert!(signals.try_recv().is_err());
+
+        release_adapter(&slot, &path("hci1"), &events);
+        assert_eq!(in_use(&slot), Some(path("hci0")), "removing another adapter changes nothing");
+        assert!(signals.try_recv().is_err());
+
+        release_adapter(&slot, &path("hci0"), &events);
+        assert_eq!(in_use(&slot), None);
+        assert_eq!(signals.try_recv(), Ok(BluetoothSignal::AdapterChanged));
+    }
 }

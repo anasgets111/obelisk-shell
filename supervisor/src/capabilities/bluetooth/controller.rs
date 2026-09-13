@@ -8,12 +8,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::agent::{self, PromptSlot, register_agent_best_effort};
-use super::proxies::{
-    Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_object_manager, subscribe_object_manager,
-};
-use super::registry::{
-    DeviceRegistry, register_device, spawn_adapter_signal_forwarder, spawn_object_manager_forwarder,
-};
+use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_object_manager, subscribe_object_manager};
+use super::registry::{AdapterSlot, DeviceRegistry, adopt_adapter, register_device, spawn_object_manager_forwarder};
 use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, PairedDevice,
     class_to_category,
@@ -23,7 +19,9 @@ use super::{
 /// proxy or `Arc`, so a clone can move into a `tokio::spawn` task.
 #[derive(Clone)]
 pub struct BluetoothController {
-    adapter: Option<Adapter1Proxy<'static>>,
+    /// The adapter in use, filled at startup or when BlueZ adds one later and emptied when BlueZ
+    /// removes it; see `registry::adopt_adapter`.
+    adapter: AdapterSlot,
     devices: DeviceRegistry,
     /// Push state (ADR-0037), mutated only by [`handle_signal`](Self::handle_signal). The mutex is
     /// never held across an await.
@@ -51,7 +49,7 @@ impl BluetoothController {
         };
 
         let devices: DeviceRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let mut adapter = None;
+        let adapter = AdapterSlot::default();
 
         // Subscribe before GetManagedObjects(): a device changing between them would be missed.
         let object_manager_streams = match &object_manager {
@@ -70,11 +68,8 @@ impl BluetoothController {
                 Ok(objects) => {
                     for (path, interfaces) in objects {
                         let has = |name: &str| interfaces.keys().any(|k| k.as_str() == name);
-                        if adapter.is_none() && has("org.bluez.Adapter1") {
-                            match bind_adapter(&connection, path.clone()).await {
-                                Ok(proxy) => adapter = Some(proxy),
-                                Err(err) => eprintln!("bluetooth: failed to bind adapter {path}: {err}"),
-                            }
+                        if has("org.bluez.Adapter1") {
+                            adopt_adapter(&connection, &adapter, path.clone(), &events).await;
                         }
                         if has("org.bluez.Device1") {
                             register_device(
@@ -92,13 +87,18 @@ impl BluetoothController {
             }
         }
 
-        if let Some(adapter) = adapter.clone() {
-            spawn_adapter_signal_forwarder(adapter, events.clone());
-        } else {
-            eprintln!("bluetooth: no adapter found; bluetooth.enabled/discovering will stay false for this session");
+        if adapter.lock().unwrap().is_none() {
+            eprintln!("bluetooth: no adapter found; bluetooth stays unavailable until BlueZ adds one");
         }
         if let Some((added, removed)) = object_manager_streams {
-            spawn_object_manager_forwarder(connection.clone(), added, removed, devices.clone(), events.clone());
+            spawn_object_manager_forwarder(
+                connection.clone(),
+                added,
+                removed,
+                devices.clone(),
+                adapter.clone(),
+                events.clone(),
+            );
         }
 
         let prompts = PromptSlot::default();
@@ -133,8 +133,9 @@ impl BluetoothController {
                 let enabled = self.read_enabled().await;
                 let discovering = self.read_discovering().await;
                 let discoverable = self.read_discoverable().await;
+                let available = self.adapter().is_some();
                 let mut state = self.state.lock().unwrap();
-                state.available = self.adapter.is_some();
+                state.available = available;
                 state.enabled = enabled;
                 state.discovering = discovering;
                 state.discoverable = discoverable;
@@ -169,9 +170,14 @@ impl BluetoothController {
         let _ = self.events.send(BluetoothSignal::DiscoveryCleared);
     }
 
+    /// The adapter in use now, cloned out so no await holds the slot's lock.
+    fn adapter(&self) -> Option<Adapter1Proxy<'static>> {
+        self.adapter.lock().unwrap().as_ref().map(|bound| bound.proxy.clone())
+    }
+
     /// Live `Powered` value; `false` without an adapter is not an error.
     async fn read_enabled(&self) -> bool {
-        match &self.adapter {
+        match self.adapter() {
             Some(adapter) => adapter.powered().await.unwrap_or(false),
             None => false,
         }
@@ -179,7 +185,7 @@ impl BluetoothController {
 
     /// Live `Discovering` value; `false` without an adapter is not an error.
     async fn read_discovering(&self) -> bool {
-        match &self.adapter {
+        match self.adapter() {
             Some(adapter) => adapter.discovering().await.unwrap_or(false),
             None => false,
         }
@@ -187,7 +193,7 @@ impl BluetoothController {
 
     /// Live `Discoverable` value; `false` without an adapter is not an error.
     async fn read_discoverable(&self) -> bool {
-        match &self.adapter {
+        match self.adapter() {
             Some(adapter) => adapter.discoverable().await.unwrap_or(false),
             None => false,
         }
@@ -279,7 +285,7 @@ impl BluetoothController {
     /// `bluetooth:set_enabled(en)`: writes `Adapter1.Powered`. The adapter signal forwarder
     /// observes the real change; `main.rs` then rebuilds and pushes state.
     pub async fn set_enabled(&self, enabled: bool) {
-        let Some(adapter) = &self.adapter else {
+        let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: set_enabled({enabled}) failed: {}", BluetoothActionError::NoAdapter);
             return;
         };
@@ -291,7 +297,7 @@ impl BluetoothController {
     /// `bluetooth:set_discoverable(on)`: writes `Adapter1.Discoverable`. The adapter forwarder
     /// observes the change, including BlueZ's own switch-off at `DiscoverableTimeout`.
     pub async fn set_discoverable(&self, on: bool) {
-        let Some(adapter) = &self.adapter else {
+        let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: set_discoverable({on}) failed: {}", BluetoothActionError::NoAdapter);
             return;
         };
@@ -303,7 +309,7 @@ impl BluetoothController {
     /// D-Bus half of `bluetooth:start_discovery()`. [`clear_discovered`](Self::clear_discovered)
     /// clears `discovered_devices` before this task is spawned (ADR-0030).
     pub async fn start_discovery(&self) {
-        let Some(adapter) = &self.adapter else {
+        let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: start_discovery() failed: {}", BluetoothActionError::NoAdapter);
             return;
         };
@@ -315,7 +321,7 @@ impl BluetoothController {
     /// `bluetooth:stop_discovery()`: no local mutation; the last `discovered_devices` snapshot
     /// stays visible (ADR-0030).
     pub async fn stop_discovery(&self) {
-        let Some(adapter) = &self.adapter else {
+        let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: stop_discovery() failed: {}", BluetoothActionError::NoAdapter);
             return;
         };
@@ -371,7 +377,7 @@ impl BluetoothController {
     /// `bluetooth:forget(mac)`: resolves `mac` and calls `Adapter1.RemoveDevice(path)`, clearing
     /// paired credentials from disk (docs/services.md §5.1).
     pub async fn forget(&self, mac: &str) {
-        let Some(adapter) = &self.adapter else {
+        let Some(adapter) = self.adapter() else {
             eprintln!("bluetooth: forget({mac:?}) failed: {}", BluetoothActionError::NoAdapter);
             return;
         };
@@ -411,7 +417,7 @@ mod tests {
     fn controller() -> (BluetoothController, tokio::sync::mpsc::UnboundedReceiver<BluetoothSignal>) {
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let controller = BluetoothController {
-            adapter: None,
+            adapter: Arc::default(),
             devices: Arc::default(),
             state: Arc::default(),
             busy: Arc::default(),
