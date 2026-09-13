@@ -314,6 +314,9 @@ struct InFlight {
     /// Set when `AddAndActivateConnection2` saved a new profile for this join, which an abort
     /// deletes rather than leaving a half-typed key saved.
     created: Option<OwnedObjectPath>,
+    /// Set when a typed key updated a saved profile in memory only, which
+    /// [`save_typed_key`](NetworkController::save_typed_key) writes to disk once NM accepts the join.
+    unsaved: Option<OwnedObjectPath>,
 }
 
 /// The latest `network:connect` attempt. `id` advances on every begin and abort, so a join NM
@@ -660,6 +663,25 @@ impl NetworkController {
         }
     }
 
+    /// Writes a typed key to disk once NM accepted the join. `UpdateUnsaved` held it in memory until
+    /// then, so a rejected key never replaces a good one on disk, where `GetSettings` could not read
+    /// it back. No-op for a join that typed no key.
+    ///
+    /// ponytail: a rejected or aborted key stays in memory, shadowing the good one, until NM
+    /// restarts or a later key is accepted. `ReloadConnections` would drop it, but polkit asks
+    /// `auth_admin_keep` for it, an admin password per typo. Upgrade path: `GetSecrets` before the
+    /// update, restored on failure.
+    async fn save_typed_key(&self, in_flight: &InFlight) {
+        let Some(profile) = &in_flight.unsaved else { return };
+        let result = match bind_settings_connection(&self.connection, profile.clone()).await {
+            Ok(connection) => connection.save().await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            eprintln!("network: failed to save the accepted key for {profile}: {err}");
+        }
+    }
+
     /// § 4.1: `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
     /// have setters. Toggle it with `Enable(bool)`, not the spec's literal property write.
     pub async fn set_networking_enabled(&self, enabled: bool) {
@@ -810,9 +832,7 @@ impl NetworkController {
         drop(secret);
         match result {
             // NM accepted the request, not completed it; the activation reports the verdict.
-            Ok(in_flight) if self.accept(attempt, &in_flight) => {
-                self.watch_activation(attempt, in_flight.active, pending)
-            }
+            Ok(in_flight) if self.accept(attempt, &in_flight) => self.watch_activation(attempt, in_flight, pending),
             Ok(in_flight) => self.stop(&in_flight).await,
             Err(err) => {
                 eprintln!("network: connect(ssid={:?}) failed: {err}", pending.ssid);
@@ -879,10 +899,14 @@ impl NetworkController {
     /// Watches one activation in the background. A rejected key reopens the password prompt, or every
     /// later click would reuse the saved bad key. Not for 802.1X, whose profile never takes a typed
     /// PSK, so the prompt would loop.
-    fn watch_activation(&self, attempt: u64, active: OwnedObjectPath, pending: PendingNetworkConnect) {
+    fn watch_activation(&self, attempt: u64, in_flight: InFlight, pending: PendingNetworkConnect) {
         let controller = self.clone();
         tokio::spawn(async move {
-            let outcome = tokio::time::timeout(ACTIVATION_CEILING, controller.activation_outcome(&active)).await.ok();
+            let outcome =
+                tokio::time::timeout(ACTIVATION_CEILING, controller.activation_outcome(&in_flight.active)).await.ok();
+            if matches!(outcome, Some(Ok(()))) {
+                controller.save_typed_key(&in_flight).await;
+            }
             let (error, rejected_key) = activation_verdict(outcome);
             let ask_password = rejected_key
                 && !controller
@@ -978,21 +1002,21 @@ impl NetworkController {
                 .nm
                 .add_and_activate_connection2(dict, &wifi.device_path, &root_object_path(), HashMap::new())
                 .await?;
-            return Ok(InFlight { active, created: Some(created) });
+            return Ok(InFlight { active, created: Some(created), unsaved: None });
         };
 
         // A typed password corrects the saved key; otherwise a bad profile could only be forgotten
-        // and re-added.
-        //
-        // ponytail: skip enterprise profiles. `GetSettings` omits secrets, so rebuilding would drop
-        // the 802.1X password; use NM's saved copy until a secret agent exists (ADR-0029).
-        if let Some(psk) = &intent.psk
-            && !saved.settings.contains_key("802-1x")
-        {
-            saved.connection.update(merge_psk(&saved.settings, psk)).await?;
-        }
+        // and re-added. In memory only until NM accepts it (`save_typed_key`), so a typo never
+        // replaces a good key on disk.
+        let unsaved = match intent.psk.as_ref().and_then(|psk| merge_psk(&saved.settings, psk)) {
+            Some(merged) => {
+                saved.connection.update_unsaved(merged).await?;
+                Some(saved.path.clone())
+            }
+            None => None,
+        };
         let active = self.nm.activate_connection(&saved.path, &wifi.device_path, &root_object_path()).await?;
-        Ok(InFlight { active, created: None })
+        Ok(InFlight { active, created: None, unsaved })
     }
 
     /// Every saved Wi-Fi profile for `ssid`, paired with the settings dict that matched it.
@@ -1436,7 +1460,7 @@ mod tests {
     fn joined(n: u32) -> InFlight {
         let active = OwnedObjectPath::try_from(format!("/org/freedesktop/NetworkManager/ActiveConnection/{n}"))
             .expect("valid object path");
-        InFlight { active, created: None }
+        InFlight { active, created: None, unsaved: None }
     }
 
     #[test]
@@ -1542,6 +1566,30 @@ mod tests {
         controller.begin_connect("office");
 
         assert_eq!(controller.attempt.lock().unwrap().joined, None, "an abort now must not stop home's join");
+    }
+
+    /// One saved profile, counting each `Save`.
+    struct FakeProfile(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.Settings.Connection")]
+    impl FakeProfile {
+        async fn save(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_join_saves_only_the_key_it_typed() {
+        const PROFILE: &str = "/org/freedesktop/NetworkManager/Settings/9";
+        let saves = Arc::default();
+        let profile = FakeProfile(Arc::clone(&saves));
+        let (controller, _receiver, _peer) = attempting("home", |peer| peer.serve_at(PROFILE, profile)).await;
+        let typed = InFlight { unsaved: Some(OwnedObjectPath::try_from(PROFILE).unwrap()), ..joined(1) };
+
+        controller.save_typed_key(&joined(1)).await;
+        controller.save_typed_key(&typed).await;
+
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1, "a join that typed no key saves nothing");
     }
 
     const ACTIVE: &str = "/org/freedesktop/NetworkManager/ActiveConnection/1";

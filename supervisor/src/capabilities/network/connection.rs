@@ -247,13 +247,22 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     dict
 }
 
-/// Shapes a saved profile for `SettingsConnection.Update` (§4.3), changing only its security
-/// section to WPA-PSK. `Update` replaces the whole profile, so static addresses, route metrics, and
-/// autoconnect priority pass through; an open profile also needs a new `key-mgmt` section.
+/// Shapes a saved profile for `SettingsConnection.UpdateUnsaved` (§4.3), changing only its PSK.
+/// The update replaces the whole profile, so static addresses, route metrics, and autoconnect
+/// priority pass through; an open profile gains a `wpa-psk` section. `None` when the profile's
+/// `key-mgmt` takes no PSK: forcing `wpa-psk` downgraded SAE, and 802.1X would lose the password
+/// `GetSettings` omits until a secret agent exists (ADR-0029).
 pub(super) fn merge_psk<'a>(
     settings: &'a HashMap<String, HashMap<String, OwnedValue>>,
     psk: &'a str,
-) -> HashMap<&'a str, HashMap<&'a str, Value<'a>>> {
+) -> Option<HashMap<&'a str, HashMap<&'a str, Value<'a>>>> {
+    let key_mgmt = settings
+        .get("802-11-wireless-security")
+        .and_then(|security| security.get("key-mgmt"))
+        .and_then(|value| String::try_from(value.clone()).ok());
+    if !matches!(key_mgmt.as_deref(), None | Some("wpa-psk" | "sae")) {
+        return None;
+    }
     let mut merged: HashMap<&str, HashMap<&str, Value>> = settings
         .iter()
         .map(|(section, keys)| {
@@ -262,9 +271,9 @@ pub(super) fn merge_psk<'a>(
         .collect();
 
     let security = merged.entry("802-11-wireless-security").or_default();
-    security.insert("key-mgmt", Value::new("wpa-psk"));
+    security.entry("key-mgmt").or_insert_with(|| Value::new("wpa-psk"));
     security.insert("psk", Value::new(psk));
-    merged
+    Some(merged)
 }
 
 /// `network:set_networking_enabled(en)`'s `arguments: [en]`. Defined once in `dbus` (shared with
@@ -564,7 +573,7 @@ mod tests {
             ),
         ]);
 
-        let merged = merge_psk(&settings, "hunter2");
+        let merged = merge_psk(&settings, "hunter2").unwrap();
         assert_eq!(String::try_from(merged["connection"]["id"].clone()).unwrap(), "HomeWifi");
         assert_eq!(String::try_from(merged["ipv4"]["method"].clone()).unwrap(), "manual");
     }
@@ -575,7 +584,7 @@ mod tests {
         let settings =
             settings_with("802-11-wireless", "ssid", OwnedValue::try_from(Value::from(b"HomeWifi".to_vec())).unwrap());
 
-        let merged = merge_psk(&settings, "hunter2");
+        let merged = merge_psk(&settings, "hunter2").unwrap();
         let security = &merged["802-11-wireless-security"];
         assert_eq!(String::try_from(security["key-mgmt"].clone()).unwrap(), "wpa-psk");
         assert_eq!(String::try_from(security["psk"].clone()).unwrap(), "hunter2");
@@ -586,8 +595,21 @@ mod tests {
         let settings =
             settings_with("802-11-wireless-security", "psk", OwnedValue::try_from(Value::from("stale")).unwrap());
 
-        let merged = merge_psk(&settings, "hunter2");
+        let merged = merge_psk(&settings, "hunter2").unwrap();
         assert_eq!(String::try_from(merged["802-11-wireless-security"]["psk"].clone()).unwrap(), "hunter2");
+    }
+
+    #[test]
+    fn merge_psk_keeps_sae_and_refuses_key_types_that_take_no_psk() {
+        let with = |key_mgmt: &str| {
+            settings_with("802-11-wireless-security", "key-mgmt", OwnedValue::try_from(Value::from(key_mgmt)).unwrap())
+        };
+        let sae = with("sae");
+        let merged = merge_psk(&sae, "hunter2").unwrap();
+        assert_eq!(String::try_from(merged["802-11-wireless-security"]["key-mgmt"].clone()).unwrap(), "sae");
+        for key_mgmt in ["wpa-eap", "owe", "none"] {
+            assert!(merge_psk(&with(key_mgmt), "hunter2").is_none(), "{key_mgmt} takes no PSK");
+        }
     }
 
     #[test]
