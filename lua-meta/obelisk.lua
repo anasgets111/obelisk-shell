@@ -154,6 +154,11 @@
 ---@field who string Free-text `who` passed to `Inhibit`, e.g. `"mpv"`; draw it as a label, never match it.
 ---@field why string Free-text `why`, e.g. `"Playing video"`, often empty.
 
+---@class JoinError
+---A failed join, as `network.connect_error`.
+---@field message string Display text, such as `"wrong password"` or `"network not found"`.
+---@field ssid string The network the join was for.
+
 ---@class MenuItem
 ---One DBusMenu layout node, resolved to `tray.items[].menu` (docs/lua-api.md §2.14).
 ---@field children MenuItem[] Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose children are dropped with an stderr line.
@@ -387,7 +392,7 @@
 ---The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
 ---down radio from a powered radio with no association.
 ---@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected first, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready to draw.
----@field connect_error? string Display text for the last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the Wi-Fi device's `StateChanged` reason, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`.
+---@field connect_error? JoinError The last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the Wi-Fi device's `StateChanged` reason, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`. It names its network, so a sheet opened for another one does not read a leftover failure as its own.
 ---@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and clears when the attempt reaches a verdict or `network:abort_connect` stops it.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.

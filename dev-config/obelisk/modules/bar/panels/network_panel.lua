@@ -413,7 +413,7 @@ local body = {
         children = {
             glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
             cell(util.label(obelisk.network, function(n)
-                return n.connect_error or ""
+                return n.connect_error and n.connect_error.message or ""
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
             panel_action_icon(icons.close, function()
                 error_dismissed:set(true)
@@ -486,7 +486,7 @@ local body = {
                 children = {
                     glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
                     cell(util.label(obelisk.network, function(n)
-                        return n.connect_error or ""
+                        return n.connect_error and n.connect_error.message or ""
                     end), theme.RED, theme.font.xs, { width = "Fill", wrap = "Word", max_lines = 2 }),
                 },
             },

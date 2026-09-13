@@ -56,6 +56,15 @@ pub struct AccessPointInfo {
     pub saved: bool,
 }
 
+/// A failed join, as `network.connect_error`.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct JoinError {
+    /// The network the join was for.
+    pub ssid: String,
+    /// Display text, such as `"wrong password"` or `"network not found"`.
+    pub message: String,
+}
+
 /// `obelisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
 /// NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ///
@@ -103,13 +112,14 @@ pub struct NetworkState {
     /// clears when the attempt reaches a verdict or `network:abort_connect` stops it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_ssid: Option<String>,
-    /// Display text for the last failed `network:connect`, or `nil` after success or before any
-    /// attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later
-    /// from the Wi-Fi device's `StateChanged` reason, where a wrong password is knowable.
+    /// The last failed `network:connect`, or `nil` after success or before any attempt.
+    /// `AddAndActivateConnection2` returns before the radio tries; this is filled later from the
+    /// Wi-Fi device's `StateChanged` reason, where a wrong password is knowable.
     ///
-    /// Sticky until the next attempt, like `UpdatesState::check_error`.
+    /// Sticky until the next attempt, like `UpdatesState::check_error`. It names its network, so a
+    /// sheet opened for another one does not read a leftover failure as its own.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connect_error: Option<String>,
+    pub connect_error: Option<JoinError>,
     /// SSID whose `network:connect` waits for a password, or `nil`. Set by
     /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile
     /// or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt
@@ -876,7 +886,7 @@ impl NetworkController {
                 return;
             }
             state.connecting_ssid = None;
-            state.connect_error = error;
+            state.connect_error = error.map(|message| JoinError { ssid: pending.ssid.clone(), message });
             current.joined = None;
             if ask_password {
                 state.password_ssid = Some(pending.ssid.clone());
@@ -1486,7 +1496,7 @@ mod tests {
             scanning: true,
             wifi_present: true,
             connecting_ssid: Some("home".to_string()),
-            connect_error: Some("wrong password".to_string()),
+            connect_error: Some(JoinError { ssid: "home".to_string(), message: "wrong password".to_string() }),
             password_ssid: Some("home".to_string()),
             ..NetworkState::default()
         };
@@ -1510,7 +1520,11 @@ mod tests {
         let state = controller.state.lock().unwrap().clone();
         assert_eq!(state.connecting_ssid, None);
         assert_eq!(state.password_ssid.as_deref(), Some("home"));
-        assert_eq!(state.connect_error.as_deref(), Some("wrong password"), "the prompt says why it is back");
+        assert_eq!(
+            state.connect_error,
+            Some(JoinError { ssid: "home".to_string(), message: "wrong password".to_string() }),
+            "the prompt says why it is back, and for which network"
+        );
         assert_eq!(controller.take_connect_intent(), Some(home()), "the typed key needs an intent to pair with");
         assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
     }

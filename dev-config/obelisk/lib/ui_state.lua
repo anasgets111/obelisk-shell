@@ -67,9 +67,9 @@ local hidden_ssid = state("network_hidden_ssid", "")
 -- (ADR-0021), so `n.ssid` reaching the typed name finishes the sheet instead of an
 -- `onConnectSucceeded` callback.
 --
--- `connect_error` is checked last. `begin_connect` and `request_password` clear it on each fresh
--- attempt, but only once the Supervisor has answered, so an old error cannot outvote the attempt in
--- flight.
+-- A failure counts only when `connect_error` names the typed network. The Supervisor clears an old
+-- error only once it answers the new name, so another join's leftover would otherwise flash
+-- "could not join" first.
 local credential_step = computed({ hidden_prompt, hidden_ssid, obelisk.network }, function(active, name, n)
     if n and n.password_ssid ~= nil then
         return "password"
@@ -83,7 +83,7 @@ local credential_step = computed({ hidden_prompt, hidden_ssid, obelisk.network }
     if n and n.ssid == name then
         return ""
     end
-    if n and n.connecting_ssid ~= name and n.connect_error ~= nil then
+    if n and n.connect_error ~= nil and n.connect_error.ssid == name then
         return "failed"
     end
     return "waiting"
