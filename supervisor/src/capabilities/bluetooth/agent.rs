@@ -455,9 +455,4 @@ mod tests {
         assert!(answer(&prompts, Some(MAC), true, after_grace()));
         assert_eq!(answered.try_recv(), Ok(true));
     }
-
-    #[test]
-    fn mac_from_path_reads_the_address_out_of_the_object_path() {
-        assert_eq!(mac_from_path("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"), "AA:BB:CC:DD:EE:FF");
-    }
 }

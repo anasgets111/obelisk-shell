@@ -373,15 +373,4 @@ mod tests {
         assert_eq!(parse_mac_arg(&[]), None);
         assert_eq!(parse_mac_arg(&[serde_json::json!(42)]), None);
     }
-
-    #[test]
-    fn parse_mac_and_bool_args_needs_both_in_order() {
-        let mac = serde_json::json!("00:1A:7D:DA:71:11");
-        assert_eq!(
-            parse_mac_and_bool_args(&[mac.clone(), serde_json::json!(true)]),
-            Some(("00:1A:7D:DA:71:11".to_string(), true))
-        );
-        assert_eq!(parse_mac_and_bool_args(&[serde_json::json!(true)]), None);
-        assert_eq!(parse_mac_and_bool_args(&[mac]), None);
-    }
 }

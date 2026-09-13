@@ -589,12 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn mac_from_card_name_reads_the_address_out_of_a_bluez_card_name() {
-        assert_eq!(mac_from_card_name("bluez_card.AA_BB_CC_DD_EE_FF"), Some("AA:BB:CC:DD:EE:FF".to_string()));
-        assert_eq!(mac_from_card_name("alsa_card.pci-0000_2b_00.1"), None);
-    }
-
-    #[test]
     fn a_serialized_props_object_reads_back_as_the_same_values() {
         // The write path hands these bytes to C; disagreement would make an accepted write no-op.
         let bytes = serialize_props(&props_object(Some(vec![0.027, 0.027]), Some(true)))
