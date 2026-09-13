@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
 
-use super::agent::{self, PromptSlot, register_agent_best_effort};
+use super::agent::{self, Invited, PromptSlot, register_agent_best_effort};
 use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_object_manager, subscribe_object_manager};
 use super::registry::{AdapterSlot, DeviceRegistry, adopt_adapter, register_device, spawn_object_manager_forwarder};
 use super::{
@@ -101,17 +102,20 @@ impl BluetoothController {
             );
         }
 
+        let state = Arc::new(Mutex::new(BluetoothState::default()));
+        let busy: Arc<Mutex<HashMap<String, &'static str>>> = Arc::default();
         let prompts = PromptSlot::default();
-        register_agent_best_effort(&connection, prompts.clone(), devices.clone(), events.clone()).await;
-
-        let controller = Self {
-            adapter,
-            devices,
-            state: Arc::new(Mutex::new(BluetoothState::default())),
-            busy: Arc::default(),
-            prompts,
-            events,
+        // A device raises a prompt only while the adapter is visible or this Supervisor is pairing
+        // it, so nothing in range can put cards on screen at will.
+        let invited: Invited = {
+            let (state, busy) = (Arc::clone(&state), Arc::clone(&busy));
+            Arc::new(move |mac: &str| {
+                state.lock().unwrap().discoverable || busy.lock().unwrap().get(mac) == Some(&"pairing")
+            })
         };
+        register_agent_best_effort(&connection, prompts.clone(), devices.clone(), invited, events.clone()).await;
+
+        let controller = Self { adapter, devices, state, busy, prompts, events };
         // Hydrate before returning, because the forwarders above are already queueing and zbus
         // yields a cached property's current value as its stream's first item: one of them writes
         // the first snapshot a config ever sees. Each signal re-derives only its own half, so
@@ -253,10 +257,10 @@ impl BluetoothController {
         guard.iter().find(|(_, entry)| entry.mac == mac).map(|(path, entry)| (path.clone(), entry.device.clone()))
     }
 
-    /// `bluetooth:answer_pairing(accept)`: answers the prompt on screen. `false` on a code display
-    /// only takes it down.
-    pub fn answer_pairing(&self, accept: bool) {
-        if agent::answer(&self.prompts, accept) {
+    /// `bluetooth:answer_pairing(mac, accept)`: answers the prompt on screen when it is for `mac`.
+    /// `false` on a code display only takes it down.
+    pub fn answer_pairing(&self, mac: &str, accept: bool) {
+        if agent::answer(&self.prompts, Some(mac), accept, Instant::now()) {
             let _ = self.events.send(BluetoothSignal::PairingChanged);
         }
     }
@@ -407,6 +411,11 @@ impl Drop for BusyGuard<'_> {
         }
         drop(busy);
         let _ = self.controller.events.send(BluetoothSignal::DeviceRegistryChanged);
+        // A code display has no answer and BlueZ sends no `Cancel` for it, so the pairing call
+        // ending, either way, is what takes it down.
+        if self.action == "pairing" && agent::clear_display(&self.controller.prompts, &self.mac) {
+            let _ = self.controller.events.send(BluetoothSignal::PairingChanged);
+        }
     }
 }
 
@@ -444,5 +453,30 @@ mod tests {
 
         let pushes = std::iter::from_fn(|| receiver.try_recv().ok()).count();
         assert_eq!(pushes, 4, "every edge rebuilds, so the spinner follows each one");
+    }
+
+    #[test]
+    fn a_pairing_that_ends_takes_down_its_code_display() {
+        let (controller, mut receiver) = controller();
+        *controller.prompts.lock().unwrap() = Some(agent::PendingPrompt::display("AA"));
+
+        drop(controller.mark_busy("AA", "pairing"));
+
+        assert!(controller.prompts.lock().unwrap().is_none());
+        let signals: Vec<BluetoothSignal> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(signals.contains(&BluetoothSignal::PairingChanged));
+    }
+
+    #[test]
+    fn a_device_that_shows_up_paired_takes_down_its_code_display() {
+        let (controller, _receiver) = controller();
+        *controller.prompts.lock().unwrap() = Some(agent::PendingPrompt::display("AA"));
+        let paired = |mac: &str| PairedDevice { mac: mac.to_string(), ..PairedDevice::default() };
+
+        controller.clear_finished_display(&[], &[paired("BB")]);
+        assert!(controller.prompts.lock().unwrap().is_some(), "another device pairing leaves it up");
+
+        controller.clear_finished_display(&[], &[paired("AA")]);
+        assert!(controller.prompts.lock().unwrap().is_none());
     }
 }

@@ -9,9 +9,10 @@
 //! absent with no hardware or no `bluetoothd`, so binding, adapter lookup, and agent registration
 //! log and produce an inert controller: `enabled`/`discovering` are `false`, lists are empty, and
 //! writes log and no-op. This extends `NetworkController::has_wifi_device` to a missing service.
-//! An adapter BlueZ adds later is picked up; a `bluetoothd` that starts after the Supervisor is
-//! not, because the `ObjectManager` binding and agent registration happen once. Upgrade path:
-//! watch `org.bluez`'s `NameOwnerChanged` and rebuild.
+//!
+//! ponytail: an adapter BlueZ adds later is picked up, but a `bluetoothd` that starts after the
+//! Supervisor is not, because the `ObjectManager` binding and agent registration happen once.
+//! Upgrade path: watch `org.bluez`'s `NameOwnerChanged` and rebuild.
 //!
 //! ponytail: After `start_discovery` clears the list and pushes a fresh Candidate, matching the
 //! `last_snapshots` bookkeeping used by every capability, any
@@ -195,6 +196,11 @@ pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
     Some(arguments.first()?.as_str()?.to_string())
 }
 
+/// `bluetooth:answer_pairing(mac, accept)`'s `arguments: [mac, accept]`.
+pub fn parse_mac_and_bool_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
+    Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
+}
+
 /// Actions accepted by `obelisk.bluetooth:invoke(...)`; exhaustive dispatch keeps variants and arms
 /// in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -245,8 +251,8 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
         }
         // Not spawned: it only answers a waiting agent call, and a late answer could land on the
         // next prompt.
-        BluetoothAction::AnswerPairing => match parse_bool_arg(&params.arguments) {
-            Some(accept) => controller.answer_pairing(accept),
+        BluetoothAction::AnswerPairing => match parse_mac_and_bool_args(&params.arguments) {
+            Some((mac, accept)) => controller.answer_pairing(&mac, accept),
             None => crate::log_malformed_command(params),
         },
         BluetoothAction::StopDiscovery => {
@@ -365,5 +371,16 @@ mod tests {
         assert_eq!(parse_mac_arg(&[serde_json::json!("00:1A:7D:DA:71:11")]), Some("00:1A:7D:DA:71:11".to_string()));
         assert_eq!(parse_mac_arg(&[]), None);
         assert_eq!(parse_mac_arg(&[serde_json::json!(42)]), None);
+    }
+
+    #[test]
+    fn parse_mac_and_bool_args_needs_both_in_order() {
+        let mac = serde_json::json!("00:1A:7D:DA:71:11");
+        assert_eq!(
+            parse_mac_and_bool_args(&[mac.clone(), serde_json::json!(true)]),
+            Some(("00:1A:7D:DA:71:11".to_string(), true))
+        );
+        assert_eq!(parse_mac_and_bool_args(&[serde_json::json!(true)]), None);
+        assert_eq!(parse_mac_and_bool_args(&[mac]), None);
     }
 }
