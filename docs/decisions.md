@@ -1529,6 +1529,9 @@ Follow-up, 2026-09-01: derive channel senders, receivers, selection and construc
 list, exhaustively checked against the roster. Lock is the stated channel exception. Keep the signal
 payload enum hand-written and exhaustively dispatched. Do not reorganize unrelated cohesive Renderer
 files.
+
+Amendment, ADR-0207: a Renderer file may split by concern where its tests move with the code;
+`layout/scene.rs` stays whole.
 ## 0077. The layout math is taffy's, not this crate's
 
 Supersedes ADR-0023's hand-written arrangement, one-pass and descendant-positioning choices, but not
@@ -4634,3 +4637,21 @@ socket path and a connection budget. Config has neither and already shells out f
 Rejected: a `session` capability wrapping these in the Supervisor. It moves one compositor check
 from Lua to Rust and costs a second place that decides compositor identity, plus a capability whose
 whole job is running two commands.
+
+## 0207. A Renderer file splits by concern when its tests can move with the code
+
+ADR-0076's follow-up kept Renderer files whole. `wayland/input.rs` then held 1,557 production and
+913 test lines for two jobs that share only `App`: pointer hit-testing, clicks, drags, wheel, hover
+and cursor, and keyboard focus with the `secure_submit` buffer.
+
+1. Split a file into a folder of concern files when its tests already call those concerns
+   separately, so every test lands beside the code it covers (AGENTS.md: tests live beside the
+   code). `wayland/input.rs` becomes `input/mod.rs` for the seat, `pointer.rs` and `keyboard.rs`.
+2. Split commits move code only, plus imports and the visibility the extra depth forces. An item
+   that was `pub(super)` one level up becomes `pub(in crate::wayland)`, keeping the reach it had.
+3. `layout/scene.rs` stays one file. 171 of its tests reach it through `apply_at`, the whole
+   prepare, solve and finish pass, so splitting the code would leave about 3,900 test lines in
+   `scene/mod.rs` beside none of the code they test.
+
+Rejected: splitting by size alone. A file whose tests drive only the whole pipeline gains file names
+and loses the one place its tests and its code meet.
