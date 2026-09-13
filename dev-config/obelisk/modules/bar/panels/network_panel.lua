@@ -9,7 +9,6 @@
 -- password field whether or not it was on screen, sending every key to that invisible buffer.
 -- `layout::secure_submit` now counts only reachable fields, so an `autofocus` name field arms
 -- normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
---
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")

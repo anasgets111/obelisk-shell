@@ -155,8 +155,13 @@ local rows = computed({ obelisk.bluetooth, obelisk.audio, ui.bluetooth_codec_for
     local function add(devices, status)
         for _, device in ipairs(devices) do
             local card = status == "connected" and codec_card(a, device.mac) or nil
-            out[#out + 1] =
-            { kind = "device", device = device, status = status, card = card, key = "device-" .. tostring(device.mac) }
+            out[#out + 1] = {
+                kind = "device",
+                device = device,
+                status = status,
+                card = card,
+                key = "device-" .. tostring(device.mac),
+            }
             if card and open_for == device.mac then
                 for _, option in ipairs(card.codecs) do
                     out[#out + 1] = {

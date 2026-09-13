@@ -108,11 +108,11 @@ Positional arguments validated by capability dispatch. Read-only capabilities ha
 
 | Capability | Actions |
 | :--- | :--- |
-| `audio` | `set_volume(volume)`, `set_muted(bool)`, `toggle_mute()`, `set_default_sink(id)`, `set_default_source(id)`, `set_source_volume(volume)`, `set_source_muted(bool)`, `toggle_source_mute()`, `set_app_volume(id, volume)`, `set_app_muted(id, bool)` |
+| `audio` | `set_volume(volume)`, `set_muted(bool)`, `toggle_mute()`, `set_default_sink(id)`, `set_default_source(id)`, `set_source_volume(volume)`, `set_source_muted(bool)`, `toggle_source_mute()`, `set_app_volume(id, volume)`, `set_app_muted(id, bool)`, `set_bluetooth_profile(device, index)` |
 | `brightness` | `set(percent)` |
 | `keyboard` | `set_backlight(percent)`, `switch_layout(index)` |
-| `network` | `set_networking_enabled(bool)`, `set_wifi_enabled(bool)`, `set_ethernet_enabled(bool)`, `scan()`, `connect(ssid, hidden)`, `cancel_connect()`, `forget(ssid)` |
-| `bluetooth` | `set_enabled(bool)`, `start_discovery()`, `stop_discovery()`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `forget(mac)` |
+| `network` | `set_networking_enabled(bool)`, `set_wifi_enabled(bool)`, `set_ethernet_enabled(bool)`, `scan()`, `connect(ssid, hidden)`, `cancel_connect()`, `abort_connect()`, `forget(ssid)`, `disconnect_wifi()` |
+| `bluetooth` | `set_enabled(bool)`, `set_discoverable(bool)`, `start_discovery()`, `stop_discovery()`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `forget(mac)`, `answer_pairing(mac, bool)` |
 | `notifications` | `dismiss(id)`, `invoke_action(id, key)`, `reply(id, text)`, `set_sound(urgency, path)`, `set_dnd(bool)`, `hold_expiry(seconds)` |
 | `mpris` | `control(id, command)`, `seek(id, position_us)`, `seek_relative(id, offset_us)` |
 | `workspaces` | `focus(id)`, `toggle_special(name)` |

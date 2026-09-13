@@ -90,7 +90,10 @@ See [network](../supervisor/src/capabilities/network/mod.rs) and
 ### 5.1 Discovery and pairing
 
 The system-bus ObjectManager and property changes maintain device state.
-Supported actions are enable, start/stop discovery, pair, connect, disconnect and forget.
+Supported actions are enable, visibility, start/stop discovery, pair, connect, disconnect, forget
+and answering a pairing prompt. The agent registers as `DisplayYesNo` and puts each confirmation,
+authorization or code display in `pairing_request` for the user, but only while the adapter is
+visible or this shell is pairing that device.
 Stopping discovery preserves the last discovered list; starting it clears that list.
 
 ### 5.2 Battery and category

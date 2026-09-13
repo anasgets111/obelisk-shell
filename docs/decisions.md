@@ -675,6 +675,12 @@ Reuse ADR-0029's capability snapshot plumbing.
 Not built: codec selection, PIN/passkey UI or multiple adapters. Codec selection shares audio's
 missing inbound-channel prerequisite with app volume/mute controls.
 
+Items 2 and 3 are superseded. The agent now registers `DisplayYesNo` and holds each confirmation,
+authorization and service request for the user through `pairing_request` and
+`bluetooth:answer_pairing`, refusing devices that are not invited (adapter visible, or this shell
+pairing them). Codec selection now lives in audio: `audio:set_bluetooth_profile` switches a BlueZ
+device's PipeWire card profile. PIN and passkey entry are still refused.
+
 ## 0031. Tray controller: hand-written SNI/DBusMenu host, IconName preference, no cache-busting
 
 1. **Proxy choice.** Reject `system-tray`: coupled Watcher/Host registration, verified pixmap
