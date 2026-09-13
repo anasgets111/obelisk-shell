@@ -46,13 +46,13 @@ local function artwork(item)
     return item.icon_name or item.icon_path
 end
 
--- The ceiling, not the width: a dozen items scroll instead of taking the zone (ADR-0069). The
--- mirror has no cap because QML `RowLayout` shrinks children; this `row` does not.
-local TRAY_WIDTH = theme.s(150, 110)
-
 -- One slot per item: the icon plus `spacing.sm`, so icons sit that far apart. `control.md` left
 -- twice that between them. Equal slots keep the row even under fallback letters.
 local ITEM_WIDTH = theme.icon.md + theme.spacing.sm
+
+-- The ceiling, not the width: six items fit, more scroll instead of taking the zone (ADR-0069). The
+-- mirror has no cap because QML `RowLayout` shrinks children; this `row` does not.
+local TRAY_WIDTH = 6 * ITEM_WIDTH
 
 local has_items = util.shown_when(obelisk.tray, function(t)
     return #items_of(t) > 0
