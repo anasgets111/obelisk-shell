@@ -29,14 +29,14 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::capabilities::bind;
 
-pub mod connection;
+mod connect;
 mod devices;
 mod profiles;
 mod scan;
 
-use connection::ConnectError;
-use connection::{ConnectionIntent, activation_verdict, build_connection_dict, connection_intent};
-pub use connection::{parse_connect_args, parse_ssid_arg};
+use connect::ConnectError;
+use connect::{ConnectionIntent, activation_verdict, build_connection_dict, connection_intent};
+pub use connect::{parse_connect_args, parse_ssid_arg};
 use devices::{Devices, EthernetDevice, WifiDevice, forward, resolve_devices, spawn_manager_forwarder, watch_devices};
 use profiles::merge_psk;
 use scan::resolve_ssid;

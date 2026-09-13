@@ -83,7 +83,7 @@ networks, then the strongest alternatives, capped at 20. Frequency supplies the 
 Saved profiles activate without duplication. Open networks need no credential. Secured connections
 request native secure submission; credentials never enter Lua.
 See [network](../supervisor/src/capabilities/network/mod.rs) and
-[connection handling](../supervisor/src/capabilities/network/connection.rs).
+[connection handling](../supervisor/src/capabilities/network/connect.rs).
 
 ## 5. BlueZ
 
