@@ -322,6 +322,10 @@ pub struct NetworkController {
     state: Arc<Mutex<NetworkState>>,
     /// The single pending `network:connect` intent slot, see [`PendingNetworkConnect`].
     pending_connect: Arc<Mutex<Option<PendingNetworkConnect>>>,
+    /// The activation of the attempt `connecting_ssid` names, once NM has accepted it, for
+    /// [`abort_connect`](Self::abort_connect). Written under the state lock, so an abort never sees
+    /// an attempt without also seeing its activation.
+    in_flight: Arc<Mutex<Option<OwnedObjectPath>>>,
     /// Signal sender for [`mark_scanning`](Self::mark_scanning)'s FIFO event and for keeping the
     /// channel open when no Wi-Fi device exists.
     events: UnboundedSender<NetworkSignal>,
@@ -388,6 +392,7 @@ impl NetworkController {
             saved_ssids: Arc::default(),
             state: Arc::new(Mutex::new(NetworkState::default())),
             pending_connect: Arc::new(Mutex::new(None)),
+            in_flight: Arc::default(),
             events,
         };
         controller.refresh_saved_ssids().await;
@@ -565,9 +570,9 @@ impl NetworkController {
     /// the field (`wayland::input`'s `SecureKeyAction::Clear`), so without this a mis-click would
     /// hold bar keyboard focus.
     ///
-    /// ponytail: an activation already in flight is untouched, although `NetworkService.qml`'s
-    /// `cancelConnect` disconnects when nothing else is live. Letting NM finish costs seconds;
-    /// racing it can disconnect a session that just came up.
+    /// An activation already in flight is left alone. Every panel close calls this, and closing the
+    /// panel should not undo a join the user started; [`abort_connect`](Self::abort_connect) is the
+    /// sheet's explicit Cancel.
     ///
     /// No-op without a pending prompt, so `modules/shell/panel_host.lua` can call it on any panel
     /// close. Without the guard, closing another panel would clear `connect_error` and push a
@@ -584,6 +589,40 @@ impl NetworkController {
         }
         eprintln!("network: the pending connect was cancelled; the password prompt is down");
         let _ = self.events.send(NetworkSignal::Changed);
+    }
+
+    /// `network:abort_connect()`: stops the join in flight, as `NetworkService.qml`'s
+    /// `cancelConnect` does. Clears `connecting_ssid` first, so the activation's late verdict finds
+    /// no attempt to report on, then deactivates that one activation.
+    ///
+    /// The mirror called `Device.Disconnect`, guarded by `wifiOnline` because it would also tear
+    /// down a live session. Deactivating the attempt's own activation needs no guard.
+    ///
+    /// No-op without an attempt. An abort that lands before NM accepts the request finds no
+    /// activation yet; `connect` sees the cleared attempt and deactivates it there.
+    pub fn abort_connect(&self) {
+        let active = {
+            let mut state = self.state.lock().unwrap();
+            if state.connecting_ssid.take().is_none() {
+                return;
+            }
+            state.connect_error = None;
+            self.in_flight.lock().unwrap().take()
+        };
+        eprintln!("network: the join in flight was aborted");
+        let _ = self.events.send(NetworkSignal::Changed);
+        if let Some(active) = active {
+            let controller = self.clone();
+            tokio::spawn(async move {
+                controller.deactivate(&active).await;
+            });
+        }
+    }
+
+    async fn deactivate(&self, active: &OwnedObjectPath) {
+        if let Err(err) = self.nm.deactivate_connection(active).await {
+            eprintln!("network: failed to deactivate the aborted activation {active}: {err}");
+        }
     }
 
     /// § 4.1: `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
@@ -736,7 +775,21 @@ impl NetworkController {
         drop(secret);
         match result {
             // NM accepted the request, not completed it; the activation reports the verdict.
-            Ok(active) => self.watch_activation(active, pending),
+            Ok(active) => {
+                let aborted = {
+                    let state = self.state.lock().unwrap();
+                    let aborted = state.connecting_ssid.as_deref() != Some(pending.ssid.as_str());
+                    if !aborted {
+                        *self.in_flight.lock().unwrap() = Some(active.clone());
+                    }
+                    aborted
+                };
+                if aborted {
+                    self.deactivate(&active).await;
+                } else {
+                    self.watch_activation(active, pending);
+                }
+            }
             Err(err) => {
                 eprintln!("network: connect(ssid={:?}) failed: {err}", pending.ssid);
                 self.finish_connect(&pending, Some(err.to_string()), false);
@@ -771,6 +824,7 @@ impl NetworkController {
             }
             state.connecting_ssid = None;
             state.connect_error = error;
+            *self.in_flight.lock().unwrap() = None;
             if ask_password {
                 state.password_ssid = Some(pending.ssid.clone());
                 self.stash_connect_intent(pending.clone());
@@ -984,6 +1038,7 @@ pub enum NetworkAction {
     Scan,
     Connect,
     CancelConnect,
+    AbortConnect,
     Forget,
     DisconnectWifi,
 }
@@ -1041,6 +1096,7 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
         },
         // Not spawned: it touches no D-Bus, and a late cancel would resurrect the prompt.
         NetworkAction::CancelConnect => controller.cancel_connect(),
+        NetworkAction::AbortConnect => controller.abort_connect(),
         NetworkAction::Forget => match parse_ssid_arg(&params.arguments) {
             Some(ssid) => {
                 let controller = controller.clone();
@@ -1243,6 +1299,7 @@ mod tests {
                 ..NetworkState::default()
             })),
             pending_connect: Arc::default(),
+            in_flight: Arc::default(),
             events,
         };
         (controller, receiver, peer)
@@ -1277,5 +1334,29 @@ mod tests {
         assert_eq!(state.password_ssid, None);
         assert_eq!(controller.take_connect_intent(), None);
         assert!(receiver.try_recv().is_err(), "nothing changed, so nothing is pushed");
+    }
+
+    #[tokio::test]
+    async fn an_aborted_join_drops_the_verdict_that_arrives_after_it() {
+        let (controller, mut receiver, _peer) = attempting("home").await;
+
+        controller.abort_connect();
+        assert_eq!(controller.state.lock().unwrap().connecting_ssid, None, "the spinner stops on the click");
+        assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
+
+        controller.finish_connect(&home(), Some("disconnected".to_string()), false);
+        let state = controller.state.lock().unwrap().clone();
+        assert_eq!(state.connect_error, None, "a cancelled join is not a failure");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_without_a_join_in_flight_changes_nothing() {
+        let (controller, mut receiver, _peer) = attempting("home").await;
+        controller.state.lock().unwrap().connecting_ssid = None;
+
+        controller.abort_connect();
+
+        assert!(receiver.try_recv().is_err(), "closing a sheet with nothing in flight pushes nothing");
     }
 }

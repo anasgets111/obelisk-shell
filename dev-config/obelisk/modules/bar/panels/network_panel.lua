@@ -112,8 +112,11 @@ obelisk.network:on_change(function(n, previous)
     if n.connecting_ssid ~= nil and previous.connecting_ssid == nil then
         error_dismissed:set(false)
     elseif previous.connecting_ssid ~= nil and n.connecting_ssid == nil and n.connect_error == nil then
-        -- The mirror's `onConnectSucceeded`: the join the panel was opened for is done.
-        if ui.panel_open:get() and ui.panel_kind:get() == KIND then
+        -- The mirror's `onConnectSucceeded`. An aborted join also clears `connecting_ssid` with no
+        -- error, so success is the radio now holding that network, not the spinner stopping.
+        local joined = util.active_access_point(n)
+        local succeeded = joined ~= nil and joined.ssid == previous.connecting_ssid
+        if succeeded and ui.panel_open:get() and ui.panel_kind:get() == KIND then
             ui.close_panel()
         end
     end
@@ -493,7 +496,7 @@ local body = {
                 align_h = "End",
                 spacing = theme.spacing.sm,
                 children = {
-                    action_button("cancel", ui.clear_network_prompts, "network-sheet-cancel", { tone = "quiet" }),
+                    action_button("cancel", ui.cancel_network_join, "network-sheet-cancel", { tone = "quiet" }),
                     -- Hidden rather than disabled while the name is empty: `action_button` has no
                     -- disabled tone, and a useless button is better absent than greyed.
                     -- Enter does the same thing for anyone already typing.

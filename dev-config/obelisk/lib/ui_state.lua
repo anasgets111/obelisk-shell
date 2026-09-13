@@ -106,6 +106,13 @@ local function clear_network_prompts()
     obelisk.network:invoke("cancel_connect")
 end
 
+-- The sheet's Cancel, which also stops a join already in flight (`abort_connect`). Closing the
+-- panel stays `clear_network_prompts` alone, so a join survives the panel going away.
+local function cancel_network_join()
+    obelisk.network:invoke("abort_connect")
+    clear_network_prompts()
+end
+
 local function open_hidden_prompt()
     clear_network_prompts()
     hidden_prompt:set(true)
@@ -318,6 +325,7 @@ return {
     hidden_join = hidden_join,
     open_hidden_prompt = open_hidden_prompt,
     clear_network_prompts = clear_network_prompts,
+    cancel_network_join = cancel_network_join,
     panel_showing = panel_showing,
     launcher_open = launcher_open,
     wallpaper_picker_open = wallpaper_picker_open,
