@@ -28,66 +28,39 @@ pub(crate) fn blocks_idle(block_inhibited: &str) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct IdleGate {
     blocked: bool,
-    /// Every `(generation_id, threshold_sec)` with a forwarded `Idled` and no `Resumed` yet.
+    /// Every `(generation_id, threshold_sec)` with an `Idled` and no `Resumed` since, blocked or not.
     idled: HashSet<(u32, u64)>,
 }
 
 impl IdleGate {
-    /// One raw threshold event. `None` drops it.
-    ///
-    /// Drops `Resumed` under a block. If the pair was open when the inhibitor arrived,
-    /// [`Self::set_blocked`] already closed it; otherwise it answers nothing.
+    /// One raw threshold event, recorded even under a block so release knows what is still idle.
+    /// `None` drops it.
     pub(crate) fn observe(&mut self, event: shared::IdleEvent) -> Option<shared::IdleEvent> {
-        if self.blocked {
-            return None;
-        }
         let key = (event.generation_id, event.threshold_sec);
         match event.state {
-            shared::IdleState::Idled => {
-                self.idled.insert(key);
-            }
-            shared::IdleState::Resumed => {
-                self.idled.remove(&key);
-            }
-        }
-        Some(event)
+            shared::IdleState::Idled => self.idled.insert(key),
+            shared::IdleState::Resumed => self.idled.remove(&key),
+        };
+        (!self.blocked).then_some(event)
     }
 
-    /// A change in logind's idle-block answer. `None` means unchanged; `BlockInhibited` changes
-    /// for every inhibitor, most unrelated to idle. `Some` carries owed `Resumed` events, so a
-    /// config dimmed at 30 seconds undims when a film starts; hence the tracked `idled` set.
+    /// A change in logind's idle-block answer; `None` if unchanged. A block takes back every idle
+    /// threshold; release announces those still idle, since a notification never resends `idled`.
     ///
     /// Starts unblocked: an unblocked first observation is `None` and logs nothing; an inhibitor
     /// already held at startup is a real change and logs.
-    ///
-    /// Release replays nothing, and cannot: `observe` returns before recording, so a seat that went
-    /// idle *during* a block is not in `idled` either. That idle period is invisible for its whole
-    /// length -- seen live as a countdown that never started after a manual hold was dropped, which
-    /// is worse than ADR-0139 decision 4 judged it.
-    ///
-    /// ponytail: recreating every notification on release was tried and reverted (ADR-0159), and
-    /// nothing about that attempt was measured -- neither that it worked nor that it broke
-    /// anything. Until then the seat needs input and a fresh idle period. An upgrade wants the
-    /// rebuild driven from the dispatch thread that owns the queue rather than from the
-    /// `BlockInhibited` task, and a way to notice a dead listener so a reload rebuilds one.
     pub(crate) fn set_blocked(&mut self, blocked: bool) -> Option<Vec<shared::IdleEvent>> {
         if blocked == self.blocked {
             return None;
         }
         self.blocked = blocked;
-        if !blocked {
-            return Some(Vec::new());
-        }
+        let state = if blocked { shared::IdleState::Resumed } else { shared::IdleState::Idled };
         let mut owed: Vec<shared::IdleEvent> = self
             .idled
-            .drain()
-            .map(|(generation_id, threshold_sec)| shared::IdleEvent {
-                generation_id,
-                threshold_sec,
-                state: shared::IdleState::Resumed,
-            })
+            .iter()
+            .map(|&(generation_id, threshold_sec)| shared::IdleEvent { generation_id, threshold_sec, state })
             .collect();
-        // HashSet drain order is arbitrary; sort before Lua callbacks for repeatable undims.
+        // HashSet order is arbitrary; sort before Lua callbacks for repeatable undims.
         owed.sort_by_key(|event| (event.generation_id, event.threshold_sec));
         Some(owed)
     }
@@ -174,16 +147,17 @@ mod tests {
     }
 
     #[test]
-    fn releasing_an_inhibitor_replays_nothing_and_reopens_the_gate() {
+    fn releasing_an_inhibitor_announces_the_thresholds_still_idle() {
         let mut gate = IdleGate::default();
         gate.observe(event(1, 30, IdleState::Idled));
+        gate.observe(event(1, 60, IdleState::Idled));
         gate.set_blocked(true);
+        gate.observe(event(1, 60, IdleState::Resumed));
+        gate.observe(event(1, 300, IdleState::Idled));
 
         assert_eq!(
             gate.set_blocked(false),
-            Some(Vec::new()),
-            "a pair the gate never saw open cannot be replayed; ADR-0159 records what re-asking cost"
+            Some(vec![event(1, 30, IdleState::Idled), event(1, 300, IdleState::Idled)])
         );
-        assert_eq!(gate.observe(event(1, 30, IdleState::Idled)), Some(event(1, 30, IdleState::Idled)));
     }
 }

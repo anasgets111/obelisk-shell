@@ -2344,6 +2344,10 @@ Amends ADR-0032: a session running its own idle daemon honors logind inhibitors.
 5. Watch independently of Wayland notify; logind failure leaves the gate open with a diagnostic.
 6. Queue registrations before notify becomes live; clear queued/live entries together on reset.
 
+Later amendment (2026-09-13), replacing decision 4 and closing ADR-0159's hole: record events under a
+block and replay `Idled` on release for thresholds still idle, so countdowns start at release, as
+mutter and PowerDevil restart theirs.
+
 Initially reject roster promotion until a UI wants foreign-holder state; ADR-0141 supplies it.
 Keep inhibitor polling and unrequested idle-hint policy out.
 
