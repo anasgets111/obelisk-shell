@@ -258,34 +258,19 @@ pub(super) struct BluezCard {
     pub(super) profiles: std::collections::BTreeMap<i32, master::Profile>,
     /// The index `Profile` reports.
     pub(super) active: Option<i32>,
-    /// Sequence number of the enumeration in progress, passed to `enum_params` and echoed back on
-    /// every answer, so answers to an older one are dropped.
-    pub(super) enumeration: i32,
-    /// Profiles collected for [`BluezCard::enumeration`], swapped in when its `Profile` arrives.
+    /// `EnumProfile` answers collected since the last `Profile` answer, swapped in when it arrives.
     pub(super) incoming: std::collections::BTreeMap<i32, master::Profile>,
 }
 
 impl BluezCard {
-    /// Starts an enumeration and returns the sequence number to ask with.
-    pub(super) fn begin_enumeration(&mut self) -> i32 {
-        self.enumeration = self.enumeration.wrapping_add(1);
-        self.incoming.clear();
-        self.enumeration
+    /// Collects one `EnumProfile` answer.
+    pub(super) fn enumerated(&mut self, profile: master::Profile) {
+        self.incoming.insert(profile.index, profile);
     }
 
-    /// Collects one `EnumProfile` answer; an answer to an older enumeration is dropped.
-    pub(super) fn enumerated(&mut self, seq: i32, profile: master::Profile) {
-        if seq == self.enumeration {
-            self.incoming.insert(profile.index, profile);
-        }
-    }
-
-    /// Ends enumeration `seq` with its `Profile` answer, replacing the list and making `index` active.
+    /// Ends an enumeration with its `Profile` answer, replacing the list and making `index` active.
     /// Returns whether either changed, so re-enumerating the same card publishes nothing.
-    pub(super) fn finish_enumeration(&mut self, seq: i32, index: i32) -> bool {
-        if seq != self.enumeration {
-            return false;
-        }
+    pub(super) fn finish_enumeration(&mut self, index: i32) -> bool {
         let profiles = std::mem::take(&mut self.incoming);
         let changed = profiles != self.profiles || self.active != Some(index);
         self.profiles = profiles;
@@ -1443,20 +1428,19 @@ mod tests {
         };
         let mut card = BluezCard::default();
 
-        let first = card.begin_enumeration();
-        card.enumerated(first, profile(1, "a2dp-sink-sbc"));
-        let second = card.begin_enumeration();
-        card.enumerated(first, profile(9, "a2dp-sink-stale"));
-        card.enumerated(second, profile(2, "a2dp-sink-aac"));
-        assert!(!card.finish_enumeration(first, 1), "an older enumeration's answer changes nothing");
-        assert!(card.finish_enumeration(second, 2));
+        card.enumerated(profile(1, "a2dp-sink-sbc"));
+        card.enumerated(profile(2, "a2dp-sink-aac"));
+        assert!(card.finish_enumeration(1));
+        assert_eq!(card.profiles.keys().copied().collect::<Vec<_>>(), [1, 2]);
+
+        card.enumerated(profile(2, "a2dp-sink-aac"));
+        assert!(card.finish_enumeration(2));
         assert_eq!(card.profiles.keys().copied().collect::<Vec<_>>(), [2], "SBC left with the old list");
         assert_eq!(card.active, Some(2));
 
         // A volume step re-enumerates the same card; nothing changed, so nothing publishes.
-        let third = card.begin_enumeration();
-        card.enumerated(third, profile(2, "a2dp-sink-aac"));
-        assert!(!card.finish_enumeration(third, 2));
+        card.enumerated(profile(2, "a2dp-sink-aac"));
+        assert!(!card.finish_enumeration(2));
     }
 
     #[test]

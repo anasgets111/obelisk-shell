@@ -511,8 +511,11 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
 }
 
 /// Binds a BlueZ `Device` for its codec profiles, keyed by MAC for the Bluetooth panel's join; its
-/// `Route` is never read. Enumerated from `info` (ADR-0200). `Profile` is asked after `EnumProfile`
-/// with the same seq, so its answer ends the enumeration and publishes only on a change.
+/// `Route` is never read. Enumerated from `info` (ADR-0200). `Profile` is asked after `EnumProfile`,
+/// so its answer ends the enumeration and publishes only on a change. Answers are matched by that
+/// order, not by seq: protocol-native's `device_marshal_enum_params` sends
+/// `SPA_RESULT_RETURN_ASYNC(msg->seq)` and ignores the caller's (a live `enum_params(7, ..)` came
+/// back as 1073741828).
 fn bind_bluez_device(
     state: &Rc<RefCell<MixerState>>,
     registry: &pw::registry::RegistryRc,
@@ -542,10 +545,9 @@ fn bind_bluez_device(
     let device = Rc::new(device);
     let device_for_info = Rc::downgrade(&device);
     let state_for_param = Rc::clone(state);
-    let state_for_info = Rc::clone(state);
     let listener = device
         .add_listener_local()
-        .param(move |seq, param_type, _index, _next, param| {
+        .param(move |_seq, param_type, _index, _next, param| {
             let Some(pod) = param else { return };
             let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
                 return;
@@ -554,8 +556,8 @@ fn bind_bluez_device(
             let mut state = state_for_param.borrow_mut();
             let Some(card) = state.bluez_cards.get_mut(&device_id) else { return };
             match param_type {
-                pw::spa::param::ParamType::EnumProfile => card.enumerated(seq, profile),
-                pw::spa::param::ParamType::Profile if card.finish_enumeration(seq, profile.index) => {
+                pw::spa::param::ParamType::EnumProfile => card.enumerated(profile),
+                pw::spa::param::ParamType::Profile if card.finish_enumeration(profile.index) => {
                     state.publish_audio();
                 }
                 _ => {}
@@ -565,15 +567,9 @@ fn bind_bluez_device(
             if !info.change_mask().contains(pw::device::DeviceChangeMask::PARAMS) {
                 return;
             }
-            // The borrow ends with this statement, before `enum_params` can lead to a `param` event.
-            let Some(seq) =
-                state_for_info.borrow_mut().bluez_cards.get_mut(&device_id).map(BluezCard::begin_enumeration)
-            else {
-                return;
-            };
             if let Some(device) = device_for_info.upgrade() {
-                device.enum_params(seq, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
-                device.enum_params(seq, Some(pw::spa::param::ParamType::Profile), 0, u32::MAX);
+                device.enum_params(0, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
+                device.enum_params(0, Some(pw::spa::param::ParamType::Profile), 0, u32::MAX);
             }
         })
         .register();
