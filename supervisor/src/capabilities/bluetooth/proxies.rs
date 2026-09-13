@@ -1,5 +1,4 @@
 //! Hand-written BlueZ proxies (ADR-0030: no maintained zbus proxy crate for BlueZ).
-//! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use zbus::zvariant::ObjectPath;
 

@@ -8,7 +8,7 @@
 //! (`zbus::Result<Self>`). NetworkManager is assumed present for `obelisk.network`; BlueZ may be
 //! absent with no hardware or no `bluetoothd`, so binding, adapter lookup, and agent registration
 //! log and produce an inert controller: `enabled`/`discovering` are `false`, lists are empty, and
-//! writes log and no-op. This extends `NetworkController::has_wifi_device` to a missing service.
+//! writes log and no-op.
 //!
 //! ponytail: an adapter BlueZ adds later is picked up, but a `bluetoothd` that starts after the
 //! Supervisor is not, because the `ObjectManager` binding and agent registration happen once.

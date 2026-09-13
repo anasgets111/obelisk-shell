@@ -1,5 +1,4 @@
 //! Hand-written `org.bluez.Agent1`; pairing waits for the user's answer in `pairing_request`.
-//! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

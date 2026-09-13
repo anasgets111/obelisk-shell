@@ -1,6 +1,5 @@
 //! Device registry: per-object/adapter/ObjectManager D-Bus signal forwarders that keep
 //! [`super::BluetoothState`]'s device lists in sync.
-//! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

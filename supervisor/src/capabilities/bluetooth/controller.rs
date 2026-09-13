@@ -1,5 +1,4 @@
 //! [`BluetoothController`]: the `obelisk.bluetooth` write-action dispatcher and state owner.
-//! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,7 +193,7 @@ impl BluetoothController {
 
     /// Re-derives the three lists from the full registry: paired and connected, paired only, and
     /// unpaired. A failed `Paired` or `Connected` read counts as `false`. Discovery is not
-    /// session-scoped; see `dbus/bluetooth/mod.rs`'s ponytail note.
+    /// session-scoped; see `bluetooth/mod.rs`'s ponytail note.
     async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<PairedDevice>, Vec<DiscoveredDevice>) {
         let snapshot: Vec<(String, Device1Proxy<'static>, Option<Battery1Proxy<'static>>)> = {
             let guard = self.devices.lock().unwrap();
