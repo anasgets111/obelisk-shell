@@ -31,13 +31,15 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 use crate::capabilities::bind;
 
 pub mod connection;
+mod scan;
 
 use connection::ConnectError;
 use connection::{
-    ConnectionIntent, access_point_is_secure, activation_verdict, build_connection_dict, connection_intent,
-    connection_wants_autoconnect, dedup_and_top20, merge_psk, profile_ssid, resolve_band, resolve_ssid,
+    ConnectionIntent, activation_verdict, build_connection_dict, connection_intent, connection_wants_autoconnect,
+    merge_psk, profile_ssid,
 };
 pub use connection::{parse_connect_args, parse_ssid_arg};
+use scan::resolve_ssid;
 
 /// One scanned AP, resolved to `network.available_networks` (docs/lua-api.md §2.5)
 /// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
@@ -200,35 +202,6 @@ trait ActiveConnection {
 
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
-}
-
-/// Reads one access point into the shape `network.available_networks` wants. `active` is passed
-/// in rather than derived here: it is a fact about the device's association, not about the access
-/// point, and only the caller holds it.
-async fn read_access_point(
-    ap: &AccessPointProxy<'static>,
-    active: bool,
-    saved_ssids: &HashSet<Vec<u8>>,
-) -> Option<AccessPointInfo> {
-    let ssid_bytes = ap.ssid().await.ok()?;
-    if ssid_bytes.is_empty() {
-        // ponytail: an empty hidden-AP SSID cannot be shown or deduped; including it collapses all
-        // hidden APs into one `""` row. Connect still works with `hidden=true`.
-        return None;
-    }
-    let strength = ap.strength().await.ok()?;
-    let frequency = ap.frequency().await.ok()?;
-    let flags = ap.flags().await.unwrap_or(0);
-    let wpa_flags = ap.wpa_flags().await.unwrap_or(0);
-    let rsn_flags = ap.rsn_flags().await.unwrap_or(0);
-    Some(AccessPointInfo {
-        saved: saved_ssids.contains(&ssid_bytes),
-        ssid: String::from_utf8_lossy(&ssid_bytes).into_owned(),
-        strength,
-        secure: access_point_is_secure(flags, wpa_flags, rsn_flags),
-        band: resolve_band(frequency).unwrap_or_default().to_string(),
-        active,
-    })
 }
 
 /// `device`'s first IPv4 address without its prefix, read uncached because `Ip4Config`'s path
@@ -477,15 +450,6 @@ impl NetworkController {
         }
     }
 
-    /// Queues [`NetworkSignal::ScanStarted`] so `scanning` flips on initiation, before
-    /// `RequestScan`. Only does so with Wi-Fi hardware; otherwise [`scan`](Self::scan) no-ops and
-    /// `scanning` would stick at `true`.
-    pub fn mark_scanning(&self) {
-        if self.devices.lock().unwrap().wifi.is_some() {
-            let _ = self.events.send(NetworkSignal::ScanStarted);
-        }
-    }
-
     /// Stashes `network:connect(ssid, hidden)` until paired `secure_submit(network, connect)`.
     /// Newest intent wins.
     pub fn stash_connect_intent(&self, pending: PendingNetworkConnect) {
@@ -701,70 +665,6 @@ impl NetworkController {
             .into_iter()
             .find(|profile| connection_wants_autoconnect(&profile.settings))
             .map(|profile| profile.path))
-    }
-
-    /// § 4.2: dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
-    pub async fn scan(&self) {
-        let Some(wifi) = self.wifi() else {
-            eprintln!("network: scan() requested but no Wi-Fi device is present");
-            return;
-        };
-        if let Err(err) = wifi.wireless.request_scan(HashMap::new()).await {
-            eprintln!("network: RequestScan failed: {err}");
-            // A refused scan never moves `LastScan`, so `mark_scanning`'s flag would hold until NM
-            // scans on its own, minutes later on a joined radio and never on a powered-down one.
-            let _ = self.events.send(NetworkSignal::ScanCompleted);
-        }
-    }
-
-    /// § 4.2: re-queries, deduplicates, and caps the current AP list at 20 by strength (ADR-0029:
-    /// no debounce). Returns empty, not an error, without Wi-Fi hardware.
-    pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
-        let Some(wifi) = self.wifi() else {
-            return Vec::new();
-        };
-        let active_path = wifi.wireless.active_access_point().await.ok();
-        let ap_paths = match wifi.wireless.get_access_points().await {
-            Ok(paths) => paths,
-            Err(err) => {
-                eprintln!("network: failed to list access points: {err}");
-                return Vec::new();
-            }
-        };
-
-        let access_points = self.warm_access_points(&ap_paths).await;
-        let saved_ssids = self.saved_ssids.lock().unwrap().clone();
-        let mut aps = Vec::with_capacity(access_points.len());
-        for (path, proxy) in &access_points {
-            if let Some(ap) = read_access_point(proxy, active_path.as_ref() == Some(path), &saved_ssids).await {
-                aps.push(ap);
-            }
-        }
-        dedup_and_top20(aps)
-    }
-
-    /// Binds missing `paths`, drops held paths no longer in range, and returns live proxies in path
-    /// order. Returned clones share each held proxy's property cache.
-    ///
-    /// Takes the lock around, not across, binding because it is a plain mutex and binding awaits.
-    async fn warm_access_points(&self, paths: &[OwnedObjectPath]) -> Vec<(OwnedObjectPath, AccessPointProxy<'static>)> {
-        let missing: Vec<OwnedObjectPath> = {
-            let held = self.access_points.lock().unwrap();
-            paths.iter().filter(|path| !held.contains_key(*path)).cloned().collect()
-        };
-        let mut bound = Vec::with_capacity(missing.len());
-        for path in missing {
-            match bind::<AccessPointProxy>(&self.connection, path.clone()).await {
-                Ok(proxy) => bound.push((path, proxy)),
-                Err(err) => eprintln!("network: failed to bind access point {path}: {err}"),
-            }
-        }
-
-        let in_range: HashSet<&OwnedObjectPath> = paths.iter().collect();
-        let mut held = self.access_points.lock().unwrap();
-        held.extend(bound);
-        held.retain(|path, _| in_range.contains(path));
-        paths.iter().filter_map(|path| Some((path.clone(), held.get(path)?.clone()))).collect()
     }
 
     /// Supervisor services §4: turns `pending` and `secret` (empty open, non-empty WPA-PSK) into
