@@ -950,6 +950,19 @@ impl NetworkController {
         *self.saved_ssids.lock().unwrap() = ssids;
     }
 
+    /// `network:disconnect_wifi()`: `Device.Disconnect` on the Wi-Fi device, as
+    /// `NetworkService.qml`'s `disconnectWifi`. NetworkManager also stops autoconnect on that
+    /// device until the user joins again, so the radio does not rejoin behind the click.
+    pub async fn disconnect_wifi(&self) {
+        let Some(wifi) = &self.wifi else {
+            eprintln!("network: disconnect_wifi() requested but no Wi-Fi device is present");
+            return;
+        };
+        if let Err(err) = wifi.device.disconnect().await {
+            eprintln!("network: failed to disconnect the Wi-Fi device: {err}");
+        }
+    }
+
     /// Supervisor services §4: deletes every connection profile matching `ssid`.
     pub async fn forget(&self, ssid: &str) {
         for profile in self.saved_profiles_for_ssid(ssid, "forget").await {
@@ -972,6 +985,7 @@ pub enum NetworkAction {
     Connect,
     CancelConnect,
     Forget,
+    DisconnectWifi,
 }
 
 /// `obelisk.network` dispatch (ADR-0037). Writes spawn rather than await inline (ADR-0029);
@@ -1036,6 +1050,12 @@ pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelo
             }
             None => crate::log_malformed_command(params),
         },
+        NetworkAction::DisconnectWifi => {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller.disconnect_wifi().await;
+            });
+        }
     }
 }
 

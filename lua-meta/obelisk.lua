@@ -491,7 +491,7 @@ local LockCapability = {}
 ---@field invoke fun(self: MprisCapability, command: "control"|"seek"|"seek_relative", ...: any)
 
 ---@class NetworkCapability: Capability<NetworkState>
----@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget", ...: any)
+---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"forget"|"disconnect_wifi", ...: any)
 
 ---@class NotificationsCapability: Capability<NotificationsState>
 local NotificationsCapability = {}

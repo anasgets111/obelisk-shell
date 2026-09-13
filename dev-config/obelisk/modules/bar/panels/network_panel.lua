@@ -158,6 +158,11 @@ local function access_point_row(entry)
     end
 
     local trailing = {}
+    if ap.active then
+        trailing[#trailing + 1] = panel_action_icon(icons.disconnect, function()
+            obelisk.network:invoke("disconnect_wifi")
+        end, { slot = "network-disconnect-" .. tostring(ap.ssid), tint = theme.RED })
+    end
     if ap.saved or ap.active then
         trailing[#trailing + 1] = panel_action_icon(icons.trash, function()
             obelisk.network:invoke("forget", ap.ssid)
