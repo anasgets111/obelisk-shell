@@ -21,6 +21,11 @@ pub(super) trait Adapter1 {
 
     #[zbus(property)]
     fn discovering(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn discoverable(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_discoverable(&self, value: bool) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(interface = "org.bluez.Device1", default_service = "org.bluez")]

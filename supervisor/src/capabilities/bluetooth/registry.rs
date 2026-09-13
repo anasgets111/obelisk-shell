@@ -176,7 +176,7 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
     });
 }
 
-/// Forwards adapter `Powered`/`Discovering` changes as [`BluetoothSignal::AdapterChanged`], so
+/// Forwards adapter `Powered`/`Discovering`/`Discoverable` changes as [`BluetoothSignal::AdapterChanged`], so
 /// state follows BlueZ's own writes as well as this controller's.
 pub(super) fn spawn_adapter_signal_forwarder(
     adapter: Adapter1Proxy<'static>,
@@ -185,12 +185,16 @@ pub(super) fn spawn_adapter_signal_forwarder(
     tokio::spawn(async move {
         let mut powered_changed = adapter.receive_powered_changed().await;
         let mut discovering_changed = adapter.receive_discovering_changed().await;
+        let mut discoverable_changed = adapter.receive_discoverable_changed().await;
         loop {
             tokio::select! {
                 Some(_) = powered_changed.next() => {
                     if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
                 }
                 Some(_) = discovering_changed.next() => {
+                    if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
+                }
+                Some(_) = discoverable_changed.next() => {
                     if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
                 }
                 else => break,

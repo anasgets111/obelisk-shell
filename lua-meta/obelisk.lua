@@ -319,6 +319,7 @@
 ---@class BluetoothState
 ---@field available boolean An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is inert and every write is a logged no-op.
 ---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
+---@field discoverable boolean Other devices can find this adapter and ask to pair; the agent asks the user before any of them does. BlueZ turns it off after `DiscoverableTimeout` (180s by default), and that change reaches this field like any other.
 ---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered, so always `false` without one.
@@ -484,7 +485,7 @@ local BatteryCapability = {}
 ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
 
 ---@class BluetoothCapability: Capability<BluetoothState>
----@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"|"answer_pairing", ...: any)
+---@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"set_discoverable"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"|"answer_pairing", ...: any)
 
 ---@class BrightnessCapability: Capability<BrightnessState>
 ---@field invoke fun(self: BrightnessCapability, command: "set", ...: any)

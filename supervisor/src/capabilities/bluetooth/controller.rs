@@ -132,10 +132,12 @@ impl BluetoothController {
             BluetoothSignal::AdapterChanged => {
                 let enabled = self.read_enabled().await;
                 let discovering = self.read_discovering().await;
+                let discoverable = self.read_discoverable().await;
                 let mut state = self.state.lock().unwrap();
                 state.available = self.adapter.is_some();
                 state.enabled = enabled;
                 state.discovering = discovering;
+                state.discoverable = discoverable;
                 state.clone()
             }
             BluetoothSignal::DeviceRegistryChanged => {
@@ -179,6 +181,14 @@ impl BluetoothController {
     async fn read_discovering(&self) -> bool {
         match &self.adapter {
             Some(adapter) => adapter.discovering().await.unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Live `Discoverable` value; `false` without an adapter is not an error.
+    async fn read_discoverable(&self) -> bool {
+        match &self.adapter {
+            Some(adapter) => adapter.discoverable().await.unwrap_or(false),
             None => false,
         }
     }
@@ -275,6 +285,18 @@ impl BluetoothController {
         };
         if let Err(err) = adapter.set_powered(enabled).await {
             eprintln!("bluetooth: failed to set Powered={enabled}: {err}");
+        }
+    }
+
+    /// `bluetooth:set_discoverable(on)`: writes `Adapter1.Discoverable`. The adapter forwarder
+    /// observes the change, including BlueZ's own switch-off at `DiscoverableTimeout`.
+    pub async fn set_discoverable(&self, on: bool) {
+        let Some(adapter) = &self.adapter else {
+            eprintln!("bluetooth: set_discoverable({on}) failed: {}", BluetoothActionError::NoAdapter);
+            return;
+        };
+        if let Err(err) = adapter.set_discoverable(on).await {
+            eprintln!("bluetooth: failed to set Discoverable={on}: {err}");
         }
     }
 

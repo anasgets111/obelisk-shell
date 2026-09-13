@@ -112,6 +112,10 @@ pub struct BluetoothState {
     pub enabled: bool,
     /// Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
     pub discovering: bool,
+    /// Other devices can find this adapter and ask to pair; the agent asks the user before any of
+    /// them does. BlueZ turns it off after `DiscoverableTimeout` (180s by default), and that change
+    /// reaches this field like any other.
+    pub discoverable: bool,
     /// Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change
     /// on any rebuild. Sort before drawing.
     pub connected_devices: Vec<ConnectedDevice>,
@@ -127,7 +131,7 @@ pub struct BluetoothState {
 /// What signal forwarders report to `main.rs`'s top-level `select!`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothSignal {
-    /// The adapter's own `Powered` or `Discovering` property changed.
+    /// The adapter's own `Powered`, `Discovering` or `Discoverable` property changed.
     AdapterChanged,
     /// A device was added/removed, or its `Connected`/`Paired`/`Name`/`Blocked`/
     /// `Battery1.Percentage` changed.
@@ -197,6 +201,7 @@ pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
 #[serde(rename_all = "snake_case")]
 pub enum BluetoothAction {
     SetEnabled,
+    SetDiscoverable,
     StartDiscovery,
     StopDiscovery,
     Pair,
@@ -218,6 +223,15 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
                 let controller = controller.clone();
                 tokio::spawn(async move {
                     controller.set_enabled(enabled).await;
+                });
+            }
+            None => crate::log_malformed_command(params),
+        },
+        BluetoothAction::SetDiscoverable => match parse_bool_arg(&params.arguments) {
+            Some(on) => {
+                let controller = controller.clone();
+                tokio::spawn(async move {
+                    controller.set_discoverable(on).await;
                 });
             }
             None => crate::log_malformed_command(params),

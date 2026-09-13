@@ -4,15 +4,14 @@
 -- Connected rows show battery, disconnect and forget. Paired rows reconnect on click and show
 -- forget. Available rows fall back to MAC and show pair.
 --
--- Dropped: the "Visible" tile (`set_discoverable` is unavailable) and codec picker (`codec` is
--- always `nil`, ADR-0030). Discovery runs while the panel shows (`lib/ui_state.lua`); the header
--- button still stops or restarts it.
+-- Dropped: the codec picker (`codec` is always `nil`, ADR-0030). Discovery runs while the panel
+-- shows (`lib/ui_state.lua`); the scan tile still stops or restarts it.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
 local cell = require("components.cell")
 local toggle = require("components.toggle")
-local icon_button = require("components.icon_button")
+local panel_toggle_card = require("components.panel_toggle_card")
 local section_header = require("components.section_header")
 local panel_header = require("components.panel_header")
 local panel_row = require("components.panel_row")
@@ -225,19 +224,6 @@ local body = {
         active = obelisk.bluetooth:map(enabled),
         subtitle = util.label(obelisk.bluetooth, state_line),
         trailing = {
-            -- Scan toggles discovery; the header says "scanning…" while it runs.
-            icon_button(icons.refresh, function()
-                local b = obelisk.bluetooth:get()
-                obelisk.bluetooth:invoke((b and b.discovering) and "stop_discovery" or "start_discovery")
-            end, {
-                slot = "bluetooth-scan",
-                size = theme.control.sm,
-                icon_size = theme.icon.sm,
-                background = obelisk.bluetooth:map(function(b)
-                    return (b and b.discovering) and theme.ACCENT_MEDIUM or theme.GLASS_CONTROL
-                end),
-                visible = util.shown_when(obelisk.bluetooth, enabled),
-            }),
             -- No adapter means no switch to flip, the mirror's `disabled: !root.ready`. Hidden rather
             -- than greyed, because `toggle` has no disabled look.
             rect {
@@ -251,6 +237,39 @@ local body = {
                         obelisk.bluetooth:invoke("set_enabled", new_value)
                     end),
                 },
+            },
+        },
+    },
+    -- The mirror's two tiles. "visible" lets other devices find this one, and the agent asks before
+    -- any of them pairs (`modules/global/bluetooth_pairing.lua`). "scan" is discovery.
+    row {
+        width = "Fill",
+        spacing = theme.spacing.xs,
+        visible = util.shown_when(obelisk.bluetooth, enabled),
+        children = {
+            panel_toggle_card {
+                slot = "bluetooth-visible-tile",
+                icon = icons.bt_visible,
+                label = "visible",
+                signal = obelisk.bluetooth,
+                read = function(b)
+                    return b.discoverable
+                end,
+                on_change = function(on)
+                    obelisk.bluetooth:invoke("set_discoverable", on)
+                end,
+            },
+            panel_toggle_card {
+                slot = "bluetooth-scan-tile",
+                icon = icons.bt_scan,
+                label = "scan",
+                signal = obelisk.bluetooth,
+                read = function(b)
+                    return b.discovering
+                end,
+                on_change = function(on)
+                    obelisk.bluetooth:invoke(on and "start_discovery" or "stop_discovery")
+                end,
             },
         },
     },

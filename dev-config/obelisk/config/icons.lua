@@ -70,6 +70,9 @@ icons.ethernet        = "\u{F0200}"
 icons.bt_off          = "\u{F00B2}"
 icons.bt_on           = "\u{F00AF}"
 icons.bt_conn         = "\u{F00B1}"
+-- The Bluetooth panel's two tiles, `BluetoothPanel.qml`'s "Visible" and "Scan" glyphs.
+icons.bt_visible      = "\u{F043E}"
+icons.bt_scan         = "\u{F0018}"
 
 -- Notifications, plus `bell_off` for the clock glyph when there are none.
 icons.bell            = "\u{F0A2}"
