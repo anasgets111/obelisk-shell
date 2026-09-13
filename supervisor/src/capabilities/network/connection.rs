@@ -326,23 +326,11 @@ mod tests {
     }
 
     #[test]
-    fn access_point_is_secure_is_false_for_a_fully_open_network() {
-        assert!(!access_point_is_secure(0, 0, 0));
-    }
-
-    #[test]
-    fn access_point_is_secure_is_true_for_wep_privacy_alone() {
-        assert!(access_point_is_secure(NM80211ApFlags::PRIVACY.bits(), 0, 0));
-    }
-
-    #[test]
-    fn access_point_is_secure_is_true_when_only_wpa_flags_are_set() {
-        assert!(access_point_is_secure(0, 0b0000_0100, 0));
-    }
-
-    #[test]
-    fn access_point_is_secure_is_true_when_only_rsn_flags_are_set() {
-        assert!(access_point_is_secure(0, 0, 0b0000_0100));
+    fn access_point_is_secure_needs_privacy_or_a_wpa_or_rsn_flag() {
+        assert!(!access_point_is_secure(0, 0, 0), "a fully open network");
+        assert!(access_point_is_secure(NM80211ApFlags::PRIVACY.bits(), 0, 0), "WEP privacy alone");
+        assert!(access_point_is_secure(0, 0b0000_0100, 0), "only WPA flags");
+        assert!(access_point_is_secure(0, 0, 0b0000_0100), "only RSN flags");
     }
 
     #[test]
@@ -444,17 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn dedup_and_top20_truncates_to_20() {
-        let aps: Vec<AccessPointInfo> = (0..30).map(|i| ap(&format!("ap{i}"), i as u8)).collect();
-        assert_eq!(dedup_and_top20(aps).len(), 20);
-    }
-
-    #[test]
     fn dedup_and_top20_keeps_the_20_strongest_not_just_the_first_20() {
         let mut aps: Vec<AccessPointInfo> = (0..30).map(|i| ap(&format!("ap{i}"), i as u8)).collect();
         // Reverse the input so a naive "take the first 20" implementation fails.
         aps.reverse();
         let result = dedup_and_top20(aps);
+        assert_eq!(result.len(), 20);
         assert!(result.iter().all(|a| a.strength >= 10), "must keep the strongest 20, not the first 20 seen");
     }
 

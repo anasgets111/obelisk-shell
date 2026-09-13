@@ -289,66 +289,23 @@ mod tests {
     // ---- class_to_category ----
 
     #[test]
-    fn class_to_category_maps_a_real_keyboards_class() {
-        assert_eq!(class_to_category(0x002540), "keyboard");
-    }
-
-    #[test]
-    fn class_to_category_maps_a_real_mouses_class() {
-        assert_eq!(class_to_category(0x002580), "mouse");
-    }
-
-    #[test]
-    fn class_to_category_maps_a_combo_peripheral_to_keyboard() {
-        // Major 0x05 (Peripheral), minor top-2-bits `11` (combo keyboard/pointing device).
-        let class = (0x05 << 8) | (0b11_0000 << 2);
-        assert_eq!(class_to_category(class), "keyboard");
-    }
-
-    #[test]
-    fn class_to_category_maps_an_unclassified_peripheral_to_generic() {
-        // Major 0x05, minor top-2-bits `00` (uncategorized per the Bluetooth spec).
-        assert_eq!(class_to_category(0x05 << 8), "generic");
-    }
-
-    #[test]
-    fn class_to_category_maps_major_0x01_to_computer() {
-        assert_eq!(class_to_category(0x01 << 8), "computer");
-    }
-
-    #[test]
-    fn class_to_category_maps_major_0x02_to_phone() {
-        assert_eq!(class_to_category(0x02 << 8), "phone");
-    }
-
-    #[test]
-    fn class_to_category_maps_audio_video_minor_0x01_and_0x02_to_headset() {
-        assert_eq!(class_to_category((0x04 << 8) | (0x01 << 2)), "headset");
-        assert_eq!(class_to_category((0x04 << 8) | (0x02 << 2)), "headset");
-    }
-
-    #[test]
-    fn class_to_category_maps_audio_video_minor_0x06_to_headphones() {
-        assert_eq!(class_to_category((0x04 << 8) | (0x06 << 2)), "headphones");
-    }
-
-    #[test]
-    fn class_to_category_maps_other_audio_video_minors_to_generic() {
-        assert_eq!(class_to_category((0x04 << 8) | (0x03 << 2)), "generic");
-    }
-
-    #[test]
-    fn class_to_category_maps_an_unmapped_major_to_generic() {
-        // Major 0x03 is "LAN/Network Access Point", not a rendered category.
-        assert_eq!(class_to_category(0x03 << 8), "generic");
-    }
-
-    #[test]
-    fn class_to_category_ignores_service_class_bits() {
-        // Real headsets carry Service Class bits above bit 12 (e.g. "Audio" = bit 21); ignore
-        // them when extracting Major/Minor.
-        let class = 0x24_0404_u32 & 0x00FF_FFFF;
-        assert_eq!(class_to_category(class), "headset");
+    fn class_to_category_reads_only_the_major_and_minor_bits() {
+        for (class, category, case) in [
+            (0x00_2540, "keyboard", "a real keyboard"),
+            (0x00_2580, "mouse", "a real mouse"),
+            ((0x05 << 8) | (0b11_0000 << 2), "keyboard", "a combo keyboard and pointing device"),
+            (0x05 << 8, "generic", "a peripheral the spec leaves uncategorized"),
+            (0x01 << 8, "computer", "major 0x01"),
+            (0x02 << 8, "phone", "major 0x02"),
+            ((0x04 << 8) | (0x01 << 2), "headset", "audio/video minor 0x01"),
+            ((0x04 << 8) | (0x02 << 2), "headset", "audio/video minor 0x02"),
+            ((0x04 << 8) | (0x06 << 2), "headphones", "audio/video minor 0x06"),
+            ((0x04 << 8) | (0x03 << 2), "generic", "another audio/video minor"),
+            (0x03 << 8, "generic", "LAN/Network Access Point, not a drawn category"),
+            (0x24_0404, "headset", "a real headset, whose Service Class bits sit above bit 12"),
+        ] {
+            assert_eq!(class_to_category(class), category, "{case}");
+        }
     }
 
     // ---- arg parsers ----
