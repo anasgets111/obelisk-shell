@@ -62,6 +62,8 @@ pub struct PairedDevice {
     pub name: String,
     /// Drawing hint, the same set as [`ConnectedDevice::category`].
     pub category: String,
+    /// BlueZ refuses every connection to or from the device until it is unblocked.
+    pub blocked: bool,
     /// Same as [`DiscoveredDevice::busy`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub busy: Option<String>,
@@ -75,6 +77,8 @@ pub struct DiscoveredDevice {
     pub name: String,
     /// Always `false`; every entry in this pool is unpaired (IDL contract).
     pub paired: bool,
+    /// BlueZ refuses to pair with or connect to the device until it is unblocked.
+    pub blocked: bool,
     /// `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device
     /// runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ
     /// has no property for a call in flight, so a pair or connect started by another client or by
@@ -106,8 +110,8 @@ pub struct BluetoothState {
 pub enum BluetoothSignal {
     /// The adapter's own `Powered` or `Discovering` property changed.
     AdapterChanged,
-    /// A device was added/removed, or its `Connected`/`Paired`/`Name`/`Battery1.Percentage`
-    /// changed.
+    /// A device was added/removed, or its `Connected`/`Paired`/`Name`/`Blocked`/
+    /// `Battery1.Percentage` changed.
     DeviceRegistryChanged,
     /// Sent by [`BluetoothController::clear_discovered`], not a forwarder, when
     /// `bluetooth:start_discovery()` begins. It clears `discovered_devices` before

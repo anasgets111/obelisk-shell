@@ -69,7 +69,7 @@ pub(super) async fn register_device(
     }
 }
 
-/// Forwards `Connected`/`Paired`/`Name` and, when present, `Battery1.Percentage` changes as
+/// Forwards `Connected`/`Paired`/`Name`/`Blocked` and, when present, `Battery1.Percentage` changes as
 /// [`BluetoothSignal::DeviceRegistryChanged`] until the connection drops. One per device,
 /// aborted on `InterfacesRemoved`.
 ///
@@ -85,6 +85,7 @@ fn spawn_device_signal_forwarder(
         let mut connected_changed = device.receive_connected_changed().await;
         let mut paired_changed = device.receive_paired_changed().await;
         let mut name_changed = device.receive_name_changed().await;
+        let mut blocked_changed = device.receive_blocked_changed().await;
         let mut percentage_changed = match &battery {
             Some(battery) => Some(battery.receive_percentage_changed().await),
             None => None,
@@ -99,6 +100,9 @@ fn spawn_device_signal_forwarder(
                     if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
                 }
                 Some(_) = name_changed.next() => {
+                    if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
+                }
+                Some(_) = blocked_changed.next() => {
                     if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
                 }
                 Some(_) = async {

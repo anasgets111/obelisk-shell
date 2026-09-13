@@ -50,6 +50,9 @@ pub(super) trait Device1 {
     fn connected(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
+    fn blocked(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
     fn set_trusted(&self, value: bool) -> zbus::Result<()>;
 }
 

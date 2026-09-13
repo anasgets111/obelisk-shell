@@ -121,6 +121,7 @@
 ---@field name string The device's advertised name.
 
 ---@class DiscoveredDevice
+---@field blocked boolean BlueZ refuses to pair with or connect to the device until it is unblocked.
 ---@field busy? string `"pairing"`, `"connecting"` or `"disconnecting"` while this Supervisor's call for the device runs, or `nil`. A device can change lists mid-action, so any list can carry any label. BlueZ has no property for a call in flight, so a pair or connect started by another client or by the device itself never shows here.
 ---@field mac string Canonical MAC address accepted by `bluetooth:pair(mac)`.
 ---@field name string Advertised name, often empty when the device broadcasts only an address.
@@ -199,6 +200,7 @@
 ---@field workspaces WorkspaceEntry[] Workspaces on this output, ordered by [`WorkspaceEntry::idx`]; the strip draws these because the two ids above are opaque.
 
 ---@class PairedDevice
+---@field blocked boolean BlueZ refuses every connection to or from the device until it is unblocked.
 ---@field busy? string Same as [`DiscoveredDevice::busy`].
 ---@field category string Drawing hint, the same set as [`ConnectedDevice::category`].
 ---@field mac string Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.

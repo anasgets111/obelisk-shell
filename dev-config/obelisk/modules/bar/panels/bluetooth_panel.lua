@@ -186,23 +186,31 @@ local function device_row(item)
         end, { slot = "bluetooth-disconnect-" .. tostring(device.mac), tint = theme.RED })
     end
     if item.status == "available" then
-        trailing[#trailing + 1] = pair_button(device)
+        if not device.blocked then
+            trailing[#trailing + 1] = pair_button(device)
+        end
     else
         trailing[#trailing + 1] = panel_action_icon(icons.trash, function()
             obelisk.bluetooth:invoke("forget", device.mac)
         end, { slot = "bluetooth-forget-" .. tostring(device.mac), tint = theme.RED })
     end
-    -- Only a paired row is a button, the mirror's `canConnect`. Connected and available rows act
-    -- through their icons and the word "pair".
+    -- Only an unblocked paired row is a button, the mirror's `canConnect`. Connected and available
+    -- rows act through their icons and the word "pair". A blocked row says so, the mirror's
+    -- `statusText`, and offers nothing BlueZ would refuse.
+    local subtitle = nil
+    if item.status == "connected" then
+        subtitle = device.codec and ("connected · " .. device.codec) or "connected"
+    elseif device.blocked then
+        subtitle = "blocked"
+    end
     return panel_row {
         slot = "bluetooth-device-" .. tostring(device.mac),
         icon = device_icon(device),
         title = display_name(device),
-        subtitle = item.status == "connected" and (device.codec and ("connected · " .. device.codec) or "connected")
-            or nil,
+        subtitle = subtitle,
         selected = item.status == "connected",
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
-        on_activate = item.status == "paired" and function()
+        on_activate = (item.status == "paired" and not device.blocked) and function()
             obelisk.bluetooth:invoke("connect", device.mac)
         end or nil,
     }

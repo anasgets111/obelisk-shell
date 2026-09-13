@@ -191,12 +191,14 @@ impl BluetoothController {
             let name = device.name().await.unwrap_or_default();
             let busy = running.get(&mac).map(|action| action.to_string());
             if !paired {
-                discovered.push(DiscoveredDevice { mac, name, paired: false, busy });
+                let blocked = device.blocked().await.unwrap_or(false);
+                discovered.push(DiscoveredDevice { mac, name, paired: false, blocked, busy });
                 continue;
             }
             let category = class_to_category(device.class().await.unwrap_or(0)).to_string();
             if !is_connected {
-                paired_only.push(PairedDevice { mac, name, category, busy });
+                let blocked = device.blocked().await.unwrap_or(false);
+                paired_only.push(PairedDevice { mac, name, category, blocked, busy });
                 continue;
             }
             let battery_percent = match &battery {
