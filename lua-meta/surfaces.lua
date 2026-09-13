@@ -25,7 +25,7 @@
 ---@field monitor? string An output name, or `"All"`.
 ---@field namespace? string What the compositor sees, for rules like Hyprland's `layerrule`. Defaults to `"obelisk-{id}"`.
 ---@field keyboard_interactivity? "None"|"OnDemand"|"Exclusive"|Bound Default `"None"`. Note that niri gives an `on_demand` layer surface focus the moment it maps, with no click involved.
----@field visible? boolean|Bound Unmaps without destroying. Toggling this churns no Wayland objects.
+---@field visible? boolean|Bound Hiding destroys the layer surface and showing recreates it (ADR-0088).
 ---@field child? Node|fun(output: string): Node? The one root node. A surface holds exactly one; use a `row` or `column` for more. A function is called once per output instance with that output's connector name and its return takes the child's place, so one `monitor = "All"` panel can show a different file per screen (ADR-0121); `nil` maps that instance empty. The eval-time probe calls it with `"PROBE"`.
 
 ---@class WindowProps: NodeBase, BoxBase

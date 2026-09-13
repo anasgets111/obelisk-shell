@@ -197,7 +197,7 @@ impl NetworkController {
         self.devices.lock().unwrap().ethernet.clone()
     }
 
-    /// § 4.1: `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
+    /// `NetworkingEnabled` is read-only; only `WirelessEnabled`/`WwanEnabled`/`WimaxEnabled`
     /// have setters. Toggle it with `Enable(bool)`, not the spec's literal property write.
     pub async fn set_networking_enabled(&self, enabled: bool) {
         if let Err(err) = self.nm.enable(enabled).await {
@@ -205,14 +205,14 @@ impl NetworkController {
         }
     }
 
-    /// § 4.1: `WirelessEnabled` is read-write.
+    /// `WirelessEnabled` is read-write.
     pub async fn set_wifi_enabled(&self, enabled: bool) {
         if let Err(err) = self.nm.set_wireless_enabled(enabled).await {
             eprintln!("network: failed to set wifi_enabled={enabled}: {err}");
         }
     }
 
-    /// § 4.1 / ADR-0029: `false` disconnects every wired device; `true` activates each existing
+    /// ADR-0029: `false` disconnects every wired device; `true` activates each existing
     /// autoconnect profile. A device with none is a no-op; NM cannot fabricate a connection.
     pub async fn set_ethernet_enabled(&self, enabled: bool) {
         for ethernet in self.ethernet() {

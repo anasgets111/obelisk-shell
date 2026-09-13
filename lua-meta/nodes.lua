@@ -1,5 +1,5 @@
 ---@meta
--- The eight geometric nodes (`lua-api.md` § 5.2) and their shared properties (§ 5.1).
+-- The nine geometric nodes (`lua-api.md` § 5.2) and their shared properties (§ 5.1).
 --
 -- HAND-WRITTEN. `just stubs` does not touch it. Of five `lua-meta` files, only `obelisk.lua` is
 -- generated: capability payloads are `Serialize` structs, while a node's schema is 29 scattered
@@ -181,7 +181,7 @@
 ---but keeps the draft; pressing the field again resumes. Only Escape with `on_cancel`, submit, or
 ---node removal clears it.
 ---@field placeholder? string|Bound Drawn in the foreground colour while the field is empty. Not the value: submitting an untouched field submits an empty string. A focused plain field shows a caret instead, so that "empty" and "empty and typing into it" do not look alike.
----@field mask_character? string|Bound Capped at 1 byte. Hides typed input.
+---@field mask_character? string|Bound Hides typed input behind its first character; `•` by default, nothing for `""`.
 ---@field secure_submit? { capability: string, action: string } Only meaningful alongside `mask_character`; without it a masked field's value is unreadable from Lua entirely (ADR-0005, ADR-0027).
 ---@field on_change? fun(text: string) The whole text after each edit, not the delta. Per keystroke, since there is no input method to batch composition.
 ---@field on_submit? fun(text?: string) Enter. Takes the whole text and leaves the field focused and empty, so a reply box takes the next message without another click. Fires with no argument when both `mask_character` and `secure_submit` are set.

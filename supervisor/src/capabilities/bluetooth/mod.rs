@@ -135,7 +135,7 @@ pub struct BluetoothState {
     pub connected_devices: Vec<ConnectedDevice>,
     /// Paired devices that are not connected, unordered like `connected_devices`.
     pub paired_devices: Vec<PairedDevice>,
-    /// Unpaired devices seen by the running scan; empties when discovery stops.
+    /// Unpaired devices BlueZ knows. A stop keeps them; BlueZ expires each after `TemporaryTimeout` (30s).
     pub discovered_devices: Vec<DiscoveredDevice>,
     /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
     #[serde(skip_serializing_if = "Option::is_none")]

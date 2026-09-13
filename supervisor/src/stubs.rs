@@ -132,9 +132,12 @@ fn payload_class(schema: &Schema) -> String {
     schema.get("title").and_then(|t| t.as_str()).unwrap_or("table").to_string()
 }
 
-/// Action variants as declaration-ordered wire strings for `invoke`. schemars' fieldless `enum`
-/// array uses `rename_all` spellings, exactly what `parse_action` accepts.
+/// Action variants as declaration-ordered wire strings for `invoke`, in the `rename_all` spellings
+/// `parse_action` accepts: one `enum` array, or [`const_enum`]'s form once a variant has a doc comment.
 fn action_names(schema: &Schema) -> Vec<String> {
+    if let Some(variants) = const_enum(schema.as_value()) {
+        return variants.into_iter().map(|(name, _)| name.to_string()).collect();
+    }
     schema
         .get("enum")
         .and_then(|e| e.as_array())
@@ -557,6 +560,18 @@ mod tests {
         assert!(!line.contains("forget_thresholds"), "a config must not be offered it: {line}");
         for config_callable in ["register", "inhibit", "release_inhibit"] {
             assert!(line.contains(config_callable), "{config_callable} must survive the exclusion: {line}");
+        }
+    }
+
+    /// The golden test only compares against itself, so it passed while audio, lock and
+    /// notifications had no `invoke` at all: a doc comment on a variant turns schemars' `enum` into
+    /// a `oneOf`.
+    #[test]
+    fn every_action_enum_yields_an_invoke_union() {
+        for (capability, _, actions) in super::capability_schemas() {
+            if let Some(actions) = actions {
+                assert!(!super::action_names(&actions).is_empty(), "{capability} has actions but no union");
+            }
         }
     }
 

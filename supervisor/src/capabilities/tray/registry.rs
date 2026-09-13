@@ -268,7 +268,7 @@ pub(super) fn spawn_name_owner_changed_forwarder(
                 if let Some(handle) = entry.menu_forwarder {
                     handle.abort();
                 }
-                // Remove all three variant files (ADR-0074). `/dev/shm` outlives this process, and
+                // Remove all three variant files (ADR-0074). The runtime dir outlives this process, and
                 // reconnecting apps get a new unique name, so stale PNGs otherwise survive to
                 // reboot.
                 for path in [

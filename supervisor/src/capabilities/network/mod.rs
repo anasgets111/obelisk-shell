@@ -52,7 +52,7 @@ pub struct JoinError {
     pub message: String,
 }
 
-/// `obelisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
+/// `obelisk.network`'s whole live state, not only its scan results. Every field is re-derived from
 /// NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ///
 /// The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
@@ -139,7 +139,7 @@ pub enum NetworkSignal {
     Changed,
     /// `LastScan` changed, or NetworkManager refused `RequestScan`. Either way no scan is in flight.
     ScanCompleted,
-    /// Sent by [`NetworkController::mark_scanning`] before `RequestScan` completes (§4.2), through
+    /// Sent by [`NetworkController::mark_scanning`] before `RequestScan` completes, through
     /// the same channel for FIFO ordering.
     ScanStarted,
     /// A saved profile was added or removed, so the saved-SSID cache is stale.

@@ -344,7 +344,7 @@
 ---@field available boolean An adapter is bound; without one every other field is inert and every write a logged no-op.
 ---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
 ---@field discoverable boolean Other devices can find this adapter and ask to pair; the agent asks first. BlueZ turns it off after `DiscoverableTimeout` (180s by default).
----@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
+---@field discovered_devices DiscoveredDevice[] Unpaired devices BlueZ knows. A stop keeps them; BlueZ expires each after `TemporaryTimeout` (30s).
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered, so always `false` without one.
 ---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
@@ -392,7 +392,7 @@
 ---@field players PlayerState[] Every MPRIS player, longest-running first. New players append and position updates do not move entries, so `players[1]` keeps its meaning. Empty when no player is running, which is valid, not an error.
 
 ---@class NetworkState
----`obelisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
+---`obelisk.network`'s whole live state, not only its scan results. Every field is re-derived from
 ---NetworkManager on each [`NetworkSignal`] (ADR-0029: no debounce or incremental state).
 ---
 ---The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
@@ -497,7 +497,7 @@
 ---@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch"|"open_url", ...: any)
 
 ---@class AudioCapability: Capability<AudioState>
-local AudioCapability = {}
+---@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_source_volume"|"set_source_muted"|"toggle_source_mute"|"set_app_volume"|"set_app_muted"|"set_bluetooth_profile", ...: any)
 
 ---@class BatteryCapability: Capability<BatteryState>
 local BatteryCapability = {}
@@ -524,7 +524,7 @@ local BatteryCapability = {}
 ---@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
 
 ---@class LockCapability: Capability<LockState>
-local LockCapability = {}
+---@field invoke fun(self: LockCapability, command: "lock"|"set_unlock_animation", ...: any)
 
 ---@class MprisCapability: Capability<MprisState>
 ---@field invoke fun(self: MprisCapability, command: "control"|"seek"|"seek_relative", ...: any)
@@ -533,7 +533,7 @@ local LockCapability = {}
 ---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"abort_connect"|"forget"|"disconnect_wifi", ...: any)
 
 ---@class NotificationsCapability: Capability<NotificationsState>
-local NotificationsCapability = {}
+---@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd"|"hold_expiry", ...: any)
 
 ---@class PowerCapability: Capability<PowerState>
 ---@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)

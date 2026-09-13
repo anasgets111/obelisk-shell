@@ -118,7 +118,7 @@ pub(super) fn connection_intent(ssid: &str, hidden: bool, secret: &[u8]) -> Resu
     Ok(ConnectionIntent { ssid: ssid.to_string(), hidden, psk })
 }
 
-/// Builds the minimal `AddAndActivateConnection2` dict (§4.3): security only for a secured intent,
+/// Builds the minimal `AddAndActivateConnection2` dict: security only for a secured intent,
 /// and `hidden`/`scan-ssid` only when `intent.hidden` is set.
 pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, HashMap<&str, Value<'_>>> {
     let mut dict: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
@@ -133,8 +133,7 @@ pub(super) fn build_connection_dict(intent: &ConnectionIntent) -> HashMap<&str, 
     wireless.insert("mode", Value::new("infrastructure"));
     if intent.hidden {
         wireless.insert("hidden", Value::new(true));
-        // NM probes hidden networks from `hidden` alone, but §4.3 requires both. NM silently
-        // ignores the extra `scan-ssid` key.
+        // Redundant for NM, which probes hidden networks from `hidden` alone and ignores this key.
         wireless.insert("scan-ssid", Value::new(true));
     }
     dict.insert("802-11-wireless", wireless);

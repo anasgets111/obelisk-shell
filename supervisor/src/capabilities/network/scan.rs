@@ -9,12 +9,11 @@ use zbus::zvariant::OwnedObjectPath;
 use super::{AccessPointInfo, NetworkController, NetworkSignal};
 use crate::capabilities::bind;
 
-/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/services.md
-/// §4.2: "serializes the top 20 access points").
+/// How many deduplicated APs [`dedup_and_top20`] keeps (docs/services.md § 4).
 const MAX_AVAILABLE_NETWORKS: usize = 20;
 
 /// `[2400, 2500]` -> `"2.4 GHz"`, `[4900, 5900]` -> `"5 GHz"`, `[5925, 7125]` -> `"6 GHz"`
-/// (§4.2). Real Wi-Fi hardware falls inside one range, so `None` is honest "no band", not a
+/// Real Wi-Fi hardware falls inside one range, so `None` is honest "no band", not a
 /// guessed default.
 pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
     match freq_mhz {
@@ -33,7 +32,7 @@ pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32)
 }
 
 /// Merges duplicate SSIDs by highest strength, then serializes the connected one plus the strongest
-/// 19 (§4.2). Equal-strength duplicates keep the first sighting; a tie is only between distinct
+/// 19. Equal-strength duplicates keep the first sighting; a tie is only between distinct
 /// BSSIDs broadcasting the same SSID, so either choice is equally correct.
 ///
 /// `active` sorts ahead of strength because `build_state` reads `ssid` and `strength` here. Without
@@ -131,7 +130,7 @@ impl NetworkController {
         }
     }
 
-    /// § 4.2: dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
+    /// Dispatches `RequestScan({})`. Missing Wi-Fi hardware is logged, not fatal.
     pub async fn scan(&self) {
         let Some(wifi) = self.wifi() else {
             eprintln!("network: scan() requested but no Wi-Fi device is present");
@@ -145,7 +144,7 @@ impl NetworkController {
         }
     }
 
-    /// § 4.2: re-queries, deduplicates, and caps the current AP list at 20 by strength (ADR-0029:
+    /// Re-queries, deduplicates, and caps the current AP list at 20 by strength (ADR-0029:
     /// no debounce). Returns empty, not an error, without Wi-Fi hardware.
     pub async fn build_available_networks(&self) -> Vec<AccessPointInfo> {
         let Some(wifi) = self.wifi() else {

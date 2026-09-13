@@ -27,7 +27,7 @@ pub(super) fn profile_ssid(settings: &HashMap<String, HashMap<String, OwnedValue
         .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
 }
 
-/// Shapes a saved profile for `SettingsConnection.UpdateUnsaved` (§4.3), changing only its PSK.
+/// Shapes a saved profile for `SettingsConnection.UpdateUnsaved`, changing only its PSK.
 /// The update replaces the whole profile, so static addresses, route metrics, and autoconnect
 /// priority pass through; an open profile gains a `wpa-psk` section. `None` when the profile's
 /// `key-mgmt` takes no PSK: forcing `wpa-psk` downgraded SAE, and 802.1X would lose the password
@@ -66,7 +66,7 @@ pub(super) struct SavedProfile {
 
 impl NetworkController {
     /// Every saved Wi-Fi profile for `ssid`, paired with the settings dict that matched it.
-    /// `context` identifies the caller in logs. Plural because §4.3 `forget` deletes all while
+    /// `context` identifies the caller in logs. Plural because `forget` deletes all while
     /// `connect` takes the first; one `ListConnections` walk serves both.
     pub(super) async fn saved_profiles_for_ssid(&self, ssid: &str, context: &str) -> Vec<SavedProfile> {
         let mut profiles = self.wifi_profiles(&format!("{context}({ssid:?})")).await;
