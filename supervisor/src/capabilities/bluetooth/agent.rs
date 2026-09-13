@@ -88,8 +88,8 @@ fn mac_from_path(path: &str) -> String {
 }
 
 /// `org.bluez.Agent1`, this session's only pairing agent. Only an invited device (the adapter is
-/// visible, or this Supervisor is pairing it) raises a prompt; a paired device's `"service"` request
-/// always asks.
+/// visible, or this Supervisor is pairing it) raises a prompt; a `"service"` request asks instead
+/// when a tracked device reads `Paired`.
 ///
 /// ponytail: `RequestPinCode` and `RequestPasskey` are rejected, since the card has no text field.
 /// Upgrade path: a `secure_submit` field. ponytail: pairing by another client with no agent of its
@@ -116,8 +116,10 @@ impl BluetoothAgent {
     }
 
     /// Puts the request on screen and returns whether it went up. An uninvited device's request
-    /// stays down unless it is `"service"`. Nothing replaces a prompt already showing, except that a
-    /// request BlueZ waits on replaces a code display, which has no answer to lose.
+    /// stays down, and so does a `"service"` request from a device that is not tracked and paired:
+    /// BlueZ asks for any untrusted device, and the card says it is paired. Nothing replaces a
+    /// prompt already showing, except that a request BlueZ waits on replaces a code display, which
+    /// has no answer to lose.
     async fn show(
         &self,
         kind: PairingKind,
@@ -126,11 +128,18 @@ impl BluetoothAgent {
         reply: Option<oneshot::Sender<bool>>,
     ) -> bool {
         let mac = mac_from_path(device.as_str());
-        if kind != PairingKind::Service && !(self.invited)(&mac) {
-            eprintln!("bluetooth: refused a {kind:?} request from {mac}: not visible and not pairing it");
+        let proxy = self.devices.lock().unwrap().get(device).map(|entry| entry.device.clone());
+        let allowed = match (kind, &proxy) {
+            (PairingKind::Service, Some(proxy)) => proxy.paired().await.unwrap_or(false),
+            (PairingKind::Service, None) => false,
+            _ => (self.invited)(&mac),
+        };
+        if !allowed {
+            eprintln!(
+                "bluetooth: refused a {kind:?} request from {mac}: not invited, or a service request from an unpaired device"
+            );
             return false;
         }
-        let proxy = self.devices.lock().unwrap().get(device).map(|entry| entry.device.clone());
         let name = match proxy {
             Some(proxy) => proxy.name().await.unwrap_or_default(),
             None => String::new(),
@@ -237,6 +246,8 @@ pub(super) async fn register_agent_best_effort(
 mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+    use super::super::proxies::Device1Proxy;
+    use super::super::registry::DeviceEntry;
     use super::*;
     use crate::capabilities::test_support::p2p_pair_serving;
 
@@ -249,15 +260,11 @@ mod tests {
     /// dropped call.
     async fn agent_pair(
         invited: bool,
+        devices: DeviceRegistry,
     ) -> (zbus::Connection, zbus::Connection, PromptSlot, UnboundedReceiver<BluetoothSignal>) {
         let prompts = PromptSlot::default();
         let (events, signals) = unbounded_channel();
-        let agent = BluetoothAgent {
-            prompts: prompts.clone(),
-            devices: Arc::default(),
-            invited: Arc::new(move |_| invited),
-            events,
-        };
+        let agent = BluetoothAgent { prompts: prompts.clone(), devices, invited: Arc::new(move |_| invited), events };
         let (caller, agent_side) = p2p_pair_serving(|peer| peer.serve_at(AGENT_OBJECT_PATH, agent)).await;
         (caller, agent_side, prompts, signals)
     }
@@ -290,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn typing_a_pin_or_passkey_on_this_host_is_rejected_by_name() {
-        let (caller, _agent, _prompts, _signals) = agent_pair(true).await;
+        let (caller, _agent, _prompts, _signals) = agent_pair(true, DeviceRegistry::default()).await;
         let proxy = agent1_proxy(&caller).await;
         assert!(rejected(proxy.call::<_, _, String>("RequestPinCode", &(dummy_device_path(),)).await));
         assert!(rejected(proxy.call::<_, _, u32>("RequestPasskey", &(dummy_device_path(),)).await));
@@ -298,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_confirmation_waits_for_the_user_and_returns_their_yes() {
-        let (caller, _agent, prompts, mut signals) = agent_pair(true).await;
+        let (caller, _agent, prompts, mut signals) = agent_pair(true, DeviceRegistry::default()).await;
         let proxy = agent1_proxy(&caller).await;
         let args = (dummy_device_path(), 1234u32);
         let call = proxy.call::<_, _, ()>("RequestConfirmation", &args);
@@ -319,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_uninvited_device_raises_nothing() {
-        let (caller, _agent, prompts, _signals) = agent_pair(false).await;
+        let (caller, _agent, prompts, _signals) = agent_pair(false, DeviceRegistry::default()).await;
         let proxy = agent1_proxy(&caller).await;
 
         assert!(rejected(proxy.call::<_, _, ()>("RequestAuthorization", &(dummy_device_path(),)).await));
@@ -331,10 +338,58 @@ mod tests {
         assert!(prompts.lock().unwrap().is_none());
     }
 
+    /// A `Device1` that answers only `Paired`.
+    struct Bonded(bool);
+
+    #[zbus::interface(name = "org.bluez.Device1")]
+    impl Bonded {
+        #[zbus(property)]
+        async fn paired(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// A registry tracking one device at `dummy_device_path()` whose `Paired` reads `paired`, with
+    /// the connections that serve it.
+    async fn tracked(paired: bool) -> (DeviceRegistry, zbus::Connection, zbus::Connection) {
+        let (caller, served) = p2p_pair_serving(|peer| peer.serve_at(dummy_device_path(), Bonded(paired))).await;
+        let device = Device1Proxy::builder(&caller).path(dummy_device_path()).unwrap().build().await.unwrap();
+        let entry = DeviceEntry { mac: MAC.to_string(), device, battery: None, forwarder: tokio::spawn(async {}) };
+        let devices = DeviceRegistry::default();
+        devices.lock().unwrap().insert(dummy_device_path().into(), entry);
+        (devices, caller, served)
+    }
+
+    #[tokio::test]
+    async fn a_service_request_while_hidden_needs_a_tracked_paired_device() {
+        let hid = "00001124-0000-1000-8000-00805f9b34fb";
+        let (unpaired, _unpaired_caller, _unpaired_device) = tracked(false).await;
+        for devices in [DeviceRegistry::default(), unpaired] {
+            let (caller, _agent, prompts, _signals) = agent_pair(false, devices).await;
+            let proxy = agent1_proxy(&caller).await;
+            assert!(rejected(proxy.call::<_, _, ()>("AuthorizeService", &(dummy_device_path(), hid)).await));
+            assert!(prompts.lock().unwrap().is_none(), "an unknown or unpaired device raises nothing");
+        }
+
+        let (paired, _paired_caller, _paired_device) = tracked(true).await;
+        let (caller, _agent, prompts, mut signals) = agent_pair(false, paired).await;
+        let proxy = agent1_proxy(&caller).await;
+        let args = (dummy_device_path(), hid);
+        let call = proxy.call::<_, _, ()>("AuthorizeService", &args);
+        tokio::pin!(call);
+        tokio::select! {
+            _ = &mut call => panic!("a paired device's request waits for the user"),
+            _ = signals.recv() => {}
+        }
+        assert_eq!(prompts.lock().unwrap().as_ref().map(|prompt| prompt.request.kind), Some(PairingKind::Service));
+        assert!(answer(&prompts, Some(MAC), false, Instant::now()));
+        assert!(rejected(call.await));
+    }
+
     #[tokio::test]
     async fn cancel_rejects_a_confirmation_that_is_still_waiting() {
         // zbus serves `Cancel` while `RequestConfirmation` is parked on the user; this pins that.
-        let (caller, _agent, prompts, mut signals) = agent_pair(true).await;
+        let (caller, _agent, prompts, mut signals) = agent_pair(true, DeviceRegistry::default()).await;
         let proxy = agent1_proxy(&caller).await;
         let args = (dummy_device_path(), 1234u32);
         let call = proxy.call::<_, _, ()>("RequestConfirmation", &args);
@@ -353,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_request_while_one_waits_is_refused_at_once() {
-        let (caller, _agent, prompts, _signals) = agent_pair(true).await;
+        let (caller, _agent, prompts, _signals) = agent_pair(true, DeviceRegistry::default()).await;
         let (reply, _answered) = oneshot::channel();
         *prompts.lock().unwrap() = Some(PendingPrompt { reply: Some(reply), ..PendingPrompt::display(MAC) });
 
@@ -368,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_confirmation_replaces_a_code_display() {
-        let (caller, _agent, prompts, mut signals) = agent_pair(true).await;
+        let (caller, _agent, prompts, mut signals) = agent_pair(true, DeviceRegistry::default()).await;
         *prompts.lock().unwrap() = Some(PendingPrompt::display("AA:AA:AA:AA:AA:AA"));
         let proxy = agent1_proxy(&caller).await;
         let args = (dummy_device_path(), 7u32);

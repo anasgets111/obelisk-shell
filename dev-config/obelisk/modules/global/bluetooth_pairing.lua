@@ -69,7 +69,8 @@ return panel {
     keyboard_interactivity = "None",
     child = panel_card({
         cell(text(function(r)
-            local name = r.name ~= "" and r.name or r.mac
+            -- The name is the device's own choice, so the MAC stays beside it.
+            local name = r.name ~= "" and string.format("%s (%s)", r.name, r.mac) or r.mac
             return { { text = string.format(TITLES[r.kind] or "%s", name), bold = true } }
         end), theme.FG, theme.font.md, { width = "Fill", wrap = "Word" }),
         cell(text(function(r)
