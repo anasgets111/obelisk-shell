@@ -47,6 +47,7 @@
 ---and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
+---@field saved boolean A saved NetworkManager profile names this SSID, so joining it asks for no password.
 ---@field secure boolean A key is required: WEP privacy or non-empty WPA1/RSN key management.
 ---@field ssid string Network name. Entries dedupe on it, keeping the stronger sighting.
 ---@field strength integer Signal strength, `0` to `100`.

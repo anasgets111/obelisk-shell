@@ -10,8 +10,6 @@
 -- `layout::secure_submit` now counts only reachable fields, so an `autofocus` name field arms
 -- normally; `modules/shell/panel_host.lua` asks for the keyboard for both.
 --
--- Still dropped: Saved/Available sections (no `saved` flag). A connected network is saved by
--- construction, so its forget action is offered there.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -22,6 +20,7 @@ local icon_button = require("components.icon_button")
 local panel_header = require("components.panel_header")
 local panel_toggle_card = require("components.panel_toggle_card")
 local panel_row = require("components.panel_row")
+local section_header = require("components.section_header")
 local panel_action_icon = require("components.panel_action_icon")
 local panel_empty_state = require("components.panel_empty_state")
 local spinner = require("components.spinner")
@@ -120,20 +119,36 @@ obelisk.network:on_change(function(n, previous)
     end
 end)
 
+-- The mirror's `section.property: "group"`. Saved networks come first, then the rest. The joined
+-- network is saved by construction and leads its section, as the payload order already has it.
 local rows = obelisk.network:map(function(n)
-    local out = {}
     local connecting = n and n.connecting_ssid
+    local sections = { saved = {}, available = {} }
     for _, ap in ipairs(access_points(n)) do
-        out[#out + 1] = {
+        local group = (ap.saved or ap.active) and sections.saved or sections.available
+        group[#group + 1] = {
+            kind = "ap",
             ap = ap,
+            key = "ap-" .. tostring(ap.ssid),
             connecting = connecting ~= nil and connecting == ap.ssid,
             blocked = connecting ~= nil and connecting ~= ap.ssid,
         }
+    end
+    local out = {}
+    for _, label in ipairs({ "saved", "available" }) do
+        local group = sections[label]
+        if #group > 0 then
+            out[#out + 1] = { kind = "header", label = label, key = "header-" .. label }
+            table.move(group, 1, #group, #out + 1, out)
+        end
     end
     return out
 end)
 
 local function access_point_row(entry)
+    if entry.kind == "header" then
+        return section_header(entry.label)
+    end
     local ap = entry.ap
     local band, color = util.band_of(ap)
 
@@ -143,7 +158,7 @@ local function access_point_row(entry)
     end
 
     local trailing = {}
-    if ap.active then
+    if ap.saved or ap.active then
         trailing[#trailing + 1] = panel_action_icon(icons.trash, function()
             obelisk.network:invoke("forget", ap.ssid)
         end, { slot = "network-forget-" .. tostring(ap.ssid), tint = theme.RED })
@@ -477,7 +492,7 @@ local body = {
         source = rows,
         itemfn = access_point_row,
         key = function(entry)
-            return tostring(entry.ap.ssid)
+            return entry.key
         end,
     },
     -- The one row nothing scanned put there, last as in the mirror. A network broadcasting no SSID

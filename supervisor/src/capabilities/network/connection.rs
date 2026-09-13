@@ -139,14 +139,18 @@ pub(super) fn connection_wants_autoconnect(settings: &HashMap<String, HashMap<St
         .unwrap_or(true)
 }
 
-/// Whether `get_settings()` is a Wi-Fi profile for `ssid`. `forget` deletes every match (§4.3 says
-/// "profiles", plural).
-pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>, ssid: &str) -> bool {
+/// The SSID bytes of a Wi-Fi profile's `get_settings()`, or `None` for any other connection type.
+pub(super) fn profile_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<Vec<u8>> {
     settings
         .get("802-11-wireless")
         .and_then(|section| section.get("ssid"))
         .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
-        .is_some_and(|bytes| bytes == ssid.as_bytes())
+}
+
+/// Whether `get_settings()` is a Wi-Fi profile for `ssid`. `forget` deletes every match (§4.3 says
+/// "profiles", plural).
+pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>, ssid: &str) -> bool {
+    profile_ssid(settings).is_some_and(|bytes| bytes == ssid.as_bytes())
 }
 
 /// The `network:connect(ssid, hidden)` intent plus `secure_submit` secret before zbus `Value`
@@ -269,7 +273,14 @@ mod tests {
     use super::*;
 
     fn ap(ssid: &str, strength: u8) -> AccessPointInfo {
-        AccessPointInfo { ssid: ssid.to_string(), strength, secure: false, band: "2.4 GHz".to_string(), active: false }
+        AccessPointInfo {
+            ssid: ssid.to_string(),
+            strength,
+            secure: false,
+            band: "2.4 GHz".to_string(),
+            active: false,
+            saved: false,
+        }
     }
 
     #[test]

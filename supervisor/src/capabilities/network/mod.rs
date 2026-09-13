@@ -3,9 +3,9 @@
 //! into `main.rs`'s top-level `tokio::select!`, like `dbus::polkit`, rather than using a dedicated
 //! thread like `audio::mixer`.
 //!
-//! Four forwarder tasks feed one channel: wireless APs/association, each device's state, and the
-//! manager's radio switches/default route. ADR-0082: scan-only watching left connected machines
-//! reading offline for minutes.
+//! Five forwarder tasks feed one channel: wireless APs/association, each device's state, the
+//! manager's radio switches/default route, and saved-profile changes. ADR-0082: scan-only watching
+//! left connected machines reading offline for minutes.
 //!
 //! ponytail: Wi-Fi/Ethernet devices resolve once at [`NetworkController::new`]; a USB dongle added
 //! later needs a restart. Upgrade path: watch `device_added`/`device_removed` and rescan.
@@ -35,7 +35,8 @@ pub mod connection;
 use connection::ConnectError;
 use connection::{
     ConnectionIntent, access_point_is_secure, build_connection_dict, connect_error_text, connection_intent,
-    connection_wants_autoconnect, dedup_and_top20, merge_psk, resolve_band, resolve_ssid, settings_match_ssid,
+    connection_wants_autoconnect, dedup_and_top20, merge_psk, profile_ssid, resolve_band, resolve_ssid,
+    settings_match_ssid,
 };
 pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 
@@ -53,6 +54,8 @@ pub struct AccessPointInfo {
     pub band: String,
     /// This is the AP currently associated.
     pub active: bool,
+    /// A saved NetworkManager profile names this SSID, so joining it asks for no password.
+    pub saved: bool,
 }
 
 /// `obelisk.network`'s live §2.5 state, not only §4.2's scan results. Every field is re-derived from
@@ -146,6 +149,8 @@ pub enum NetworkSignal {
     /// Sent by [`NetworkController::mark_scanning`] before `RequestScan` completes (§4.2), through
     /// the same channel for FIFO ordering.
     ScanStarted,
+    /// A saved profile was added or removed, so the saved-SSID cache is stale.
+    SavedChanged,
 }
 
 /// [`NetworkController::watch_activation`]'s backstop timeout. NetworkManager normally gives up
@@ -217,7 +222,11 @@ async fn bind_settings_connection(
 /// Reads one access point into the shape `network.available_networks` wants. `active` is passed
 /// in rather than derived here: it is a fact about the device's association, not about the access
 /// point, and only the caller holds it.
-async fn read_access_point(ap: &AccessPointProxy<'static>, active: bool) -> Option<AccessPointInfo> {
+async fn read_access_point(
+    ap: &AccessPointProxy<'static>,
+    active: bool,
+    saved_ssids: &HashSet<Vec<u8>>,
+) -> Option<AccessPointInfo> {
     let ssid_bytes = ap.ssid().await.ok()?;
     if ssid_bytes.is_empty() {
         // ponytail: an empty hidden-AP SSID cannot be shown or deduped; including it collapses all
@@ -230,6 +239,7 @@ async fn read_access_point(ap: &AccessPointProxy<'static>, active: bool) -> Opti
     let wpa_flags = ap.wpa_flags().await.unwrap_or(0);
     let rsn_flags = ap.rsn_flags().await.unwrap_or(0);
     Some(AccessPointInfo {
+        saved: saved_ssids.contains(&ssid_bytes),
         ssid: String::from_utf8_lossy(&ssid_bytes).into_owned(),
         strength,
         secure: access_point_is_secure(flags, wpa_flags, rsn_flags),
@@ -300,6 +310,12 @@ pub struct NetworkController {
     ///
     /// Pruned against the live path list on each rebuild; `AccessPointRemoved` already requests it.
     access_points: Arc<Mutex<HashMap<OwnedObjectPath, AccessPointProxy<'static>>>>,
+    /// SSID bytes of every saved Wi-Fi profile, for [`AccessPointInfo::saved`]. Refreshed on
+    /// [`NetworkSignal::SavedChanged`], so a rebuild never walks `ListConnections`.
+    ///
+    /// ponytail: editing a saved profile's SSID fires neither watched signal, so the flag stays
+    /// stale until the next add or remove. Upgrade path: watch each profile's `Updated`.
+    saved_ssids: Arc<Mutex<HashSet<Vec<u8>>>>,
     /// `obelisk.network` push state (ADR-0037), mutated only by
     /// [`handle_signal`](Self::handle_signal).
     /// The cloned controller shares it; the mutex is never held across an await.
@@ -359,18 +375,23 @@ impl NetworkController {
             spawn_device_state_forwarder(device.device.clone(), events.clone());
         }
         spawn_manager_forwarder(nm.clone(), events.clone());
+        // Subscribed before the first fill below, so a profile saved in between is not missed.
+        spawn_settings_forwarder(settings.clone(), events.clone()).await;
 
-        Ok(Self {
+        let controller = Self {
             connection,
             nm,
             settings,
             wifi,
             ethernet,
             access_points: Arc::new(Mutex::new(HashMap::new())),
+            saved_ssids: Arc::default(),
             state: Arc::new(Mutex::new(NetworkState::default())),
             pending_connect: Arc::new(Mutex::new(None)),
             events,
-        })
+        };
+        controller.refresh_saved_ssids().await;
+        Ok(controller)
     }
 
     /// Applies one [`NetworkSignal`] to the controller-owned [`NetworkState`] and returns the
@@ -383,11 +404,14 @@ impl NetworkController {
                 state.scanning = true;
                 state.clone()
             }
-            NetworkSignal::ScanCompleted | NetworkSignal::Changed => {
+            NetworkSignal::ScanCompleted | NetworkSignal::Changed | NetworkSignal::SavedChanged => {
+                if signal == NetworkSignal::SavedChanged {
+                    self.refresh_saved_ssids().await;
+                }
                 // Read D-Bus before taking the plain mutex; never hold it across an await.
                 let mut next = self.build_state().await;
                 let mut state = self.state.lock().unwrap();
-                next.scanning = signal == NetworkSignal::Changed && state.scanning;
+                next.scanning = signal != NetworkSignal::ScanCompleted && state.scanning;
                 // These are attempt memory, not NetworkManager readings, so carry them across the
                 // re-derive like `scanning`. Take them because `state` is overwritten below.
                 next.connecting_ssid = state.connecting_ssid.take();
@@ -663,9 +687,10 @@ impl NetworkController {
         };
 
         let access_points = self.warm_access_points(&ap_paths).await;
+        let saved_ssids = self.saved_ssids.lock().unwrap().clone();
         let mut aps = Vec::with_capacity(access_points.len());
         for (path, proxy) in &access_points {
-            if let Some(ap) = read_access_point(proxy, active_path.as_ref() == Some(path)).await {
+            if let Some(ap) = read_access_point(proxy, active_path.as_ref() == Some(path), &saved_ssids).await {
                 aps.push(ap);
             }
         }
@@ -876,35 +901,53 @@ impl NetworkController {
     /// `context` identifies the caller in logs. Plural because §4.3 `forget` deletes all while
     /// `connect` takes the first; one `ListConnections` walk serves both.
     async fn saved_profiles_for_ssid(&self, ssid: &str, context: &str) -> Vec<SavedProfile> {
+        let mut profiles = self.wifi_profiles(&format!("{context}({ssid:?})")).await;
+        profiles.retain(|profile| settings_match_ssid(&profile.settings, ssid));
+        profiles
+    }
+
+    /// Every saved Wi-Fi profile. Unreadable profiles are logged under `context` and skipped.
+    async fn wifi_profiles(&self, context: &str) -> Vec<SavedProfile> {
         let paths = match self.settings.list_connections().await {
             Ok(paths) => paths,
             Err(err) => {
-                eprintln!("network: {context}({ssid:?}) failed to list connections: {err}");
+                eprintln!("network: {context} failed to list connections: {err}");
                 return Vec::new();
             }
         };
 
-        let mut matches = Vec::new();
+        let mut profiles = Vec::new();
         for path in paths {
             let connection = match bind_settings_connection(&self.connection, path.clone()).await {
                 Ok(connection) => connection,
                 Err(err) => {
-                    eprintln!("network: {context}({ssid:?}) failed to bind connection {path}: {err}");
+                    eprintln!("network: {context} failed to bind connection {path}: {err}");
                     continue;
                 }
             };
             let settings = match connection.get_settings().await {
                 Ok(settings) => settings,
                 Err(err) => {
-                    eprintln!("network: {context}({ssid:?}) failed to read settings for {path}: {err}");
+                    eprintln!("network: {context} failed to read settings for {path}: {err}");
                     continue;
                 }
             };
-            if settings_match_ssid(&settings, ssid) {
-                matches.push(SavedProfile { path, connection, settings });
+            if profile_ssid(&settings).is_some() {
+                profiles.push(SavedProfile { path, connection, settings });
             }
         }
-        matches
+        profiles
+    }
+
+    /// Replaces the saved-SSID cache with one fresh `ListConnections` walk.
+    async fn refresh_saved_ssids(&self) {
+        let ssids = self
+            .wifi_profiles("saved networks")
+            .await
+            .iter()
+            .filter_map(|profile| profile_ssid(&profile.settings))
+            .collect();
+        *self.saved_ssids.lock().unwrap() = ssids;
     }
 
     /// Supervisor services §4: deletes every connection profile matching `ssid`.
@@ -1129,6 +1172,33 @@ fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSe
     });
 }
 
+/// Forwards `Settings`' `NewConnection` and `ConnectionRemoved` as [`NetworkSignal::SavedChanged`].
+/// Subscribes before returning, so [`NetworkController::new`]'s first cache fill cannot race a
+/// profile saved in the gap.
+async fn spawn_settings_forwarder(settings: SettingsProxy<'static>, events: UnboundedSender<NetworkSignal>) {
+    let (mut added, mut removed) =
+        match tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed()) {
+            Ok(streams) => streams,
+            Err(err) => {
+                eprintln!("network: failed to subscribe to saved-profile changes: {err}");
+                return;
+            }
+        };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(_) = added.next() => {
+                    if events.send(NetworkSignal::SavedChanged).is_err() { break; }
+                }
+                Some(_) = removed.next() => {
+                    if events.send(NetworkSignal::SavedChanged).is_err() { break; }
+                }
+                else => break,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1217,7 @@ mod tests {
             wifi: None,
             ethernet: Vec::new(),
             access_points: Arc::default(),
+            saved_ssids: Arc::default(),
             state: Arc::new(Mutex::new(NetworkState {
                 connecting_ssid: Some(connecting.to_string()),
                 ..NetworkState::default()
