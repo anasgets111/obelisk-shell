@@ -1,7 +1,7 @@
 //! Tracked `obelisk.audio` state and pure parsing helpers, testable against recorded `pw-dump`
 //! properties without a live PipeWire proxy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -40,7 +40,7 @@ const STREAM_CAPTURE_SINK: &str = "stream.capture.sink";
 /// § 2.4 names `id`/`name` (ADR-0053 decision 3), while ADR-0016's `pid`/`process_name` remain.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
-    /// PipeWire registry id, the [`AudioApps`] key.
+    /// PipeWire registry id, the `MixerState::apps` key.
     pub id: u32,
     /// `application.process.id` recorded for the owning process.
     pub pid: i32,
@@ -140,7 +140,7 @@ fn build_app_stream(proc_root: &Path, node_id: u32, props: &impl PropsLookup) ->
 /// carry empty props and must not drop a live stream. `global_bind`'s first `info` has PROPS.
 pub(super) fn apply_info_event(
     proc_root: &Path,
-    apps: &mut AudioApps,
+    apps: &mut BTreeMap<u32, AppStream>,
     node_id: u32,
     has_props_change: bool,
     props: Option<&impl PropsLookup>,
@@ -149,40 +149,9 @@ pub(super) fn apply_info_event(
         return;
     }
     match props.and_then(|props| build_app_stream(proc_root, node_id, props)) {
-        Some(app) => apps.upsert(app),
-        None => {
-            apps.remove(node_id);
-        }
-    }
-}
-
-/// Live per-app streams keyed by PipeWire node id.
-#[derive(Debug, Default)]
-pub struct AudioApps {
-    streams: HashMap<u32, AppStream>,
-}
-
-impl AudioApps {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Inserts or replaces a stream entry.
-    pub fn upsert(&mut self, stream: AppStream) {
-        self.streams.insert(stream.id, stream);
-    }
-
-    /// Removes a registry node or an entry whose properties no longer parse.
-    pub fn remove(&mut self, node_id: u32) {
-        self.streams.remove(&node_id);
-    }
-
-    /// Current streams, sorted by node id for deterministic snapshots.
-    pub fn snapshot(&self) -> Vec<AppStream> {
-        let mut apps: Vec<AppStream> = self.streams.values().cloned().collect();
-        apps.sort_by_key(|app| app.id);
-        apps
-    }
+        Some(app) => apps.insert(node_id, app),
+        None => apps.remove(&node_id),
+    };
 }
 
 /// Full `obelisk.audio` payload (§ 2.4, ADR-0053 decision 3).
@@ -401,7 +370,7 @@ fn parse_video_source_props(node_id: u32, props: &impl PropsLookup) -> Option<Vi
 
 /// Applies a bound `Video/Source` `info`, with the same PROPS gating as [`apply_info_event`].
 pub(super) fn apply_video_info_event(
-    sources: &mut VideoSourceApps,
+    sources: &mut BTreeMap<u32, VideoSourceApp>,
     node_id: u32,
     has_props_change: bool,
     props: Option<&impl PropsLookup>,
@@ -410,45 +379,15 @@ pub(super) fn apply_video_info_event(
         return;
     }
     match props.and_then(|props| parse_video_source_props(node_id, props)) {
-        Some(source) => sources.upsert(source),
-        None => {
-            sources.remove(node_id);
-        }
-    }
+        Some(source) => sources.insert(node_id, source),
+        None => sources.remove(&node_id),
+    };
 }
 
-/// Live `Video/Source` nodes keyed by PipeWire id. Kept separate from [`AudioApps`] deliberately.
-#[derive(Debug, Default)]
-pub struct VideoSourceApps {
-    sources: HashMap<u32, VideoSourceApp>,
-}
-
-impl VideoSourceApps {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn upsert(&mut self, source: VideoSourceApp) {
-        self.sources.insert(source.node_id, source);
-    }
-
-    /// Removes an entry and reports whether it was present, letting `global_remove` choose the
-    /// update channel without tracking node kind separately.
-    pub fn remove(&mut self, node_id: u32) -> bool {
-        self.sources.remove(&node_id).is_some()
-    }
-
-    pub fn snapshot(&self) -> Vec<VideoSourceApp> {
-        let mut sources: Vec<VideoSourceApp> = self.sources.values().cloned().collect();
-        sources.sort_by_key(|source| source.node_id);
-        sources
-    }
-}
-
-/// One microphone or screen-capture stream (ADR-0137); [`CaptureApps`] supplies the kind.
+/// One microphone or screen-capture stream (ADR-0137); the list it is in supplies the kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct CaptureApp {
-    /// PipeWire registry id, the [`CaptureApps`] key.
+    /// PipeWire registry id, its list's key.
     pub node_id: u32,
     /// `application.process.id`, which portal-created streams may omit because the owner is the
     /// portal. A naming hint, never an identity.
@@ -483,7 +422,7 @@ fn parse_capture_props(node_id: u32, kind: NodeKind, props: &impl PropsLookup) -
 /// empty dict; `pw_node_info::state` is complete on every event, so `running` is not gated. The
 /// STATE bit only says whether it moved since the last one.
 pub(super) fn apply_capture_info_event(
-    apps: &mut CaptureApps,
+    apps: &mut BTreeMap<u32, CaptureApp>,
     node_id: u32,
     kind: NodeKind,
     has_props_change: bool,
@@ -492,49 +431,19 @@ pub(super) fn apply_capture_info_event(
 ) {
     if has_props_change {
         match props.and_then(|props| parse_capture_props(node_id, kind, props)) {
-            Some(app) => apps.upsert(app),
-            None => {
-                apps.remove(node_id);
-            }
-        }
+            Some(app) => apps.insert(node_id, app),
+            None => apps.remove(&node_id),
+        };
     }
-    apps.set_running(node_id, running);
+    // An unknown node stays unknown: a state event must not resurrect a rejected monitor capture.
+    if let Some(app) = apps.get_mut(&node_id) {
+        app.running = running;
+    }
 }
 
-/// Live capture streams for one kind, keyed by PipeWire id; kept separate from
-/// [`VideoSourceApps`] deliberately.
-#[derive(Debug, Default)]
-pub struct CaptureApps {
-    apps: HashMap<u32, CaptureApp>,
-}
-
-impl CaptureApps {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn upsert(&mut self, app: CaptureApp) {
-        self.apps.insert(app.node_id, app);
-    }
-
-    /// Ignores unknown nodes; a state event must not resurrect a rejected monitor capture.
-    pub fn set_running(&mut self, node_id: u32, running: bool) {
-        if let Some(app) = self.apps.get_mut(&node_id) {
-            app.running = running;
-        }
-    }
-
-    /// Removes an entry and reports whether it was present, like [`VideoSourceApps::remove`].
-    pub fn remove(&mut self, node_id: u32) -> bool {
-        self.apps.remove(&node_id).is_some()
-    }
-
-    /// Running entries only. Idle streams stay tracked so a later `Running` needs no re-parse.
-    pub fn snapshot(&self) -> Vec<CaptureApp> {
-        let mut apps: Vec<CaptureApp> = self.apps.values().filter(|app| app.running).cloned().collect();
-        apps.sort_by_key(|app| app.node_id);
-        apps
-    }
+/// Running entries only. Idle streams stay tracked so a later `Running` needs no re-parse.
+fn running(apps: &BTreeMap<u32, CaptureApp>) -> Vec<CaptureApp> {
+    apps.values().filter(|app| app.running).cloned().collect()
 }
 
 /// All PipeWire inputs to `obelisk.privacy` in one snapshot (ADR-0137). One channel keeps the three
@@ -577,12 +486,13 @@ pub(super) struct MixerState {
     ///
     /// The maps keep updating throughout. This gates sending, not tracking.
     pub(super) hydrated: bool,
-    pub(super) apps: AudioApps,
-    pub(super) video_sources: VideoSourceApps,
-    /// Running `Stream/Input/Audio` nodes (ADR-0137).
-    pub(super) microphones: CaptureApps,
-    /// Running `Stream/Output/Video` nodes (ADR-0137).
-    pub(super) screencasts: CaptureApps,
+    /// Maps are keyed by node id; `BTreeMap` publishes them in id order.
+    pub(super) apps: BTreeMap<u32, AppStream>,
+    pub(super) video_sources: BTreeMap<u32, VideoSourceApp>,
+    /// `Stream/Input/Audio` nodes, idle ones included (ADR-0137).
+    pub(super) microphones: BTreeMap<u32, CaptureApp>,
+    /// `Stream/Output/Video` nodes, idle ones included (ADR-0137).
+    pub(super) screencasts: BTreeMap<u32, CaptureApp>,
     pub(super) nodes: HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     pub(super) updates: UnboundedSender<AudioState>,
     pub(super) privacy_updates: UnboundedSender<PrivacySources>,
@@ -618,10 +528,10 @@ impl MixerState {
     pub(super) fn new(updates: UnboundedSender<AudioState>, privacy_updates: UnboundedSender<PrivacySources>) -> Self {
         Self {
             hydrated: false,
-            apps: AudioApps::new(),
-            video_sources: VideoSourceApps::new(),
-            microphones: CaptureApps::new(),
-            screencasts: CaptureApps::new(),
+            apps: BTreeMap::new(),
+            video_sources: BTreeMap::new(),
+            microphones: BTreeMap::new(),
+            screencasts: BTreeMap::new(),
             nodes: HashMap::new(),
             updates,
             privacy_updates,
@@ -689,8 +599,8 @@ impl MixerState {
         // folding volume in at info time could overwrite a reading already landed.
         let apps = self
             .apps
-            .snapshot()
-            .into_iter()
+            .values()
+            .cloned()
             .map(|app| match self.app_props.get(&app.id).map(master::master_volume_from_props) {
                 Some(measured) => AppStream { volume: measured.volume, muted: measured.muted, ..app },
                 None => app,
@@ -722,9 +632,9 @@ impl MixerState {
             return;
         }
         let _ = self.privacy_updates.send(PrivacySources {
-            cameras: self.video_sources.snapshot(),
-            microphones: self.microphones.snapshot(),
-            screencasts: self.screencasts.snapshot(),
+            cameras: self.video_sources.values().cloned().collect(),
+            microphones: running(&self.microphones),
+            screencasts: running(&self.screencasts),
         });
     }
 }
@@ -788,22 +698,6 @@ mod tests {
         assert!(parse_video_source_props(7, &props).is_none());
     }
 
-    #[test]
-    fn video_source_apps_upsert_then_snapshot_returns_the_source() {
-        let mut sources = VideoSourceApps::new();
-        let source = VideoSourceApp { node_id: 1, pid: 42, app_name: Some("Firefox".to_string()) };
-        sources.upsert(source.clone());
-        assert_eq!(sources.snapshot(), vec![source]);
-    }
-
-    #[test]
-    fn video_source_apps_remove_reports_whether_an_entry_was_present() {
-        let mut sources = VideoSourceApps::new();
-        sources.upsert(VideoSourceApp { node_id: 1, pid: 42, app_name: None });
-        assert!(sources.remove(1));
-        assert!(!sources.remove(1), "already removed -- nothing left to remove");
-    }
-
     fn capture_props(media_class: &str) -> HashMap<String, String> {
         HashMap::from([
             ("media.class".to_string(), media_class.to_string()),
@@ -830,7 +724,7 @@ mod tests {
     /// A browser tab holds capture open between calls; publishing idle would light privacy forever.
     #[test]
     fn an_idle_capture_stream_is_tracked_but_not_published() {
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(
             &mut apps,
             1,
@@ -839,17 +733,17 @@ mod tests {
             Some(&capture_props("Stream/Input/Audio")),
             false,
         );
-        assert!(apps.snapshot().is_empty(), "an idle stream is not capture");
+        assert!(running(&apps).is_empty(), "an idle stream is not capture");
 
         let empty: HashMap<String, String> = HashMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
-        assert_eq!(apps.snapshot().len(), 1, "the same node going Running must publish without a re-parse");
+        assert_eq!(running(&apps).len(), 1, "the same node going Running must publish without a re-parse");
     }
 
     /// The following state-only event has empty props; re-parsing would drop the entry.
     #[test]
     fn a_running_capture_stream_survives_a_state_only_event() {
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(
             &mut apps,
             1,
@@ -861,7 +755,7 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
 
-        assert_eq!(apps.snapshot().len(), 1);
+        assert_eq!(running(&apps).len(), 1);
     }
 
     /// cava reads the sink monitor; PipeWire's `stream.capture.sink` property beats a name list.
@@ -870,10 +764,10 @@ mod tests {
         let mut props = capture_props("Stream/Input/Audio");
         props.insert("stream.capture.sink".to_string(), "true".to_string());
 
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, true, Some(&props), true);
 
-        assert!(apps.snapshot().is_empty(), "a visualiser reading the monitor must not light a microphone indicator");
+        assert!(running(&apps).is_empty(), "a visualiser reading the monitor must not light a microphone indicator");
     }
 
     /// A later state event cannot resurrect a node whose props were rejected.
@@ -882,12 +776,12 @@ mod tests {
         let mut props = capture_props("Stream/Input/Audio");
         props.insert("stream.capture.sink".to_string(), "true".to_string());
 
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, true, Some(&props), true);
         let empty: HashMap<String, String> = HashMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Microphone, false, Some(&empty), true);
 
-        assert!(apps.snapshot().is_empty());
+        assert!(running(&apps).is_empty());
     }
 
     /// Portal streams may omit pid; dropping one would drop the screencast, unlike the pid-matched
@@ -896,15 +790,15 @@ mod tests {
     fn a_capture_stream_without_a_pid_is_still_tracked() {
         let props = HashMap::from([("media.class".to_string(), "Stream/Output/Video".to_string())]);
 
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(&mut apps, 1, NodeKind::Screencast, true, Some(&props), true);
 
-        assert_eq!(apps.snapshot(), vec![CaptureApp { node_id: 1, pid: None, app_name: None, running: true }]);
+        assert_eq!(running(&apps), vec![CaptureApp { node_id: 1, pid: None, app_name: None, running: true }]);
     }
 
     #[test]
     fn a_node_of_the_wrong_class_for_its_kind_is_dropped() {
-        let mut apps = CaptureApps::new();
+        let mut apps = BTreeMap::new();
         apply_capture_info_event(
             &mut apps,
             1,
@@ -914,28 +808,28 @@ mod tests {
             true,
         );
 
-        assert!(apps.snapshot().is_empty());
+        assert!(running(&apps).is_empty());
     }
 
     #[test]
     fn apply_video_info_event_ignores_a_state_only_event() {
-        let mut sources = VideoSourceApps::new();
+        let mut sources = BTreeMap::new();
         apply_video_info_event(&mut sources, 1, true, Some(&camera_stream_props()));
         let empty: HashMap<String, String> = HashMap::new();
         apply_video_info_event(&mut sources, 1, false, Some(&empty));
-        assert_eq!(sources.snapshot().len(), 1, "a non-PROPS info event must not drop an already-tracked source");
+        assert_eq!(sources.len(), 1, "a non-PROPS info event must not drop an already-tracked source");
     }
 
     #[test]
     fn apply_video_info_event_removes_when_a_props_bearing_event_no_longer_parses() {
-        let mut sources = VideoSourceApps::new();
+        let mut sources = BTreeMap::new();
         apply_video_info_event(&mut sources, 1, true, Some(&camera_stream_props()));
-        assert_eq!(sources.snapshot().len(), 1);
+        assert_eq!(sources.len(), 1);
 
         let non_video_props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
         apply_video_info_event(&mut sources, 1, true, Some(&non_video_props));
 
-        assert!(sources.snapshot().is_empty());
+        assert!(sources.is_empty());
     }
 
     fn zen_browser_stream_props() -> HashMap<String, String> {
@@ -1044,77 +938,39 @@ mod tests {
     }
 
     #[test]
-    fn audio_apps_upsert_then_snapshot_returns_the_stream() {
-        let mut apps = AudioApps::new();
-        apps.upsert(sample_stream(1));
-        assert_eq!(apps.snapshot(), vec![sample_stream(1)]);
-    }
-
-    #[test]
-    fn audio_apps_upsert_replaces_the_existing_entry_for_the_same_node_id() {
-        let mut apps = AudioApps::new();
-        apps.upsert(sample_stream(1));
-        let renamed = AppStream { name: Some("renamed".to_string()), ..sample_stream(1) };
-        apps.upsert(renamed.clone());
-        assert_eq!(apps.snapshot(), vec![renamed]);
-    }
-
-    #[test]
-    fn audio_apps_remove_drops_the_entry() {
-        let mut apps = AudioApps::new();
-        apps.upsert(sample_stream(1));
-        apps.remove(1);
-        assert!(apps.snapshot().is_empty());
-    }
-
-    #[test]
     fn apply_info_event_keeps_a_tracked_stream_through_a_state_only_info_event() {
-        let mut apps = AudioApps::new();
+        let mut apps = BTreeMap::new();
         // Bind-time global_bind guarantees the first info event carries PROPS and full props.
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
-        assert_eq!(apps.snapshot().len(), 1, "the initial props-bearing info event should track the stream");
+        assert_eq!(apps.len(), 1, "the initial props-bearing info event should track the stream");
 
         // A state-only transition (e.g. RUNNING -> IDLE) sends empty props, not stream removal.
         let state_only_props: HashMap<String, String> = HashMap::new();
         apply_info_event(Path::new("/proc"), &mut apps, 1, false, Some(&state_only_props));
 
-        assert_eq!(
-            apps.snapshot().len(),
-            1,
-            "a state-only info event (no PROPS change) must not drop an already-tracked stream"
-        );
+        assert_eq!(apps.len(), 1, "a state-only info event (no PROPS change) must not drop an already-tracked stream");
     }
 
     #[test]
     fn apply_info_event_upserts_on_a_props_bearing_event() {
-        let mut apps = AudioApps::new();
+        let mut apps = BTreeMap::new();
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
         assert_eq!(
-            apps.snapshot(),
+            apps.values().cloned().collect::<Vec<_>>(),
             vec![build_app_stream(Path::new("/proc"), 1, &zen_browser_stream_props()).unwrap()]
         );
     }
 
     #[test]
     fn apply_info_event_removes_when_a_props_bearing_event_no_longer_parses() {
-        let mut apps = AudioApps::new();
+        let mut apps = BTreeMap::new();
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
-        assert_eq!(apps.snapshot().len(), 1);
+        assert_eq!(apps.len(), 1);
 
         let non_stream_props = HashMap::from([("media.class".to_string(), "Audio/Sink".to_string())]);
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&non_stream_props));
 
-        assert!(apps.snapshot().is_empty(), "a PROPS-bearing event that no longer parses as a stream should remove it");
-    }
-
-    #[test]
-    fn audio_apps_snapshot_is_sorted_by_node_id() {
-        let mut apps = AudioApps::new();
-        apps.upsert(sample_stream(3));
-        apps.upsert(sample_stream(1));
-        apps.upsert(sample_stream(2));
-        let ids: Vec<u32> = apps.snapshot().iter().map(|app| app.id).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(apps.is_empty(), "a PROPS-bearing event that no longer parses as a stream should remove it");
     }
 
     #[test]
@@ -1359,7 +1215,7 @@ mod tests {
         state.sinks =
             HashMap::from([(59, sink_at("alsa_output.pci-...analog-stereo", None, Some(props_at(0.3, false))))]);
         state.default_sink_name = Some("alsa_output.pci-...analog-stereo".to_string());
-        state.apps.upsert(sample_stream(1));
+        state.apps.insert(1, sample_stream(1));
 
         state.publish_audio();
 
@@ -1454,7 +1310,7 @@ mod tests {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, privacy_updates);
-        state.apps.upsert(sample_stream(1));
+        state.apps.insert(1, sample_stream(1));
         state.app_props = HashMap::from([(1, props_at(0.42, true))]);
 
         state.publish_audio();
@@ -1469,7 +1325,7 @@ mod tests {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, privacy_updates);
-        state.apps.upsert(sample_stream(1));
+        state.apps.insert(1, sample_stream(1));
         state.app_props = HashMap::from([(99, props_at(0.42, true))]);
 
         state.publish_audio();

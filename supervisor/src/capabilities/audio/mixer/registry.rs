@@ -144,12 +144,12 @@ fn run_inner(
             }
             // Audio publishes on every removal (ADR-0034); privacy publishes only for its three
             // node kinds. Sink/metadata cleanup is unconditional because publish_audio recomputes.
-            state.apps.remove(id);
+            state.apps.remove(&id);
             state.publish_audio();
             // Evaluate all three before the check: `||` could leave one stale map entry.
-            let was_camera = state.video_sources.remove(id);
-            let was_microphone = state.microphones.remove(id);
-            let was_screencast = state.screencasts.remove(id);
+            let was_camera = state.video_sources.remove(&id).is_some();
+            let was_microphone = state.microphones.remove(&id).is_some();
+            let was_screencast = state.screencasts.remove(&id).is_some();
             if was_camera || was_microphone || was_screencast {
                 state.publish_privacy();
             }
