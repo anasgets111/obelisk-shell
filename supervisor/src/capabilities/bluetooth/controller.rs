@@ -121,6 +121,7 @@ impl BluetoothController {
                 let enabled = self.read_enabled().await;
                 let discovering = self.read_discovering().await;
                 let mut state = self.state.lock().unwrap();
+                state.available = self.adapter.is_some();
                 state.enabled = enabled;
                 state.discovering = discovering;
                 state.clone()

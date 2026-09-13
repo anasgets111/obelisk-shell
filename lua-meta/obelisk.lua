@@ -305,10 +305,11 @@
 ---@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell. A Wayland holder has an empty `who`, because no protocol names one (ADR-0160).
 
 ---@class BluetoothState
+---@field available boolean An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is inert and every write is a logged no-op.
 ---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
 ---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
----@field enabled boolean Whether the adapter is powered. `false` also means no adapter, so it does not prove Bluetooth hardware exists.
+---@field enabled boolean Whether the adapter is powered, so always `false` without one.
 ---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
 
 ---@class BrightnessState

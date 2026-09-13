@@ -73,8 +73,10 @@ pub struct DiscoveredDevice {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothState {
-    /// Whether the adapter is powered. `false` also means no adapter, so it does not prove
-    /// Bluetooth hardware exists.
+    /// An adapter is bound. `false` means no adapter or no `bluetoothd`, so every other field is
+    /// inert and every write is a logged no-op.
+    pub available: bool,
+    /// Whether the adapter is powered, so always `false` without one.
     pub enabled: bool,
     /// Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
     pub discovering: bool,

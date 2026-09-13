@@ -41,7 +41,9 @@ local bluetooth_tooltip = tooltip({
     slot = SLOT,
     children = {
         cell(obelisk.bluetooth:map(function(b)
-            if b == nil or not b.enabled then
+            if b ~= nil and not b.available then
+                return "bluetooth unavailable"
+            elseif b == nil or not b.enabled then
                 return "bluetooth off"
             end
             local devices = connected(b)

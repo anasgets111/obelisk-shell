@@ -69,6 +69,9 @@ local function enabled(b)
 end
 
 local function state_line(b)
+    if not b.available then
+        return "unavailable"
+    end
     if not b.enabled then
         return "off"
     end
@@ -205,11 +208,20 @@ local body = {
                 end),
                 visible = util.shown_when(obelisk.bluetooth, enabled),
             }),
-            toggle(obelisk.bluetooth, function(b)
-                return b.enabled
-            end, function(new_value)
-                obelisk.bluetooth:invoke("set_enabled", new_value)
-            end),
+            -- No adapter means no switch to flip, the mirror's `disabled: !root.ready`. Hidden rather
+            -- than greyed, because `toggle` has no disabled look.
+            rect {
+                visible = util.shown_when(obelisk.bluetooth, function(b)
+                    return b.available
+                end),
+                children = {
+                    toggle(obelisk.bluetooth, function(b)
+                        return b.enabled
+                    end, function(new_value)
+                        obelisk.bluetooth:invoke("set_enabled", new_value)
+                    end),
+                },
+            },
         },
     },
     -- Rows up to the cap, then a scrolling viewport (ADR-0110), matching
@@ -227,7 +239,9 @@ local body = {
     },
     panel_empty_state(
         util.label(obelisk.bluetooth, function(b)
-            if not b.enabled then
+            if not b.available then
+                return "bluetooth unavailable"
+            elseif not b.enabled then
                 return "bluetooth off"
             end
             return b.discovering and "scanning…" or "no devices found"
