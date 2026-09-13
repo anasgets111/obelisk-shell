@@ -30,7 +30,7 @@ local ui = require("lib.ui_state")
 local KIND = "network"
 local SCROLL = scroll("network_aps")
 
--- Payload order is connected-first, then descending signal (§ 2.5); reading it straight is enough.
+-- Payload order is connected-first, then descending raw signal (§ 2.5). The list re-sorts by tier.
 local function access_points(n)
     return (n and n.available_networks) or {}
 end
@@ -120,7 +120,21 @@ obelisk.network:on_change(function(n, previous)
 end)
 
 -- The mirror's `section.property: "group"`. Saved networks come first, then the rest. The joined
--- network is saved by construction and leads its section, as the payload order already has it.
+-- network is saved by construction and leads its section.
+--
+-- Within a section, `wifiAps`' sort. Tiers, not raw strength, so scan-to-scan jitter cannot swap
+-- rows under the pointer.
+local function before(left, right)
+    if left.ap.active ~= right.ap.active then
+        return left.ap.active
+    end
+    local left_tier, right_tier = util.signal_tier(left.ap.strength), util.signal_tier(right.ap.strength)
+    if left_tier ~= right_tier then
+        return left_tier > right_tier
+    end
+    return tostring(left.ap.ssid):lower() < tostring(right.ap.ssid):lower()
+end
+
 local rows = obelisk.network:map(function(n)
     local connecting = n and n.connecting_ssid
     local sections = { saved = {}, available = {} }
@@ -138,6 +152,7 @@ local rows = obelisk.network:map(function(n)
     for _, label in ipairs({ "saved", "available" }) do
         local group = sections[label]
         if #group > 0 then
+            table.sort(group, before)
             out[#out + 1] = { kind = "header", label = label, key = "header-" .. label }
             table.move(group, 1, #group, #out + 1, out)
         end

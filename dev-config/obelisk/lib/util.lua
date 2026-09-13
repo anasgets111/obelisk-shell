@@ -163,12 +163,15 @@ function util.network_glyph(n)
     return util.wifi_glyph(n.strength)
 end
 
--- Match `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0; Lua is 1-indexed. The panel's rows
--- share it so a network draws the same bars in the bar and in the list.
-function util.wifi_glyph(strength)
-    local icons = require("config.icons")
+-- `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0, 1-indexed here. The bars in the bar, the
+-- bars in the list, and the list's order all read it.
+function util.signal_tier(strength)
     local percent = strength or 0
-    return icons.wifi[percent >= 95 and 4 or percent >= 80 and 3 or percent >= 50 and 2 or 1]
+    return percent >= 95 and 4 or percent >= 80 and 3 or percent >= 50 and 2 or 1
+end
+
+function util.wifi_glyph(strength)
+    return require("config.icons").wifi[util.signal_tier(strength)]
 end
 
 -- Bluetooth devices by shown name, then MAC. The Supervisor builds both lists from a `HashMap`, so
