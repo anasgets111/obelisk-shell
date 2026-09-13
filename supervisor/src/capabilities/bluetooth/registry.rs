@@ -246,23 +246,13 @@ fn spawn_adapter_signal_forwarder(
     events: UnboundedSender<BluetoothSignal>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut powered_changed = adapter.receive_powered_changed().await;
-        let mut discovering_changed = adapter.receive_discovering_changed().await;
-        let mut discoverable_changed = adapter.receive_discoverable_changed().await;
-        loop {
-            tokio::select! {
-                Some(_) = powered_changed.next() => {
-                    if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
-                }
-                Some(_) = discovering_changed.next() => {
-                    if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
-                }
-                Some(_) = discoverable_changed.next() => {
-                    if events.send(BluetoothSignal::AdapterChanged).is_err() { break; }
-                }
-                else => break,
-            }
-        }
+        let mut changes = adapter
+            .receive_powered_changed()
+            .await
+            .map(drop)
+            .merge(adapter.receive_discovering_changed().await.map(drop))
+            .merge(adapter.receive_discoverable_changed().await.map(drop));
+        while changes.next().await.is_some() && events.send(BluetoothSignal::AdapterChanged).is_ok() {}
     })
 }
 

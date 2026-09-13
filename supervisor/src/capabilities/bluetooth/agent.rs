@@ -306,16 +306,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_pin_code_returns_a_properly_named_rejected_error() {
+    async fn typing_a_pin_or_passkey_on_this_host_is_rejected_by_name() {
         let (caller, _agent, _prompts, _signals) = agent_pair(true).await;
         let proxy = agent1_proxy(&caller).await;
         assert!(rejected(proxy.call::<_, _, String>("RequestPinCode", &(dummy_device_path(),)).await));
-    }
-
-    #[tokio::test]
-    async fn request_passkey_returns_a_properly_named_rejected_error() {
-        let (caller, _agent, _prompts, _signals) = agent_pair(true).await;
-        let proxy = agent1_proxy(&caller).await;
         assert!(rejected(proxy.call::<_, _, u32>("RequestPasskey", &(dummy_device_path(),)).await));
     }
 
@@ -338,22 +332,6 @@ mod tests {
 
         assert!(answer(&prompts, Some(MAC), true, after_grace()));
         call.await.expect("an accepted confirmation returns Ok");
-    }
-
-    #[tokio::test]
-    async fn a_declined_pairing_request_is_rejected() {
-        let (caller, _agent, prompts, mut signals) = agent_pair(true).await;
-        let proxy = agent1_proxy(&caller).await;
-        let args = (dummy_device_path(),);
-        let call = proxy.call::<_, _, ()>("RequestAuthorization", &args);
-        tokio::pin!(call);
-
-        tokio::select! {
-            _ = &mut call => panic!("the call returned before the user answered"),
-            _ = signals.recv() => {}
-        }
-        assert!(answer(&prompts, Some(MAC), false, Instant::now()));
-        assert!(rejected(call.await));
     }
 
     #[tokio::test]

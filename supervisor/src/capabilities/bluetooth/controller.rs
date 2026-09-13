@@ -14,7 +14,7 @@ use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_object_man
 use super::registry::{AdapterSlot, DeviceRegistry, adopt_adapter, register_device, spawn_object_manager_forwarder};
 use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DeviceAction, DiscoveredDevice,
-    PairedDevice, PairingKind, class_to_category,
+    PairedDevice, class_to_category,
 };
 
 /// Proxies needed by `obelisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
@@ -148,10 +148,17 @@ impl BluetoothController {
             BluetoothSignal::AdapterChanged => {
                 // A start that landed after its stop, or a radio switched back on, shows up here.
                 self.spawn_reconcile_discovery();
-                let enabled = self.read_enabled().await;
-                let discovering = self.read_discovering().await;
-                let discoverable = self.read_discoverable().await;
-                let available = self.adapter().is_some();
+                let adapter = self.adapter();
+                let available = adapter.is_some();
+                // Each read falls back to `false`, and so does no adapter at all.
+                let (enabled, discovering, discoverable) = match &adapter {
+                    Some(adapter) => (
+                        adapter.powered().await.unwrap_or(false),
+                        adapter.discovering().await.unwrap_or(false),
+                        adapter.discoverable().await.unwrap_or(false),
+                    ),
+                    None => (false, false, false),
+                };
                 let mut state = self.state.lock().unwrap();
                 state.available = available;
                 state.enabled = enabled;
@@ -191,30 +198,6 @@ impl BluetoothController {
     /// The adapter in use now, cloned out so no await holds the slot's lock.
     fn adapter(&self) -> Option<Adapter1Proxy<'static>> {
         self.adapter.lock().unwrap().as_ref().map(|bound| bound.proxy.clone())
-    }
-
-    /// Live `Powered` value; `false` without an adapter is not an error.
-    async fn read_enabled(&self) -> bool {
-        match self.adapter() {
-            Some(adapter) => adapter.powered().await.unwrap_or(false),
-            None => false,
-        }
-    }
-
-    /// Live `Discovering` value; `false` without an adapter is not an error.
-    async fn read_discovering(&self) -> bool {
-        match self.adapter() {
-            Some(adapter) => adapter.discovering().await.unwrap_or(false),
-            None => false,
-        }
-    }
-
-    /// Live `Discoverable` value; `false` without an adapter is not an error.
-    async fn read_discoverable(&self) -> bool {
-        match self.adapter() {
-            Some(adapter) => adapter.discoverable().await.unwrap_or(false),
-            None => false,
-        }
     }
 
     /// Re-derives the three lists from the full registry: paired and connected, paired only, and
@@ -286,22 +269,14 @@ impl BluetoothController {
     }
 
     /// Takes down a code display once its device is paired. BlueZ ends a successful passkey entry
-    /// without calling `Cancel`, so nothing else would. Checked and taken under one lock, so a
-    /// request that replaced the display in between is not the one removed.
+    /// without calling `Cancel`, so nothing else would. [`agent::clear_display`] checks the MAC and
+    /// the missing reply again under its lock, so a request that replaced the display in between is
+    /// not the one removed.
     fn clear_finished_display(&self, connected: &[ConnectedDevice], paired: &[PairedDevice]) {
-        let finished = {
-            let mut slot = self.prompts.lock().unwrap();
-            let done = slot.as_ref().is_some_and(|prompt| {
-                prompt.request.kind == PairingKind::Display
-                    && connected
-                        .iter()
-                        .map(|d| &d.mac)
-                        .chain(paired.iter().map(|d| &d.mac))
-                        .any(|mac| *mac == prompt.request.mac)
-            });
-            if done { slot.take() } else { None }
-        };
-        if finished.is_some() {
+        let shown = self.prompts.lock().unwrap().as_ref().map(|prompt| prompt.request.mac.clone());
+        let Some(mac) = shown else { return };
+        let done = connected.iter().map(|d| &d.mac).chain(paired.iter().map(|d| &d.mac)).any(|m| *m == mac);
+        if done && agent::clear_display(&self.prompts, &mac) {
             let _ = self.events.send(BluetoothSignal::PairingChanged);
         }
     }
