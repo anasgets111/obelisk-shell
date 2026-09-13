@@ -159,12 +159,6 @@ pub(super) fn profile_ssid(settings: &HashMap<String, HashMap<String, OwnedValue
         .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
 }
 
-/// Whether `get_settings()` is a Wi-Fi profile for `ssid`. `forget` deletes every match (§4.3 says
-/// "profiles", plural).
-pub(super) fn settings_match_ssid(settings: &HashMap<String, HashMap<String, OwnedValue>>, ssid: &str) -> bool {
-    profile_ssid(settings).is_some_and(|bytes| bytes == ssid.as_bytes())
-}
-
 /// The `network:connect(ssid, hidden)` intent plus `secure_submit` secret before zbus `Value`
 /// wrapping, keeping this unit-testable without D-Bus. Empty means open (ADR-0029); non-empty
 /// bytes must be UTF-8 for NM's string-valued `802-11-wireless-security.psk`, or fail as
@@ -477,17 +471,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_match_ssid_compares_the_wireless_sections_ssid_bytes() {
+    fn profile_ssid_reads_the_wireless_sections_ssid_bytes() {
         let settings =
             settings_with("802-11-wireless", "ssid", OwnedValue::try_from(Value::from(b"HomeWifi".to_vec())).unwrap());
-        assert!(settings_match_ssid(&settings, "HomeWifi"));
-        assert!(!settings_match_ssid(&settings, "OfficeWifi"));
-    }
-
-    #[test]
-    fn settings_match_ssid_is_false_when_the_wireless_section_is_missing() {
-        let settings: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
-        assert!(!settings_match_ssid(&settings, "HomeWifi"));
+        assert_eq!(profile_ssid(&settings).as_deref(), Some(&b"HomeWifi"[..]));
+        assert_eq!(profile_ssid(&HashMap::new()), None, "a profile without a wireless section has no SSID");
     }
 
     #[test]

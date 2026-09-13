@@ -25,7 +25,7 @@ use rusty_network_manager::{
 use serde::Serialize;
 use shared::Zeroize;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
 pub mod connection;
@@ -34,7 +34,6 @@ use connection::ConnectError;
 use connection::{
     ConnectionIntent, access_point_is_secure, activation_verdict, build_connection_dict, connection_intent,
     connection_wants_autoconnect, dedup_and_top20, merge_psk, profile_ssid, resolve_band, resolve_ssid,
-    settings_match_ssid,
 };
 pub use connection::{parse_bool_arg, parse_connect_args, parse_ssid_arg};
 
@@ -276,8 +275,8 @@ async fn read_access_point(
 /// ponytail: rebuilds follow device state, so a DHCP renewal that changes the address without a
 /// state change shows the old one until the next rebuild. Upgrade path: watch the config's
 /// `AddressData`.
-async fn read_ipv4(connection: &zbus::Connection, device: &DeviceProxy<'static>) -> Option<String> {
-    let path = device.ip4_config().await.ok().filter(|path| path.as_str() != "/")?;
+async fn read_ipv4(connection: &zbus::Connection, device: Option<&DeviceProxy<'static>>) -> Option<String> {
+    let path = device?.ip4_config().await.ok().filter(|path| path.as_str() != "/")?;
     let config = IP4ConfigProxy::builder(connection)
         .path(path)
         .ok()?
@@ -409,10 +408,7 @@ impl NetworkController {
                 state.scanning = true;
                 state.clone()
             }
-            NetworkSignal::ScanCompleted
-            | NetworkSignal::Changed
-            | NetworkSignal::SavedChanged
-            | NetworkSignal::DevicesChanged => {
+            _ => {
                 match signal {
                     NetworkSignal::SavedChanged => self.refresh_saved_ssids().await,
                     NetworkSignal::DevicesChanged => self.refresh_devices().await,
@@ -439,14 +435,8 @@ impl NetworkController {
         let wired = connected && self.nm.primary_connection_type().await.is_ok_and(|kind| kind == "802-3-ethernet");
         let wifi = self.wifi();
         let ethernet = self.activated_ethernet().await;
-        let wifi_ip = match &wifi {
-            Some(wifi) => read_ipv4(&self.connection, &wifi.device).await,
-            None => None,
-        };
-        let ethernet_ip = match &ethernet {
-            Some(ethernet) => read_ipv4(&self.connection, &ethernet.device).await,
-            None => None,
-        };
+        let wifi_ip = read_ipv4(&self.connection, wifi.as_ref().map(|wifi| &wifi.device)).await;
+        let ethernet_ip = read_ipv4(&self.connection, ethernet.as_ref().map(|ethernet| &ethernet.device)).await;
         // Its own statement: a guard inside the literal below would live across the awaits after it.
         let ethernet_present = !self.devices.lock().unwrap().ethernet.is_empty();
         NetworkState {
@@ -1021,7 +1011,7 @@ impl NetworkController {
     /// `connect` takes the first; one `ListConnections` walk serves both.
     async fn saved_profiles_for_ssid(&self, ssid: &str, context: &str) -> Vec<SavedProfile> {
         let mut profiles = self.wifi_profiles(&format!("{context}({ssid:?})")).await;
-        profiles.retain(|profile| settings_match_ssid(&profile.settings, ssid));
+        profiles.retain(|profile| profile_ssid(&profile.settings).is_some_and(|bytes| bytes == ssid.as_bytes()));
         profiles
     }
 
@@ -1213,8 +1203,9 @@ fn spawn_wifi_forwarder(
         let mut last_scan_changed = wireless.receive_last_scan_changed().await;
         let mut active_ap_changed = wireless.receive_active_access_point_changed().await;
         // The first `active_ap_changed` emission fills the property cache, so an existing
-        // association is watched without a startup read.
-        let mut strength: Option<AbortOnDrop> = None;
+        // association is watched without a startup read. A `JoinSet` aborts its task when dropped,
+        // so aborting this watcher on a device rescan stops the strength watch too.
+        let mut strength = tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
@@ -1225,9 +1216,9 @@ fn spawn_wifi_forwarder(
                     if events.send(NetworkSignal::Changed).is_err() { break; }
                 }
                 Some(change) = active_ap_changed.next() => {
-                    drop(strength.take());
+                    strength.shutdown().await;
                     if let Ok(path) = change.get().await {
-                        strength = spawn_strength_forwarder(&connection, path, events.clone()).map(AbortOnDrop);
+                        strength.extend(strength_forwarder(&connection, path, events.clone()));
                     }
                     if events.send(NetworkSignal::Changed).is_err() { break; }
                 }
@@ -1247,16 +1238,16 @@ fn spawn_wifi_forwarder(
 /// poll, versus 76 events across 17 APs, one every 2.4s indefinitely. Rebuilds reread every AP,
 /// so the full list stayed as fresh at one third the traffic; ADR-0029 item 6 required this
 /// measured choice before adding debounce.
-fn spawn_strength_forwarder(
+fn strength_forwarder(
     connection: &zbus::Connection,
     path: OwnedObjectPath,
     events: UnboundedSender<NetworkSignal>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
     if path.as_str() == "/" {
         return None;
     }
     let connection = connection.clone();
-    Some(tokio::spawn(async move {
+    Some(async move {
         let access_point = match bind_access_point(&connection, path.clone()).await {
             Ok(access_point) => access_point,
             Err(err) => {
@@ -1270,7 +1261,7 @@ fn spawn_strength_forwarder(
                 break;
             }
         }
-    }))
+    })
 }
 
 /// Forwards each device's `State` as [`NetworkSignal::Changed`]. Per-device tasks cover
@@ -1386,69 +1377,38 @@ fn watch_devices(
     watchers
 }
 
-/// Aborts its task when dropped. The Wi-Fi watcher holds its strength watch in one, so aborting the
-/// watcher on a device rescan stops the strength watch too; dropping a bare `JoinHandle` detaches
-/// the task instead.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Forwards NetworkManager's `DeviceAdded` and `DeviceRemoved` as
 /// [`NetworkSignal::DevicesChanged`]. Subscribes before returning, so [`NetworkController::new`]'s
 /// first device scan cannot miss an adapter plugged in during it. Its own task, so a failed
 /// subscription here leaves the radio and route watches running.
 async fn spawn_device_list_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
-    let (mut added, mut removed) = match tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed()) {
-        Ok(streams) => streams,
+    match tokio::try_join!(nm.receive_device_added(), nm.receive_device_removed()) {
+        Ok((added, removed)) => {
+            forward(added.map(drop).merge(removed.map(drop)), NetworkSignal::DevicesChanged, events)
+        }
         Err(err) => {
-            eprintln!("network: failed to subscribe to device changes; an adapter added later needs a restart: {err}");
-            return;
+            eprintln!("network: failed to subscribe to device changes; an adapter added later needs a restart: {err}")
         }
-    };
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(_) = added.next() => {
-                    if events.send(NetworkSignal::DevicesChanged).is_err() { break; }
-                }
-                Some(_) = removed.next() => {
-                    if events.send(NetworkSignal::DevicesChanged).is_err() { break; }
-                }
-                else => break,
-            }
-        }
-    });
+    }
 }
 
 /// Forwards `Settings`' `NewConnection` and `ConnectionRemoved` as [`NetworkSignal::SavedChanged`].
 /// Subscribes before returning, so [`NetworkController::new`]'s first cache fill cannot race a
 /// profile saved in the gap.
 async fn spawn_settings_forwarder(settings: SettingsProxy<'static>, events: UnboundedSender<NetworkSignal>) {
-    let (mut added, mut removed) =
-        match tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed()) {
-            Ok(streams) => streams,
-            Err(err) => {
-                eprintln!("network: failed to subscribe to saved-profile changes: {err}");
-                return;
-            }
-        };
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(_) = added.next() => {
-                    if events.send(NetworkSignal::SavedChanged).is_err() { break; }
-                }
-                Some(_) = removed.next() => {
-                    if events.send(NetworkSignal::SavedChanged).is_err() { break; }
-                }
-                else => break,
-            }
-        }
-    });
+    match tokio::try_join!(settings.receive_new_connection(), settings.receive_connection_removed()) {
+        Ok((added, removed)) => forward(added.map(drop).merge(removed.map(drop)), NetworkSignal::SavedChanged, events),
+        Err(err) => eprintln!("network: failed to subscribe to saved-profile changes: {err}"),
+    }
+}
+
+/// Sends `signal` for each item of `changes` until the stream or the receiver ends.
+fn forward(
+    mut changes: impl Stream<Item = ()> + Unpin + Send + 'static,
+    signal: NetworkSignal,
+    events: UnboundedSender<NetworkSignal>,
+) {
+    tokio::spawn(async move { while changes.next().await.is_some() && events.send(signal).is_ok() {} });
 }
 
 #[cfg(test)]
@@ -1541,16 +1501,6 @@ mod tests {
         let state = controller.state.lock().unwrap().clone();
         assert_eq!(state.connect_error, None, "a cancelled join is not a failure");
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn abort_without_a_join_in_flight_changes_nothing() {
-        let (controller, mut receiver, _peer) = attempting("home").await;
-        controller.state.lock().unwrap().connecting_ssid = None;
-
-        controller.abort_connect();
-
-        assert!(receiver.try_recv().is_err(), "closing a sheet with nothing in flight pushes nothing");
     }
 
     #[tokio::test]
