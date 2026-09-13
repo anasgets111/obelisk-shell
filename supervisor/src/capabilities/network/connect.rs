@@ -217,7 +217,7 @@ impl NetworkController {
     ///
     /// A saved profile or open AP connects on click with no typed secret, matching
     /// `NetworkPanel.qml`'s bare `connectToSsid(ssid, "")` for known/unsecured rows. Only a secured
-    /// network without a profile sets [`NetworkState::password_ssid`] and waits for
+    /// network without a profile sets [`NetworkState::password_ssid`](super::NetworkState::password_ssid) and waits for
     /// `secure_submit(network, connect)`.
     ///
     /// Without those branches, `network:connect` only stashes and every click leaves an intent
