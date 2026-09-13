@@ -202,11 +202,13 @@ pub fn extract_route_target(value: &Value) -> Option<(i32, i32)> {
     Some((profile_device?, index?))
 }
 
-/// One BlueZ card profile from `EnumProfile` or `Profile`, e.g. index 2 described as
-/// `"High Fidelity Playback (A2DP Sink, codec AAC)"`.
+/// One BlueZ card profile from `EnumProfile` or `Profile`, e.g. index 2, `a2dp-sink-aac`, described
+/// as `"High Fidelity Playback (A2DP Sink, codec AAC)"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub index: i32,
+    /// PipeWire's untranslated id, empty when the object carries none.
+    pub name: String,
     pub description: String,
     /// `false` only when PipeWire reports the profile unavailable; unknown counts as available.
     pub available: bool,
@@ -217,11 +219,13 @@ pub struct Profile {
 pub fn extract_profile(value: &Value) -> Option<Profile> {
     let Value::Object(object) = value else { return None };
     let mut index = None;
+    let mut name = String::new();
     let mut description = None;
     let mut available = true;
     for property in &object.properties {
         match (property.key, &property.value) {
             (spa_sys::SPA_PARAM_PROFILE_index, Value::Int(value)) => index = Some(*value),
+            (spa_sys::SPA_PARAM_PROFILE_name, Value::String(value)) => name = value.clone(),
             (spa_sys::SPA_PARAM_PROFILE_description, Value::String(value)) => description = Some(value.clone()),
             (spa_sys::SPA_PARAM_PROFILE_available, Value::Id(Id(value))) => {
                 available = *value != spa_sys::SPA_PARAM_AVAILABILITY_no;
@@ -229,13 +233,31 @@ pub fn extract_profile(value: &Value) -> Option<Profile> {
             _ => {}
         }
     }
-    Some(Profile { index: index?, description: description?, available })
+    Some(Profile { index: index?, name, description: description?, available })
+}
+
+/// The codec a BlueZ profile name carries after its role, e.g. `"AAC"` from `a2dp-sink-aac`, or
+/// `None` for a name with no codec, such as `off` or a bare `a2dp-sink`. Read first because the
+/// name is never translated, where the description is.
+pub fn codec_from_name(name: &str) -> Option<String> {
+    let codec = ["a2dp-sink-", "a2dp-duplex-", "headset-head-unit-", "bap-sink-", "bap-duplex-"]
+        .iter()
+        .find_map(|role| name.strip_prefix(role))?;
+    let spelled = match codec {
+        "aptx" => "aptX".to_string(),
+        "aptx_hd" => "aptX HD".to_string(),
+        "aptx_ll" => "aptX LL".to_string(),
+        "msbc" => "mSBC".to_string(),
+        "faststream" => "FastStream".to_string(),
+        other => other.replace('_', "-").to_uppercase(),
+    };
+    (!spelled.is_empty()).then_some(spelled)
 }
 
 /// The codec a BlueZ profile description names, e.g. `"AAC"` from
 /// `"High Fidelity Playback (A2DP Sink, codec AAC)"`, or `None` for a profile without one, such as
-/// `Off`. PipeWire states the codec only in the description, which `BluetoothService.qml` parsed
-/// out of `pactl` the same way.
+/// `Off`. The fallback for a name [`codec_from_name`] cannot read; it matches only an English
+/// description, as `BluetoothService.qml`'s `pactl` parse did.
 pub fn codec_of(description: &str) -> Option<String> {
     let rest = &description[description.find("codec ")? + "codec ".len()..];
     let codec = rest.split([')', ',']).next()?.trim();
@@ -536,7 +558,12 @@ mod tests {
         let aac = "High Fidelity Playback (A2DP Sink, codec AAC)";
         assert_eq!(
             extract_profile(&enum_profile(2, aac, spa_sys::SPA_PARAM_AVAILABILITY_yes)),
-            Some(Profile { index: 2, description: aac.to_string(), available: true })
+            Some(Profile {
+                index: 2,
+                name: "a2dp-sink-aac".to_string(),
+                description: aac.to_string(),
+                available: true
+            })
         );
         let gone = enum_profile(3, aac, spa_sys::SPA_PARAM_AVAILABILITY_no);
         assert_eq!(extract_profile(&gone).map(|profile| profile.available), Some(false));
@@ -549,6 +576,16 @@ mod tests {
         assert_eq!(codec_of("High Fidelity Playback (A2DP Sink, codec SBC-XQ)"), Some("SBC-XQ".to_string()));
         assert_eq!(codec_of("Headset Head Unit (HSP/HFP, codec mSBC)"), Some("mSBC".to_string()));
         assert_eq!(codec_of("Off"), None);
+    }
+
+    #[test]
+    fn codec_from_name_reads_the_codec_after_the_profile_role() {
+        assert_eq!(codec_from_name("a2dp-sink-aac"), Some("AAC".to_string()));
+        assert_eq!(codec_from_name("a2dp-sink-sbc_xq"), Some("SBC-XQ".to_string()));
+        assert_eq!(codec_from_name("a2dp-sink-aptx_hd"), Some("aptX HD".to_string()));
+        assert_eq!(codec_from_name("headset-head-unit-msbc"), Some("mSBC".to_string()));
+        assert_eq!(codec_from_name("a2dp-sink"), None, "a bare role names no codec");
+        assert_eq!(codec_from_name("off"), None);
     }
 
     #[test]

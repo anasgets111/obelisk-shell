@@ -514,9 +514,10 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
 /// Bluetooth panel can join it to `obelisk.bluetooth`. Its `Route` is never read, so Bluetooth
 /// volume keeps the node-owned write path it had before this binding existed.
 ///
-/// Enumerated from `info` like [`bind_device`], for ADR-0200's reason. Publishes on `Profile`,
-/// which PipeWire answers after the `EnumProfile` requested just before it, so one enumeration
-/// pushes one snapshot rather than one per profile.
+/// Enumerated from `info` like [`bind_device`], for ADR-0200's reason. `Profile` is asked for after
+/// `EnumProfile` with the same sequence number, so its answer closes the enumeration and pushes one
+/// snapshot, and only when the profiles or the active one changed. A route change on every
+/// Bluetooth volume step also lands in `info`, and publishes nothing new.
 fn bind_bluez_device(
     state: &Rc<RefCell<MixerState>>,
     registry: &pw::registry::RegistryRc,
@@ -546,9 +547,10 @@ fn bind_bluez_device(
     let device = Rc::new(device);
     let device_for_info = Rc::downgrade(&device);
     let state_for_param = Rc::clone(state);
+    let state_for_info = Rc::clone(state);
     let listener = device
         .add_listener_local()
-        .param(move |_seq, param_type, _index, _next, param| {
+        .param(move |seq, param_type, _index, _next, param| {
             let Some(pod) = param else { return };
             let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
                 return;
@@ -556,24 +558,31 @@ fn bind_bluez_device(
             let Some(profile) = master::extract_profile(&value) else { return };
             let mut state = state_for_param.borrow_mut();
             let Some(card) = state.bluez_cards.get_mut(&device_id) else { return };
-            match param_type {
+            let changed = match param_type {
                 pw::spa::param::ParamType::EnumProfile => {
-                    card.profiles.insert(profile.index, profile);
+                    card.enumerated(seq, profile);
+                    false
                 }
-                pw::spa::param::ParamType::Profile => {
-                    card.active = Some(profile.index);
-                    state.publish_audio();
-                }
-                _ => {}
+                pw::spa::param::ParamType::Profile => card.finish_enumeration(seq, profile.index),
+                _ => false,
+            };
+            if changed {
+                state.publish_audio();
             }
         })
         .info(move |info| {
             if !info.change_mask().contains(pw::device::DeviceChangeMask::PARAMS) {
                 return;
             }
+            // The borrow ends with this statement, before `enum_params` can lead to a `param` event.
+            let Some(seq) =
+                state_for_info.borrow_mut().bluez_cards.get_mut(&device_id).map(BluezCard::begin_enumeration)
+            else {
+                return;
+            };
             if let Some(device) = device_for_info.upgrade() {
-                device.enum_params(0, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
-                device.enum_params(0, Some(pw::spa::param::ParamType::Profile), 0, u32::MAX);
+                device.enum_params(seq, Some(pw::spa::param::ParamType::EnumProfile), 0, u32::MAX);
+                device.enum_params(seq, Some(pw::spa::param::ParamType::Profile), 0, u32::MAX);
             }
         })
         .register();

@@ -254,10 +254,45 @@ pub struct CodecProfile {
 #[derive(Debug, Clone, Default)]
 pub(super) struct BluezCard {
     pub(super) mac: String,
-    /// Every profile from `EnumProfile`, keyed by index.
+    /// The profiles from the last finished `EnumProfile`, keyed by index.
     pub(super) profiles: std::collections::BTreeMap<i32, master::Profile>,
     /// The index `Profile` reports.
     pub(super) active: Option<i32>,
+    /// Sequence number of the enumeration in progress, passed to `enum_params` and echoed back on
+    /// every answer, so answers to an older one are dropped.
+    pub(super) enumeration: i32,
+    /// Profiles collected for [`BluezCard::enumeration`], swapped in when its `Profile` arrives.
+    pub(super) incoming: std::collections::BTreeMap<i32, master::Profile>,
+}
+
+impl BluezCard {
+    /// Starts an enumeration and returns the sequence number to ask with.
+    pub(super) fn begin_enumeration(&mut self) -> i32 {
+        self.enumeration = self.enumeration.wrapping_add(1);
+        self.incoming.clear();
+        self.enumeration
+    }
+
+    /// Collects one `EnumProfile` answer; an answer to an older enumeration is dropped.
+    pub(super) fn enumerated(&mut self, seq: i32, profile: master::Profile) {
+        if seq == self.enumeration {
+            self.incoming.insert(profile.index, profile);
+        }
+    }
+
+    /// Ends enumeration `seq` with its `Profile` answer: the collected profiles replace the old
+    /// list, so one PipeWire stopped listing leaves it, and `index` becomes active. Returns whether
+    /// either changed, so a re-enumeration that finds the same card publishes nothing.
+    pub(super) fn finish_enumeration(&mut self, seq: i32, index: i32) -> bool {
+        if seq != self.enumeration {
+            return false;
+        }
+        let profiles = std::mem::take(&mut self.incoming);
+        let changed = profiles != self.profiles || self.active != Some(index);
+        self.profiles = profiles;
+        self.active = Some(index);
+        changed
+    }
 }
 
 /// Builds [`AudioState::bluetooth`], ordered by device id for deterministic publishes.
@@ -272,7 +307,8 @@ fn bluetooth_codecs(cards: &HashMap<u32, BluezCard>) -> Vec<BluetoothCodecs> {
                 .filter_map(|profile| {
                     Some(CodecProfile {
                         index: profile.index,
-                        codec: master::codec_of(&profile.description)?,
+                        codec: master::codec_from_name(&profile.name)
+                            .or_else(|| master::codec_of(&profile.description))?,
                         description: profile.description.clone(),
                     })
                 })
@@ -1365,22 +1401,26 @@ mod tests {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, privacy_updates);
-        let profile = |index: i32, description: &str, available: bool| {
-            (index, master::Profile { index, description: description.to_string(), available })
+        let profile = |index: i32, name: &str, description: &str, available: bool| {
+            let profile =
+                master::Profile { index, name: name.to_string(), description: description.to_string(), available };
+            (index, profile)
         };
         state.bluez_cards = HashMap::from([(
             80,
             BluezCard {
                 mac: "AA:BB:CC:DD:EE:FF".to_string(),
                 profiles: [
-                    profile(0, "Off", true),
-                    profile(1, "High Fidelity Playback (A2DP Sink, codec SBC)", true),
-                    profile(2, "High Fidelity Playback (A2DP Sink, codec AAC)", true),
-                    profile(3, "High Fidelity Playback (A2DP Sink, codec LDAC)", false),
+                    profile(0, "off", "Off", true),
+                    profile(1, "a2dp-sink-sbc", "High Fidelity Playback (A2DP Sink, codec SBC)", true),
+                    // A translated description names no codec in English; the name still does.
+                    profile(2, "a2dp-sink-aac", "High-Fidelity-Wiedergabe (A2DP-Senke, Codec AAC)", true),
+                    profile(3, "a2dp-sink-ldac", "High Fidelity Playback (A2DP Sink, codec LDAC)", false),
                 ]
                 .into_iter()
                 .collect(),
                 active: Some(2),
+                ..BluezCard::default()
             },
         )]);
 
@@ -1390,8 +1430,34 @@ mod tests {
         let card = &published.bluetooth[0];
         assert_eq!(card.mac, "AA:BB:CC:DD:EE:FF");
         let codecs: Vec<&str> = card.codecs.iter().map(|codec| codec.codec.as_str()).collect();
-        assert_eq!(codecs, ["SBC", "AAC"], "Off names no codec and LDAC is unavailable");
+        assert_eq!(codecs, ["SBC", "AAC"], "off names no codec and LDAC is unavailable");
         assert_eq!(card.active, Some(2));
+    }
+
+    #[test]
+    fn a_profile_enumeration_replaces_the_list_and_reports_only_a_change() {
+        let profile = |index: i32, name: &str| master::Profile {
+            index,
+            name: name.to_string(),
+            description: String::new(),
+            available: true,
+        };
+        let mut card = BluezCard::default();
+
+        let first = card.begin_enumeration();
+        card.enumerated(first, profile(1, "a2dp-sink-sbc"));
+        let second = card.begin_enumeration();
+        card.enumerated(first, profile(9, "a2dp-sink-stale"));
+        card.enumerated(second, profile(2, "a2dp-sink-aac"));
+        assert!(!card.finish_enumeration(first, 1), "an older enumeration's answer changes nothing");
+        assert!(card.finish_enumeration(second, 2));
+        assert_eq!(card.profiles.keys().copied().collect::<Vec<_>>(), [2], "SBC left with the old list");
+        assert_eq!(card.active, Some(2));
+
+        // A volume step re-enumerates the same card; nothing changed, so nothing publishes.
+        let third = card.begin_enumeration();
+        card.enumerated(third, profile(2, "a2dp-sink-aac"));
+        assert!(!card.finish_enumeration(third, 2));
     }
 
     #[test]
