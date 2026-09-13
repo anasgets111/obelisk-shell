@@ -97,8 +97,8 @@ pub enum LoaderError {
     /// [`Loader::evaluate_file`] could not read `shell.lua` (missing file, permissions).
     #[error("failed to read shell.lua: {0}")]
     Io(#[from] std::io::Error),
-    /// A valid top-level surface had a mistyped topology field
-    /// (`id`/`layer`/`anchor`/`monitor`), distinct from [`Self::InvalidTopLevelReturn`].
+    /// A valid top-level surface had a mistyped topology field (`id`/`layer`/`anchor`/`monitor`),
+    /// distinct from [`Self::InvalidTopLevelReturn`].
     #[error("shell.lua's surface topology is invalid: {0}")]
     InvalidTopology(String),
 }

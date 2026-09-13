@@ -6,8 +6,8 @@ use crate::capabilities::shm_icons;
 
 use super::MAX_PIXMAP_DIMENSION;
 
-/// `$XDG_RUNTIME_DIR/obelisk` subdirectory for tray pixmaps, shared by writes, per-item deletion, and
-/// startup sweep.
+/// `$XDG_RUNTIME_DIR/obelisk` subdirectory for tray pixmaps, shared by writes, per-item deletion,
+/// and startup sweep.
 pub(super) const SPOOL_SUBDIR: &str = "tray";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,9 +17,8 @@ pub(super) struct IconPixmap {
     pub(super) bytes: Vec<u8>,
 }
 
-/// Validates one raw `IconPixmap`: non-empty square,
-/// at most
-/// [`MAX_PIXMAP_DIMENSION`], with exactly `width * height * 4` ARGB32 bytes.
+/// Validates one raw `IconPixmap`: non-empty square, at most [`MAX_PIXMAP_DIMENSION`], with exactly
+/// `width * height * 4` ARGB32 bytes.
 fn pixmap_is_valid(width: i32, height: i32, byte_len: usize) -> bool {
     width > 0
         && width == height

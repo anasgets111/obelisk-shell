@@ -581,10 +581,10 @@ impl NotificationsController {
         id
     }
 
-    /// `CloseNotification(id)` removes the entry (if present) and emits
-    /// `NotificationClosed(id, reason=ClosedByMethod)`. A `dismiss()` write command emits the
-    /// same signal with `reason=Dismissed` instead -- distinct wire callers of the same removal
-    /// primitive ([`remove_by_id`]).
+    /// `CloseNotification(id)` removes the entry (if present) and emits `NotificationClosed(id,
+    /// reason=ClosedByMethod)`. A `dismiss()` write command emits the same signal with
+    /// `reason=Dismissed` instead -- distinct wire callers of the same removal primitive
+    /// ([`remove_by_id`]).
     #[zbus(name = "CloseNotification")]
     async fn close_notification(&self, id: u32) {
         let removed = {

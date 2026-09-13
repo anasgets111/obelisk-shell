@@ -273,10 +273,11 @@ impl App {
         //
         // Every hidden panel defers, not only a measured one. A fully anchored panel could be sized
         // here, but keeping its object made `visible = false` mean two things: no object for one
-        // panel, a permanent unmapped object for another. PBA staging loses nothing either way, an
-        // `Unmapped` surface presents no frame (`MapState::presents`) and `candidate_has_staged`
-        // counts a no-object surface complete. `show_panel` and `apply_spec_change` both repeat
-        // [`ambiguous_zero_axis`], so a bad anchor is still refused, on the pass that shows it.
+        // panel, a permanent unmapped object for another. Staging during a swap loses nothing
+        // either way, an `Unmapped` surface presents no frame (`MapState::presents`) and
+        // `candidate_has_staged` counts a no-object surface complete. `show_panel` and
+        // `apply_spec_change` both repeat [`ambiguous_zero_axis`], so a bad anchor is still
+        // refused, on the pass that shows it.
         let deferred = !visible;
         if !deferred && let Some(axis) = ambiguous_zero_axis(size, spec.topology.anchor) {
             eprintln!(
@@ -416,7 +417,7 @@ impl App {
     /// redraws a clock every second hides the bug.
     ///
     /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
-    /// procedure, and the PBA protocol keeps Candidates invisible until `ActivateDraw`.
+    /// procedure, and the generation swap keeps Candidates invisible until `ActivateDraw`.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec, visible: bool) {
         // [`App::apply_visibility`]'s own unmap test, run before it: a mapped panel going invisible
         // loses its layer object later this pass, so requests sent now die with it. Not just waste --
@@ -482,7 +483,7 @@ impl App {
         // After the zone request, keeping the pass to one commit.
         if update.moved_anything()
             && self.surfaces[index].map_state == MapState::Mapped
-            && !self.is_pba_candidate
+            && !self.is_swap_candidate
             && let TrackedRole::Panel { layer: Some(layer), .. } = &self.surfaces[index].role
         {
             layer.commit();

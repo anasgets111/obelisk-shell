@@ -1,6 +1,5 @@
--- On/off switch for boolean writes, including `bluetooth:set_enabled`,
--- `network:set_wifi_enabled`, and `audio:set_muted`. The next capability snapshot is the only
--- readback.
+-- On/off switch for boolean writes, including `bluetooth:set_enabled`, `network:set_wifi_enabled`,
+-- and `audio:set_muted`. The next capability snapshot is the only readback.
 -- Takes the raw signal plus `read`, as `components/meter.lua` does, because `obelisk.bluetooth`
 -- pushes a table, not a bool; caller knows the field. `on_change` passes the flipped value.
 -- The caller routes it through `capability:invoke(...)` or local `state()`.

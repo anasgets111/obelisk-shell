@@ -53,15 +53,15 @@ capability call; references above mean config writing to the `state()` signal bo
 
 ## 0003. Authority transfers per output, not per process
 
-`services.md` § 15.4's all-display presentation barrier is replaced by
+`services.md` § 14's all-display presentation barrier is replaced by
 per-(`generation`, output) authority. Each output moves to the candidate when its own presentation
 evidence arrives, without waiting for siblings. The Supervisor reaps a generation at zero owned
 outputs, immediately or minutes later if one output sleeps.
 
 A sleeping DPMS-off or slow output would otherwise stall every promotion, or force a deadline that
 either leaks the old generation or blind-promotes an unproven candidate, reintroducing the black
-frame PBA prevents. This matches `surface` with `monitor = "All"`, which already binds one
-`wl_surface` per output.
+frame the generation swap prevents. This matches `surface` with `monitor = "All"`, which already
+binds one `wl_surface` per output.
 
 Rejected: whole-process authority with a deadline that force-promotes every output. A dead
 candidate, detected by SIGCHLD before any output promotes, aborts the whole candidate. A slow output
@@ -160,7 +160,7 @@ on the same lower-level crate.
 The renderer has one `TextInputService` bound to the seat. It owns `Dispatch<ZwpTextInputV3, D>` and
 the raw event sequence; scene nodes never see the protocol.
 
-`textfield` (IDL § 5.2) maps to `wp-text-input-v3`. No maintained crate wraps it beyond
+`textfield` (`lua-api.md` § 5.2) maps to `wp-text-input-v3`. No maintained crate wraps it beyond
 `wayland-protocols` raw generated bindings gated behind `unstable`. Following Noctalia's
 `src/wayland/text_input_service.h` and `src/ui/text_input_client.h`, each node implements the
 `TextInputClient` shape: it reports surrounding text, cursor, purpose, and sensitive/hidden state,
@@ -336,10 +336,10 @@ Since built: the socket, Lua VM, and audio push as a real signal in ADR-0022. Ph
 end-to-end slice uses the mixer's data as its first payload. ADR-0037 generalizes it to per-capability
 push.
 
-## 0018. Process-group spawn/reap primitives land without `process.run`, a registry, or the PBA orchestrator
+## 0018. Process-group spawn/reap primitives land without `process.run`, a registry, or the swap orchestrator
 
 Phase 7 ships only the two low-level primitives requested. `process.run`'s Lua binding, a process
-registry, stdout/stderr streaming, and the PBA generation-swap orchestrator are deferred because
+registry, stdout/stderr streaming, and the generation swap orchestrator are deferred because
 their interfaces are not yet defined, as in ADR-0015 and ADR-0017.
 
 1. **`spawn_group_leader(cmd, args) -> io::Result<Child>`.** Spawns an independent process-group
@@ -357,28 +357,28 @@ from the test process, clean `SIGTERM` reap, escalation of a `SIGTERM`-ignoring 
 backgrounded grandchild in the same group.
 
 Since built: `process.run`'s Lua binding and a process registry in ADR-0026. ADR-0025 first calls
-`reap_process_group` from the PBA orchestrator.
+`reap_process_group` from the swap orchestrator.
 
-## 0019. PBA control-socket transport and Lua AST evaluation are deferred, not built
+## 0019. Generation swap control-socket transport and Lua AST evaluation are deferred, not built
 
-Phase 8 ships PBA ordering and gating only, not the surrounding
-`services.md` § 15.1-15.4 system. These items are deferred for the same
-reason as ADR-0015/0017/0018: no consumer or transport exists yet to build against. They are the
-Unix control-socket wire,
-Lua AST evaluation, Renderer null-buffer commit and `wp_presentation_feedback`, NetworkManager/BlueZ
-state hydration, true per-(`generation`, output) evidence fan-out (ADR-0003), `§ 15.4` Swap messages
+Phase 8 ships generation swap ordering and gating only, not the surrounding `services.md` § 14
+system. These items are deferred for the same reason as ADR-0015/0017/0018: no consumer or
+transport exists yet to build against. They are the Unix control-socket wire, Lua AST evaluation,
+Renderer null-buffer commit and `wp_presentation_feedback`, NetworkManager/BlueZ state hydration,
+true per-(`generation`, output) evidence fan-out (ADR-0003), `services.md` § 14.3 swap messages
 (input deselection on N and the promotion signal to N+1), `reload.rs` wiring into `main.rs`, and the
 `inotify` config-watch trigger.
 
-1. **Real process lifecycle.** `run_pba` calls `process::spawn_group_leader` during Overlapping Spawn
-   and `process::reap_process_group` after evidence verification and on every Candidate failure.
-2. **`CandidateLink`, the IPC-boundary trait.** Its four `§ 15.2-15.3` operations are
+1. **Real process lifecycle.** `run_swap` calls `process::spawn_group_leader` during Overlapping
+   Spawn and `process::reap_process_group` after evidence verification and on every Candidate
+   failure.
+2. **`CandidateLink`, the IPC-boundary trait.** Its four `services.md` § 14.2-14.3 operations are
    `push_state_snapshot` (state hydration), `recv_ready_signal` (null-buffer staging),
    `send_activate_draw` (activate draw), and `recv_presentation_evidence` (evidence verification).
-   It reuses `shared::StateSnapshot` for hydration, but not
-   `shared::CommandEnvelope` for `ActivateDraw`: `lua-api.md` § 7.2 defines that
-   envelope as a generation-guarded Renderer-to-Supervisor Lua write, while activation is a
-   Supervisor-issued nonce, so it carries a plain `u64`.
+   It reuses `shared::StateSnapshot` for hydration, but not `shared::CommandEnvelope` for
+   `ActivateDraw`: `lua-api.md` § 7 defines that envelope as a generation-guarded
+   Renderer-to-Supervisor Lua write, while activation is a Supervisor-issued nonce, so it carries a
+   plain `u64`.
 3. **Failure semantics.** Any failure before presentation evidence is verified, including a
    `CandidateLink` error or ready/evidence deadline, aborts the Candidate and leaves generation N
    untouched and authoritative. N is reaped only after evidence verification.
@@ -392,7 +392,7 @@ confirmation that an aborted Candidate's process group was reaped.
 production `SocketCandidateLink` and control-socket transport in ADR-0025; real `shell.lua`
 evaluation from ADR-0023; and a production caller through ADR-0024's Watcher.
 
-## 0020. Control-socket transport ships without dispatch, PBA wiring, or `process.run` streaming
+## 0020. Control-socket transport ships without dispatch, swap wiring, or `process.run` streaming
 
 Phase 9 builds Unix control-socket framing and connection identity, but defers everything after a
 frame arrives: the `lua-api.md` § 3.2 command table of ~30 writes, still forwarded to an
@@ -422,7 +422,8 @@ Tests use real I/O: framing over `tokio::io::duplex`; a `UnixListener` under
 decodes correctly.
 
 Since built: command dispatch in ADR-0037, with per-module routing replacing the aggregated log;
-production `CandidateLink` and PBA wiring in ADR-0025; and `process.run` line streaming in ADR-0026.
+production `CandidateLink` and swap wiring in ADR-0025; and `process.run` line streaming in
+ADR-0026.
 ## 0021. Lua loader ships without retained-scene reconciliation or signal memoization
 
 Phase 10 builds an `mlua` VM and loader for `shell.lua` node trees and surface topology. It defers
@@ -526,7 +527,7 @@ Rejected: reusing `shared::CommandEnvelope`. `SupervisorFrame`/`RendererFrame` a
 tagged because `CommandEnvelope` carries a Lua-initiated Renderer -> Supervisor write, not an
 engine-internal message.
 
-Not built: generation swap on `TopologyChanged` (`run_pba` has no runtime caller, per ADR-0019);
+Not built: generation swap on `TopologyChanged` (`run_swap` has no runtime caller, per ADR-0019);
 useful `reset_registrations` (called but empty; ADR-0006 requires reset before fresh evaluation,
 but this round trip cannot honor that ordering because the reset decision depends on the evaluation's
 verdict; it needs the same pending/apply staging the Scene already has once a real registration
@@ -534,7 +535,7 @@ capability exists to stage against);
 full `obelisk.*` tree (only `rescue`, as in ADR-0022's `audio`); startup fallback;
 multi-generation bookkeeping (generation `0`, per ADR-0020); or real `layer`/`anchor`/`monitor`.
 
-## 0025. PBA orchestrator wired with atomic per-candidate promotion, not true per-output streaming
+## 0025. Swap orchestrator wired with atomic per-candidate promotion, not true per-output streaming
 
 Promotion is atomic per candidate. Evidence is per surface, and every expected surface must report
 within one shared timeout. Otherwise the candidate is aborted and no swap occurs. Partial promotion
@@ -1212,7 +1213,7 @@ reload branch, not an animation system.
 No picker or folder scan in this pass. A 3840×2160 RGBA texture costs roughly 32 MB; measurement was
 left to the memory harness.
 
-## 0056. `workspaces` speaks niri, and § 2.9 is wrong in three places
+## 0056. `workspaces` speaks niri, and its documented contract is wrong in three places
 
 1. Implement niri first without a compositor trait. Missing niri leaves state nil; a second tested
 implementation must justify abstraction.
@@ -2441,7 +2442,7 @@ QML's `Behavior on width { NumberAnimation { duration; easing.type } }` is the m
 `InOutQuad`/`OutCubic` run at 100-250 ms. Use retained structure:
 
 1. A node names what eases: `animate = { width = 147, background = { duration = 147, easing =
-   "OutCubic" } }`, possibly a § 5.1 nested signal. Allow numbers, `"NN%"` and colours; percent
+   "OutCubic" } }`, possibly a nested signal. Allow numbers, `"NN%"` and colours; percent
    only meets percent. `"Fill"`, percent/number and edge-table pairs snap; other properties refuse.
    The first cut snapped every percent, leaving every meter's fill, the mirror's `FillBar`,
    unanimated; the amendment fixed that.
@@ -2781,7 +2782,7 @@ On 2026-09-07 a live session locked with no PAM worker behind the lock screen. I
 keystrokes but could not authenticate under `ext-session-lock-v1`, a lockout rather than a failed
 unlock; recovery used ADR-0060's takeover marker.
 
-The Renderer evaluates `shell.lua` before `ReadySignal` (`wayland/mod.rs` § 14.2: evaluate, bind,
+The Renderer evaluates `shell.lua` before `ReadySignal` (`wayland/mod.rs`: evaluate, bind,
 clear, signal). ADR-0070 decision 1 makes reading `obelisk.<capability>` queue a `StartCapability`,
 so Candidate starts precede the signal awaited by the swap. `SocketCandidateLink::recv_matching`
 logged and threw away everything that was not the frame it wanted, on every swap, not only a rushed
@@ -3325,21 +3326,20 @@ Restored:
 1. `SystemInfoWidget` is the factory from `modules/bar/indicators/system_info.lua`, instantiated by
    `modules/bar/panels/notification_history.lua` as in the mirror. Each instance owns `expanded`.
    The settings toplevel keeps no second instance. Its `window {}` is the config's only one and its
-   only exercise of § 6's toplevel.
+   only exercise of a toplevel.
 2. `Components/InfoBadge.qml` became `components/info_badge.lua` and carries the header's urgent
    count. `bluetooth_panel.lua` already had the same capsule as local `battery_badge`; it is now
    shared for six call sites, as in the mirror.
 
 ### What is absent, and why absent beats faked
 
-The mirror's `SystemInfoService` shells out for GPU load, per-disk usage, uptime and boot time. §
-2.12 exposes only `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and `temp_gpu`: "CPU,
-memory and temperatures", exactly as the capability table names it, and nothing here proposes to
-grow it. So
-those tiles are absent. The panel uses swap as the memory tile's second line, where the mirror prints
-`used / total`, and GPU temperature where the GPU tile stood. That tile is conditional on
-`gpuTemp > 0`; with no sensor `temp_gpu` is `-1`. The collapsed summary is `CPU`/`RAM`/`SWAP`, not
-the mirror's `CPU`/`RAM`/`GPU`/`DISK`.
+The mirror's `SystemInfoService` shells out for GPU load, per-disk usage, uptime and boot time.
+`obelisk.sysinfo` exposes only `cpu_percent`, `ram_percent`, `swap_percent`, `temp_cores` and
+`temp_gpu`: "CPU, memory and temperatures", exactly as the capability table names it, and nothing
+here proposes to grow it. So those tiles are absent. The panel uses swap as the memory tile's
+second line, where the mirror prints `used / total`, and GPU temperature where the GPU tile stood.
+That tile is conditional on `gpuTemp > 0`; with no sensor `temp_gpu` is `-1`. The collapsed summary
+is `CPU`/`RAM`/`SWAP`, not the mirror's `CPU`/`RAM`/`GPU`/`DISK`.
 
 `temp_cores` has one value per hwmon sensor, while `cpuTemp` is a package figure. The tile shows the
 hottest sensor; averaging the list could include a cooler chipset probe.
@@ -3347,10 +3347,10 @@ hottest sensor; averaging the list could include a cooler chipset probe.
 ### Polling has no off switch here
 
 The mirror ref-counts `SystemInfoService.refCount` from `active`, so pollers run only while the panel
-is open. § 2.12's `configure` sets an interval, and zero stops every reader rather than one widget.
-Polling always is the choice: against never polling and leaving the status stale, two `/proc`
-reads every couple of seconds is the cheaper mistake. `temp_interval` follows RAM at 5s because
-the tile's second line is not watched.
+is open. The capability's `configure` sets an interval, and zero stops every reader rather than one
+widget. Polling always is the choice: against never polling and leaving the status stale, two
+`/proc` reads every couple of seconds is the cheaper mistake. `temp_interval` follows RAM at 5s
+because the tile's second line is not watched.
 
 ### An unrelated swap this uncovered
 
@@ -3385,9 +3385,10 @@ would cover the requested sheet.
 
 `MinimalCalendar` sizes to its month with `rowCount:
 Math.ceil((firstDayOffset + daysInMonth) / 7)`, giving four to six rows. Fixed six-week sizing left
-seven blank cells under September 2026. A `popup` surface has explicit size under § 6, so height is
-a `Bound`, which is why § 6 accepts `integer|Bound`; the tooltip follows it. Its vertical padding is
-`spacing.md`, not shared `xs`, because one- and two-line tips already count `xs` in fixed height.
+seven blank cells under September 2026. A `popup` surface has explicit size under `lua-api.md` § 6,
+so height is a `Bound`, which is why that section accepts `integer|Bound`; the tooltip follows it.
+Its vertical padding is `spacing.md`, not shared `xs`, because one- and two-line tips already count
+`xs` in fixed height.
 
 `NotificationHistoryPanel.qml` uses `readonly property int padding: Theme.spacingMd` and
 `anchors.margins: root.padding`, sizing as `contentColumn.implicitHeight + padding * 2`.
@@ -3444,8 +3445,8 @@ already holds a `Child` for every `process.run`; no orphan liveness probe is nee
 
 3. **The stop signal is declared, and shutdown uses it.** `SIGTERM` is the default but wrong for
    `gpu-screen-recorder`, which finalises its container on `SIGINT`; skipping that leaves an
-   unplayable file. The grace is five seconds, not § 10's 100 ms, because this long-running program
-   needs time to close its output.
+   unplayable file. The grace is five seconds, not the usual 100 ms, because this long-running
+   program needs time to close its output.
 
 4. **stdio is inherited, not piped.** A session process outlives its generation, so no callback can
    receive its output. Piping would drop lines or require an owner across generations. The shell's

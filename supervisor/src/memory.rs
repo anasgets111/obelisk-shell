@@ -239,8 +239,8 @@ fn read_gpu(process_dir: &Path) -> Gpu {
 }
 
 /// Reads `<proc_root>/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A
-/// pid already exited during an ordinary PBA handoff or crash is logged and skipped; only the
-/// supervisor read is fatal.
+/// pid already exited during an ordinary generation swap handoff or crash is logged and skipped;
+/// only the supervisor read is fatal.
 pub(crate) fn sample(proc_root: &Path, renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
     let supervisor = read_process_memory(proc_root, "self")?;
     let mut renderers = Vec::with_capacity(renderer_pids.len());
@@ -267,8 +267,9 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
 }
 
 /// Reads and logs one sample across Supervisor and `renderers` (ADR-0043 decision 1). `main.rs`
-/// calls it from the steady-state timer (one authoritative generation) and PBA (both during the
-/// two-generation window). A reaped `Child` with `id() == None` is dropped, not reported as zero.
+/// calls it from the steady-state timer (one authoritative generation) and the generation swap
+/// (both during the two-generation window). A reaped `Child` with `id() == None` is dropped, not
+/// reported as zero.
 pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)]) {
     let pids: Vec<(u32, u32)> =
         renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();

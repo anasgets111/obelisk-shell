@@ -1,5 +1,4 @@
-//! Node constructors and `VirtualNode`, the loader's shallow
-//! table-to-Rust conversion.
+//! Node constructors and `VirtualNode`, the loader's shallow table-to-Rust conversion.
 //!
 //! ponytail: shallow by design. `deserialize_lua_table` reads `kind`, copies other keys unchanged,
 //! never recurses into `children`/`child` (reconciliation's job), and does not validate shapes such

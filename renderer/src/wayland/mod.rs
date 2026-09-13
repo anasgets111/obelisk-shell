@@ -97,7 +97,7 @@ pub struct App {
     session_lock: Option<SessionLock>,
     /// Shared EGL display/config/GLES3 context, lazy because `eglInitialize` loads Mesa,
     /// `libgallium`, and LLVM: 125 MB mapped and 13-35 ms. No-surface configs avoid it
-    /// (ADR-0070 decision 7); PBA Candidates pay after `ActivateDraw`, their only bind
+    /// (ADR-0070 decision 7); Candidates pay after `ActivateDraw`, their only bind
     /// (ADR-0071).
     egl: Option<egl::EglState>,
     gl: Option<glow::Context>,
@@ -120,8 +120,8 @@ pub struct App {
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// Whether `OBELISK_PBA_CANDIDATE` was set (PBA protocol), read once in [`run`].
-    is_pba_candidate: bool,
+    /// Whether `OBELISK_SWAP_CANDIDATE` was set (the generation swap), read once in [`run`].
+    is_swap_candidate: bool,
     /// Set after [`App::maybe_send_ready_signal`] sends its one-time `ReadySignal`.
     ready_signal_sent: bool,
     /// Set after startup evaluation and surface creation. The initial `wl_output` burst occurs in
@@ -137,8 +137,8 @@ pub struct App {
     presentation_time: PresentationTimeState,
     /// Clone used by poll-loop [`App::activate_draw`] to request `wp_presentation_feedback`.
     queue_handle: QueueHandle<App>,
-    /// In-flight `ActivateDraw` nonce for every `presented` event. PBA has one handshake at a time,
-    /// so one field replaces a per-surface map.
+    /// In-flight `ActivateDraw` nonce for every `presented` event. The generation swap has one
+    /// handshake at a time, so one field replaces a per-surface map.
     active_nonce: Option<u64>,
     /// Advertised seat pointer, kept alive because dropping it destroys pointer events. One slot;
     /// [`SeatHandler::new_capability`] stores whichever seat announces the capability.
@@ -159,8 +159,9 @@ pub struct App {
     /// Focused surface instance id (ADR-0050); `input::keyboard::focus_is_still_armed` requires a
     /// `secure_submit` field's declaring surface to match it.
     ///
-    /// ponytail: nothing else consumes it (there is no `on_key` property; ADR-0050 declines to invent
-    /// one). Upgrade path: an IDL key-handler property, dispatching into this surface's tree.
+    /// ponytail: nothing else consumes it (there is no `on_key` property; ADR-0050 declines to
+    /// invent one). Upgrade path: an IDL key-handler property, dispatching into this surface's
+    /// tree.
     keyboard_focus: Option<String>,
     /// Press waiting for release (ADR-0050 decision 2, [`ArmedClick`]).
     armed: Option<ArmedClick>,
@@ -264,7 +265,7 @@ pub fn run(
     // `GlobalError::MissingGlobal`.
     let presentation_time = PresentationTimeState::bind(&globals, &qh);
 
-    let is_pba_candidate = std::env::var("OBELISK_PBA_CANDIDATE").is_ok();
+    let is_swap_candidate = std::env::var("OBELISK_SWAP_CANDIDATE").is_ok();
 
     // One process-wide shaping handle; `RendererClient` gets a clone (ADR-0039 decision 3).
     // `Loader::new()` stays here because `mlua::Lua` is `!Send`.
@@ -292,7 +293,7 @@ pub fn run(
         client,
         surfaces: Vec::new(),
         exit: false,
-        is_pba_candidate,
+        is_swap_candidate,
         ready_signal_sent: false,
         startup_complete: false,
         outbound_tx,
@@ -325,14 +326,13 @@ pub fn run(
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // Candidate order from the PBA protocol: evaluate shell.lua, bind
-    // declared layer surfaces (ADR-0038 decision 1), commit null buffers (`bind_and_clear`'s
-    // candidate branch), and signal ready (`maybe_send_ready_signal`).
+    // Candidate order from the generation swap: evaluate shell.lua, bind declared layer surfaces
+    // (ADR-0038 decision 1), commit null buffers (`bind_and_clear`'s candidate branch), and signal
+    // ready (`maybe_send_ready_signal`).
     //
-    // ponytail: this runs inside the PBA ready window (`ready_timeout` 2s,
-    // `supervisor/src/main.rs`'s `PBA_TIMINGS`); first `text` shaping blocks on
-    // `FontSystem::new()`.
-    // Accepted because the PBA protocol requires evaluate-before-bind.
+    // ponytail: this runs inside the swap's ready window (`ready_timeout` 2s,
+    // `supervisor/src/main.rs`'s `SWAP_TIMINGS`); first `text` shaping blocks on
+    // `FontSystem::new()`. Accepted because the generation swap requires evaluate-before-bind.
     //
     // Seed `screens` before evaluation (ADR-0041 decision 2): configs loop over it during the
     // first pass, so seeding after evaluation would declare no per-monitor panels.
@@ -362,7 +362,7 @@ pub fn run(
         }
     }
     app.client.set_instances(instances.clone());
-    // The first resolve validates only: the PBA protocol requires evaluate-before-bind, so
+    // The first resolve validates only: the generation swap requires evaluate-before-bind, so
     // instances use output logical sizes and are never painted. Evaluation/apply already log and
     // set rescue; this adds the consequence.
     if !app.client.apply_instances() {
@@ -372,7 +372,7 @@ pub fn run(
     }
 
     app.create_surfaces(&qh, &specs, &instances);
-    if app.is_pba_candidate {
+    if app.is_swap_candidate {
         // Hidden-only windows have no `xdg_toplevel` configure (ADR-0049 decision 1), so without
         // this gate such a Candidate never sends `ReadySignal` and hits `ready_timeout`.
         app.maybe_send_ready_signal();

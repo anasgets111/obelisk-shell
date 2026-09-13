@@ -36,10 +36,10 @@ use supervisor::Supervisor;
 /// (ADR-0024).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Ready-signal and evidence-verification deadlines (`reload::PbaTimings`), scaled
+/// Ready-signal and evidence-verification deadlines (`reload::SwapTimings`), scaled
 /// above `reload.rs`'s test constants for a Candidate binding Wayland/EGL. Healthy Candidates fit;
 /// wedged ones cannot hang a config edit.
-const PBA_TIMINGS: reload::PbaTimings = reload::PbaTimings {
+const SWAP_TIMINGS: reload::SwapTimings = reload::SwapTimings {
     ready_timeout: Duration::from_secs(2),
     evidence_timeout: Duration::from_secs(3),
     reap_grace: process::DEFAULT_REAP_GRACE,
@@ -388,7 +388,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
                     // SocketCandidateLink reads these only mid-handshake from `inbound_frames` (see
                     // TopologyChanged, ADR-0025). Here they are stale or a wire-protocol desync.
-                    eprintln!("generation {}'s handshake frame arrived outside any in-flight PBA handshake; dropping: {:?}", inbound.generation_id, inbound.frame);
+                    eprintln!("generation {}'s handshake frame arrived outside any in-flight generation swap; dropping: {:?}", inbound.generation_id, inbound.frame);
                 }
                 RendererFrame::StartCapability { capability } => {
                     // ADR-0070: config read `obelisk.<capability>` or named it in `secure_submit`.
@@ -433,10 +433,10 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     supervisor.answer_unchanged_report(inbound.generation_id, sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if supervisor.lock.defers_swap() => {
-                    // ADR-0042: candidate N+1 cannot acquire generation N's lock, so PBA waits for
-                    // release. `Unchanged` reloads are not gated. Use `defers_swap`, not
-                    // `is_active`: an unreported lock order is also unswappable, and a swap then
-                    // would reap the process owning the lock object.
+                    // ADR-0042: candidate N+1 cannot acquire generation N's lock, so the generation
+                    // swap waits for release. `Unchanged` reloads are not gated. Use `defers_swap`,
+                    // not `is_active`: an unreported lock order is also unswappable, and a swap
+                    // then would reap the process owning the lock object.
                     supervisor.defer_swap(sequence);
                 }
                 RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) => {

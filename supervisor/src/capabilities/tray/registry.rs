@@ -268,8 +268,8 @@ pub(super) fn spawn_name_owner_changed_forwarder(
                 if let Some(handle) = entry.menu_forwarder {
                     handle.abort();
                 }
-                // Remove all three variant files (ADR-0074). Reconnecting apps get a new unique name,
-                // so stale PNGs otherwise pile up for the rest of the session (logind clears
+                // Remove all three variant files (ADR-0074). Reconnecting apps get a new unique
+                // name, so stale PNGs otherwise pile up for the rest of the session (logind clears
                 // $XDG_RUNTIME_DIR only when the user's last session ends).
                 for path in [
                     &entry.last_known.icon_path,

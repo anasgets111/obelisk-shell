@@ -1,10 +1,11 @@
 //! `obelisk.power` reports profiles and battery charge/discharge rate
 //! from two D-Bus services (ADR-0053 amendment).
 //!
-//! `obelisk.power` combines unrelated facts: power-profiles-daemon supplies `active_profile`/`profiles`,
-//! UPower supplies `on_battery`/`energy_rate`. Either half may be absent, so fields are optional
-//! and never fabricated: no `"balanced"` without the profile daemon or `0` without UPower. It
-//! has no absence sentinel; ADR-0037's nil-until-hydrated contract covers it.
+//! `obelisk.power` combines unrelated facts: power-profiles-daemon supplies
+//! `active_profile`/`profiles`, UPower supplies `on_battery`/`energy_rate`. Either half may be
+//! absent, so fields are optional and never fabricated: no `"balanced"` without the profile daemon
+//! or `0` without UPower. It has no absence sentinel; ADR-0037's nil-until-hydrated contract covers
+//! it.
 //!
 //! **The power-profiles-daemon half is not live-verified.** It is absent on this machine; its
 //! interface follows the documented D-Bus API. UPower is verified here: both properties were read

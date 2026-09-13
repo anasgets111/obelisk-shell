@@ -1,10 +1,10 @@
-//! `obelisk.brightness` reports display backlight percent,
-//! reads sysfs through a udev `backlight` watch, and writes through logind (ADR-0053). Its write
-//! action is `brightness:set(pct)`, unlike read-only `battery`.
+//! `obelisk.brightness` reports display backlight percent, reads sysfs through a udev `backlight`
+//! watch, and writes through logind (ADR-0053). Its write action is `brightness:set(pct)`, unlike
+//! read-only `battery`.
 //!
-//! No device means no [`controller::BrightnessSignal::Changed`], not a placeholder: `brightness` has no
-//! absence sentinel, and `0` means "backlight is off", not "no hardware". Lua therefore keeps
-//! `obelisk.brightness` `nil` forever (ADR-0037's nil-until-hydrated contract).
+//! No device means no [`controller::BrightnessSignal::Changed`], not a placeholder: `brightness`
+//! has no absence sentinel, and `0` means "backlight is off", not "no hardware". Lua therefore
+//! keeps `obelisk.brightness` `nil` forever (ADR-0037's nil-until-hydrated contract).
 
 pub mod controller;
 

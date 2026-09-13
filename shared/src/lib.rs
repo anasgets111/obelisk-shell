@@ -233,32 +233,30 @@ pub struct ActivateDraw {
     pub nonce: u64,
 }
 
-/// The Candidate's one-time report that every tracked
-/// Wayland surface staged its null buffer and awaits `ActivateDraw`. `surfaces` lists surface IDs,
-/// not monitor IDs (ADR-0025).
+/// The Candidate's one-time report that every tracked Wayland surface staged its null buffer and
+/// awaits `ActivateDraw`. `surfaces` lists surface IDs, not monitor IDs (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadySignal {
     pub surfaces: Vec<String>,
 }
 
-/// One message per surface ID after its
-/// `wp_presentation_feedback` `presented` event (ADR-0019). This is the Candidate's report; the
-/// all-surfaces barrier is in `reload::run_pba`.
+/// One message per surface ID after its `wp_presentation_feedback` `presented` event (ADR-0019).
+/// This is the Candidate's report; the all-surfaces barrier is in `reload::run_swap`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentationEvidence {
     pub nonce: u64,
     pub surface_id: String,
 }
 
-/// Makes the superseded generation stop treating `surface_id`
-/// as authoritative. Per-surface input-region/focus wiring does not exist yet (ADR-0025).
+/// Makes the superseded generation stop treating `surface_id` as authoritative. Per-surface
+/// input-region/focus wiring does not exist yet (ADR-0025).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeselectInput {
     pub surface_id: String,
 }
 
-/// Gives the new generation ownership of `surface_id`.
-/// Currently inert for the same reason as `DeselectInput`.
+/// Gives the new generation ownership of `surface_id`. Currently inert for the same reason as
+/// `DeselectInput`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromoteGeneration {
     pub surface_id: String,
@@ -398,7 +396,7 @@ pub enum SupervisorFrame {
 
 /// Renderer -> Supervisor frames, tagged like [`SupervisorFrame`]. `Command` is the Lua-write
 /// envelope; `ReevaluateReport` is the reload verdict; `ReadySignal`/`PresentationEvidence` are
-/// PBA handshake reports.
+/// generation swap reports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
 pub enum RendererFrame {

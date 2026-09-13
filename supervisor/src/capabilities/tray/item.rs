@@ -16,8 +16,8 @@ use crate::capabilities::truncate_utf8_bytes;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct TrayItem {
-    /// Sanitized D-Bus unique name with the item's object
-    /// path appended, e.g. `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
+    /// Sanitized D-Bus unique name with the item's object path appended, e.g.
+    /// `"1.234/StatusNotifierItem"`. Used by every `tray:` command.
     pub id: String,
     /// Display name: `Title`, falling back to `Id` when `Title` is empty.
     pub name: String,
@@ -131,9 +131,9 @@ pub(super) async fn fetch_tray_item_base(
     }
 }
 
-/// One icon triple (`{X}IconName`, `{X}IconPixmap`,
-/// `IconThemePath`) resolved to the config's `(name, path)` pair (ADR-0074). `spool_suffix` keeps
-/// the three PNGs distinct; otherwise the last write to `{unique_name}.png` would win.
+/// One icon triple (`{X}IconName`, `{X}IconPixmap`, `IconThemePath`) resolved to the config's
+/// `(name, path)` pair (ADR-0074). `spool_suffix` keeps the three PNGs distinct; otherwise the last
+/// write to `{unique_name}.png` would win.
 fn resolve_variant(
     icon_name_prop: String,
     pixmaps_raw: Vec<(i32, i32, Vec<u8>)>,

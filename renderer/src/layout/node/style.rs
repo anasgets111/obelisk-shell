@@ -378,8 +378,8 @@ pub fn parse_align(properties: &HashMap<String, Value>, property: &str) -> Resul
     }
 }
 
-/// `list.direction`, defaulting to `"Vertical"`; returns the borrowed `row` or
-/// `column` kind rather than adding a third layout arm.
+/// `list.direction`, defaulting to `"Vertical"`; returns the borrowed `row` or `column` kind rather
+/// than adding a third layout arm.
 pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'static str, LayoutError> {
     let Some(value) = properties.get("direction") else {
         return Ok("column");
@@ -394,16 +394,15 @@ pub fn parse_list_direction(properties: &HashMap<String, Value>) -> Result<&'sta
     }
 }
 
-/// `opacity` belongs to every kind, including non-painting lists,
-/// and is inherited by multiplication on `ResolvedNode`. It does not replace `visible`: a fully
-/// transparent node still lays out, occupies space, and hit-tests. Values outside `[0, 1]` error
-/// rather than clamp (ADR-0068), matching the reference config's use of this property in 32 files.
-/// `blur`: ask the compositor to blur the desktop behind this node's box
-/// (ADR-0195). Opt-in per node and never inferred, because "translucent" is not "wants blur":
-/// a control may be deliberately invisible at `#00000000`, and a border-only or image-backed glass
-/// box has no background alpha to read at all.
-/// A node that asks and a compositor that cannot is silently nothing, which is what every other
-/// unavailable compositor feature already does here.
+/// `opacity` belongs to every kind, including non-painting lists, and is inherited by
+/// multiplication on `ResolvedNode`. It does not replace `visible`: a fully transparent node still
+/// lays out, occupies space, and hit-tests. Values outside `[0, 1]` error rather than clamp
+/// (ADR-0068), matching the reference config's use of this property in 32 files.
+/// `blur`: ask the compositor to blur the desktop behind this node's box (ADR-0195). Opt-in per
+/// node and never inferred, because "translucent" is not "wants blur": a control may be
+/// deliberately invisible at `#00000000`, and a border-only or image-backed glass box has no
+/// background alpha to read at all. A node that asks and a compositor that cannot is silently
+/// nothing, which is what every other unavailable compositor feature already does here.
 pub fn parse_blur(properties: &HashMap<String, Value>) -> Result<bool, LayoutError> {
     content::parse_bool(properties, "blur", false)
 }

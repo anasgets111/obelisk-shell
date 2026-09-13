@@ -19,9 +19,8 @@ use super::notify::{
 };
 use super::state::{IdleState, foreign_idle_inhibitors};
 
-/// `idle:register_threshold(sec, on_idle, on_resume)`'s `arguments: [sec]`
-/// (ADR-0032). Callbacks stay Renderer-side;
-/// only `sec` crosses the wire.
+/// `idle:register_threshold(sec, on_idle, on_resume)`'s `arguments: [sec]` (ADR-0032). Callbacks
+/// stay Renderer-side; only `sec` crosses the wire.
 pub fn parse_register_args(arguments: &[serde_json::Value]) -> Option<u64> {
     arguments.first()?.as_u64()
 }
@@ -208,9 +207,9 @@ impl IdleController {
         }
     }
 
-    /// Supervisor half of `idle:register_threshold(sec, on_idle, on_resume)`
-    /// (ADR-0032). Inert notify queues nothing
-    /// here; live notify applies [`register_threshold_entry`] and creates a new listener if needed.
+    /// Supervisor half of `idle:register_threshold(sec, on_idle, on_resume)` (ADR-0032). Inert
+    /// notify queues nothing here; live notify applies [`register_threshold_entry`] and creates a
+    /// new listener if needed.
     pub fn register_threshold(&self, generation_id: u32, sec: u64) {
         let notify = self.notify.read().unwrap();
         let NotifyState::Live(live) = &*notify else {

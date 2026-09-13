@@ -45,8 +45,8 @@ fn workspace_rows(
 /// niri flags focus on each window, so search here rather than in `derive_state`. Clone only the
 /// winner; even a fifty-window session builds one `FocusedWindow` per event.
 ///
-/// Wire `title`/`app_id` are `Option` but the payload makes them non-nullable, so default to empty. A
-/// window reporting neither is still a real toplevel.
+/// Wire `title`/`app_id` are `Option` but the payload makes them non-nullable, so default to empty.
+/// A window reporting neither is still a real toplevel.
 fn focused_window(windows: &HashMap<u64, niri_ipc::Window>) -> Option<FocusedWindow> {
     windows.values().find(|window| window.is_focused).map(|window| FocusedWindow {
         title: window.title.clone().unwrap_or_default(),

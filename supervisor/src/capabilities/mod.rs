@@ -84,8 +84,8 @@ pub fn read_attr(entry_dir: &Path, name: &str) -> Option<String> {
 /// Truncates to `max_bytes`, backing off to a UTF-8 boundary (bytes, not chars).
 ///
 /// Every capability that copies a string out of a third party's D-Bus reply caps it here, so the
-/// rule lives once: notifications for `Notify`'s properties and tray for the
-/// `StatusNotifierItem` and DBusMenu text an arbitrary application supplies.
+/// rule lives once: notifications for `Notify`'s properties and tray for the `StatusNotifierItem`
+/// and DBusMenu text an arbitrary application supplies.
 pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         return input.to_string();

@@ -1,7 +1,6 @@
-//! Idle capability (`obelisk.idle`, ADR-0032).
-//! Notify uses the Supervisor's dedicated `ext_idle_notifier_v1` Wayland connection; inhibit uses
-//! `org.freedesktop.login1.Manager.Inhibit` on the existing system bus. They share one controller
-//! and generation-scoped cleanup.
+//! Idle capability (`obelisk.idle`, ADR-0032). Notify uses the Supervisor's dedicated
+//! `ext_idle_notifier_v1` Wayland connection; inhibit uses `org.freedesktop.login1.Manager.Inhibit`
+//! on the existing system bus. They share one controller and generation-scoped cleanup.
 //!
 //! Notify becomes inert (silent no-op, logged once) if the protocol is absent, its connection
 //! fails, or setup exceeds [`IDLE_NOTIFY_SETUP_TIMEOUT`]. Background setup lets

@@ -28,13 +28,15 @@ pub struct AudioDevice {
 /// One BlueZ audio device's codec choices, joined to `obelisk.bluetooth` by MAC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothCodecs {
-    /// PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device, index)`.
+    /// PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device,
+    /// index)`.
     pub device: u32,
     /// MAC address from WirePlumber's `bluez_card.` name, spelled as `obelisk.bluetooth` spells it.
     pub mac: String,
     /// Available profiles that name a codec, in profile index order.
     pub codecs: Vec<CodecProfile>,
-    /// `index` of the active profile, or `nil` before PipeWire reports it or when it names no codec.
+    /// `index` of the active profile, or `nil` before PipeWire reports it or when it names no
+    /// codec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<i32>,
 }
@@ -116,7 +118,8 @@ pub(super) struct DeviceNames {
 }
 
 impl DeviceNames {
-    /// The display `name`, falling back to the routing name so an unnamed device remains selectable.
+    /// The display `name`, falling back to the routing name so an unnamed device remains
+    /// selectable.
     fn display(&self) -> String {
         self.description.clone().unwrap_or_else(|| self.node_name.clone())
     }
@@ -161,8 +164,8 @@ pub(super) fn device_list<'a>(
     list
 }
 
-/// The display name: `node.description`, then `node.nick`, then `node.name`.
-/// Live `pw-dump` shows the first two absent on streams and present on every sink/source.
+/// The display name: `node.description`, then `node.nick`, then `node.name`. Live `pw-dump` shows
+/// the first two absent on streams and present on every sink/source.
 pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
     props
         .get_prop(*keys::NODE_DESCRIPTION)

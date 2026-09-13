@@ -17,7 +17,7 @@ pub(crate) fn bump_revision(revisions: &mut HashMap<String, u32>, capability: Ca
 }
 
 /// Bumps the revision, pushes `state` as a fresh `StateSnapshot`, and records it in
-/// `last_snapshots` (ADR-0029), which seeds a promoted PBA candidate.
+/// `last_snapshots` (ADR-0029), which seeds a promoted Candidate.
 ///
 /// ADR-0037's `&[&str]` roster check was a `debug_assert`. Taking [`Capability`] makes off-roster
 /// names unrepresentable (ADR-0076).

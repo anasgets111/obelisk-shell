@@ -1,6 +1,6 @@
-//! `Signal`: `get`, `map`, `set`, `computed(dependencies, fn)`,
-//! and `state(name, initial)` (ADR-0044 decision 5). Rust owns the userdata; `computed` calls `fn`
-//! with dependency values, not handles, so its body does not call `:get()` on declared deps.
+//! `Signal`: `get`, `map`, `set`, `computed(dependencies, fn)`, and `state(name, initial)`
+//! (ADR-0044 decision 5). Rust owns the userdata; `computed` calls `fn` with dependency values, not
+//! handles, so its body does not call `:get()` on declared deps.
 //!
 //! ponytail: `computed`/`map` recompute on every layout pass, with no invalidation graph across
 //! passes. [`EvaluationMemo`] collapses repeats *within* one pass; nothing caches *between* them,
@@ -55,8 +55,8 @@ impl Deadline {
     }
 }
 
-/// CPU used by the calling thread. Per thread, not process: Lua runs start to
-/// finish on the entering Wayland thread (ADR-0039); process-wide time would charge shaping.
+/// CPU used by the calling thread. Per thread, not process: Lua runs start to finish on the
+/// entering Wayland thread (ADR-0039); process-wide time would charge shaping.
 /// `crate::wayland::idle_profile` charges blocks of its loop against the same per-thread scope.
 pub(crate) fn thread_cpu_time() -> Option<Duration> {
     let spent = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
@@ -915,12 +915,11 @@ pub fn is_signal(ud: &mlua::AnyUserData) -> bool {
     ud.is::<Signal>() || ud.is::<crate::lua::capability::Capability>() || ud.is::<crate::lua::idle::IdleMember>()
 }
 
-/// Registers `computed`, `delay` and `pulse` (ADR-0146, ADR-0153), `state`
-/// (ADR-0044 decision 5), `hover`, `hover_rect`, and `scroll`.
-/// Dependencies are signal-like userdata. Pass the shared dirty flag explicitly, not via
-/// `app_data`: a hidden coupling failing inside a config author's `state()` call is worse than
-/// threading one argument through. `set` marks the same flag `new_live` returns and
-/// The `ms` a `delay` or a `pulse` is given, as whole milliseconds.
+/// Registers `computed`, `delay` and `pulse` (ADR-0146, ADR-0153), `state` (ADR-0044 decision 5),
+/// `hover`, `hover_rect`, and `scroll`. Dependencies are signal-like userdata. Pass the shared
+/// dirty flag explicitly, not via `app_data`: a hidden coupling failing inside a config author's
+/// `state()` call is worse than threading one argument through. `set` marks the same flag
+/// `new_live` returns and The `ms` a `delay` or a `pulse` is given, as whole milliseconds.
 ///
 /// Bounded on what the caller actually gets rather than on the number it wrote: `0.1` clears a
 /// bound written in floats and then rounds to nothing, leaving a `delay` that holds for no time

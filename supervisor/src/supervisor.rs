@@ -23,7 +23,7 @@ use crate::process::registry::{LiveProcesses, reap_all_processes, wait_and_repor
 use crate::reload_link::SocketCandidateLink;
 use crate::snapshot::push_snapshot;
 use crate::socket::{self, InboundFrame};
-use crate::{PBA_TIMINGS, Shutdown, begin_reload, memory, process, reload, send_frame_logged};
+use crate::{SWAP_TIMINGS, Shutdown, begin_reload, memory, process, reload, send_frame_logged};
 
 /// Why a generation must take an unrequested lock. Causes differ in logs but both mean the
 /// compositor holds a lock with nothing of ours on it; a named enum beats an ambiguous `bool`.
@@ -82,7 +82,7 @@ pub(crate) struct Supervisor {
     last_snapshots: HashMap<String, shared::StateSnapshot>,
     /// Most recently sent `Reevaluate` sequence (ADR-0024).
     next_sequence: u64,
-    /// Id for the next PBA candidate or crash replacement.
+    /// Id for the next Candidate or crash replacement.
     next_generation_id: u32,
     /// Renderer binary for every spawn.
     renderer_path: String,
@@ -273,7 +273,7 @@ impl Supervisor {
     }
 
     /// Replays snapshots to a newly registered authoritative generation, then gives it an owed
-    /// lock. PBA candidates hydrate from `run_pba`'s snapshots (ADR-0029), fixing the boot race.
+    /// lock. Candidates hydrate from `run_swap`'s snapshots (ADR-0029), fixing the boot race.
     pub(crate) fn hydrate(&mut self, generation_id: u32) {
         if generation_id != self.authoritative.generation_id {
             return;
@@ -441,7 +441,7 @@ impl Supervisor {
     }
 
     /// Runs one `TopologyChanged` swap (ADR-0025) inline. Swaps are rare and bounded by seconds
-    /// (`PBA_TIMINGS`), so capability traffic cannot starve. Borrow `inbound` so the link reads
+    /// (`SWAP_TIMINGS`), so capability traffic cannot starve. Borrow `inbound` so the link reads
     /// Candidate ReadySignal/evidence from the loop's receiver.
     /// `replay` receives every frame the handshake took off the shared channel without being its
     /// reader, in arrival order, for the caller's loop to handle once the swap is over (ADR-0156).
@@ -454,7 +454,7 @@ impl Supervisor {
         let candidate_generation_id = self.take_generation_id();
         let candidate_envs = vec![
             (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
-            ("OBELISK_PBA_CANDIDATE".to_string(), "1".to_string()),
+            ("OBELISK_SWAP_CANDIDATE".to_string(), "1".to_string()),
         ];
         // All latest snapshots hydrate Candidate's first evaluation (ADR-0029), not just
         // audio's.
@@ -462,7 +462,7 @@ impl Supervisor {
         let mut link = SocketCandidateLink::new(self.registry.clone(), candidate_generation_id, inbound);
 
         let outcome =
-            reload::run_pba(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, PBA_TIMINGS)
+            reload::run_swap(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, SWAP_TIMINGS)
                 .await;
 
         match outcome {
@@ -479,7 +479,7 @@ impl Supervisor {
                 // ADR-0043 decision 1: widest handoff point, Candidate presented while superseded
                 // still owns every buffer and both are resident. Sample before swap reaps one.
                 memory::log_sample(
-                    "pba handoff",
+                    "swap handoff",
                     &[
                         (self.authoritative.generation_id, &self.authoritative.child),
                         (candidate_generation_id, &outcome.candidate),

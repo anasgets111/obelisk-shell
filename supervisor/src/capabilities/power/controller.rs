@@ -48,9 +48,9 @@ trait UPower {
     fn on_battery(&self) -> zbus::Result<bool>;
 }
 
-/// The composite `DisplayDevice`, not `battery_BAT0`: UPower sums every battery there.
-/// `EnergyRate` is a positive watt magnitude while charging or discharging; `obelisk.power` wants no
-/// direction, so configs needing it read `obelisk.battery.state`.
+/// The composite `DisplayDevice`, not `battery_BAT0`: UPower sums every battery there. `EnergyRate`
+/// is a positive watt magnitude while charging or discharging; `obelisk.power` wants no direction,
+/// so configs needing it read `obelisk.battery.state`.
 #[zbus::proxy(
     interface = "org.freedesktop.UPower.Device",
     default_service = "org.freedesktop.UPower",

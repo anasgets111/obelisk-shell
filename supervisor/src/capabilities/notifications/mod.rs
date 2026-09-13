@@ -1,7 +1,7 @@
-//! Notifications capability (`obelisk.notifications`, ADR-0033).
-//! Hosts `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view,
-//! global DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a
-//! tier default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
+//! Notifications capability (`obelisk.notifications`, ADR-0033). Hosts
+//! `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view, global
+//! DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a tier
+//! default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
 //! theme-resolution capability exists.
 //!
 //! Like `dbus::tray`, a controller owns writes, degrades to inert without the session bus, and

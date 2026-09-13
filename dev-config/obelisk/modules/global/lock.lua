@@ -361,9 +361,8 @@ local function content(output)
 end
 
 -- Declared, not open. `lock` refuses `visible`, `monitor`, `anchor`, `width`, and `height`, but
--- otherwise takes the common and box properties like any other surface. The compositor creates
--- one per output
--- while locked. No Wayland object exists until `obelisk.lock:invoke("lock")` (ADR-0049).
+-- otherwise takes the common and box properties like any other surface. The compositor creates one
+-- per output while locked. No Wayland object exists until `obelisk.lock:invoke("lock")` (ADR-0049).
 return lock {
     id = "lock_screen",
     child = content,

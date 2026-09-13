@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-/// `obelisk.sysinfo`'s five Lua-visible fields, with field
-/// names unchanged from the `StateSnapshot` JSON keys.
+/// `obelisk.sysinfo`'s five Lua-visible fields, with field names unchanged from the `StateSnapshot`
+/// JSON keys.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct SysinfoState {
     /// Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.

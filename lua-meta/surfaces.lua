@@ -1,7 +1,7 @@
 ---@meta
--- The four surface roles (ADR-0040); a `wl_surface` stays inert.
--- Protocol assigns its role. This shell has one constructor per role. `shell.lua` returns the set,
--- freshly evaluated on every reload (ADR-0038).
+-- The four surface roles (ADR-0040); a `wl_surface` stays inert. Protocol assigns its role. This
+-- shell has one constructor per role. `shell.lua` returns the set, freshly evaluated on every
+-- reload (ADR-0038).
 --
 -- HAND-WRITTEN, on `nodes.lua`'s terms. Its header covers generation and checks; constructor
 -- `---@param props`/`---@return Node` lines are bare there too.

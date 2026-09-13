@@ -1,14 +1,14 @@
-//! Presentation-Before-Authority (PBA) hot-reload orchestration.
+//! Generation swap orchestration: a Candidate presents before it takes authority.
 //!
 //! Ordering/gating only for six steps: spawn, hydrate, null-buffer stage, activate draw, verify
 //! evidence, swap/reap. [`process`] owns spawn/reap; [`CandidateLink`] is the control-socket trait
 //! with `socket::SocketCandidateLink` in production and a fake in this module's tests. Not here
 //! (ADR-0025): independent per-output timing from ADR-0003, or partial-candidate abort. No output
 //! transfers when its own evidence lands; sibling evidence is a barrier. This gates all expected
-//! `surface_id`s within one `evidence_timeout`, a deliberate safety simplification. PBA never
-//! shows a black frame or performs an unverified swap. Any failure before all evidence is verified
-//! aborts the Candidate and leaves Generation `N` untouched.
-//! `run_pba` never touches `N`; [`swap_and_reap`] does. All four link steps have deadlines.
+//! `surface_id`s within one `evidence_timeout`, a deliberate safety simplification. The generation
+//! swap never shows a black frame or performs an unverified swap. Any failure before all evidence
+//! is verified aborts the Candidate and leaves Generation `N` untouched. `run_swap` never touches
+//! `N`; [`swap_and_reap`] does. All four link steps have deadlines.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -52,7 +52,7 @@ pub trait CandidateLink {
     async fn recv_presentation_evidence(&mut self, nonce: u64) -> Result<String, Self::Error>;
 }
 
-/// Step in the handshake where [`PbaFailure`] occurred.
+/// Step in the handshake where [`SwapFailure`] occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     StateHydration,
@@ -62,10 +62,10 @@ pub enum Stage {
     EvidenceVerification,
 }
 
-/// Why reload missed [`PbaOutcome`]. Except `SpawnFailed`, the Candidate was reaped; Generation `N`
-/// remains untouched.
+/// Why reload missed [`SwapOutcome`]. Except `SpawnFailed`, the Candidate was reaped; Generation
+/// `N` remains untouched.
 #[derive(Debug)]
-pub enum PbaFailure<E> {
+pub enum SwapFailure<E> {
     /// Step 1 spawn failed; no Candidate exists to abort.
     SpawnFailed(io::Error),
     /// A `CandidateLink` call failed during `stage`.
@@ -75,20 +75,20 @@ pub enum PbaFailure<E> {
     /// Candidate reported an unannounced or duplicate `surface_id`: wire desync, not timeout/link.
     UnexpectedEvidence { stage: Stage, surface_id: String },
     /// Abort reap also failed; retain both errors.
-    AbortReapFailed { original: Box<PbaFailure<E>>, reap_error: io::Error },
+    AbortReapFailed { original: Box<SwapFailure<E>>, reap_error: io::Error },
 }
 
 /// Log format for failed swaps, including `AbortReapFailed`'s nested `original` as text.
-impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
+impl<E: fmt::Display> fmt::Display for SwapFailure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PbaFailure::SpawnFailed(err) => write!(f, "could not spawn the candidate: {err}"),
-            PbaFailure::Link { stage, source } => write!(f, "{stage:?} failed: {source}"),
-            PbaFailure::Timeout { stage } => write!(f, "{stage:?} timed out"),
-            PbaFailure::UnexpectedEvidence { stage, surface_id } => {
+            SwapFailure::SpawnFailed(err) => write!(f, "could not spawn the candidate: {err}"),
+            SwapFailure::Link { stage, source } => write!(f, "{stage:?} failed: {source}"),
+            SwapFailure::Timeout { stage } => write!(f, "{stage:?} timed out"),
+            SwapFailure::UnexpectedEvidence { stage, surface_id } => {
                 write!(f, "{stage:?} got unexpected evidence for surface_id {surface_id:?}")
             }
-            PbaFailure::AbortReapFailed { original, reap_error } => {
+            SwapFailure::AbortReapFailed { original, reap_error } => {
                 write!(f, "{original}, and the candidate's abort-reap also failed: {reap_error}")
             }
         }
@@ -96,11 +96,11 @@ impl<E: fmt::Display> fmt::Display for PbaFailure<E> {
 }
 
 /// Completed reload: `N+1` is presented on every expected surface; `promoted_surfaces` follows
-/// `ReadySignal` order. `run_pba` neither reaps nor takes `N`: the swap orders deselection,
+/// `ReadySignal` order. `run_swap` neither reaps nor takes `N`: the swap orders deselection,
 /// promotion, reap, with messages on two connections while the link reaches only Candidate.
 /// [`swap_and_reap`] sends them, then reaps `superseded` via [`process::reap_process_group`].
 #[derive(Debug)]
-pub struct PbaOutcome {
+pub struct SwapOutcome {
     pub candidate: Child,
     pub promoted_surfaces: Vec<String>,
 }
@@ -115,21 +115,21 @@ async fn drive_handshake<L: CandidateLink>(
     nonce: u64,
     ready_timeout: Duration,
     evidence_timeout: Duration,
-) -> Result<Vec<String>, PbaFailure<L::Error>> {
+) -> Result<Vec<String>, SwapFailure<L::Error>> {
     timeout(ready_timeout, link.push_state_snapshot(snapshots))
         .await
-        .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::StateHydration })?
-        .map_err(|source| PbaFailure::Link { stage: Stage::StateHydration, source })?;
+        .map_err(|_elapsed| SwapFailure::Timeout { stage: Stage::StateHydration })?
+        .map_err(|source| SwapFailure::Link { stage: Stage::StateHydration, source })?;
 
     let expected = timeout(ready_timeout, link.recv_ready_signal())
         .await
-        .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::NullBufferStaging })?
-        .map_err(|source| PbaFailure::Link { stage: Stage::NullBufferStaging, source })?;
+        .map_err(|_elapsed| SwapFailure::Timeout { stage: Stage::NullBufferStaging })?
+        .map_err(|source| SwapFailure::Link { stage: Stage::NullBufferStaging, source })?;
 
     timeout(evidence_timeout, link.send_activate_draw(nonce))
         .await
-        .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::ActivateDraw })?
-        .map_err(|source| PbaFailure::Link { stage: Stage::ActivateDraw, source })?;
+        .map_err(|_elapsed| SwapFailure::Timeout { stage: Stage::ActivateDraw })?
+        .map_err(|source| SwapFailure::Link { stage: Stage::ActivateDraw, source })?;
 
     let collect = async {
         let mut collected: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -137,63 +137,64 @@ async fn drive_handshake<L: CandidateLink>(
             let surface_id = link
                 .recv_presentation_evidence(nonce)
                 .await
-                .map_err(|source| PbaFailure::Link { stage: Stage::EvidenceVerification, source })?;
+                .map_err(|source| SwapFailure::Link { stage: Stage::EvidenceVerification, source })?;
             if !expected.contains(&surface_id) || !collected.insert(surface_id.clone()) {
-                return Err(PbaFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id });
+                return Err(SwapFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id });
             }
         }
         Ok(())
     };
     timeout(evidence_timeout, collect)
         .await
-        .map_err(|_elapsed| PbaFailure::Timeout { stage: Stage::EvidenceVerification })??;
+        .map_err(|_elapsed| SwapFailure::Timeout { stage: Stage::EvidenceVerification })??;
 
     Ok(expected)
 }
 
 /// Aborts before evidence verification by reaping the group, folding any reap error into `failure`.
 /// The only failure-path reap.
-async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: PbaFailure<E>) -> PbaFailure<E> {
+async fn abort_candidate<E>(candidate: &mut Child, grace: Duration, failure: SwapFailure<E>) -> SwapFailure<E> {
     match process::reap_process_group(candidate, grace).await {
         Ok(_) => failure,
-        Err(reap_error) => PbaFailure::AbortReapFailed { original: Box::new(failure), reap_error },
+        Err(reap_error) => SwapFailure::AbortReapFailed { original: Box::new(failure), reap_error },
     }
 }
 
-/// [`run_pba`] deadlines: ready, evidence, and process reap grace (`SIGTERM` to `SIGKILL`, passed
+/// [`run_swap`] deadlines: ready, evidence, and process reap grace (`SIGTERM` to `SIGKILL`, passed
 /// to [`process::reap_process_group`]). Ready bounds hydration+ready-wait; evidence bounds activate
-/// through the evidence-verification barrier. Grouped only to limit parameters; no shared invariant.
+/// through the evidence-verification barrier. Grouped only to limit parameters; no shared
+/// invariant.
 #[derive(Debug, Clone, Copy)]
-pub struct PbaTimings {
+pub struct SwapTimings {
     pub ready_timeout: Duration,
     pub evidence_timeout: Duration,
     pub reap_grace: Duration,
 }
 
-/// Runs PBA steps 1-5:
+/// Runs the swap steps 1-5:
 ///
 /// 1. **Overlapping Spawn**: [`process::spawn_group_leader`], passing `candidate_envs` unchanged
-///    (for example `OBELISK_GENERATION_ID`/`OBELISK_PBA_CANDIDATE`).
+///    (for example `OBELISK_GENERATION_ID`/`OBELISK_SWAP_CANDIDATE`).
 /// 2. **State Hydration** through 5. **Evidence Verification**: [`drive_handshake`].
 ///
-/// Step 6 (**Swap & Reap**) is outside this function (see [`PbaOutcome`]). Failure in steps 1-5
+/// Step 6 (**Swap & Reap**) is outside this function (see [`SwapOutcome`]). Failure in steps 1-5
 /// aborts Candidate and leaves the authoritative superseded generation alone.
-pub async fn run_pba<L: CandidateLink>(
+pub async fn run_swap<L: CandidateLink>(
     candidate_cmd: &str,
     candidate_args: &[String],
     candidate_envs: &[(String, String)],
     link: &mut L,
     snapshots: &[shared::StateSnapshot],
     nonce: u64,
-    timings: PbaTimings,
-) -> Result<PbaOutcome, PbaFailure<L::Error>> {
+    timings: SwapTimings,
+) -> Result<SwapOutcome, SwapFailure<L::Error>> {
     let mut candidate =
-        process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(PbaFailure::SpawnFailed)?;
+        process::spawn_group_leader(candidate_cmd, candidate_args, candidate_envs).map_err(SwapFailure::SpawnFailed)?;
     // Before step 2 pushes it anything: the Candidate's generation id is bound to this pid.
     link.expect_candidate_pid(candidate.id());
 
     match drive_handshake(link, snapshots, nonce, timings.ready_timeout, timings.evidence_timeout).await {
-        Ok(promoted_surfaces) => Ok(PbaOutcome { candidate, promoted_surfaces }),
+        Ok(promoted_surfaces) => Ok(SwapOutcome { candidate, promoted_surfaces }),
         Err(failure) => {
             // About to be reaped, so release the id it was holding.
             link.expect_candidate_pid(None);
@@ -242,19 +243,19 @@ pub(crate) fn replay_deferred_frames(
     );
 }
 
-/// Owns everything after [`run_pba`] verifies evidence, which previously lived in `main.rs`'s
-/// `TopologyChanged` arm. It implements Swap & Reap. Rules: deselect each
-/// surface before promotion, and reassign `authoritative` last. Deselect/reap read its
-/// generation id, so promoting first would target Candidate and sweep its `process.run` children
-/// while leaving superseded ones. Reap order is irrelevant: each generation's children are their
-/// own group leaders (ADR-0026), so Renderer reap cannot reach them and either sweep collects
-/// them. Consume [`PbaOutcome`] because Candidate becomes authoritative and must have one owner.
+/// Owns everything after [`run_swap`] verifies evidence, which previously lived in `main.rs`'s
+/// `TopologyChanged` arm. It implements Swap & Reap. Rules: deselect each surface before promotion,
+/// and reassign `authoritative` last. Deselect/reap read its generation id, so promoting first
+/// would target Candidate and sweep its `process.run` children while leaving superseded ones. Reap
+/// order is irrelevant: each generation's children are their own group leaders (ADR-0026), so
+/// Renderer reap cannot reach them and either sweep collects them. Consume [`SwapOutcome`] because
+/// Candidate becomes authoritative and must have one owner.
 pub(crate) async fn swap_and_reap(
     registry: &GenerationRegistry,
     processes: &mut LiveProcesses,
     authoritative: &mut Authoritative,
     candidate_generation_id: u32,
-    outcome: PbaOutcome,
+    outcome: SwapOutcome,
 ) {
     for (generation_id, frame) in
         swap_frames(authoritative.generation_id, candidate_generation_id, &outcome.promoted_surfaces)
@@ -291,8 +292,8 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    /// Deselect superseded before promoting Candidate on every surface, so no
-    /// surface is live on both. Two frames per surface target opposite generations in that order.
+    /// Deselect superseded before promoting Candidate on every surface, so no surface is live on
+    /// both. Two frames per surface target opposite generations in that order.
     #[test]
     fn every_surface_is_deselected_on_the_superseded_generation_before_the_candidate_is_promoted() {
         let surfaces = vec!["bar@DP-1".to_string(), "bar@HDMI-A-1".to_string()];
@@ -348,7 +349,7 @@ mod tests {
         let superseded_pid = superseded.id().expect("a freshly spawned child has a pid");
         let mut authoritative = Authoritative { generation_id: 1, child: superseded };
         let candidate = process::spawn_group_leader("sh", &sh_args("sleep 5"), &[]).unwrap();
-        let outcome = PbaOutcome { candidate, promoted_surfaces: vec!["bar@DP-1".to_string()] };
+        let outcome = SwapOutcome { candidate, promoted_surfaces: vec!["bar@DP-1".to_string()] };
 
         swap_and_reap(&registry, &mut processes, &mut authoritative, 2, outcome).await;
 
@@ -508,16 +509,16 @@ mod tests {
     const SHORT_DEADLINE: Duration = Duration::from_millis(80);
     const GRACE: Duration = Duration::from_millis(200);
 
-    /// `PbaTimings` with `reap_grace` fixed to [`GRACE`]; process tests cover reap escalation.
-    fn timings(ready_timeout: Duration, evidence_timeout: Duration) -> PbaTimings {
-        PbaTimings { ready_timeout, evidence_timeout, reap_grace: GRACE }
+    /// `SwapTimings` with `reap_grace` fixed to [`GRACE`]; process tests cover reap escalation.
+    fn timings(ready_timeout: Duration, evidence_timeout: Duration) -> SwapTimings {
+        SwapTimings { ready_timeout, evidence_timeout, reap_grace: GRACE }
     }
 
     #[tokio::test]
-    async fn run_pba_promotes_the_candidate_on_full_success() {
+    async fn run_swap_promotes_the_candidate_on_full_success() {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("main_bar".to_string()));
 
-        let mut outcome = run_pba(
+        let mut outcome = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -550,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_promotes_all_expected_surfaces_in_readysignals_order_regardless_of_arrival_order() {
+    async fn run_swap_promotes_all_expected_surfaces_in_readysignals_order_regardless_of_arrival_order() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
         // Evidence arrives out of order; promoted order must follow ReadySignal, not arrival.
         let arrival_order = VecDeque::from([
@@ -566,7 +567,7 @@ mod tests {
             arrival_order,
         );
 
-        let mut outcome = run_pba(
+        let mut outcome = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -583,10 +584,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_when_ready_signal_times_out() {
+    async fn run_swap_aborts_the_candidate_when_ready_signal_times_out() {
         let mut link = FakeCandidateLink::new(StepBehavior::Hang, EvidenceOutcome::Return("main_bar".to_string()));
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -598,14 +599,14 @@ mod tests {
         .await
         .expect_err("a hanging ready signal must not promote");
 
-        assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::NullBufferStaging }));
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::NullBufferStaging }));
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_when_evidence_times_out() {
+    async fn run_swap_aborts_the_candidate_when_evidence_times_out() {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Hang);
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -617,11 +618,11 @@ mod tests {
         .await
         .expect_err("evidence that never arrives must not promote");
 
-        assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::EvidenceVerification }));
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::EvidenceVerification }));
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_when_state_hydration_times_out() {
+    async fn run_swap_aborts_the_candidate_when_state_hydration_times_out() {
         let mut link = FakeCandidateLink::with_steps(
             StepBehavior::Hang,
             StepBehavior::Succeed,
@@ -630,7 +631,7 @@ mod tests {
             VecDeque::from([EvidenceOutcome::Return("main_bar".to_string())]),
         );
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -642,11 +643,11 @@ mod tests {
         .await
         .expect_err("a hanging state-snapshot push must not promote");
 
-        assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::StateHydration }));
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::StateHydration }));
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_when_activate_draw_times_out() {
+    async fn run_swap_aborts_the_candidate_when_activate_draw_times_out() {
         let mut link = FakeCandidateLink::with_steps(
             StepBehavior::Succeed,
             StepBehavior::Succeed,
@@ -655,7 +656,7 @@ mod tests {
             VecDeque::from([EvidenceOutcome::Return("main_bar".to_string())]),
         );
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -667,7 +668,7 @@ mod tests {
         .await
         .expect_err("a hanging activate-draw send must not promote");
 
-        assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::ActivateDraw }));
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::ActivateDraw }));
     }
 
     /// Polls for a parseable pid in `path`. Failure-path recovery uses the Candidate's `$$`, which
@@ -696,11 +697,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_process_group_on_a_ready_timeout() {
+    async fn run_swap_aborts_the_candidate_process_group_on_a_ready_timeout() {
         let mut link = FakeCandidateLink::new(StepBehavior::Hang, EvidenceOutcome::Return("main_bar".to_string()));
         let pidfile = unique_pidfile();
 
-        run_pba(
+        run_swap(
             "sh",
             &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
             &[],
@@ -722,7 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_times_out_and_aborts_the_candidate_when_one_of_three_expected_surfaces_never_reports_evidence() {
+    async fn run_swap_times_out_and_aborts_the_candidate_when_one_of_three_expected_surfaces_never_reports_evidence() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
         // No third queue entry: `recv_presentation_evidence` treats it as a hang.
         let evidence = VecDeque::from([
@@ -738,7 +739,7 @@ mod tests {
         );
         let pidfile = unique_pidfile();
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
             &[],
@@ -750,7 +751,7 @@ mod tests {
         .await
         .expect_err("2 of 3 expected surfaces reporting evidence must not promote -- all-or-nothing gating");
 
-        assert!(matches!(failure, PbaFailure::Timeout { stage: Stage::EvidenceVerification }));
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::EvidenceVerification }));
 
         let candidate_pid = wait_for_pidfile(&pidfile, Duration::from_millis(300))
             .await
@@ -765,11 +766,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_fails_with_unexpected_evidence_for_a_surface_id_never_announced() {
+    async fn run_swap_fails_with_unexpected_evidence_for_a_surface_id_never_announced() {
         let mut link =
             FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("never_announced".to_string()));
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -782,7 +783,7 @@ mod tests {
         .expect_err("evidence for an unannounced surface_id must not promote");
 
         match failure {
-            PbaFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
+            SwapFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
                 assert_eq!(surface_id, "never_announced");
             }
             other => panic!("expected UnexpectedEvidence, got {other:?}"),
@@ -790,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_fails_with_unexpected_evidence_when_the_same_surface_id_is_reported_twice() {
+    async fn run_swap_fails_with_unexpected_evidence_when_the_same_surface_id_is_reported_twice() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string()];
         let evidence = VecDeque::from([
             EvidenceOutcome::Return("main_bar".to_string()),
@@ -804,7 +805,7 @@ mod tests {
             evidence,
         );
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -817,7 +818,7 @@ mod tests {
         .expect_err("a duplicate surface_id must not promote");
 
         match failure {
-            PbaFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
+            SwapFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
                 assert_eq!(surface_id, "main_bar");
             }
             other => panic!("expected UnexpectedEvidence, got {other:?}"),
@@ -825,10 +826,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_on_a_link_error() {
+    async fn run_swap_aborts_the_candidate_on_a_link_error() {
         let mut link = FakeCandidateLink::new(StepBehavior::Fail, EvidenceOutcome::Return("main_bar".to_string()));
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -841,7 +842,7 @@ mod tests {
         .expect_err("a link error must not promote");
 
         match failure {
-            PbaFailure::Link { stage: Stage::NullBufferStaging, source } => {
+            SwapFailure::Link { stage: Stage::NullBufferStaging, source } => {
                 assert_eq!(source, FakeLinkError("candidate link failed".to_string()))
             }
             other => panic!("expected a NullBufferStaging link error, got {other:?}"),
@@ -849,10 +850,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_aborts_the_candidate_on_a_link_error_during_evidence_collection() {
+    async fn run_swap_aborts_the_candidate_on_a_link_error_during_evidence_collection() {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Fail);
 
-        let failure = run_pba(
+        let failure = run_swap(
             "sh",
             &sh_args("sleep 30"),
             &[],
@@ -865,7 +866,7 @@ mod tests {
         .expect_err("a link error during evidence collection must not promote");
 
         match failure {
-            PbaFailure::Link { stage: Stage::EvidenceVerification, source } => {
+            SwapFailure::Link { stage: Stage::EvidenceVerification, source } => {
                 assert_eq!(source, FakeLinkError("candidate link failed".to_string()))
             }
             other => panic!("expected an EvidenceVerification link error, got {other:?}"),
@@ -873,10 +874,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pba_reports_spawn_failure_without_spawning_a_candidate() {
+    async fn run_swap_reports_spawn_failure_without_spawning_a_candidate() {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("main_bar".to_string()));
 
-        let failure = run_pba(
+        let failure = run_swap(
             "/no/such/binary-obelisk-reload-test",
             &[],
             &[],
@@ -888,7 +889,7 @@ mod tests {
         .await
         .expect_err("spawning a nonexistent binary must fail");
 
-        assert!(matches!(failure, PbaFailure::SpawnFailed(_)));
+        assert!(matches!(failure, SwapFailure::SpawnFailed(_)));
         assert!(link.calls.lock().unwrap().is_empty(), "no handshake call should happen if the spawn itself failed");
     }
 

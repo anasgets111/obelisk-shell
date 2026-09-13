@@ -133,8 +133,8 @@ impl TrayController {
         }
     }
 
-    /// `tray:secondary_activate(id, x, y)`: middle-click (ADR-0074). No
-    /// `should_call_activate` gate: `ItemIsMenu` constrains primary clicks only.
+    /// `tray:secondary_activate(id, x, y)`: middle-click (ADR-0074). No `should_call_activate`
+    /// gate: `ItemIsMenu` constrains primary clicks only.
     pub async fn secondary_activate(&self, id: &str, x: i32, y: i32) {
         let Some((key, _)) = self.find_item_id(id) else {
             eprintln!("tray: secondary_activate({id:?}) failed: {}", TrayActionError::UnknownItem);

@@ -136,10 +136,10 @@ impl App {
     /// when a config's `screens` loop changes surface ids
     /// (ADR-0041 decisions 2-3). Candidates build their own set, so the two paths do not conflict.
     ///
-    /// ponytail: hotplug inside a PBA Candidate's ready window is unsupported. A late surface would
-    /// trip `PbaFailure::UnexpectedEvidence` after the one-shot `maybe_send_ready_signal`; then
+    /// ponytail: hotplug inside a Candidate's ready window is unsupported. A late surface would
+    /// trip `SwapFailure::UnexpectedEvidence` after the one-shot `maybe_send_ready_signal`; then
     /// `RequestReload` is skipped while `SocketCandidateLink::recv_matching` drains
-    /// `inbound_frames`. Window: `PBA_TIMINGS` seconds.
+    /// `inbound_frames`. Window: `SWAP_TIMINGS` seconds.
     /// Upgrade: defer like `apply_visibility` defers `visible`, when this is hit.
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
@@ -183,8 +183,8 @@ impl PresentationTimeHandler for App {
         &mut self.presentation_time
     }
 
-    /// Presentation evidence: the compositor confirmed `surface`'s committed frame reached the screen;
-    /// queue `shared::PresentationEvidence` for the socket thread.
+    /// Presentation evidence: the compositor confirmed `surface`'s committed frame reached the
+    /// screen; queue `shared::PresentationEvidence` for the socket thread.
     fn presented(
         &mut self,
         _conn: &Connection,

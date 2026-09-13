@@ -1,6 +1,6 @@
 //! Process-group lifecycle: spawn a new group leader, then reap the group with `SIGTERM`, grace,
 //! and `SIGKILL`. See ADR-0018, ADR-0026 (`process.run`, [`registry`]), and ADR-0025
-//! (`reload::run_pba` calls the reap primitive).
+//! (`reload::run_swap` calls the reap primitive).
 //!
 //! Uses `tokio::process::Command::process_group(0)` rather than hand-rolling `setpgid`.
 
@@ -50,8 +50,7 @@ pub(crate) fn signal_group_best_effort(pgid: Pid, signal: Signal) -> io::Result<
     }
 }
 
-/// The 100ms grace window between SIGTERM and SIGKILL. Parameterized so
-/// tests can reap faster.
+/// The 100ms grace window between SIGTERM and SIGKILL. Parameterized so tests can reap faster.
 pub const DEFAULT_REAP_GRACE: Duration = Duration::from_millis(100);
 
 /// Spawns `cmd` as a new group leader. Descendants without `setsid`/`setpgid` inherit the group,

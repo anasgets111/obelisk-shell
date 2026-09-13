@@ -9,8 +9,7 @@
 -- exposed the need for clock, battery and volume data sources; none had a source until that ADR.
 --
 -- Editing reloads the stack. Changing surface `id`/`layer`/`anchor`/`monitor`/`namespace` changes
--- topology and triggers a full PBA generation swap; other edits reload in place on
--- the same Lua VM.
+-- topology and triggers a full generation swap; other edits reload in place on the same Lua VM.
 
 -- Imports mirror the Quickshell tree. `config/` holds tokens, `components/` dumb reusable widgets,
 -- `lib/` node-free functions, and `modules/` assembles `bar/indicators/`, `bar/panels/`,

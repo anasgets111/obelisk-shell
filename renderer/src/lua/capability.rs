@@ -4,10 +4,10 @@
 //! Lua runs on the Wayland dispatch thread and has no socket in scope. `Rc`, not `Arc`, is correct
 //! because this state stays on that thread.
 //!
-//! One userdata owns both halves. Commands are invoked as methods via
-//! `capability:invoke("action", ...)`, and ADR-0052 decision 4 reads lock state through the name
-//! it locks, so `obelisk.lock:get().attempts` and `obelisk.lock:invoke("lock")` use the same
-//! object; [`Capability`] delegates `get`/`map` to its [`Signal`].
+//! One userdata owns both halves. Commands are invoked as methods via `capability:invoke("action",
+//! ...)`, and ADR-0052 decision 4 reads lock state through the name it locks, so
+//! `obelisk.lock:get().attempts` and `obelisk.lock:invoke("lock")` use the same object;
+//! [`Capability`] delegates `get`/`map` to its [`Signal`].
 //!
 //! ponytail: an `__index` upgrade cannot distinguish `cap.lock()` from `cap:lock()`, which is why
 //! commands dispatch through `invoke` instead of bare per-action methods (ADR-0052 decision 1).
@@ -68,9 +68,9 @@ impl CommandSender {
         self.outbound_tx.clone()
     }
 
-    /// Queues the command envelope. `expected_revision` is the last hydrated `StateSnapshot` revision,
-    /// kept current by [`CapabilityHandle`]. `0` means "never hydrated": `bump_revision` starts
-    /// at `1`, and state-less `lock` capabilities send it forever (ADR-0052 decision 1,
+    /// Queues the command envelope. `expected_revision` is the last hydrated `StateSnapshot`
+    /// revision, kept current by [`CapabilityHandle`]. `0` means "never hydrated": `bump_revision`
+    /// starts at `1`, and state-less `lock` capabilities send it forever (ADR-0052 decision 1,
     /// `process.rs`).
     pub(crate) fn send(
         &self,
@@ -121,8 +121,8 @@ pub struct Capability {
 impl Capability {
     /// Builds an `obelisk.<name>` member and the handle `socket::RendererClient` hydrates. Return
     /// them together: value and revision must move as one, because ordinary dispatch does not
-    /// enforce envelope revision claims. Pairing them here is the only
-    /// guard against a `set` that stamps a stale read onto the current write.
+    /// enforce envelope revision claims. Pairing them here is the only guard against a `set` that
+    /// stamps a stale read onto the current write.
     pub fn new(name: &str, dirty: DirtyFlag, commands: CommandSender) -> (Self, CapabilityHandle) {
         // `nil` until the Supervisor's first push (ADR-0037), paired with revision `0`, which no
         // push can produce.
@@ -156,9 +156,9 @@ impl Capability {
         &self.commands
     }
 
-    /// Wrapped read signal for `signal::from_userdata`, allowing live forms
-    /// (`content = obelisk.mpris`, `computed({obelisk.audio}, f)`) through a wrapper the engine
-    /// otherwise cannot see past.
+    /// Wrapped read signal for `signal::from_userdata`, allowing live forms (`content =
+    /// obelisk.mpris`, `computed({obelisk.audio}, f)`) through a wrapper the engine otherwise
+    /// cannot see past.
     pub fn signal(&self) -> Signal {
         self.signal.clone()
     }

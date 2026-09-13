@@ -43,8 +43,8 @@
 --- Payload types ------------------------------------------------------------------------------
 
 ---@class AccessPointInfo
----One scanned AP, resolved to `network.available_networks`
----and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
+---One scanned AP, resolved to `network.available_networks` and serialized in a `StateSnapshot`
+---payload, same convention as `audio::mixer::AppStream`.
 ---@field active boolean This is the AP currently associated.
 ---@field band string `"2.4 GHz"`, `"5 GHz"` or `"6 GHz"`, from the AP's frequency.
 ---@field saved boolean A saved NetworkManager profile names this SSID, so joining it asks for no password.
@@ -433,8 +433,8 @@
 ---@field screencast_users PrivacyUser[] Apps producing PipeWire screen-capture streams (ADR-0137). Names may be the portal's identity for portal-created nodes. wlr-screencopy recorders (`wf-recorder`, `grim`) bypass PipeWire and never appear.
 
 ---@class SysinfoState
----`obelisk.sysinfo`'s five Lua-visible fields, with field
----names unchanged from the `StateSnapshot` JSON keys.
+---`obelisk.sysinfo`'s five Lua-visible fields, with field names unchanged from the `StateSnapshot`
+---JSON keys.
 ---@field cpu_percent integer Total CPU utilization, `0` to `100`, across cores. `0` before two samples can form a delta.
 ---@field ram_percent integer Physical memory in use, `0` to `100`.
 ---@field swap_percent integer Swap in use, `0` to `100`; `0` means either no swap or empty swap.
@@ -442,8 +442,7 @@
 ---@field temp_gpu integer GPU temperature in Celsius, or `-1` without a GPU sensor. Read in the same hwmon pass as [`SysinfoState::temp_cores`], so neither is newer than the other.
 
 ---@class SystemState
----`obelisk.system`'s Lua-visible fields, with their
----`StateSnapshot` JSON keys unchanged.
+---`obelisk.system`'s Lua-visible fields, with their `StateSnapshot` JSON keys unchanged.
 ---@field monotonic integer Whole seconds since this controller was built, which is the first time a config asked for `system`. Only a difference means anything; take durations from this rather than from `time`, which `settimeofday` and an NTP step move underneath a deadline. ponytail: `Instant` is `CLOCK_MONOTONIC` on Linux, so a suspend does not count toward an elapsed reading. Suspend-inclusive timing wants `CLOCK_BOOTTIME` as a second field.
 ---@field time integer Unix epoch seconds, not milliseconds. `os.date` expects seconds; milliseconds would be wrong by 1000x.
 

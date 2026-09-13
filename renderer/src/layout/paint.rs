@@ -616,8 +616,8 @@ fn draw_for(
     let dissolve = node.dissolve.as_ref();
     match node.paint.as_ref()? {
         // The shared paint of `rect`/`row`/`column`/`button` and all four surface roles: background
-        // fill, then borders. `clip` is not read here: it
-        // decides what this node's *children* are cut to, `build_node`'s question, not this one's.
+        // fill, then borders. `clip` is not read here: it decides what this node's *children* are
+        // cut to, `build_node`'s question, not this one's.
         PaintStyle::Box { background, radius, colors, widths, clip: _ } => Some(Draw::Box {
             background: background.map(|color| fade(color, opacity)),
             radius: *radius,
@@ -625,10 +625,10 @@ fn draw_for(
             widths: *widths,
         }),
 
-        // `text`: `content` through `TextPainter`, at `rect`, coloured by
-        // `foreground`. `elide`, `wrap` and `max_lines` are absent on purpose: `Scene::apply`
-        // already rewrote `content` to the string that fits -- ellipsized, or line-broken with
-        // `\n` -- in the only place the box width and the shaping worker are both in reach.
+        // `text`: `content` through `TextPainter`, at `rect`, coloured by `foreground`. `elide`,
+        // `wrap` and `max_lines` are absent on purpose: `Scene::apply` already rewrote `content` to
+        // the string that fits -- ellipsized, or line-broken with `\n` -- in the only place the box
+        // width and the shaping worker are both in reach.
         //
         // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
         // (`layout::scene`'s measure callback), so if femtovg ever renders wider than cosmic-text

@@ -1,5 +1,4 @@
-//! `json` global table (ADR-0057), the config's only reader for
-//! structured subprocess output.
+//! `json` global table (ADR-0057), the config's only reader for structured subprocess output.
 //!
 //! `process.run`'s `out_cb` fires once per newline-stripped line, so a config polling
 //! `lsblk --json` accumulates and decodes the buffer. Without a decoder, such subprocesses are

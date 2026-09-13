@@ -130,10 +130,9 @@ pub(super) fn decode_raw_image_data(value: &Value<'_>) -> Option<RawImageData> {
     })
 }
 
-/// Validates image-data bounds and the "ARGB icon
-/// rejection": positive dimensions up to [`MAX_IMAGE_DIMENSION`], 8-bit samples only, channels
-/// matching alpha (3=RGB, 4=RGBA), no row padding, and exact data length. ponytail: no 16-bit/float
-/// support until a real sender needs it.
+/// Validates image-data bounds and the "ARGB icon rejection": positive dimensions up to
+/// [`MAX_IMAGE_DIMENSION`], 8-bit samples only, channels matching alpha (3=RGB, 4=RGBA), no row
+/// padding, and exact data length. ponytail: no 16-bit/float support until a real sender needs it.
 pub(super) fn image_data_is_valid(image: &RawImageData) -> bool {
     image.width > 0
         && image.height > 0

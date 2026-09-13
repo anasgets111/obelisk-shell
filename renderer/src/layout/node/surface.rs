@@ -74,8 +74,8 @@ pub fn parse_namespace(properties: &HashMap<String, Value>, id: &str) -> Result<
     parse_string_property(properties, "namespace", Some(&default))
 }
 
-/// `keyboard_interactivity`, mapped to layer-shell by
-/// `crate::wayland::keyboard_interactivity_for`; kept local to avoid Wayland types here.
+/// `keyboard_interactivity`, mapped to layer-shell by `crate::wayland::keyboard_interactivity_for`;
+/// kept local to avoid Wayland types here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyboardInteractivity {
     /// The surface never receives key events.

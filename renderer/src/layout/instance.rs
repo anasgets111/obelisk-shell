@@ -11,7 +11,7 @@ use crate::layout::node::{SizeMode, SurfaceSpec};
 use crate::layout::scene::LogicalSize;
 
 /// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the shared id
-/// space for Lua, the retained scene, Wayland, and the PBA handshake (ADR-0038), using the
+/// space for Lua, the retained scene, Wayland, and the generation swap (ADR-0038), using the
 /// `"{id}@{output}"` convention from `supervisor/src/reload.rs`, generalising wallpaper's existing
 /// id namespace.
 #[derive(Debug, Clone, PartialEq)]

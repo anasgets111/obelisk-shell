@@ -1,10 +1,9 @@
-//! Typed, validated properties for `VirtualNode`.
-//! `resolve_properties` reads each ordinary `Signal` once per node/pass (ADR-0044 decision 1);
-//! `SurfaceTopology`'s five fields and every node's optional `id` stay raw and reject signals. A
-//! `panel`'s other properties are live fields, not exceptions. Plain tables remain
-//! metamethod-backed, so each `table.get` can still run `__index`; see `parse_edge_insets`'s
-//! `ponytail:`. A signal resolving to another signal errors rather than reading again, while
-//! `MAX_TREE_DEPTH` bounds recursive tree construction.
+//! Typed, validated properties for `VirtualNode`. `resolve_properties` reads each ordinary `Signal`
+//! once per node/pass (ADR-0044 decision 1); `SurfaceTopology`'s five fields and every node's
+//! optional `id` stay raw and reject signals. A `panel`'s other properties are live fields, not
+//! exceptions. Plain tables remain metamethod-backed, so each `table.get` can still run `__index`;
+//! see `parse_edge_insets`'s `ponytail:`. A signal resolving to another signal errors rather than
+//! reading again, while `MAX_TREE_DEPTH` bounds recursive tree construction.
 
 mod animate;
 mod content;

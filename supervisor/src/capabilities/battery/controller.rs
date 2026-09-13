@@ -1,5 +1,5 @@
-//! [`BatteryController`] owns read-only `obelisk.battery` telemetry.
-//! Module-level behavior is documented in `battery/mod.rs`.
+//! [`BatteryController`] owns read-only `obelisk.battery` telemetry. Module-level behavior is
+//! documented in `battery/mod.rs`.
 
 use std::sync::{Arc, Mutex};
 

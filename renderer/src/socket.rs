@@ -87,10 +87,9 @@ pub fn spawn_client(
 /// Reload state. `applied_topology` is this generation's topology and is `None` only before any
 /// evaluation. `pending` holds evaluated-but-unapplied output/topology between `Unchanged`
 /// `Reevaluate` and `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve
-/// target, retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef`
-/// holds `WeakLua`: a retained `mlua::Value` does not keep Lua alive and
-/// `ValueRef::to_pointer` panics after death, so Rust field-drop order must keep `Lua` last (see
-/// [`RendererClient`]).
+/// target, retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef` holds `WeakLua`: a retained
+/// `mlua::Value` does not keep Lua alive and `ValueRef::to_pointer` panics after death, so Rust
+/// field-drop order must keep `Lua` last (see [`RendererClient`]).
 struct ReloadState {
     applied_topology: Option<Vec<SurfaceFingerprint>>,
     applied_output: Option<lua::LoadOutput>,
@@ -105,8 +104,8 @@ struct ReloadState {
 pub enum FrameOutcome {
     /// Fully serviced by [`RendererClient::handle_frame`].
     Handled,
-    /// The PBA protocol's `ActivateDraw`: draw surfaces and request per-surface
-    /// presentation feedback tagged with this nonce (`crate::wayland::App::activate_draw`).
+    /// The generation swap's `ActivateDraw`: draw surfaces and request per-surface presentation
+    /// feedback tagged with this nonce (`crate::wayland::App::activate_draw`).
     ActivateDraw(u64),
     /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
     /// (`crate::wayland::App::set_session_lock`).
@@ -194,8 +193,8 @@ impl RendererClient {
         loader
             .register_process(process_registry.clone())
             .map_err(|err| format!("failed to register the process global: {err}"))?;
-        // `ProcessRegistry` uses the same id, so `process.kill` cannot cross generations. Capability
-        // commands all use this write path.
+        // `ProcessRegistry` uses the same id, so `process.kill` cannot cross generations.
+        // Capability commands all use this write path.
         let commands = CommandSender::new(generation_id, outbound_tx);
         let client = Self::new(loader, shell_lua_path, shaping, commands, process_registry, dirty)
             .map_err(|err| format!("failed to build the `obelisk` namespace: {err}"))?;
@@ -308,8 +307,8 @@ impl RendererClient {
     /// Evaluates `shell.lua` once at startup without a Supervisor round trip (ADR-0024, "safe to
     /// apply"). `applied_topology` stays `None` only on *evaluation* failure; a failed *apply*
     /// leaves it because surfaces are already bound and later topology changes need a new
-    /// generation (ADR-0038). Runs before layer binding as part of the PBA protocol, split so the
-    /// caller expands returned specs via [`Self::apply_instances`].
+    /// generation (ADR-0038). Runs before layer binding as part of the generation swap, split so
+    /// the caller expands returned specs via [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         self.clear_change_handlers();
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
@@ -516,7 +515,7 @@ impl RendererClient {
     }
 
     /// Handles one [`pump`]-decoded frame. Returns [`FrameOutcome`]: `Handled`, or work handed to
-    /// `crate::wayland::App` for EGL/surface draw (PBA protocol) or SCTK
+    /// `crate::wayland::App` for EGL/surface draw (the generation swap) or SCTK
     /// `SessionLockState`/lock surfaces (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
@@ -1083,8 +1082,7 @@ mod tests {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
     }
 
-    /// `crate::wayland::run` startup in PBA Candidate order: evaluate, expand,
-    /// store instances, apply.
+    /// `crate::wayland::run` startup in swap order: evaluate, expand, store instances, apply.
     fn run_startup(client: &mut RendererClient) -> bool {
         let Some(specs) = client.run_startup_evaluation() else {
             return false;

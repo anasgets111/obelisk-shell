@@ -23,8 +23,8 @@ mod scan;
 
 pub use controller::NetworkController;
 
-/// One scanned AP, resolved to `network.available_networks`
-/// and serialized in a `StateSnapshot` payload, same convention as `audio::mixer::AppStream`.
+/// One scanned AP, resolved to `network.available_networks` and serialized in a `StateSnapshot`
+/// payload, same convention as `audio::mixer::AppStream`.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AccessPointInfo {
     /// Network name. Entries dedupe on it, keeping the stronger sighting.

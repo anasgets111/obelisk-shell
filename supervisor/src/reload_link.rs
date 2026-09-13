@@ -1,5 +1,5 @@
 //! Real [`reload::CandidateLink`] over the control socket (ADR-0019 item 1/6), driven by
-//! `main.rs`'s `reload::run_pba` handshake.
+//! `main.rs`'s `reload::run_swap` handshake.
 //!
 //! Borrows shared `inbound_frames` for one handshake rather than a per-candidate channel
 //! (ADR-0025). Irrelevant frames are logged and dropped, not routed elsewhere.
@@ -47,7 +47,7 @@ pub struct SocketCandidateLink<'a> {
     ///
     /// ponytail: unbounded, and moving a frame here frees the slot `MAX_INBOUND_FRAMES` was
     /// holding it in, so a flood over the handshake window grows this without a cap of its own.
-    /// The window is the `ready_timeout` in `PBA_TIMINGS` (2s) and the flood would have to come
+    /// The window is the `ready_timeout` in `SWAP_TIMINGS` (2s) and the flood would have to come
     /// from a Renderer this Supervisor spawned. Upgrade to a cap that drops the oldest and says
     /// so, if one ever fills.
     pub deferred: Vec<InboundFrame>,

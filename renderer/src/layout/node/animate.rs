@@ -1,8 +1,8 @@
-//! `animate`: per-property tweens on a retained node, the
-//! engine's answer to QML's `Behavior on x { NumberAnimation { ... } }` (ADR-0145). A node names
-//! the properties it wants eased and how long; when a pass resolves a different target for one of
-//! them, the node's [`Tween`] carries the displayed value from where it was to where it is going,
-//! and `layout::scene::Scene::tick` advances it between passes without running any Lua.
+//! `animate`: per-property tweens on a retained node, the engine's answer to QML's `Behavior on x {
+//! NumberAnimation { ... } }` (ADR-0145). A node names the properties it wants eased and how long;
+//! when a pass resolves a different target for one of them, the node's [`Tween`] carries the
+//! displayed value from where it was to where it is going, and `layout::scene::Scene::tick`
+//! advances it between passes without running any Lua.
 //!
 //! This module owns the parsing and the arithmetic. Where the tween lives, when one starts and
 //! what a tick relays out are `layout::scene`'s.

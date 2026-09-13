@@ -32,14 +32,14 @@ pub(super) enum MapState {
     Mapped,
 }
 impl MapState {
-    /// Whether this surface will put a frame on screen: the one predicate PBA's expected set
-    /// and its drawn set must agree on. See [`presenting_surface_ids`].
+    /// Whether this surface will put a frame on screen: the one predicate the generation swap's
+    /// expected set and its drawn set must agree on. See [`presenting_surface_ids`].
     fn presents(self) -> bool {
         self != MapState::Unmapped
     }
 }
 /// A tracked `wl_surface`'s role and last-applied spec (ADR-0040 decision 1). One enum keeps
-/// EGL, paint, input, and PBA paths on the shared `App::surfaces` index. Role objects exist only
+/// EGL, paint, input, and swap paths on the shared `App::surfaces` index. Role objects exist only
 /// while shown (ADR-0049 decision 1, ADR-0088), hence the `Option`s.
 pub(super) enum TrackedRole {
     Panel {
@@ -237,11 +237,11 @@ pub(super) struct TrackedSurface {
     pub(super) bound: Option<BoundSurface>,
     pub(super) role: TrackedRole,
     /// `surface_id`: `"{id}@{output}"` for panels, bare `id` for windows; shared
-    /// by Lua, the retained scene, Wayland, and PBA.
+    /// by Lua, the retained scene, Wayland, and the generation swap.
     pub(super) surface_id: String,
     pub(super) map_state: MapState,
-    /// Null buffer committed in PBA mode; hidden windows never set it because
-    /// they receive no configure. Always false outside candidates.
+    /// Null buffer committed during a swap; hidden windows never set it because they receive no
+    /// configure. Always false outside candidates.
     pub(super) null_buffered: bool,
     /// Latest configure size for [`App::activate_draw`]'s EGL bind; candidate mode records it
     /// before binding (see [`App::bind_and_clear`]).
@@ -407,16 +407,16 @@ fn resolved_surface_spec(
         SurfaceSpec::Lock(_) => ("lock", node::lock_spec(properties).map(SurfaceSpec::Lock)),
     }
 }
-/// Surface ids a PBA Candidate announces in `ReadySignal` and draws on `ActivateDraw`, using the
+/// Surface ids a Candidate announces in `ReadySignal` and draws on `ActivateDraw`, using the
 /// same [`MapState::presents`] predicate. They must match: `drive_handshake` otherwise waits past
 /// `evidence_timeout` for an announced-but-undrawn surface or aborts with
-/// `PbaFailure::UnexpectedEvidence` for an unannounced frame. Hidden panels stage but do not
+/// `SwapFailure::UnexpectedEvidence` for an unannounced frame. Hidden panels stage but do not
 /// present; hidden windows/popups have no role object, and Candidates freeze popup visibility.
 /// Empty is legal; the evidence loop exits immediately.
 fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
     surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
 }
-/// PBA staging gate. It takes `(null_buffered, exists)`: a hidden window has no
+/// The swap's staging gate. It takes `(null_buffered, exists)`: a hidden window has no
 /// `xdg_toplevel`, so `null_buffered` stays false forever and a plain `all(null_buffered)` would
 /// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also
 /// attaches a null buffer on its first configure. A `panel` gets a configure once it has a layer
@@ -571,7 +571,7 @@ impl App {
     }
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds
-    /// EGL, and paints. PBA mode stops after a null-buffer commit, deferring the real bind to
+    /// EGL, and paints. A swap stops after a null-buffer commit, deferring the real bind to
     /// [`App::activate_draw`]. Layer-shell and xdg-shell share this path
     /// because both require an initial unbuffered commit (ADR-0040 decision 4). The callers differ
     /// only in size source: layer-shell supplies it, while a toplevel's `None` axes may be chosen
@@ -595,7 +595,7 @@ impl App {
         // the scene clean before its input region is ever set and swallow clicks behind it.
         self.apply_resolved_state(index);
 
-        if self.is_pba_candidate {
+        if self.is_swap_candidate {
             // Cloned rather than borrowed: a `wl_surface` proxy is a refcounted handle, and holding
             // a borrow of `self.surfaces` across the `null_buffered` write below would not compile.
             let surface = self.surfaces[index].role.wl_surface().cloned();
@@ -608,7 +608,7 @@ impl App {
                 // `ActivateDraw` to carry staged state.
                 surface.commit();
             } else {
-                // A hidden surface already has the invisible PBA state; mark staged without wire
+                // A hidden surface already has the invisible swap state; mark staged without wire
                 // traffic and let `presenting_surface_ids` omit it.
                 self.surfaces[index].null_buffered = true;
             }
@@ -894,9 +894,9 @@ impl App {
         surface.commit();
     }
 
-    /// Apply `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
-    /// Freeze it for PBA Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the
-    /// same set, or the PBA protocol yields `evidence_timeout` or `PbaFailure::UnexpectedEvidence`.
+    /// Apply `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088). Freeze it
+    /// for Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the same set, or the
+    /// generation swap yields `evidence_timeout` or `SwapFailure::UnexpectedEvidence`.
     ///
     /// A change skipped by that freeze waits for the next full pass. Promotion does not cause one:
     /// `activate_draw` clears the flag as its last statement (`mod.rs` runs it after the turn's
@@ -918,7 +918,7 @@ impl App {
     /// evidence-complete state to hang it on (`active_nonce` is set and never cleared), and this
     /// is the least-tested path in the crate.
     fn apply_visibility(&mut self, index: usize, visible: bool) {
-        if self.is_pba_candidate {
+        if self.is_swap_candidate {
             return;
         }
         match &self.surfaces[index].role {
@@ -986,7 +986,7 @@ impl App {
     }
 
     /// Lazily builds the process-wide EGL state on the first drawable surface (ADR-0071). Failure
-    /// is fatal: a PBA Candidate signals ready before proving it can build a context, so a broken
+    /// is fatal: a Candidate signals ready before proving it can build a context, so a broken
     /// EGL between generations takes the shell down rather than rolling back (ADR-0071 decision 3).
     fn ensure_egl(&mut self, surface_id: &str) -> bool {
         if self.egl.is_some() {
@@ -1309,7 +1309,7 @@ impl App {
             if self.surfaces[index].bound.is_none() {
                 // A panel shown after starting hidden was configured without EGL; bind here because
                 // no further configure is coming. Candidates wait for `ActivateDraw`.
-                if self.is_pba_candidate || !self.ensure_bound(index) {
+                if self.is_swap_candidate || !self.ensure_bound(index) {
                     continue;
                 }
             }
@@ -1336,7 +1336,7 @@ impl App {
         }
     }
 
-    /// Draw the PBA first frame for `ActivateDraw`, requesting presentation feedback and tagging
+    /// Draw the swap's first frame for `ActivateDraw`, requesting presentation feedback and tagging
     /// it with `nonce`. Draw exactly the `ReadySignal` presenting set; Candidates freeze map state,
     /// so any mismatch would hang or abort the handshake.
     pub(super) fn activate_draw(&mut self, nonce: u64) {
@@ -1356,7 +1356,7 @@ impl App {
         }
         // Promotion must return later configure events to the ordinary resize path; the candidate
         // branch stops after `null_buffered` and would otherwise disable resize permanently.
-        self.is_pba_candidate = false;
+        self.is_swap_candidate = false;
     }
 
     /// One `ActivateDraw`: bind like the ordinary path, request presentation feedback before
@@ -1485,11 +1485,11 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_pba_ready_set() {
+    fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_swap_ready_set() {
         // A `lock` instance owns zero Wayland objects until `locked` arrives, so it reaches both
-        // PBA gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` -- complete
-        // by construction for the staging gate, absent from the announced set. Getting either wrong
-        // is a `ready_timeout` hang or an `UnexpectedEvidence` abort.
+        // swap gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` --
+        // complete by construction for the staging gate, absent from the announced set. Getting
+        // either wrong is a `ready_timeout` hang or an `UnexpectedEvidence` abort.
         assert!(candidate_has_staged([(false, false)].into_iter()));
         assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
     }
@@ -1515,7 +1515,7 @@ mod tests {
     #[test]
     fn the_ready_signal_announces_every_surface_that_will_present_and_no_others() {
         // The one place a mistake hangs the shell instead of failing a test: `activate_draw` draws
-        // exactly this set, `run_pba` expects evidence from exactly this set, and both directions
+        // exactly this set, `run_swap` expects evidence from exactly this set, and both directions
         // of a mismatch abort or time out the Candidate.
         let surfaces = [
             ("bar@eDP-1", MapState::Mapped),

@@ -1,24 +1,24 @@
-//! [`SystemController`] feeds `obelisk.system.time` from one
-//! wall-clock-aligned task, refreshed every second.
+//! [`SystemController`] feeds `obelisk.system.time` from one wall-clock-aligned task, refreshed
+//! every second.
 //!
-//! `system.time` has no interval argument, so it ticks unconditionally from construction to shutdown,
-//! aligning its first wake to the wall-clock second boundary ([`time_until_next_second`]).
+//! `system.time` has no interval argument, so it ticks unconditionally from construction to
+//! shutdown, aligning its first wake to the wall-clock second boundary
+//! ([`time_until_next_second`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-/// `obelisk.system`'s Lua-visible fields, with their
-/// `StateSnapshot` JSON keys unchanged.
+/// `obelisk.system`'s Lua-visible fields, with their `StateSnapshot` JSON keys unchanged.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct SystemState {
-    /// Unix epoch seconds, not milliseconds. `os.date` expects seconds;
-    /// milliseconds would be wrong by 1000x.
+    /// Unix epoch seconds, not milliseconds. `os.date` expects seconds; milliseconds would be wrong
+    /// by 1000x.
     pub time: i64,
     /// Whole seconds since this controller was built, which is the first time a config asked for
-    /// `system`. Only a difference means anything; take durations from this rather than from `time`,
-    /// which `settimeofday` and an NTP step move underneath a deadline.
+    /// `system`. Only a difference means anything; take durations from this rather than from
+    /// `time`, which `settimeofday` and an NTP step move underneath a deadline.
     ///
     /// ponytail: `Instant` is `CLOCK_MONOTONIC` on Linux, so a suspend does not count toward an
     /// elapsed reading. Suspend-inclusive timing wants `CLOCK_BOOTTIME` as a second field.

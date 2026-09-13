@@ -52,10 +52,10 @@ const MAX_CONNECTIONS: usize = 64;
 /// Decoded frames queued from all peers toward `main`'s loop.
 ///
 /// Bounded with backpressure rather than a drop policy: `main` reads these in protocol order, and
-/// PBA's evidence, reload reports and lock reports are each load-bearing (ADR-0025), so a
-/// dropped frame is a stalled handshake rather than a lost log line. A full queue instead parks
-/// the one connection task that is producing faster than `main` consumes, which is the peer that
-/// should be waiting.
+/// the generation swap's evidence, reload reports and lock reports are each load-bearing
+/// (ADR-0025), so a dropped frame is a stalled handshake rather than a lost log line. A full queue
+/// instead parks the one connection task that is producing faster than `main` consumes, which is
+/// the peer that should be waiting.
 const MAX_INBOUND_FRAMES: usize = 1024;
 
 /// Frames queued for one peer before it is treated as wedged.
