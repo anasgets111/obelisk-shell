@@ -921,7 +921,11 @@ impl NetworkController {
             tokio::select! {
                 biased;
                 Some(change) = device_changes.next() => {
-                    if let Ok(args) = change.args() {
+                    // Leaving FAILED, NM queues DISCONNECTED with reason NONE (`nm-device.c`), and
+                    // `biased` can drain both before the verdict; NONE must not erase the reason.
+                    if let Ok(args) = change.args()
+                        && args.reason != 0
+                    {
                         reason = Some(args.reason);
                     }
                 }
@@ -1381,13 +1385,19 @@ fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::test_support::p2p_pair;
+    use crate::capabilities::test_support::p2p_pair_serving;
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    /// A controller mid-attempt on `connecting`, bound to a peer that answers nothing.
-    /// `finish_connect` only touches the state and intent slots, so no call leaves the process.
-    async fn attempting(connecting: &str) -> (NetworkController, UnboundedReceiver<NetworkSignal>, zbus::Connection) {
-        let (connection, peer) = p2p_pair().await;
+    /// A controller mid-attempt on `connecting`, bound to a peer serving what `serve` installs
+    /// (`Ok` for nothing). `finish_connect` only touches the state and intent slots.
+    async fn attempting<F>(
+        connecting: &str,
+        serve: F,
+    ) -> (NetworkController, UnboundedReceiver<NetworkSignal>, zbus::Connection)
+    where
+        F: FnOnce(zbus::connection::Builder<'static>) -> zbus::Result<zbus::connection::Builder<'static>>,
+    {
+        let (connection, peer) = p2p_pair_serving(serve).await;
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let controller = NetworkController {
             nm: NetworkManagerProxy::new(&connection).await.expect("binding makes no call"),
@@ -1440,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_key_reopens_the_prompt_for_the_same_network() {
-        let (controller, mut receiver, _peer) = attempting("home").await;
+        let (controller, mut receiver, _peer) = attempting("home", Ok).await;
 
         controller.finish_connect(0, &home(), Some("wrong password".to_string()), true);
 
@@ -1458,7 +1468,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_aborted_join_drops_the_verdict_that_arrives_after_it() {
-        let (controller, mut receiver, _peer) = attempting("home").await;
+        let (controller, mut receiver, _peer) = attempting("home", Ok).await;
 
         controller.abort_connect();
         assert_eq!(controller.state.lock().unwrap().connecting_ssid, None, "the spinner stops on the click");
@@ -1473,7 +1483,7 @@ mod tests {
     #[tokio::test]
     async fn a_join_aborted_and_clicked_again_never_stands_in_for_the_new_one() {
         // Both attempts name "home"; only the attempt id tells the first join from the second.
-        let (controller, _receiver, _peer) = attempting("home").await;
+        let (controller, _receiver, _peer) = attempting("home", Ok).await;
         let first = controller.begin_connect("home");
         controller.abort_connect();
         let second = controller.begin_connect("home");
@@ -1492,11 +1502,48 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_attempt_owns_no_join_until_nm_accepts_it() {
-        let (controller, _receiver, _peer) = attempting("home").await;
+        let (controller, _receiver, _peer) = attempting("home", Ok).await;
         assert!(controller.accept(0, &joined(1)));
 
         controller.begin_connect("office");
 
         assert_eq!(controller.attempt.lock().unwrap().joined, None, "an abort now must not stop home's join");
+    }
+
+    const ACTIVE: &str = "/org/freedesktop/NetworkManager/ActiveConnection/1";
+    const DEVICE: &str = "/org/freedesktop/NetworkManager/Devices/4";
+
+    /// An activation whose `State` read queues, ahead of its reply, what NM emits for a rejected key:
+    /// device FAILED(NO_SECRETS), device DISCONNECTED(NONE), then the activation's DEACTIVATED.
+    struct RejectedKey;
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.Connection.Active")]
+    impl RejectedKey {
+        #[zbus(property)]
+        async fn state(&self, #[zbus(connection)] connection: &zbus::Connection) -> u32 {
+            let device = "org.freedesktop.NetworkManager.Device";
+            for body in [(120u32, 50u32, 7u32), (30, 120, 0)] {
+                connection.emit_signal(None::<&str>, DEVICE, device, "StateChanged", &body).await.unwrap();
+            }
+            let active = "org.freedesktop.NetworkManager.Connection.Active";
+            connection.emit_signal(None::<&str>, ACTIVE, active, "StateChanged", &(4u32, 3u32)).await.unwrap();
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_keeps_its_reason_past_the_disconnect_nm_queues_after_it() {
+        let (controller, _receiver, _peer) = attempting("home", |peer| peer.serve_at(ACTIVE, RejectedKey)).await;
+        let device_path = OwnedObjectPath::try_from(DEVICE).unwrap();
+        let wifi = WifiDevice {
+            device: bind_device(&controller.connection, device_path.clone()).await.unwrap(),
+            wireless: bind_wireless(&controller.connection, device_path.clone()).await.unwrap(),
+            device_path,
+        };
+        controller.devices.lock().unwrap().wifi = Some(wifi);
+
+        let outcome = controller.activation_outcome(&OwnedObjectPath::try_from(ACTIVE).unwrap()).await;
+
+        assert_eq!(outcome, Err(Some(7)), "NO_SECRETS, so the password prompt comes back");
     }
 }
