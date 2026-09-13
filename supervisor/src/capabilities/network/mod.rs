@@ -28,6 +28,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::{Stream, StreamExt};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
+use crate::capabilities::bind;
+
 pub mod connection;
 
 use connection::ConnectError;
@@ -179,28 +181,6 @@ fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-/// The crate's hand-written `<Proxy>::new_from_path` ties the proxy lifetime to `&Connection`, even
-/// though its builder clones the connection. Call the builder directly so stored proxies are
-/// `'static`.
-async fn bind_device(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<DeviceProxy<'static>> {
-    DeviceProxy::builder(connection).path(path)?.build().await
-}
-
-async fn bind_wireless(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<WirelessProxy<'static>> {
-    WirelessProxy::builder(connection).path(path)?.build().await
-}
-
-async fn bind_wired(connection: &zbus::Connection, path: OwnedObjectPath) -> zbus::Result<WiredProxy<'static>> {
-    WiredProxy::builder(connection).path(path)?.build().await
-}
-
-async fn bind_access_point(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<AccessPointProxy<'static>> {
-    AccessPointProxy::builder(connection).path(path)?.build().await
-}
-
 /// Hand-written `org.freedesktop.NetworkManager.Connection.Active` proxy. In crate 0.7.1,
 /// `ActiveProxy` declares `state_changed`; zbus uses that explicit name verbatim, so it subscribes
 /// to a member NetworkManager never emits. Twenty activations reaching `ACTIVATED` in about one
@@ -220,20 +200,6 @@ trait ActiveConnection {
 
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
-}
-
-async fn bind_active_connection(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<ActiveConnectionProxy<'static>> {
-    ActiveConnectionProxy::builder(connection).path(path)?.build().await
-}
-
-async fn bind_settings_connection(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<SettingsConnectionProxy<'static>> {
-    SettingsConnectionProxy::builder(connection).path(path)?.build().await
 }
 
 /// Reads one access point into the shape `network.available_networks` wants. `active` is passed
@@ -653,7 +619,7 @@ impl NetworkController {
     /// and leaves no half-typed key saved; a join through an existing profile is only deactivated.
     async fn stop(&self, in_flight: &InFlight) {
         let result = match &in_flight.created {
-            Some(created) => match bind_settings_connection(&self.connection, created.clone()).await {
+            Some(created) => match bind::<SettingsConnectionProxy>(&self.connection, created.clone()).await {
                 Ok(connection) => connection.delete().await,
                 Err(err) => Err(err),
             },
@@ -674,7 +640,7 @@ impl NetworkController {
     /// update, restored on failure.
     async fn save_typed_key(&self, in_flight: &InFlight) {
         let Some(profile) = &in_flight.unsaved else { return };
-        let result = match bind_settings_connection(&self.connection, profile.clone()).await {
+        let result = match bind::<SettingsConnectionProxy>(&self.connection, profile.clone()).await {
             Ok(connection) => connection.save().await,
             Err(err) => Err(err),
         };
@@ -729,7 +695,7 @@ impl NetworkController {
 
     async fn find_autoconnect_profile(&self, device: &DeviceProxy<'_>) -> zbus::Result<Option<OwnedObjectPath>> {
         for conn_path in device.available_connections().await? {
-            let conn = match bind_settings_connection(&self.connection, conn_path.clone()).await {
+            let conn = match bind::<SettingsConnectionProxy>(&self.connection, conn_path.clone()).await {
                 Ok(conn) => conn,
                 Err(err) => {
                     eprintln!(
@@ -805,7 +771,7 @@ impl NetworkController {
         };
         let mut bound = Vec::with_capacity(missing.len());
         for path in missing {
-            match bind_access_point(&self.connection, path.clone()).await {
+            match bind::<AccessPointProxy>(&self.connection, path.clone()).await {
                 Ok(proxy) => bound.push((path, proxy)),
                 Err(err) => eprintln!("network: failed to bind access point {path}: {err}"),
             }
@@ -924,7 +890,7 @@ impl NetworkController {
     /// device failure to it as `DEVICE_DISCONNECTED` (`nm-act-request.c`). NM emits the device
     /// signal first (`_set_state_full`), and `biased` reads it first.
     async fn activation_outcome(&self, active: &OwnedObjectPath) -> Result<(), Option<u32>> {
-        let proxy = match bind_active_connection(&self.connection, active.clone()).await {
+        let proxy = match bind::<ActiveConnectionProxy>(&self.connection, active.clone()).await {
             Ok(proxy) => proxy,
             Err(err) => {
                 eprintln!("network: failed to bind the active connection {active}: {err}");
@@ -1041,7 +1007,7 @@ impl NetworkController {
 
         let mut profiles = Vec::new();
         for path in paths {
-            let connection = match bind_settings_connection(&self.connection, path.clone()).await {
+            let connection = match bind::<SettingsConnectionProxy>(&self.connection, path.clone()).await {
                 Ok(connection) => connection,
                 Err(err) => {
                     eprintln!("network: {context} failed to bind connection {path}: {err}");
@@ -1261,7 +1227,7 @@ fn strength_forwarder(
     }
     let connection = connection.clone();
     Some(async move {
-        let access_point = match bind_access_point(&connection, path.clone()).await {
+        let access_point = match bind::<AccessPointProxy>(&connection, path.clone()).await {
             Ok(access_point) => access_point,
             Err(err) => {
                 eprintln!("network: failed to bind the associated access point {path}: {err}");
@@ -1339,7 +1305,7 @@ async fn resolve_devices(
     let mut wifi = None;
     let mut ethernet = Vec::new();
     for path in nm.get_all_devices().await? {
-        let device = match bind_device(connection, path.clone()).await {
+        let device = match bind::<DeviceProxy>(connection, path.clone()).await {
             Ok(device) => device,
             Err(err) => {
                 eprintln!("network: failed to bind device {path}: {err}");
@@ -1354,11 +1320,11 @@ async fn resolve_devices(
             }
         };
         match NMDeviceType::try_from(device_type) {
-            Ok(NMDeviceType::ETHERNET) => match bind_wired(connection, path.clone()).await {
+            Ok(NMDeviceType::ETHERNET) => match bind::<WiredProxy>(connection, path.clone()).await {
                 Ok(wired) => ethernet.push(EthernetDevice { path, device, wired }),
                 Err(err) => eprintln!("network: failed to bind wired device {path}: {err}"),
             },
-            Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind_wireless(connection, path.clone()).await {
+            Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind::<WirelessProxy>(connection, path.clone()).await {
                 Ok(wireless) => wifi = Some(WifiDevice { device_path: path, device, wireless }),
                 Err(err) => eprintln!("network: failed to bind wireless device {path}: {err}"),
             },
@@ -1598,8 +1564,8 @@ mod tests {
         let (controller, _receiver, _peer) = attempting("home", |peer| peer.serve_at(ACTIVE, RejectedKey)).await;
         let device_path = OwnedObjectPath::try_from(DEVICE).unwrap();
         let wifi = WifiDevice {
-            device: bind_device(&controller.connection, device_path.clone()).await.unwrap(),
-            wireless: bind_wireless(&controller.connection, device_path.clone()).await.unwrap(),
+            device: bind::<DeviceProxy>(&controller.connection, device_path.clone()).await.unwrap(),
+            wireless: bind::<WirelessProxy>(&controller.connection, device_path.clone()).await.unwrap(),
             device_path,
         };
         controller.devices.lock().unwrap().wifi = Some(wifi);

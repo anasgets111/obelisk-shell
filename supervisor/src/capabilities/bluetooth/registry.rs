@@ -11,7 +11,8 @@ use tokio_stream::StreamExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::BluetoothSignal;
-use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_adapter, bind_battery, bind_device};
+use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy};
+use crate::capabilities::bind;
 
 /// One tracked `Device1`. Cache `mac` at registration so write actions resolve it with a
 /// synchronous `HashMap` scan, without `.await` in the hot path. Abort `forwarder` on
@@ -46,7 +47,7 @@ pub(super) async fn adopt_adapter(
     if slot.lock().unwrap().is_some() {
         return;
     }
-    let proxy = match bind_adapter(connection, path.clone()).await {
+    let proxy = match bind::<Adapter1Proxy>(connection, path.clone()).await {
         Ok(proxy) => proxy,
         Err(err) => {
             eprintln!("bluetooth: failed to bind adapter {path}: {err}");
@@ -85,7 +86,7 @@ pub(super) async fn register_device(
     has_battery: bool,
     events: UnboundedSender<BluetoothSignal>,
 ) {
-    let device = match bind_device(connection, path.clone()).await {
+    let device = match bind::<Device1Proxy>(connection, path.clone()).await {
         Ok(device) => device,
         Err(err) => {
             eprintln!("bluetooth: failed to bind device {path}: {err}");
@@ -100,7 +101,7 @@ pub(super) async fn register_device(
         }
     };
     let battery = if has_battery {
-        match bind_battery(connection, path.clone()).await {
+        match bind::<Battery1Proxy>(connection, path.clone()).await {
             Ok(battery) => Some(battery),
             Err(err) => {
                 eprintln!("bluetooth: failed to bind Battery1 for device {path} ({mac}): {err}");

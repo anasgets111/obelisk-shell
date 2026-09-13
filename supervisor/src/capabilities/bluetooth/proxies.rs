@@ -1,7 +1,7 @@
 //! Hand-written BlueZ proxies (ADR-0030: no maintained zbus proxy crate for BlueZ).
 //! Split from `dbus::bluetooth` -- see `dbus/bluetooth/mod.rs` for the module-level doc.
 
-use zbus::zvariant::{ObjectPath, OwnedObjectPath};
+use zbus::zvariant::ObjectPath;
 
 #[zbus::proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 pub(super) trait Adapter1 {
@@ -74,28 +74,6 @@ pub(super) trait AgentManager1 {
 
     #[zbus(name = "RequestDefaultAgent")]
     fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
-}
-
-/// Wrap each macro-generated `builder()` so per-path binding stays one line.
-pub(super) async fn bind_adapter(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<Adapter1Proxy<'static>> {
-    Adapter1Proxy::builder(connection).path(path)?.build().await
-}
-
-pub(super) async fn bind_device(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<Device1Proxy<'static>> {
-    Device1Proxy::builder(connection).path(path)?.build().await
-}
-
-pub(super) async fn bind_battery(
-    connection: &zbus::Connection,
-    path: OwnedObjectPath,
-) -> zbus::Result<Battery1Proxy<'static>> {
-    Battery1Proxy::builder(connection).path(path)?.build().await
 }
 
 pub(super) async fn bind_object_manager(

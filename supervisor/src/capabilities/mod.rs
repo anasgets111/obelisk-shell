@@ -102,6 +102,16 @@ pub fn parse_bool_arg(arguments: &[serde_json::Value]) -> Option<bool> {
     arguments.first()?.as_bool()
 }
 
+/// Binds a macro-generated zbus proxy at `path`. A generated `<Proxy>::new` ties the proxy to
+/// `&Connection` even though its builder clones the connection, so stored proxies go through the
+/// builder to stay `'static`.
+pub async fn bind<T>(connection: &zbus::Connection, path: zbus::zvariant::OwnedObjectPath) -> zbus::Result<T>
+where
+    T: zbus::proxy::Defaults + From<zbus::Proxy<'static>>,
+{
+    zbus::proxy::Builder::new(connection).path(path)?.build().await
+}
+
 /// A received signal waiting for [`Capabilities::push`]. [`Signals::next`] only awaits `recv()`,
 /// so losing the `tokio::select!` race drops no signal; the winning arm's body is not canceled.
 /// This matters because `network`/`bluetooth` await while building state.
