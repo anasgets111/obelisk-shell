@@ -89,7 +89,7 @@ pub fn first_unix_user_uid(identities: &[(String, HashMap<String, OwnedValue>)])
 
 /// `org.freedesktop.PolicyKit1.AuthenticationAgent`, called by polkitd after [`register_agent`].
 ///
-/// Forwards only. The challenge becomes `obelisk.polkit` state; the setuid helper runs PAM after
+/// Forwards only. The challenge becomes `obelisk.polkit` state; the root helper runs PAM after
 /// `secure_submit("polkit", "authenticate")`, and `main.rs` releases the held reply when it answers
 /// (ADR-0114). zbus uses one task per call, so cancel can arrive while begin waits.
 pub struct AuthenticationAgent {

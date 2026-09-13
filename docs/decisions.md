@@ -2003,6 +2003,11 @@ Same-day amendment, retaining the original decision numbers:
 7. Destroyed surfaces clear focus and cannot auto-arm; the compositor owes no leave for them.
 8. Clicking non-fields preserves secure focus; another field, leave or unmap still scrubs it.
 
+Later amendment (2026-09-13), changing how decision 5 reaches the helper:
+
+9. Reach the helper only through `/run/polkit/agent-helper.socket`. Arch's polkit 127 ships the helper
+   without setuid, so spawning it fails unless someone runs `chmod 4755`. No spawn fallback.
+
 Masked Escape-to-cancel, multibyte mask support and interactive prompt metadata were not implemented.
 
 ## 0115. A capability push can run a handler: `on_change`, and the five things it unblocked

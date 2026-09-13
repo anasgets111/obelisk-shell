@@ -3,8 +3,8 @@
 //! the async Supervisor. [`run_worker`] handles `OBELISK_PAM_WORKER=1`, reads one stdin password,
 //! runs one transaction, and writes one outcome frame. [`run_authentication`] re-execs via
 //! [`crate::process::spawn_group_leader_stdio_piped`], exchanges piped stdin/stdout, and reports
-//! to `main.rs`, the only unlock authority (ADR-0052). [`run_polkit_helper`] uses polkit's setuid
-//! helper instead: polkitd accepts `AuthenticationAgentResponse2` only from uid 0 (ADR-0114).
+//! to `main.rs`, the only unlock authority (ADR-0052). [`run_polkit_helper`] uses polkit's root
+//! helper instead: polkitd accepts the agent response only from uid 0 (ADR-0114).
 //! It does not reuse `RendererFrame`/`SupervisorFrame`, which cross a different boundary.
 
 use std::cell::RefCell;
@@ -168,14 +168,14 @@ fn username_for(uid: u32) -> Result<String, String> {
     }
 }
 
-/// polkit's setuid helper runs PAM as root and invokes `AuthenticationAgentResponse2`, which
-/// polkitd accepts only from uid 0. A session-user agent cannot answer through [`run_worker`]. This
-/// is libpolkit-agent's path; Quickshell's agent reaches it through that library.
-const POLKIT_HELPER: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
+/// systemd starts polkit's helper as root for each connection. It runs PAM and invokes
+/// `AuthenticationAgentResponse3`, which polkitd accepts only from uid 0, so [`run_worker`] cannot.
+/// It reads our uid and pid from the socket. Quickshell's agent reaches it through libpolkit-agent.
+const POLKIT_HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 
-/// [`run_authentication`]'s polkit sibling (ADR-0114): same spawn/report and `Drop` backstop, but
-/// the conversation is [`POLKIT_HELPER`]'s. `Success` means polkitd was told; the caller answers
-/// the held `BeginAuthentication`.
+/// [`run_authentication`]'s polkit sibling (ADR-0114): same report and `Drop` backstop, but the
+/// conversation is the helper's behind [`POLKIT_HELPER_SOCKET`]. `Success` means polkitd was told;
+/// the caller answers the held `BeginAuthentication`.
 pub async fn run_polkit_helper(
     uid: u32,
     cookie: String,
@@ -193,37 +193,37 @@ pub async fn run_polkit_helper(
 
 async fn authenticate_via_helper(uid: u32, cookie: &str, secret: &[u8]) -> Result<shared::PamOutcome, String> {
     let username = username_for(uid)?;
-    let mut child = crate::process::spawn_group_leader_stdio_piped(POLKIT_HELPER, &[username], &[])
-        .map_err(|err| format!("could not spawn {POLKIT_HELPER}: {err}"))?;
-    let result = tokio::time::timeout(PAM_EXCHANGE_TIMEOUT, drive_helper(&mut child, cookie, secret)).await;
-    if let Err(err) = crate::process::reap_process_group(&mut child, crate::process::DEFAULT_REAP_GRACE).await {
-        eprintln!("failed to reap the polkit helper: {err}");
-    }
-    match result {
+    let (reader, writer) = tokio::net::UnixStream::connect(POLKIT_HELPER_SOCKET)
+        .await
+        .map_err(|err| format!("could not connect to {POLKIT_HELPER_SOCKET}: {err}"))?
+        .into_split();
+    match tokio::time::timeout(PAM_EXCHANGE_TIMEOUT, drive_helper(reader, writer, &username, cookie, secret)).await {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(err)) => Err(format!("polkit helper exchange failed: {err}")),
         Err(_elapsed) => Err("the polkit helper did not respond within the timeout".to_string()),
     }
 }
 
-/// libpolkit-agent's `polkitagentsession.c` protocol: cookie first; answer every
+/// libpolkit-agent's `polkitagentsession.c` protocol: username and cookie lines first; answer every
 /// `PAM_PROMPT_ECHO_OFF`/`PAM_PROMPT_ECHO_ON` with the one password (ADR-0028); log
 /// `PAM_ERROR_MSG`/`PAM_TEXT_INFO`; `SUCCESS`/`FAILURE` end it. Verified against polkit 127.
 async fn drive_helper(
-    child: &mut tokio::process::Child,
+    reader: impl tokio::io::AsyncRead + Unpin,
+    mut writer: impl tokio::io::AsyncWrite + Unpin,
+    username: &str,
     cookie: &str,
     secret: &[u8],
 ) -> std::io::Result<shared::PamOutcome> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let mut stdin = child.stdin.take().expect("spawn_group_leader_stdio_piped always pipes stdin");
-    let stdout = child.stdout.take().expect("spawn_group_leader_stdio_piped always pipes stdout");
-    stdin.write_all(cookie.as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    for line in [username, cookie] {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    let mut lines = tokio::io::BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         if line.starts_with("PAM_PROMPT_ECHO_OFF") || line.starts_with("PAM_PROMPT_ECHO_ON") {
-            stdin.write_all(secret).await?;
-            stdin.write_all(b"\n").await?;
+            writer.write_all(secret).await?;
+            writer.write_all(b"\n").await?;
         } else if line == "SUCCESS" {
             return Ok(shared::PamOutcome::Success);
         } else if line == "FAILURE" {
@@ -232,7 +232,7 @@ async fn drive_helper(
             eprintln!("polkit helper: {line}");
         }
     }
-    Err(std::io::Error::other("the helper closed its stdout without a verdict"))
+    Err(std::io::Error::other("the helper closed without a verdict"))
 }
 
 /// One worker round trip for `uid`; send the outcome on `outcome_tx` tagged by the lock acquisition
@@ -673,6 +673,27 @@ mod tests {
             gone.is_ok(),
             "the worker (pid {pid}) should be reaped even after a timeout, not left sleeping for the full 30s"
         );
+    }
+
+    #[tokio::test]
+    async fn drive_helper_writes_the_opening_lines_in_order_then_answers_the_prompt() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (ours, theirs) = tokio::io::duplex(256);
+        let helper = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(theirs);
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let mut seen = vec![lines.next_line().await.unwrap().unwrap(), lines.next_line().await.unwrap().unwrap()];
+            writer.write_all(b"PAM_PROMPT_ECHO_OFF Password: \n").await.unwrap();
+            seen.push(lines.next_line().await.unwrap().unwrap());
+            writer.write_all(b"SUCCESS\n").await.unwrap();
+            seen
+        });
+
+        let (reader, writer) = tokio::io::split(ours);
+        let outcome = drive_helper(reader, writer, "alice", "cookie-1", b"hunter2").await.unwrap();
+
+        assert_eq!(outcome, shared::PamOutcome::Success);
+        assert_eq!(helper.await.unwrap(), ["alice", "cookie-1", "hunter2"]);
     }
 
     #[test]
