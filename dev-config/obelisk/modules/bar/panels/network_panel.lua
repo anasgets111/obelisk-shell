@@ -34,24 +34,14 @@ local function access_points(n)
     return (n and n.available_networks) or {}
 end
 
--- A tile's second line, the mirror's `[address, band].filter(Boolean).join(" · ")`. Takes a
--- `table.pack` because a missing address is a `nil` hole that `ipairs` would stop at.
-local function detail_line(parts)
-    local shown = {}
-    for index = 1, parts.n do
-        if parts[index] ~= nil and parts[index] ~= "" then
-            shown[#shown + 1] = parts[index]
-        end
-    end
-    return table.concat(shown, " · ")
+-- A tile's second line, the mirror's `[address, band].filter(Boolean).join(" · ")`.
+local function detail_line(first, second)
+    return first and second and (first .. " · " .. second) or first or second or ""
 end
 
 -- `formatEthernetSpeed`. NetworkManager reports Mb/s, with `0` for unknown.
 local function speed_text(mbps)
-    if mbps == nil or mbps <= 0 then
-        return nil
-    end
-    return mbps >= 1000 and string.format("%g Gb/s", mbps / 1000) or string.format("%d Mb/s", mbps)
+    return mbps >= 1000 and string.format("%g Gb/s", mbps / 1000) or mbps > 0 and string.format("%d Mb/s", mbps) or nil
 end
 
 local function radio_on(n)
@@ -284,9 +274,9 @@ local function retry_hidden()
     obelisk.network:invoke("connect", ui.hidden_ssid:get(), true)
 end
 
--- `NetworkService.startWifiScan` sets `scannerEnabled` for as long as the panel is open. Scan now,
--- then again every `RESCAN_MS` until the panel closes; the first tick after a close ends the chain.
--- Cancelling the previous chain first keeps a quick close and reopen from running two.
+-- `NetworkService.startWifiScan` sets `scannerEnabled` for as long as the panel is open. The
+-- indicator calls this on every toggle: an open scans now and every `RESCAN_MS` after, and a close
+-- cancels the chain. Cancelling first also keeps a quick close and reopen from running two.
 local RESCAN_MS = 10000
 local rescan = nil
 
@@ -294,14 +284,13 @@ local function scan_while_open()
     if rescan ~= nil then
         rescan:cancel()
     end
+    if not (ui.panel_open:get() and ui.panel_kind:get() == KIND) then
+        return
+    end
     if radio_on(obelisk.network:get()) then
         obelisk.network:invoke("scan")
     end
-    rescan = timer(RESCAN_MS, function()
-        if ui.panel_open:get() and ui.panel_kind:get() == KIND then
-            scan_while_open()
-        end
-    end)
+    rescan = timer(RESCAN_MS, scan_while_open)
 end
 
 local body = {
@@ -360,7 +349,7 @@ local body = {
                     if ap == nil then
                         return ""
                     end
-                    return detail_line(table.pack(n.wifi_ip, (util.band_of(ap))))
+                    return detail_line(n.wifi_ip, (util.band_of(ap)))
                 end),
                 signal = obelisk.network,
                 read = function(n)
@@ -380,8 +369,7 @@ local body = {
                     return not n.ethernet_present
                 end),
                 detail = util.label(obelisk.network, function(n)
-                    return n.ethernet_enabled and detail_line(table.pack(n.ethernet_ip, speed_text(n.ethernet_speed)))
-                        or ""
+                    return n.ethernet_enabled and detail_line(n.ethernet_ip, speed_text(n.ethernet_speed)) or ""
                 end),
                 signal = obelisk.network,
                 read = function(n)

@@ -11,11 +11,8 @@ local network_panel = require("modules.bar.panels.network_panel")
 local SLOT = "network"
 
 local network_module = icon_button(obelisk.network:map(util.network_glyph), function(rect)
-    local opening = not (ui_state.panel_open:get() and ui_state.panel_kind:get() == network_panel.kind)
     ui_state.toggle_panel(network_panel.kind, rect)
-    if opening then
-        network_panel.scan_while_open()
-    end
+    network_panel.scan_while_open()
 end, {
     slot = SLOT,
     selected = ui_state.panel_showing(network_panel.kind),

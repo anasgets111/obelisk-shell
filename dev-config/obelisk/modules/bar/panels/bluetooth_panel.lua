@@ -122,7 +122,6 @@ local function codec_card(a, mac)
             return card
         end
     end
-    return nil
 end
 
 local function active_codec(card)
@@ -131,7 +130,6 @@ local function active_codec(card)
             return option.codec
         end
     end
-    return nil
 end
 
 -- Paired and available rows share one list so neither section must guess the other's extent. It is
