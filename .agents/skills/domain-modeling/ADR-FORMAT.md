@@ -8,10 +8,7 @@ Decisions live in one file, `docs/decisions.md`, one entry each, numbered sequen
 
     One to three sentences: the context, what was decided, and why.
 
-That is it. An entry can be a single paragraph. The value is in recording *that* a decision was
-made and *why*, not in filling out sections. The 81 entries in that file were once 81 separate
-files running 8,635 lines, median 99 lines for one decision. They were compressed because the
-essays had buried the decisions.
+That is it. The value is *that* a decision was made and *why*; essays bury it.
 
 ## Optional structure
 
@@ -25,13 +22,13 @@ Only when it adds value. Most entries need none.
 
 ## Numbering
 
-Take the highest `## NNNN.` in `docs/decisions.md` and add one. Never reuse or renumber: 1,233
-Rust comments cite these numbers as `ADR-NNNN`.
+Take the highest `## NNNN.` in `docs/decisions.md` and add one. Never reuse or renumber: code cites
+`ADR-NNNN`.
 
 ## Superseding
 
-Do not edit an entry to match what shipped later. Add a line to it naming the entry that
-superseded it, and leave the record alone. An entry is dated evidence, not documentation.
+Do not rewrite an entry to match what shipped later. Add `Amendment, ADR-NNNN: <what changed>.` to it,
+naming the new entry.
 
 ## When to write one
 

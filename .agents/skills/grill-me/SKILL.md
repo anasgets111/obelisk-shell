@@ -1,5 +1,5 @@
 ---
-name: grill
+name: grill-me
 description: Relentlessly stress-test an architectural plan or idea. Enforce Systems Thinking and YAGNI.
 ---
 
@@ -11,7 +11,7 @@ Stress-test the plan. Map the architecture as a dependency graph. Accept no assu
 
 Operate in strict rounds. Attack the **frontier**: questions whose prerequisites are fully settled. Do not ask downstream questions until the current blockers are resolved.
 
-1. **The YAGNI Gate (Round 0):** Does this need to exist? Can standard FOSS, native features, or existing logic (e.g., in Laravel/Vue/Postgres) handle this? 
+1. **The YAGNI Gate (Round 0):** Does this need to exist? Can std, an installed crate, the compositor, existing engine code, or plain Lua in the config handle this?
 2. **Automated Fact-Finding:** Never ask the user for environment facts (code, system state, docs). Use tools to parse the reality. 
 3. **The Grill:** Output the current frontier questions. Wait for answers. Recompute the frontier.
 

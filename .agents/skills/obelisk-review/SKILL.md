@@ -20,35 +20,35 @@ Run axes as parallel sub-agents, each a genuinely fresh `Agent` call (`general-p
 
 ## 2. Identify the Spec
 Locate the originating requirement in this order:
-1.  Issue references in commits (`#123`, `Closes #45`, GitLab `!67`).
+1.  Issue references in commits (`#123`, `Closes #45`).
 2.  User-provided path.
-3.  Local spec file (`docs/`, `specs/`, or `.scratch/`).
+3.  `docs/` and the ADRs the commits cite.
 *   *If missing, ask the user. If none exists, the Spec sub-agent aborts and reports "No spec available."*
 
 ## 3. Identify the Standards
-Combine repo-specific docs (`CODING_STANDARDS.md`) with the **Baseline Smells**. 
-*Rule of Law:* Documented repo standards override the baseline. Skip anything enforced by automated tooling (e.g., PHP_CodeSniffer, ESLint).
+Combine `AGENTS.md` with the **Baseline Smells**. 
+*Rule of Law:* `AGENTS.md` overrides the baseline. Skip anything `just check` enforces (rustfmt, clippy, luafmt, doc links).
 
 ### Baseline Smells
 | Smell | Definition | The Fix |
 | :--- | :--- | :--- |
+| **Avoidable Lines** | Added code the change does not need, or dead code it leaves behind. | Delete it. |
+| **Framework Leak** | Rust code, a test or a comment depending on `dev-config`. | Inline fixture; state the engine reason. |
 | **Mysterious Name** | Unclear variable, function, or type name. | Rename it. If you cannot name it, the architecture is flawed. |
-| **Duplicated Code** | Repeated logic shapes across the diff. | Extract to an Action, Trait, or Vue Composable. |
-| **Feature Envy** | A method querying another object's data heavily. | Move the method onto the Eloquent model/object it envies. |
-| **Data Clumps** | The same 3-4 parameters travel together constantly. | Extract a DTO (Data Transfer Object) or Value Object. |
-| **Primitive Obsession** | Strings/Ints acting as domain concepts. | Use Enums, Value Objects, or custom Casts. |
-| **Repeated Switches** | Identical `switch`/`if` cascades on one type. | Replace with Polymorphism or a Config/Match Map. |
-| **Shotgun Surgery** | One logical change scatters edits across 10 files. | Consolidate the logic into a cohesive domain module. |
-| **Divergent Change** | One file edits for 5 unrelated reasons. | Split the class. Enforce Single Responsibility. |
-| **Speculative Generality** | Interfaces/hooks built for "future needs". | **YAGNI.** Delete it. Inline until a concrete requirement exists. |
-| **Message Chains** | `a->b()->c()->d()` navigation. | Hide the walk behind a single method on the root object. |
-| **Middle Man** | A class/function that just delegates (Shallow Module). | Delete it. Call the target directly. |
-| **Refused Bequest** | Subclass overriding/ignoring most inherited logic. | Drop inheritance. Use Composition. |
+| **Duplicated Code** | Repeated logic shapes across the diff. | Reuse the existing helper, or extract one function. |
+| **Feature Envy** | A function reading another type's data heavily. | Move it onto the type it envies. |
+| **Data Clumps** | The same 3-4 parameters travel together constantly. | Extract a struct. |
+| **Primitive Obsession** | Strings/ints acting as domain concepts. | Use an enum or newtype. |
+| **Repeated Switches** | Identical `match`/`if` cascades on one type. | One `match` behind a method. |
+| **Shotgun Surgery** | One logical change scatters edits across 10 files. | Consolidate the logic into one module. |
+| **Divergent Change** | One file edits for 5 unrelated reasons. | Split the module. |
+| **Speculative Generality** | Traits/hooks built for "future needs". | **YAGNI.** Delete it. Inline until a concrete requirement exists. |
+| **Middle Man** | A function or module that just delegates (Shallow Module). | Delete it. Call the target directly. |
 
 ## 4. Spawn Parallel Sub-Agents
 
 **Agent A: Standards Review**
-*   **Input:** Diff, commit list, `CODING_STANDARDS.md`, Baseline Smells.
+*   **Input:** Diff, commit list, `AGENTS.md`, Baseline Smells.
 *   **Task:** Flag standards violations and code smells. Distinguish hard repo violations from baseline judgment calls. Ignore tooling-enforced formatting.
 *   **Limit:** < 400 words.
 

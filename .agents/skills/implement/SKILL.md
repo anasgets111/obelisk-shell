@@ -3,29 +3,15 @@ name: implement
 description: "Implement an Obelisk slice."
 ---
 
-Implement the requested Obelisk slice against `docs/lua-api.md`, the
-relevant entries in `docs/decisions.md`, and the user's request. `docs/roadmap.md`
-lists what is not built. Use the canonical terms in `CONTEXT.md`.
+Implement the request against `docs/lua-api.md`, the relevant `docs/decisions.md` entries and the `CONTEXT.md`
+terms. `docs/roadmap.md` lists what is not built.
 
-Use `/tdd` where possible, at pre-agreed module seams. Keep Rust ownership in
-the engine and supervisor, and keep Lua focused on generation configuration and
-scene composition.
-
-Run `cargo check --workspace` regularly. Run
-`cargo clippy --workspace --all-targets --all-features -- -D warnings` before
-considering any slice done, not just at the very end. Run focused `cargo test`
-commands for the touched crate or test filter, then run `cargo test --workspace`
-once at the end. Run the headless Wayland or real-session check required by the
-build step when the change crosses a protocol or capability seam.
-
-If you moved code between modules, run `cargo doc --workspace --no-deps` and
-compare the `unresolved link` count against the one before your change. Clippy
-does not check intra-doc links, so a doc comment pointing at an item that moved
-a module away passes every other gate silently. Fix one by demoting the link to
-a plain backtick path with the module prefix, never by widening an item's
-visibility to satisfy rustdoc. The counts to beat are 29 in the supervisor and
-3 in the renderer, all predating this note.
-
-Once done, use `/obelisk-review` to review the work against the requested slice.
-
-Do not commit unless the user asks for a commit.
+- Framework first: platform connections, validation, secrets, lifetimes, input and rendering stay in Rust;
+  composition, appearance and policy stay in Lua. Nothing in Rust depends on `dev-config`.
+- Smallest diff. Delete what the change makes redundant.
+- `/tdd` at agreed seams.
+- `cargo check` while working, focused `cargo test`, then `just check` before done (fmt, tests, clippy,
+  doc-link baselines, Lua types).
+- A `dev-config`-only change: `just lua types` and `obelisk check -c dev-config/obelisk`.
+- Crossing a Wayland or capability seam: verify on the live session (`diagnosing-bugs` step 1).
+- Review with `/obelisk-review`. Commit only when asked.

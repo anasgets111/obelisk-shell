@@ -22,7 +22,7 @@ Do not review stable code. Deepening only pays off if the code changes.
 - **Read Context:** Parse `CONTEXT.md` and `docs/decisions.md` for the target area.
 - **Audit for Friction (Spawn Sub-Agent):**
   - Locate **shallow modules** (interface complexity ≈ implementation complexity).
-  - Locate leaked abstractions (e.g., Eloquent queries bleeding into Vue components).
+  - Locate leaked abstractions (e.g., backend types leaking into Lua payloads, or `dev-config` names in engine code).
   - Identify pure functions lacking **locality** (extracted for tests, but real bugs hide in the untested callers).
 - **The Deletion Test:** Would deleting this module concentrate complexity, or just move it? If it concentrates, it is shallow. Target it.
 
@@ -48,9 +48,9 @@ Write a self-contained HTML file to the OS temp directory. Do not pollute the re
 
 ### 4. The Grilling Loop
 
-Once the user selects a candidate, execute `grill` to stress-test the architectural decision tree.
+Once the user selects a candidate, execute `grill-me` to stress-test the architectural decision tree.
 
 **Inline Side Effects:**
 - **Missing Domain Term?** Update `CONTEXT.md` immediately.
 - **User Rejects Candidate?** Ask to record an entry in `docs/decisions.md` to prevent future re-suggestions. (Skip if the reason is ephemeral).
-- **Alternative Interfaces?** Spawn parallel sub-agents to design it twice using the codebase-design principles.
+- **Alternative Interfaces?** Spawn parallel sub-agents to design it twice using the `project-design` principles.

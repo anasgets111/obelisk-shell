@@ -17,18 +17,18 @@ See [tests.md](tests.md) for examples and [mocking.md](mocking.md) for mocking g
 
 ## Seams: where tests go
 
-A **seam** is the module interface where you observe behavior without reaching inside. Tests live at seams, never against internals. In Obelisk, likely seams include the reload transaction, dependency snapshot, retained-scene transaction, and capability authority.
+A **seam** is the module interface where you observe behavior without reaching inside. Tests live at seams, never against internals. In Obelisk, likely seams include the generation swap, the retained-scene transaction, a capability controller and the wire types in `shared`. Framework tests use inline fixtures, never `dev-config`.
 
 **Test only at pre-agreed seams.** Before writing any test, write down the seams under test and confirm them with the user. No test is written at an unconfirmed seam. You can't test everything, so agreeing the seams up front is how testing effort lands on the critical paths and complex logic instead of every edge case.
 
 Ask: "What is the public interface, and which Obelisk seams should we test?"
 
-When the shape of that interface is itself in question (how deep the module is, where the seam belongs, what the interface should expose), call the Skill tool with "codebase-design" for the vocabulary. It is the shared source of the module, interface, depth, seam, adapter, leverage and locality terms, and it is a reference to consult, not a session to run.
+When the shape of that interface is itself in question (how deep the module is, where the seam belongs, what the interface should expose), call the Skill tool with "project-design" for the vocabulary. It is the shared source of the module, interface, depth, seam, adapter, leverage and locality terms, and it is a reference to consult, not a session to run.
 
 ## Anti-patterns
 
-- **Implementation-coupled**: mocks internal collaborators, tests private methods, or verifies through a side channel (querying the database instead of using the interface). The tell: the test breaks when you refactor but behavior hasn't changed.
-- **Tautological**: the assertion recomputes the expected value the way the code does (`expect(add(a, b)).toBe(a + b)`, a snapshot derived by hand the same way, a constant asserted equal to itself), so it passes by construction and can never disagree with the code. Expected values must come from an independent source of truth: a known-good literal, a worked example, the spec.
+- **Implementation-coupled**: mocks internal collaborators, tests private methods, or verifies through a side channel (reading a private field instead of using the interface). The tell: the test breaks when you refactor but behavior hasn't changed.
+- **Tautological**: the assertion recomputes the expected value the way the code does (`assert_eq!(add(a, b), a + b)`, a snapshot derived by hand the same way, a constant asserted equal to itself), so it passes by construction and can never disagree with the code. Expected values must come from an independent source of truth: a known-good literal, a worked example, the spec.
 - **Horizontal slicing**: writing all tests first, then all implementation. Bulk tests verify imagined behavior and lock in test structure before the implementation is understood. Work in **vertical slices** instead: one test, one implementation, then repeat. Each test should answer what the previous cycle exposed.
 
 ## Rules of the loop

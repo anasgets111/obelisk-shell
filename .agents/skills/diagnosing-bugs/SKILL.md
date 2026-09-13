@@ -1,63 +1,45 @@
 ---
 name: diagnosing-bugs
-description: Diagnosis loop for hard bugs and performance regressions. Forked for Laravel/Livewire and Quickshell/QML.
+description: Diagnosis loop for hard Obelisk bugs and performance regressions, in the Rust framework or the Lua shell.
 ---
 
-# Diagnosing Bugs
+# Diagnosing bugs
 
-A strict discipline for hard bugs. Stop guessing. Build a loop, form a hypothesis, measure, fix.
+Stop guessing. Build a loop, hypothesize, measure, fix.
 
-## 0. Redact & Read
-*   **Context:** Determine the project domain (Laravel/Livewire vs. Quickshell/QML). Read `CONTEXT.md` and ADRs.
-*   **Security:** Redact all secrets (`<REDACTED>`) before outputting artifacts. Quote only the specific log lines carrying the signal.
+## 0. Read and redact
+- Place the bug: framework (Rust) or shell (`dev-config` Lua). A framework bug reproduces without `dev-config`.
+- Read `CONTEXT.md` and the ADRs for the area.
+- Redact secrets. Quote only the log lines carrying the signal.
 
-## 1. Build a Feedback Loop (The Hard Part)
-If you do not have a tight pass/fail signal that goes red on *this specific bug*, you will fail. Do not read code to guess. Build the loop.
+## 1. Build a feedback loop
+No signal that goes red on this bug, no diagnosis. Cheapest first:
 
-### Domain A: Laravel & Livewire (Web)
-*No bash wrappers for PHP logic.*
-1.  **Tinker REPL:** Isolate logic and run directly via `php artisan tinker --execute="dd(User::find(1)->calculate());"`.
-2.  **Failing Test:** A Pest/PHPUnit test hitting the exact class, endpoint, or Eloquent model.
-3.  **Browser Script:** Dusk or Playwright for Livewire reactivity/DOM state issues.
-4.  **Database Isolation:** A raw Postgres query proving the data state or performance bottleneck.
+1. A failing `cargo test -p <crate> <filter>` at the seam.
+2. `obelisk check -c <dir>`: evaluates a config with no display.
+3. The live session: `cargo build --workspace --release`, stop the running `obelisk`, copy both binaries over
+   `$CARGOBIN`, restart with `obelisk -d`, read `obelisk log -f`.
+4. Probes: `OBELISK_DUMP_LAYOUT=<surface@output>` for geometry, `WAYLAND_DEBUG=1` for protocol traffic,
+   `busctl`/`dbus-monitor` for backends, `obelisk call <action>` for Lua state.
+5. Only a human can see it (a frame, a flicker): numbered steps for the user, one y/n question each.
 
-### Domain B: Quickshell & QML (Linux Desktop UI)
-1.  **CLI Execution:** Write `.sh` scripts to run `quickshell path/to/file.qml` or `qmlscene`. Diff stdout/stderr.
-2.  **LSP/Linting:** Run `qmlls` to catch static QML binding errors.
-3.  **IPC/State Monitoring:** Bash loops utilizing `dbus-monitor`, `hyprctl`, or `journalctl` to trace state changes feeding the UI.
+Done when one command reproduces the exact symptom, in seconds, every time.
 
-### Tighten It
-*   Make it fast (seconds, not minutes).
-*   Make it deterministic (seed RNG, mock APIs, isolate UI components).
-*   *Completion Criterion:* You must name **one runnable command** that reliably reproduces the exact symptom.
+## 2. Reproduce and minimize
+Confirm it is the user's exact symptom. Cut inputs, callers, nodes and config one at a time; keep only what
+the failure needs.
 
-## 2. Reproduce & Minimize
-Watch the loop go red. Confirm it is the *user's exact symptom*.
+## 3. Hypothesize
+Show the user 3-5 ranked, falsifiable hypotheses: "If X causes it, changing Y turns it green."
 
-**Minimize (The Deletion Test for Bugs):**
-Cut inputs, callers, Livewire components, or QML objects one by one. Re-run. Keep only what is load-bearing for the failure. Shrink the hypothesis space.
+## 4. Instrument
+One variable at a time. Tag temporary `eprintln!`/`print()` probes with `[DEBUG]`.
 
-## 3. Hypothesize (3-5 Ranked)
-Before touching the code, state 3-5 falsifiable hypotheses.
-*   *Format:* "If [X] is the cause, then [changing Y] will make it pass / [changing Z] will alter the error message."
-*   Show the list to the user.
-
-## 4. Instrument & Measure
-Map probes to the hypotheses. Change one variable at a time.
-*   **Laravel Logic:** Use Xdebug, `dd()`, or Ray.
-*   **Quickshell/QML:** `console.log()` inside QML, or examine shell stdout.
-*   **Performance:** Telescope (Laravel) or `EXPLAIN ANALYZE` (Postgres).
-*   **Logging:** Tag all debug logs with `[DEBUG]`. Never "log everything."
-
-## 5. Fix & Regression Test
-1.  Turn the minimized repro into a permanent test (Pest for Laravel, or a stable QML shell assertion).
-2.  Watch it fail.
-3.  Apply the fix.
-4.  Watch it pass.
+## 5. Fix
+The minimized repro becomes a permanent test with an inline fixture, never `dev-config`. Watch it fail, fix,
+watch it pass.
 
 ## 6. Cleanup
-*   [ ] Original loop runs green.
-*   [ ] Regression test runs green.
-*   [ ] `grep -r "DEBUG"` is empty.
-*   [ ] `dd()`, `console.log()` and temporary routes are deleted.
-*   [ ] The correct hypothesis is documented in the commit message.
+- [ ] Loop and regression test green.
+- [ ] `git grep DEBUG` empty.
+- [ ] Commit message names the confirmed hypothesis.
