@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rusty_network_manager::dbus_interface_types::{
-    NMActiveConnectionState, NMActiveConnectionStateReason, NMDeviceState, NMDeviceType,
+    NMActiveConnectionState, NMDeviceState, NMDeviceStateReason, NMDeviceType,
 };
 use rusty_network_manager::{
     AccessPointProxy, DeviceProxy, IP4ConfigProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy,
@@ -893,7 +893,7 @@ impl NetworkController {
                 match tokio::time::timeout(ACTIVATION_CEILING, controller.activation_outcome(&active)).await {
                     Ok(Ok(())) => (None, false),
                     Ok(Err(reason)) => {
-                        let wrong_key = reason == Some(NMActiveConnectionStateReason::NO_SECRETS as u32)
+                        let wrong_key = reason == Some(NMDeviceStateReason::NO_SECRETS as u32)
                             && !controller
                                 .saved_profiles_for_ssid(&pending.ssid, "connect")
                                 .await
@@ -907,8 +907,10 @@ impl NetworkController {
         });
     }
 
-    /// `Ok` on `ACTIVATED`. `Err` on deactivation, carrying NM's reason when the `StateChanged`
-    /// signal delivered one.
+    /// `Ok` on `ACTIVATED`. `Err` on deactivation, carrying the Wi-Fi device's last `StateChanged`
+    /// reason. The active connection's own reason cannot say a key was rejected: NM reports every
+    /// device failure to it as `DEVICE_DISCONNECTED` (`nm-act-request.c`). NM emits the device
+    /// signal first (`_set_state_full`), and `biased` reads it first.
     async fn activation_outcome(&self, active: &OwnedObjectPath) -> Result<(), Option<u32>> {
         let proxy = match bind_active_connection(&self.connection, active.clone()).await {
             Ok(proxy) => proxy,
@@ -917,14 +919,16 @@ impl NetworkController {
                 return Err(None);
             }
         };
-        // Use the signal, not `receive_state_changed()`: the property stream gives no reason.
-        let mut changes = match proxy.receive_active_state_changed().await {
-            Ok(changes) => changes,
-            Err(err) => {
-                eprintln!("network: failed to subscribe to StateChanged on {active}: {err}");
-                return Err(None);
-            }
-        };
+        let Some(wifi) = self.wifi() else { return Err(None) };
+        // Use the signals, not `receive_state_changed()`: the property stream gives no reason.
+        let (mut changes, mut device_changes) =
+            match tokio::try_join!(proxy.receive_active_state_changed(), wifi.device.receive_device_state_changed()) {
+                Ok(streams) => streams,
+                Err(err) => {
+                    eprintln!("network: failed to subscribe to StateChanged for {active}: {err}");
+                    return Err(None);
+                }
+            };
 
         // Subscription follows activation, so a verdict can land in the gap. Read the property
         // once.
@@ -937,16 +941,27 @@ impl NetworkController {
             _ => {}
         }
 
-        while let Some(change) = changes.next().await {
-            let Ok(args) = change.args() else { continue };
-            match NMActiveConnectionState::try_from(args.state) {
-                Ok(NMActiveConnectionState::ACTIVATED) => return Ok(()),
-                Ok(NMActiveConnectionState::DEACTIVATED) => return Err(Some(args.reason)),
-                _ => {}
+        let mut reason = None;
+        loop {
+            tokio::select! {
+                biased;
+                Some(change) = device_changes.next() => {
+                    if let Ok(args) = change.args() {
+                        reason = Some(args.reason);
+                    }
+                }
+                change = changes.next() => {
+                    // `None`: the object disappeared without a terminal state.
+                    let Some(change) = change else { return Err(reason) };
+                    let Ok(args) = change.args() else { continue };
+                    match NMActiveConnectionState::try_from(args.state) {
+                        Ok(NMActiveConnectionState::ACTIVATED) => return Ok(()),
+                        Ok(NMActiveConnectionState::DEACTIVATED) => return Err(reason),
+                        _ => {}
+                    }
+                }
             }
         }
-        // The object disappeared without a terminal state.
-        Err(None)
     }
 
     async fn connect_inner(&self, pending: &PendingNetworkConnect, secret: &[u8]) -> Result<InFlight, ConnectError> {

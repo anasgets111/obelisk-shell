@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use rusty_network_manager::NM80211ApFlags;
-use rusty_network_manager::dbus_interface_types::NMActiveConnectionStateReason;
+use rusty_network_manager::dbus_interface_types::NMDeviceStateReason;
 use shared::Zeroize;
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -42,19 +42,18 @@ impl From<zbus::Error> for ConnectError {
     }
 }
 
-/// Maps `Connection.Active`'s `StateChanged(state, reason)` to display text, following
-/// `LockState::error` and `NetworkService.qml`'s `_connectErrorText`; it is the only source that
-/// says why a connection went down, while `State` alone gives none.
+/// Maps the Wi-Fi device's `StateChanged` reason for a failed join to display text, following
+/// `NetworkService.qml`'s `_connectErrorText`. The active connection's reason is no use here: it is
+/// `DEVICE_DISCONNECTED` for every device failure.
 ///
-/// Other reasons are VPN, dependency, or realize failures. A Wi-Fi row cannot act on them, so they
+/// Other reasons are wired, modem, or dependency failures. A Wi-Fi row cannot act on them, so they
 /// collapse to "connection failed".
 pub(super) fn connect_error_text(reason: u32) -> &'static str {
-    match NMActiveConnectionStateReason::try_from(reason) {
-        Ok(NMActiveConnectionStateReason::NO_SECRETS) => "wrong password",
-        Ok(NMActiveConnectionStateReason::LOGIN_FAILED) => "authentication failed",
-        Ok(NMActiveConnectionStateReason::CONNECT_TIMEOUT) => "connection timed out",
-        Ok(NMActiveConnectionStateReason::USER_DISCONNECTED) => "disconnected",
-        Ok(NMActiveConnectionStateReason::DEVICE_DISCONNECTED) => "device disconnected",
+    match NMDeviceStateReason::try_from(reason) {
+        Ok(NMDeviceStateReason::NO_SECRETS) => "wrong password",
+        Ok(NMDeviceStateReason::SUPPLICANT_TIMEOUT) => "connection timed out",
+        Ok(NMDeviceStateReason::SSID_NOT_FOUND) => "network not found",
+        Ok(NMDeviceStateReason::USER_REQUESTED) => "disconnected",
         _ => "connection failed",
     }
 }
@@ -570,17 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn connect_error_text_names_the_reason_a_wrong_password_arrives_as() {
-        // NM reports a bad PSK as `NO_SECRETS`; `AddAndActivate` returns before this verdict.
-        assert_eq!(connect_error_text(NMActiveConnectionStateReason::NO_SECRETS as u32), "wrong password");
-        assert_eq!(connect_error_text(NMActiveConnectionStateReason::LOGIN_FAILED as u32), "authentication failed");
-        assert_eq!(connect_error_text(NMActiveConnectionStateReason::CONNECT_TIMEOUT as u32), "connection timed out");
+    fn connect_error_text_names_the_device_reason_a_wrong_password_arrives_as() {
+        // NM fails the device with `NO_SECRETS` for a bad PSK; the active connection only says
+        // `DEVICE_DISCONNECTED`.
+        assert_eq!(connect_error_text(NMDeviceStateReason::NO_SECRETS as u32), "wrong password");
+        assert_eq!(connect_error_text(NMDeviceStateReason::SUPPLICANT_TIMEOUT as u32), "connection timed out");
+        assert_eq!(connect_error_text(NMDeviceStateReason::SSID_NOT_FOUND as u32), "network not found");
     }
 
     #[test]
     fn connect_error_text_falls_back_for_reasons_a_wifi_row_cannot_act_on() {
-        // `SERVICE_START_FAILED` is a VPN reason; 255 is not a reason at all.
-        assert_eq!(connect_error_text(NMActiveConnectionStateReason::SERVICE_START_FAILED as u32), "connection failed");
+        // `MODEM_FAILED` is a modem reason; 255 is not a reason at all.
+        assert_eq!(connect_error_text(NMDeviceStateReason::MODEM_FAILED as u32), "connection failed");
         assert_eq!(connect_error_text(255), "connection failed");
     }
 
