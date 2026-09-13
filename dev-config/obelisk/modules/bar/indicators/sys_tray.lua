@@ -50,10 +50,9 @@ end
 -- mirror has no cap because QML `RowLayout` shrinks children; this `row` does not.
 local TRAY_WIDTH = theme.s(150, 110)
 
--- One square per item, `IconButton`'s `implicitWidth: _size` at the `md` step the mirror's delegate
--- takes. The square minus `icon.md` is the pill's breathing space; it has no padding. Equal squares
--- keep the row even, where fallback letters and icon-plus-gap widths would not.
-local ITEM_WIDTH = theme.control.md
+-- One slot per item: the icon plus `spacing.sm`, so icons sit that far apart. `control.md` left
+-- twice that between them. Equal slots keep the row even under fallback letters.
+local ITEM_WIDTH = theme.icon.md + theme.spacing.sm
 
 local has_items = util.shown_when(obelisk.tray, function(t)
     return #items_of(t) > 0
