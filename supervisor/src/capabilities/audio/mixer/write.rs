@@ -9,9 +9,8 @@ use pipewire as pw;
 
 use crate::capabilities::audio::master;
 
-use super::state::{
-    AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceRoute, MixerState,
-};
+use super::devices::DeviceRoute;
+use super::state::{AudioCommand, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, MixerState};
 
 /// The `type_` a `default.audio.*` metadata value carries. Read straight off `pw-metadata`'s own
 /// dump (`type:'Spa:String:JSON'`) rather than inferred from the value looking like JSON.

@@ -30,6 +30,7 @@
 //! events and resolves them through `default.audio.sink`/`source` metadata names.
 //! This file wires events; [`super::master`] owns parsing, resolution, and linear/cubic conversion.
 
+mod devices;
 mod registry;
 mod state;
 mod streams;

@@ -17,9 +17,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::capabilities::audio::master;
 
 use super::PropsLookup;
+use super::devices::{BluezCard, DeviceEntry, DeviceRoute, device_names};
 use super::state::{
-    AudioCommand, AudioState, BluezCard, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceEntry,
-    DeviceRoute, MixerState, PrivacySources, device_names,
+    AudioCommand, AudioState, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, MixerState,
+    PrivacySources,
 };
 use super::streams::{NodeKind, apply_capture_info_event, apply_info_event, apply_video_info_event, classify};
 use super::write::apply_command;
