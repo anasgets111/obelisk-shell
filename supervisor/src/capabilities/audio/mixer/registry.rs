@@ -558,16 +558,12 @@ fn bind_bluez_device(
             let Some(profile) = master::extract_profile(&value) else { return };
             let mut state = state_for_param.borrow_mut();
             let Some(card) = state.bluez_cards.get_mut(&device_id) else { return };
-            let changed = match param_type {
-                pw::spa::param::ParamType::EnumProfile => {
-                    card.enumerated(seq, profile);
-                    false
+            match param_type {
+                pw::spa::param::ParamType::EnumProfile => card.enumerated(seq, profile),
+                pw::spa::param::ParamType::Profile if card.finish_enumeration(seq, profile.index) => {
+                    state.publish_audio();
                 }
-                pw::spa::param::ParamType::Profile => card.finish_enumeration(seq, profile.index),
-                _ => false,
-            };
-            if changed {
-                state.publish_audio();
+                _ => {}
             }
         })
         .info(move |info| {
