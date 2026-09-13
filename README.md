@@ -26,7 +26,7 @@ state and reconciling the retained scene.
 | Blur | `ext-background-effect-v1`, ignored where absent |
 | Workspaces, keyboard layout | niri or Hyprland |
 | Updates capability | pacman, through libalpm |
-| Linked at build | PipeWire, PAM, udev, EGL, xkbcommon, libwayland-client |
+| Linked at build | PipeWire, PAM, udev, EGL, xkbcommon, libwayland-client, libwayland-egl |
 
 Lua 5.4 is vendored, so no system Lua is needed.
 
@@ -68,7 +68,7 @@ return {
 ```
 
 Surfaces are `panel`, `window`, `popup`, `lock`. Nodes are `row`, `column`, `text`, `image`,
-`icon`, `button`, `textfield`, `scroll`, `rect`, `list`. Anything that changes over time is a
+`icon`, `button`, `textfield`, `rect`, `list`. Anything that changes over time is a
 signal, so the `:map` above re-resolves that clock without re-running the config.
 
 ## Capabilities

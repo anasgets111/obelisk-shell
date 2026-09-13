@@ -132,7 +132,8 @@ threshold events and resumes reported thresholds. `idle.inhibited` reflects any 
 
 Logind's session Lock signal and config lock commands request the session lock flow. The Supervisor
 owns lock decisions; the Renderer owns protocol surfaces. Only successful authentication authorizes
-unlock; `set_unlock_animation` keeps the lock up for at most 600 ms after it. Renderer crashes cannot unlock the compositor.
+unlock. `set_unlock_animation(ms)` delays that release by at most 600 ms; the value survives reloads
+until set again. Renderer crashes cannot unlock the compositor.
 
 Polkit agent registration is on-demand. Challenge state and cancel actions belong to the Supervisor;
 secrets route directly from native input to the authentication helper.
@@ -164,7 +165,8 @@ See [sysinfo](../supervisor/src/capabilities/sysinfo/mod.rs).
 `process.run(cmd, args, out_cb, exit_cb)` spawns a separate process group and streams newline-stripped
 lines. `out_cb(line, stream)` identifies the stream; `exit_cb(code)` uses nil for a signal exit.
 The handle exposes `kill()`. `process.detach(cmd, args)` starts a program in its own session with no
-handle; nothing reaps it.
+handle; the shell never waits on or signals it, and init reaps it. It survives reloads, but it stays in
+the systemd unit's control group, so stopping or restarting the unit kills it.
 
 Generation retirement and Supervisor shutdown reap managed children using SIGTERM and a 100 ms grace
 before SIGKILL. In-place reload preserves the generation without restarting processes.
@@ -229,7 +231,8 @@ Commands carry generation and revision metadata:
 ```
 
 Inbound frames are tagged with the connection's generation ID.
-Frames from a non-authoritative generation, or naming another generation, are dropped. Nothing checks
+Frames from a non-authoritative generation, or naming another generation, are dropped, except a
+`CallResult`: the generation a call went to may answer it after a swap. Nothing checks
 `expected_revision`, so it is not an authorization guarantee.
 See [wire types](../shared/src/lib.rs), [socket](../supervisor/src/socket.rs) and
 [dispatch](../supervisor/src/supervisor.rs).

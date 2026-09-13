@@ -145,8 +145,8 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
-| `process.detach(cmd, args)` | Spawns a program in its own session that outlives the shell; no handle, output or exit code |
-| `action(name, handler)` | Declares what `obelisk call <name>` runs; the return is printed as JSON. One evaluation only |
+| `process.detach(cmd, args)` | Spawns a program in its own session that survives reloads; no handle, output or exit code. Stopping the systemd unit still kills it |
+| `action(name, handler)` | Declares what `obelisk call <name>` runs; a string return prints bare, nil prints nothing, anything else prints as JSON. One evaluation only |
 | `session_process { name, stop_signal? }` | Declares a program whose lifetime is the session's; returns a handle with `running`/`pid`/`started_at`/`exit_code`/`start_error` signals and `start`/`signal`/`stop` methods |
 
 See [idle wrapper](../renderer/src/lua/idle.rs), [timers](../renderer/src/lua/timer.rs),
@@ -291,6 +291,9 @@ Text size and icon size default to 12; `font_size` must be within [1, 8192], bec
 refuses a zero line height. Text and icon content defaults can render empty before hydration.
 
 `image.async = true` decodes off-thread and draws nothing until ready; false is the default.
+`image.retain = true` keeps the last picture up while a new `source` decodes.
+`image.transition = { duration, easing?, shader?, params? }` crosses to it instead and implies `retain`;
+both need `async` and a stable `id`. `shader` is an absolute `.frag` path; `params` maps uniforms to numbers.
 Icons resolve in the Renderer. See [content parsing](../renderer/src/layout/node/content.rs).
 
 A list calls `itemfn(element)` for every source element, including offscreen items.
@@ -309,7 +312,7 @@ See [list construction](../renderer/src/layout/node/spec.rs).
 | `hover_rect(name)` | Surface-local rect signal; retains the last rect after leave |
 | `scroll(name)` | Read-only logical offset; bind it to a row, column or list |
 | `scroll(name):reveal(index)` | Request visibility of a 1-based child; layout clamps the offset |
-| `fonts { families... }` | Dense ordered family list, applied at generation startup; no per-node font family |
+| `fonts { families... }` | Dense ordered family list, applied at generation startup; a text node's `font` leads it |
 
 A click fires on release inside the pressed target. Drag ends on release or surface leave;
 a left click can also fire after drag end. The innermost wheel handler or scrolling container wins.
@@ -371,7 +374,9 @@ See [wire format and dispatch limits](services.md#13-control-socket-and-wire-for
 
 | Command | Behavior |
 | :--- | :--- |
-| `obelisk init -c <dir>` | Config/editor setup; generates capability field and action stubs |
+| `obelisk -d` | Starts the shell in its own session and returns; output goes to `obelisk log` |
+| `obelisk log [-f]` | Prints this run's stdout and stderr; `-f` follows until the shell exits |
+| `obelisk init -c <dir> [--force]` | Config/editor setup; generates capability field and action stubs; `--force` overwrites existing files |
 | `obelisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
 | `obelisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
 | `obelisk toggle <name>` | Toggles declared boolean state |
