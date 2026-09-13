@@ -111,6 +111,21 @@ local function open_hidden_prompt()
     hidden_prompt:set(true)
 end
 
+-- Discovery runs while the bluetooth panel shows, as `BluetoothPanel.qml`'s `shouldDiscover`. The
+-- literal kind, like `"notifications"` below: requiring the panel here would be a cycle.
+local function set_bluetooth_discovery(on)
+    local b = obelisk.bluetooth:get()
+    if b ~= nil and b.enabled and b.discovering ~= on then
+        obelisk.bluetooth:invoke(on and "start_discovery" or "stop_discovery")
+    end
+end
+
+local function leave_bluetooth_panel()
+    if panel_open:get() and panel_kind:get() == "bluetooth" then
+        set_bluetooth_discovery(false)
+    end
+end
+
 -- The panel host's single close path, including prompts. `network:connect` on an unsaved secured
 -- network parks intent and raises `password_ssid` (ADR-0085); `cancel_connect` clears it and
 -- is a no-op otherwise, so generic close cannot clear `connect_error` accidentally.
@@ -122,6 +137,7 @@ local function close_panel()
     if panel_open:get() and panel_kind:get() == "notifications" then
         mark_popups_seen()
     end
+    leave_bluetooth_panel()
     panel_open:set(false)
     clear_network_prompts()
 end
@@ -146,11 +162,15 @@ local function toggle_panel(kind, rect)
     -- Switching panels ends the network panel's prompts as surely as closing does. Left standing,
     -- a pending password would keep this surface `Exclusive` over a panel that has no field in it.
     clear_network_prompts()
+    leave_bluetooth_panel()
     -- A panel and a modal never share the screen (`openPanel` clears `activeModal`).
     active_modal:set("")
     popup_anchor:set(rect)
     panel_kind:set(kind)
     panel_open:set(true)
+    if kind == "bluetooth" then
+        set_bluetooth_discovery(true)
+    end
 end
 
 -- Whether `kind` is on screen, matching `ShellUiState.isPanelOpen(kind)` and indicator rings.
@@ -290,6 +310,7 @@ return {
     panel_kind = panel_kind,
     toggle_panel = toggle_panel,
     close_panel = close_panel,
+    set_bluetooth_discovery = set_bluetooth_discovery,
     hidden_prompt = hidden_prompt,
     hidden_draft = hidden_draft,
     hidden_ssid = hidden_ssid,

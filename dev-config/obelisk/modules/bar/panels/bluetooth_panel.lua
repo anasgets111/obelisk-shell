@@ -4,7 +4,8 @@
 -- rows can show battery, disconnect and forget; available rows fall back to MAC and show pair.
 --
 -- Dropped: the "Visible" tile (`set_discoverable` is unavailable) and codec picker (`codec` is
--- always `nil`, ADR-0030). Discovery is a header button so both radio panels open the same way.
+-- always `nil`, ADR-0030). Discovery runs while the panel shows (`lib/ui_state.lua`); the header
+-- button still stops or restarts it.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -41,13 +42,22 @@ local function battery_text(device)
     return string.format("%d%%", device.battery)
 end
 
+local ui = require("lib.ui_state")
+
 local function connected(b)
-    return (b and b.connected_devices) or {}
+    return util.sorted_devices(b and b.connected_devices)
 end
 
 local function discovered(b)
-    return (b and b.discovered_devices) or {}
+    return util.sorted_devices(b and b.discovered_devices)
 end
+
+-- Switching the radio on with the panel up starts the scan the open would have (`shouldDiscover`).
+obelisk.bluetooth:on_change(function(b, previous)
+    if previous ~= nil and b.enabled and not previous.enabled and ui.panel_open:get() and ui.panel_kind:get() == KIND then
+        ui.set_bluetooth_discovery(true)
+    end
+end)
 
 local function enabled(b)
     return b ~= nil and b.enabled

@@ -5,6 +5,7 @@
 -- foreground for "doing something"; Bluetooth connected is the latter.
 local theme = require("config.theme")
 local icons = require("config.icons")
+local util = require("lib.util")
 local cell = require("components.cell")
 local icon_button = require("components.icon_button")
 local tooltip = require("components.tooltip")
@@ -14,7 +15,7 @@ local bluetooth_panel = require("modules.bar.panels.bluetooth_panel")
 local SLOT = "bluetooth"
 
 local function connected(b)
-    return (b or {}).connected_devices or {}
+    return util.sorted_devices((b or {}).connected_devices)
 end
 
 local bluetooth_module = icon_button(obelisk.bluetooth:map(function(b)

@@ -160,10 +160,32 @@ function util.network_glyph(n)
     if n.ssid == nil then
         return icons.wifi_none
     end
-    -- Match `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0; Lua is 1-indexed.
-    local strength = n.strength or 0
-    local tier = strength >= 95 and 4 or strength >= 80 and 3 or strength >= 50 and 2 or 1
-    return icons.wifi[tier]
+    return util.wifi_glyph(n.strength)
+end
+
+-- Match `signalTier`: >= 95 ? 3 : >= 80 ? 2 : >= 50 ? 1 : 0; Lua is 1-indexed. The panel's rows
+-- share it so a network draws the same bars in the bar and in the list.
+function util.wifi_glyph(strength)
+    local icons = require("config.icons")
+    local percent = strength or 0
+    return icons.wifi[percent >= 95 and 4 or percent >= 80 and 3 or percent >= 50 and 2 or 1]
+end
+
+-- Bluetooth devices by shown name, then MAC. The Supervisor builds both lists from a `HashMap`, so
+-- their order can change on any rebuild and rows would swap under the pointer.
+function util.sorted_devices(devices)
+    local function key(device)
+        return (device.name ~= nil and device.name ~= "") and device.name:lower() or (device.mac or "")
+    end
+    local out = table.move(devices or {}, 1, #(devices or {}), 1, {})
+    table.sort(out, function(left, right)
+        local left_key, right_key = key(left), key(right)
+        if left_key ~= right_key then
+            return left_key < right_key
+        end
+        return (left.mac or "") < (right.mac or "")
+    end)
+    return out
 end
 
 -- `Theme.networkBandColor` plus the short label the panel draws beside the bars: "6G", "5G", "2.4".

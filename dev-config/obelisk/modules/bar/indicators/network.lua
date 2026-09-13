@@ -11,7 +11,13 @@ local network_panel = require("modules.bar.panels.network_panel")
 local SLOT = "network"
 
 local network_module = icon_button(obelisk.network:map(util.network_glyph), function(rect)
-    obelisk.network:invoke("scan")
+    -- Scan on the opening click only, and only with a radio to scan with: a refused `RequestScan`
+    -- leaves `scanning` set until NetworkManager's next scan of its own.
+    local n = obelisk.network:get()
+    local opening = not (ui_state.panel_open:get() and ui_state.panel_kind:get() == network_panel.kind)
+    if opening and n ~= nil and n.networking_enabled and n.wifi_enabled then
+        obelisk.network:invoke("scan")
+    end
     ui_state.toggle_panel(network_panel.kind, rect)
 end, {
     slot = SLOT,

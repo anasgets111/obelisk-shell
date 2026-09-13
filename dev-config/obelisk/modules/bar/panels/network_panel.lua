@@ -40,20 +40,12 @@ local function radio_on(n)
     return n ~= nil and n.networking_enabled and n.wifi_enabled
 end
 
-local function strength_glyph(strength)
-    local percent = strength or 0
-    if percent >= 75 then
-        return icons.wifi[4]
-    elseif percent >= 50 then
-        return icons.wifi[3]
-    elseif percent >= 25 then
-        return icons.wifi[2]
-    end
-    return icons.wifi[1]
-end
-
--- Header subtitle, in priority order: an off stack speaks before its radios.
+-- Header subtitle, in priority order: an off stack speaks before its radios. No payload at all means
+-- NetworkManager never answered (the capability stays down for the run), the mirror's `!ready`.
 local function state_line(n)
+    if n == nil then
+        return "unavailable"
+    end
     if not n.networking_enabled then
         return "off"
     end
@@ -90,6 +82,24 @@ local radio_up_and_idle = computed({ obelisk.network, ui.hidden_join }, function
     return radio_on(n) and not joining
 end)
 
+-- The error card's close button, the mirror's `errorDismissed`. `connect_error` itself stays until
+-- the next attempt (§ 2.5), so the dismissal is view state and a new attempt re-arms it.
+local error_dismissed = state("network_error_dismissed", false)
+
+obelisk.network:on_change(function(n, previous)
+    if previous == nil then
+        return
+    end
+    if n.connecting_ssid ~= nil and previous.connecting_ssid == nil then
+        error_dismissed:set(false)
+    elseif previous.connecting_ssid ~= nil and n.connecting_ssid == nil and n.connect_error == nil then
+        -- The mirror's `onConnectSucceeded`: the join the panel was opened for is done.
+        if ui.panel_open:get() and ui.panel_kind:get() == KIND then
+            ui.close_panel()
+        end
+    end
+end)
+
 local rows = obelisk.network:map(function(n)
     local out = {}
     local connecting = n and n.connecting_ssid
@@ -107,7 +117,7 @@ local function access_point_row(entry)
     local ap = entry.ap
     local band, color = util.band_of(ap)
 
-    local leading = { glyph(strength_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
+    local leading = { glyph(util.wifi_glyph(ap.strength), color, theme.icon.md, { align_v = "Center" }) }
     if band then
         leading[#leading + 1] = cell({ { text = band, bold = true } }, color, theme.font.xs, { align_v = "End" })
     end
@@ -224,7 +234,7 @@ local body = {
         active = obelisk.network:map(function(n)
             return n ~= nil and n.networking_enabled
         end),
-        subtitle = util.label(obelisk.network, state_line),
+        subtitle = obelisk.network:map(state_line),
         trailing = {
             -- The mirror swaps rescan for a spinner while scanning; `scanning` flips on click (§ 2.5).
             icon_button(icons.refresh, function()
@@ -270,7 +280,8 @@ local body = {
                         return ""
                     end
                     local band = util.band_of(ap)
-                    return string.format("%d%% · %s", ap.strength or 0, band or "")
+                    return band and string.format("%d%% · %s", ap.strength or 0, band)
+                        or string.format("%d%%", ap.strength or 0)
                 end),
                 signal = obelisk.network,
                 read = function(n)
@@ -294,10 +305,9 @@ local body = {
             },
         },
     },
-    -- Mirror error card, red on a red-tinted ground. `connect_error` is sticky until the next
-    -- attempt (§ 2.5), with no clear command; the next row click dismisses it. It yields to the
-    -- sheet, where `visible: ... && !root.isHiddenTarget` prevents two copies reading as two
-    -- two failures.
+    -- Mirror error card, red on a red-tinted ground, closed by its own button or the next attempt.
+    -- It yields to the sheet, where `visible: ... && !root.isHiddenTarget` prevents two copies
+    -- reading as two failures.
     row {
         width = "Fill",
         spacing = theme.spacing.sm,
@@ -305,14 +315,21 @@ local body = {
         padding = { top = theme.spacing.sm, right = theme.spacing.sm, bottom = theme.spacing.sm, left = theme.spacing.sm },
         radius = theme.radius.md,
         background = theme.ALERT_BG,
-        visible = computed({ obelisk.network, step }, function(n, current)
-            return current == "" and n ~= nil and n.connect_error ~= nil and n.connecting_ssid == nil
+        visible = computed({ obelisk.network, step, error_dismissed }, function(n, current, dismissed)
+            return current == ""
+                and not dismissed
+                and n ~= nil
+                and n.connect_error ~= nil
+                and n.connecting_ssid == nil
         end),
         children = {
             glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
             cell(util.label(obelisk.network, function(n)
                 return n.connect_error or ""
             end), theme.RED, theme.font.sm, { width = "Fill", wrap = "Word", max_lines = 2 }),
+            panel_action_icon(icons.close, function()
+                error_dismissed:set(true)
+            end, { slot = "network-error-dismiss", tint = theme.RED }),
         },
     },
     -- The sheet's parts leave layout as the step moves; `panel_host` tweens the card's height to
@@ -441,8 +458,10 @@ local body = {
         on_activate = ui.open_hidden_prompt,
     },
     panel_empty_state(
-        util.label(obelisk.network, function(n)
-            if not n.networking_enabled then
+        obelisk.network:map(function(n)
+            if n == nil then
+                return "network unavailable"
+            elseif not n.networking_enabled then
                 return "networking off"
             elseif not n.wifi_enabled then
                 return "wi-fi off"
@@ -452,9 +471,6 @@ local body = {
             return "no networks found"
         end),
         computed({ obelisk.network, ui.hidden_join }, function(n, joining)
-            if n == nil then
-                return false
-            end
             return not radio_on(n) or (not joining and #access_points(n) == 0)
         end),
         {
