@@ -1515,32 +1515,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_aborted_join_drops_the_verdict_that_arrives_after_it() {
-        let (controller, mut receiver, _peer) = attempting("home", Ok).await;
-
-        controller.abort_connect();
-        assert_eq!(controller.state.lock().unwrap().connecting_ssid, None, "the spinner stops on the click");
-        assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
-
-        controller.finish_connect(0, &home(), Some("disconnected".to_string()), false);
-        let state = controller.state.lock().unwrap().clone();
-        assert_eq!(state.connect_error, None, "a cancelled join is not a failure");
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
     async fn a_join_aborted_and_clicked_again_never_stands_in_for_the_new_one() {
         // Both attempts name "home"; only the attempt id tells the first join from the second.
-        let (controller, _receiver, _peer) = attempting("home", Ok).await;
+        let (controller, mut receiver, _peer) = attempting("home", Ok).await;
         let first = controller.begin_connect("home");
         controller.abort_connect();
+        assert_eq!(controller.state.lock().unwrap().connecting_ssid, None, "the spinner stops on the click");
         let second = controller.begin_connect("home");
 
         assert!(!controller.accept(first, &joined(1)), "the first join is stopped, not watched");
         assert!(controller.accept(second, &joined(2)));
 
         controller.finish_connect(first, &home(), Some("disconnected".to_string()), false);
-        assert_eq!(controller.state.lock().unwrap().connecting_ssid.as_deref(), Some("home"));
+        let state = controller.state.lock().unwrap().clone();
+        assert_eq!((state.connecting_ssid.as_deref(), state.connect_error), (Some("home"), None));
+        let pushes = std::iter::from_fn(|| receiver.try_recv().ok()).count();
+        assert_eq!(pushes, 3, "two begins and the abort push; the aborted join's verdict does not");
 
         controller.finish_connect(second, &home(), None, false);
         let state = controller.state.lock().unwrap().clone();
