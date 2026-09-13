@@ -11,7 +11,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use super::agent::{self, Invited, PromptSlot, register_agent_best_effort};
 use super::proxies::{Adapter1Proxy, Battery1Proxy, Device1Proxy, bind_object_manager, subscribe_object_manager};
-use super::registry::{AdapterSlot, DeviceRegistry, adopt_adapter, register_device, spawn_object_manager_forwarder};
+use super::registry::{AdapterSlot, DeviceRegistry, spawn_object_manager_forwarder, track_interfaces};
 use super::{
     BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DeviceAction, DiscoveredDevice,
     PairedDevice, class_to_category,
@@ -78,19 +78,7 @@ impl BluetoothController {
                 Ok(objects) => {
                     for (path, interfaces) in objects {
                         let has = |name: &str| interfaces.keys().any(|k| k.as_str() == name);
-                        if has("org.bluez.Adapter1") {
-                            adopt_adapter(&connection, &adapter, path.clone(), &events).await;
-                        }
-                        if has("org.bluez.Device1") {
-                            register_device(
-                                &connection,
-                                &devices,
-                                path.clone(),
-                                has("org.bluez.Battery1"),
-                                events.clone(),
-                            )
-                            .await;
-                        }
+                        track_interfaces(&connection, &devices, &adapter, path, has, &events).await;
                     }
                 }
                 Err(err) => eprintln!("bluetooth: GetManagedObjects failed: {err}"),

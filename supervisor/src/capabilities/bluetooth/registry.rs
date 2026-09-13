@@ -38,7 +38,7 @@ pub(super) type AdapterSlot = Arc<Mutex<Option<BoundAdapter>>>;
 
 /// Binds `path` as the adapter unless one is already in use, starts its property forwarder, and
 /// pushes [`BluetoothSignal::AdapterChanged`]. The first adapter wins, as it did at startup.
-pub(super) async fn adopt_adapter(
+async fn adopt_adapter(
     connection: &zbus::Connection,
     slot: &AdapterSlot,
     path: OwnedObjectPath,
@@ -65,7 +65,7 @@ pub(super) async fn adopt_adapter(
 ///
 /// ponytail: a second adapter already present does not take over; it is adopted only when BlueZ
 /// adds it again. Upgrade path: rerun `GetManagedObjects` here and adopt the first `Adapter1`.
-pub(super) fn release_adapter(slot: &AdapterSlot, path: &OwnedObjectPath, events: &UnboundedSender<BluetoothSignal>) {
+fn release_adapter(slot: &AdapterSlot, path: &OwnedObjectPath, events: &UnboundedSender<BluetoothSignal>) {
     let released = {
         let mut bound = slot.lock().unwrap();
         if bound.as_ref().is_some_and(|adapter| &adapter.path == path) { bound.take() } else { None }
@@ -79,7 +79,7 @@ pub(super) fn release_adapter(slot: &AdapterSlot, path: &OwnedObjectPath, events
 
 /// Binds `path` as `Device1`, caches `Address`, optionally binds `Battery1`, starts its forwarder,
 /// and inserts it into `devices`. Logs and skips any D-Bus failure without a partial entry.
-pub(super) async fn register_device(
+async fn register_device(
     connection: &zbus::Connection,
     devices: &DeviceRegistry,
     path: OwnedObjectPath,
@@ -119,6 +119,32 @@ pub(super) async fn register_device(
     if let Some(previous) = previous {
         previous.forwarder.abort();
     }
+}
+
+/// Adopts an `Adapter1` and registers a `Device1` at `path`, given what `has` says BlueZ reports
+/// there. Returns whether the device registry changed. Serves both `GetManagedObjects` hydration
+/// and `InterfacesAdded`, which reports only newly added interfaces: BlueZ commonly adds `Device1`
+/// on pair/connect and `Battery1` after GATT discovery, and re-registering a tracked device binds
+/// both and aborts its battery-less forwarder.
+pub(super) async fn track_interfaces(
+    connection: &zbus::Connection,
+    devices: &DeviceRegistry,
+    adapter: &AdapterSlot,
+    path: OwnedObjectPath,
+    has: impl Fn(&str) -> bool,
+    events: &UnboundedSender<BluetoothSignal>,
+) -> bool {
+    if has("org.bluez.Adapter1") {
+        adopt_adapter(connection, adapter, path.clone(), events).await;
+    }
+    let has_battery = has("org.bluez.Battery1");
+    // A battery-only event without a prior `Device1` has nothing to attach to.
+    let tracked = has_battery && devices.lock().unwrap().contains_key(&path);
+    if !has("org.bluez.Device1") && !tracked {
+        return false;
+    }
+    register_device(connection, devices, path, has_battery, events.clone()).await;
+    true
 }
 
 /// Forwards `Connected`/`Paired`/`Name`/`Blocked` and, when present, `Battery1.Percentage` changes as
@@ -195,25 +221,13 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
             tokio::select! {
                 Some(signal) = added.next() => {
                     let Ok(args) = signal.args() else { continue; };
-                    let has_device = args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Device1");
-                    let has_battery = args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Battery1");
-                    if args.interfaces_and_properties().keys().any(|k| k.as_str() == "org.bluez.Adapter1") {
-                        adopt_adapter(&connection, &adapter, args.object_path().to_owned().into(), &events).await;
-                    }
-                    if has_device {
-                        register_device(&connection, &devices, args.object_path().to_owned().into(), has_battery, events.clone()).await;
-                        if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                    } else if has_battery {
-                        // The signal reports only newly added interfaces. BlueZ commonly emits
-                        // `Device1` first on pair/connect, then `Battery1` after GATT discovery;
-                        // re-registering binds both and aborts the old battery-less forwarder.
-                        let path: OwnedObjectPath = args.object_path().to_owned().into();
-                        let already_tracked = devices.lock().unwrap().contains_key(&path);
-                        if already_tracked {
-                            register_device(&connection, &devices, path, true, events.clone()).await;
-                            if events.send(BluetoothSignal::DeviceRegistryChanged).is_err() { break; }
-                        }
-                        // A battery-only event without a prior `Device1` has nothing to attach to.
+                    let interfaces = args.interfaces_and_properties();
+                    let has = |name: &str| interfaces.keys().any(|k| k.as_str() == name);
+                    let path = args.object_path().to_owned().into();
+                    if track_interfaces(&connection, &devices, &adapter, path, has, &events).await
+                        && events.send(BluetoothSignal::DeviceRegistryChanged).is_err()
+                    {
+                        break;
                     }
                 }
                 Some(signal) = removed.next() => {
