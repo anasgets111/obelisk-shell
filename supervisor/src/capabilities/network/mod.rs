@@ -1165,17 +1165,11 @@ fn spawn_wifi_forwarder(
     events: UnboundedSender<NetworkSignal>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ap_added = match wireless.receive_access_point_added().await {
-            Ok(stream) => stream,
+        let ap_set = tokio::try_join!(wireless.receive_access_point_added(), wireless.receive_access_point_removed());
+        let mut ap_set_changed = match ap_set {
+            Ok((added, removed)) => added.map(drop).merge(removed.map(drop)),
             Err(err) => {
-                eprintln!("network: failed to subscribe to AccessPointAdded: {err}");
-                return;
-            }
-        };
-        let mut ap_removed = match wireless.receive_access_point_removed().await {
-            Ok(stream) => stream,
-            Err(err) => {
-                eprintln!("network: failed to subscribe to AccessPointRemoved: {err}");
+                eprintln!("network: failed to subscribe to AccessPointAdded/AccessPointRemoved: {err}");
                 return;
             }
         };
@@ -1188,10 +1182,7 @@ fn spawn_wifi_forwarder(
 
         loop {
             tokio::select! {
-                Some(_) = ap_added.next() => {
-                    if events.send(NetworkSignal::Changed).is_err() { break; }
-                }
-                Some(_) = ap_removed.next() => {
+                Some(()) = ap_set_changed.next() => {
                     if events.send(NetworkSignal::Changed).is_err() { break; }
                 }
                 Some(change) = active_ap_changed.next() => {
@@ -1235,11 +1226,7 @@ fn strength_forwarder(
             }
         };
         let mut strength_changed = access_point.receive_strength_changed().await;
-        while strength_changed.next().await.is_some() {
-            if events.send(NetworkSignal::Changed).is_err() {
-                break;
-            }
-        }
+        while strength_changed.next().await.is_some() && events.send(NetworkSignal::Changed).is_ok() {}
     })
 }
 
@@ -1252,11 +1239,7 @@ fn spawn_device_state_forwarder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state_changed = device.receive_state_changed().await;
-        while state_changed.next().await.is_some() {
-            if events.send(NetworkSignal::Changed).is_err() {
-                break;
-            }
-        }
+        while state_changed.next().await.is_some() && events.send(NetworkSignal::Changed).is_ok() {}
     })
 }
 
@@ -1265,24 +1248,13 @@ fn spawn_device_state_forwarder(
 /// can move between two activated devices.
 fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     tokio::spawn(async move {
-        let mut wireless_enabled = nm.receive_wireless_enabled_changed().await;
-        let mut networking_enabled = nm.receive_networking_enabled_changed().await;
-        let mut primary_connection = nm.receive_primary_connection_changed().await;
-
-        loop {
-            tokio::select! {
-                Some(_) = wireless_enabled.next() => {
-                    if events.send(NetworkSignal::Changed).is_err() { break; }
-                }
-                Some(_) = networking_enabled.next() => {
-                    if events.send(NetworkSignal::Changed).is_err() { break; }
-                }
-                Some(_) = primary_connection.next() => {
-                    if events.send(NetworkSignal::Changed).is_err() { break; }
-                }
-                else => break,
-            }
-        }
+        let mut changes = nm
+            .receive_wireless_enabled_changed()
+            .await
+            .map(drop)
+            .merge(nm.receive_networking_enabled_changed().await.map(drop))
+            .merge(nm.receive_primary_connection_changed().await.map(drop));
+        while changes.next().await.is_some() && events.send(NetworkSignal::Changed).is_ok() {}
     });
 }
 
