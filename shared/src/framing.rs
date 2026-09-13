@@ -29,7 +29,8 @@ pub enum FramingError {
     Decode(#[from] serde_json::Error),
 }
 
-/// Writes a 4-byte big-endian length prefix followed by `payload`.
+/// Writes a 4-byte big-endian length prefix followed by `payload`, flushed: the PAM worker's
+/// `tokio::io::stdout()` queues writes that its dropped runtime lost, a failed unlock.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<(), FramingError> {
     if payload.len() > MAX_FRAME_LEN {
         return Err(FramingError::FrameTooLarge { len: payload.len() });
@@ -37,6 +38,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) 
     let len = payload.len() as u32; // safe: bounded by MAX_FRAME_LEN above, which fits in u32.
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(payload).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -121,6 +123,14 @@ mod tests {
         write_json_frame(&mut a, &sent).await.unwrap();
         let received: ConnectionHandshake = read_json_frame(&mut b).await.unwrap();
         assert_eq!(received, sent);
+    }
+
+    #[tokio::test]
+    async fn write_frame_returns_only_once_the_frame_is_flushed() {
+        // `BufWriter` holds bytes until flushed, as tokio's stdout does.
+        let mut sink = tokio::io::BufWriter::new(Vec::new());
+        write_frame(&mut sink, b"ok").await.unwrap();
+        assert_eq!(sink.get_ref(), &[0, 0, 0, 2, b'o', b'k']);
     }
 
     #[tokio::test]
