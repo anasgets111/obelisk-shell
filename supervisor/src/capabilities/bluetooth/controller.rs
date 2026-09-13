@@ -154,7 +154,6 @@ impl BluetoothController {
                 // A start that landed after its stop, or a radio switched back on, shows up here.
                 self.spawn_reconcile_discovery();
                 let adapter = self.adapter();
-                let available = adapter.is_some();
                 // Each read falls back to `false`, and so does no adapter at all.
                 let (enabled, discovering, discoverable) = match &adapter {
                     Some(adapter) => (
@@ -165,7 +164,7 @@ impl BluetoothController {
                     None => (false, false, false),
                 };
                 let mut state = self.state.lock().unwrap();
-                state.available = available;
+                state.available = adapter.is_some();
                 state.enabled = enabled;
                 state.discovering = discovering;
                 state.discoverable = discoverable;

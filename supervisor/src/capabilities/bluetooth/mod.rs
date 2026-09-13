@@ -237,20 +237,14 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
     let params = &envelope.params;
     let Some(action) = crate::parse_action::<BluetoothAction>(params) else { return };
     match action {
-        BluetoothAction::SetEnabled => match parse_bool_arg(&params.arguments) {
-            Some(enabled) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set_enabled(enabled).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        BluetoothAction::SetDiscoverable => match parse_bool_arg(&params.arguments) {
+        BluetoothAction::SetEnabled | BluetoothAction::SetDiscoverable => match parse_bool_arg(&params.arguments) {
             Some(on) => {
                 let controller = controller.clone();
                 tokio::spawn(async move {
-                    controller.set_discoverable(on).await;
+                    match action {
+                        BluetoothAction::SetEnabled => controller.set_enabled(on).await,
+                        _ => controller.set_discoverable(on).await,
+                    }
                 });
             }
             None => crate::log_malformed_command(params),
