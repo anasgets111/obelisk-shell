@@ -17,7 +17,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use rusty_network_manager::dbus_interface_types::{NMActiveConnectionState, NMDeviceState, NMDeviceType};
+use rusty_network_manager::dbus_interface_types::{
+    NMActiveConnectionState, NMActiveConnectionStateReason, NMDeviceState, NMDeviceType,
+};
 use rusty_network_manager::{
     AccessPointProxy, DeviceProxy, NetworkManagerProxy, SettingsConnectionProxy, SettingsProxy, WirelessProxy,
 };
@@ -93,8 +95,9 @@ pub struct NetworkState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_error: Option<String>,
     /// SSID whose `network:connect` waits for a password, or `nil`. Set by
-    /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) only when needed;
-    /// cleared by the consuming attempt or `network:cancel_connect`.
+    /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile
+    /// or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt
+    /// or `network:cancel_connect`.
     ///
     /// Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037).
     /// The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a
@@ -123,7 +126,7 @@ pub enum NetworkSignal {
     /// Any non-`scanning` field change: AP set, association, device state, or radio. All trigger
     /// the same full re-derive (ADR-0029), so one variant is enough.
     Changed,
-    /// `LastScan` changed, so a Supervisor-triggered scan finished.
+    /// `LastScan` changed, or NetworkManager refused `RequestScan`. Either way no scan is in flight.
     ScanCompleted,
     /// Sent by [`NetworkController::mark_scanning`] before `RequestScan` completes (§4.2), through
     /// the same channel for FIFO ordering.
@@ -577,6 +580,9 @@ impl NetworkController {
         };
         if let Err(err) = wifi.wireless.request_scan(HashMap::new()).await {
             eprintln!("network: RequestScan failed: {err}");
+            // A refused scan never moves `LastScan`, so `mark_scanning`'s flag would hold until NM
+            // scans on its own, minutes later on a joined radio and never on a powered-down one.
+            let _ = self.events.send(NetworkSignal::ScanCompleted);
         }
     }
 
@@ -644,10 +650,10 @@ impl NetworkController {
         drop(secret);
         match result {
             // NM accepted the request, not completed it; the activation reports the verdict.
-            Ok(active) => self.watch_activation(active, pending.ssid),
+            Ok(active) => self.watch_activation(active, pending),
             Err(err) => {
                 eprintln!("network: connect(ssid={:?}) failed: {err}", pending.ssid);
-                self.finish_connect(&pending.ssid, Some(err.to_string()));
+                self.finish_connect(&pending, Some(err.to_string()), false);
             }
         }
     }
@@ -668,38 +674,62 @@ impl NetworkController {
 
     /// Records and pushes an attempt's verdict. Drops a verdict for a different in-flight SSID, so
     /// an older failure cannot land on a newer spinner; `connect` need not refuse overlap.
-    fn finish_connect(&self, ssid: &str, error: Option<String>) {
+    ///
+    /// `ask_password` parks the intent again and raises the prompt, keeping `connect_error` so the
+    /// prompt can say why it is back.
+    fn finish_connect(&self, pending: &PendingNetworkConnect, error: Option<String>, ask_password: bool) {
         {
             let mut state = self.state.lock().unwrap();
-            if state.connecting_ssid.as_deref() != Some(ssid) {
+            if state.connecting_ssid.as_deref() != Some(pending.ssid.as_str()) {
                 return;
             }
             state.connecting_ssid = None;
             state.connect_error = error;
+            if ask_password {
+                state.password_ssid = Some(pending.ssid.clone());
+                self.stash_connect_intent(pending.clone());
+            }
         }
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
     /// Watches one activation in the background.
-    fn watch_activation(&self, active: OwnedObjectPath, ssid: String) {
+    ///
+    /// A rejected key reopens the password prompt, as `NetworkService.qml`'s `connectFailed`
+    /// re-expands the row. Without it every later click reuses the saved profile's bad key, because
+    /// a saved profile connects without asking, and forget is the only way out.
+    ///
+    /// 802.1X profiles are left out: `activate_intent` never merges a typed PSK into one, so the
+    /// prompt would loop.
+    fn watch_activation(&self, active: OwnedObjectPath, pending: PendingNetworkConnect) {
         let controller = self.clone();
         tokio::spawn(async move {
-            let error = match tokio::time::timeout(ACTIVATION_CEILING, controller.activation_outcome(&active)).await {
-                Ok(error) => error,
-                Err(_) => Some("connection timed out".to_string()),
-            };
-            controller.finish_connect(&ssid, error);
+            let (error, ask_password) =
+                match tokio::time::timeout(ACTIVATION_CEILING, controller.activation_outcome(&active)).await {
+                    Ok(Ok(())) => (None, false),
+                    Ok(Err(reason)) => {
+                        let wrong_key = reason == Some(NMActiveConnectionStateReason::NO_SECRETS as u32)
+                            && !controller
+                                .saved_profiles_for_ssid(&pending.ssid, "connect")
+                                .await
+                                .iter()
+                                .any(|profile| profile.settings.contains_key("802-1x"));
+                        (Some(reason.map_or("connection failed", connect_error_text).to_string()), wrong_key)
+                    }
+                    Err(_) => (Some("connection timed out".to_string()), false),
+                };
+            controller.finish_connect(&pending, error, ask_password);
         });
     }
 
-    /// `None` on `ACTIVATED`, reason text on deactivation.
-    async fn activation_outcome(&self, active: &OwnedObjectPath) -> Option<String> {
-        let generic = || Some("connection failed".to_string());
+    /// `Ok` on `ACTIVATED`. `Err` on deactivation, carrying NM's reason when the `StateChanged`
+    /// signal delivered one.
+    async fn activation_outcome(&self, active: &OwnedObjectPath) -> Result<(), Option<u32>> {
         let proxy = match bind_active_connection(&self.connection, active.clone()).await {
             Ok(proxy) => proxy,
             Err(err) => {
                 eprintln!("network: failed to bind the active connection {active}: {err}");
-                return generic();
+                return Err(None);
             }
         };
         // Use the signal, not `receive_state_changed()`: the property stream gives no reason.
@@ -707,7 +737,7 @@ impl NetworkController {
             Ok(changes) => changes,
             Err(err) => {
                 eprintln!("network: failed to subscribe to StateChanged on {active}: {err}");
-                return generic();
+                return Err(None);
             }
         };
 
@@ -717,21 +747,21 @@ impl NetworkController {
         // ponytail: a failure in that gap loses its reason and reports the generic line; only the
         // signal carries it. Success does not, and is the likelier race.
         match proxy.state().await.map(NMActiveConnectionState::try_from) {
-            Ok(Ok(NMActiveConnectionState::ACTIVATED)) => return None,
-            Ok(Ok(NMActiveConnectionState::DEACTIVATED)) => return generic(),
+            Ok(Ok(NMActiveConnectionState::ACTIVATED)) => return Ok(()),
+            Ok(Ok(NMActiveConnectionState::DEACTIVATED)) => return Err(None),
             _ => {}
         }
 
         while let Some(change) = changes.next().await {
             let Ok(args) = change.args() else { continue };
             match NMActiveConnectionState::try_from(args.state) {
-                Ok(NMActiveConnectionState::ACTIVATED) => return None,
-                Ok(NMActiveConnectionState::DEACTIVATED) => return Some(connect_error_text(args.reason).to_string()),
+                Ok(NMActiveConnectionState::ACTIVATED) => return Ok(()),
+                Ok(NMActiveConnectionState::DEACTIVATED) => return Err(Some(args.reason)),
                 _ => {}
             }
         }
         // The object disappeared without a terminal state.
-        generic()
+        Err(None)
     }
 
     async fn connect_inner(
@@ -1036,4 +1066,64 @@ fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSe
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::test_support::p2p_pair;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// A controller mid-attempt on `connecting`, bound to a peer that answers nothing.
+    /// `finish_connect` only touches the state and intent slots, so no call leaves the process.
+    async fn attempting(connecting: &str) -> (NetworkController, UnboundedReceiver<NetworkSignal>, zbus::Connection) {
+        let (connection, peer) = p2p_pair().await;
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let controller = NetworkController {
+            nm: NetworkManagerProxy::new(&connection).await.expect("binding makes no call"),
+            settings: SettingsProxy::new(&connection).await.expect("binding makes no call"),
+            connection,
+            wifi: None,
+            ethernet: Vec::new(),
+            access_points: Arc::default(),
+            state: Arc::new(Mutex::new(NetworkState {
+                connecting_ssid: Some(connecting.to_string()),
+                ..NetworkState::default()
+            })),
+            pending_connect: Arc::default(),
+            events,
+        };
+        (controller, receiver, peer)
+    }
+
+    fn home() -> PendingNetworkConnect {
+        PendingNetworkConnect { ssid: "home".to_string(), hidden: true }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_reopens_the_prompt_for_the_same_network() {
+        let (controller, mut receiver, _peer) = attempting("home").await;
+
+        controller.finish_connect(&home(), Some("wrong password".to_string()), true);
+
+        let state = controller.state.lock().unwrap().clone();
+        assert_eq!(state.connecting_ssid, None);
+        assert_eq!(state.password_ssid.as_deref(), Some("home"));
+        assert_eq!(state.connect_error.as_deref(), Some("wrong password"), "the prompt says why it is back");
+        assert_eq!(controller.take_connect_intent(), Some(home()), "the typed key needs an intent to pair with");
+        assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_an_older_attempt_changes_nothing() {
+        let (controller, mut receiver, _peer) = attempting("office").await;
+
+        controller.finish_connect(&home(), Some("wrong password".to_string()), true);
+
+        let state = controller.state.lock().unwrap().clone();
+        assert_eq!(state.connecting_ssid.as_deref(), Some("office"));
+        assert_eq!(state.password_ssid, None);
+        assert_eq!(controller.take_connect_intent(), None);
+        assert!(receiver.try_recv().is_err(), "nothing changed, so nothing is pushed");
+    }
 }

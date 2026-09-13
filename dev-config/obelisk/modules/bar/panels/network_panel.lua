@@ -386,12 +386,15 @@ local body = {
                 children = { spinner(during("waiting"), theme.icon.md), cell("connecting…", theme.DIM, theme.font.xs) },
             },
             -- `⚠ errorMessage` under the field, not at the card's top, where the mirror puts it:
-            -- the error belongs to the network being asked about.
+            -- the error belongs to the network being asked about. A password step carries one
+            -- when NetworkManager rejected the last key and the Supervisor asked again.
             row {
                 width = "Fill",
                 spacing = theme.spacing.xs,
                 align_v = "Center",
-                visible = during("failed"),
+                visible = computed({ step, obelisk.network }, function(current, n)
+                    return current == "failed" or (current == "password" and n ~= nil and n.connect_error ~= nil)
+                end),
                 children = {
                     glyph(icons.warning, theme.RED, theme.icon.sm, { align_v = "Center" }),
                     cell(util.label(obelisk.network, function(n)

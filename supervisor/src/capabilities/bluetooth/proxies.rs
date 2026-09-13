@@ -48,6 +48,9 @@ pub(super) trait Device1 {
 
     #[zbus(property)]
     fn connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn set_trusted(&self, value: bool) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(interface = "org.bluez.Battery1", default_service = "org.bluez")]

@@ -195,6 +195,11 @@
 ---@field name string Connector name, e.g. `"eDP-1"`; matches `obelisk.screens.name` and a surface's `monitor`.
 ---@field workspaces WorkspaceEntry[] Workspaces on this output, ordered by [`WorkspaceEntry::idx`]; the strip draws these because the two ids above are opaque.
 
+---@class PairedDevice
+---@field category string Drawing hint, the same set as [`ConnectedDevice::category`].
+---@field mac string Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
+---@field name string The device's advertised name.
+
 ---@class PlayerState
 ---@field album_art_path string Absolute artwork path, or empty. `mpris:artUrl` must be a `file://` URL canonicalizing to an existing file; remote/stale URLs become empty. Held across same-track updates so covers do not blink.
 ---@field artist string `xesam:artist`, joined with `", "`; empty when absent.
@@ -299,10 +304,11 @@
 ---@field inhibitors IdleInhibitor[] Idle-inhibitor holders other than this shell. A Wayland holder has an empty `who`, because no protocol names one (ADR-0160).
 
 ---@class BluetoothState
----@field connected_devices ConnectedDevice[] Paired, connected devices in BlueZ object order, which is not sorted.
+---@field connected_devices ConnectedDevice[] Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change on any rebuild. Sort before drawing.
 ---@field discovered_devices DiscoveredDevice[] Unpaired devices seen by the running scan; empties when discovery stops.
 ---@field discovering boolean Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
 ---@field enabled boolean Whether the adapter is powered. `false` also means no adapter, so it does not prove Bluetooth hardware exists.
+---@field paired_devices PairedDevice[] Paired devices that are not connected, unordered like `connected_devices`.
 
 ---@class BrightnessState
 ---`obelisk.brightness`'s full payload (§ 2.3). `percent` is the unchanged `StateSnapshot` JSON
@@ -357,7 +363,7 @@
 ---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and clears when the attempt reaches either verdict.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
 ---@field networking_enabled boolean Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the other fields describe a switched-off stack.
----@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) only when needed; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
+---@field password_ssid? string SSID whose `network:connect` waits for a password, or `nil`. Set by [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt or `network:cancel_connect`. Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037). The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a network.
 ---@field scanning boolean A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms, so the spinner starts on the click.
 ---@field ssid? string Wi-Fi SSID, `"Ethernet"` for a wired default route, or `nil` with no association. Wired wins when both are up. An association negotiating DHCP has an `ssid` but `connected == false`.
 ---@field strength integer Associated AP strength, `0` to `100`, or `0` without Wi-Fi association. Read from the merged entry the panel draws, so the bar and list agree.

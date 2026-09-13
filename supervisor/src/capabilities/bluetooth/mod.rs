@@ -52,6 +52,16 @@ pub struct ConnectedDevice {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct PairedDevice {
+    /// Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
+    pub mac: String,
+    /// The device's advertised name.
+    pub name: String,
+    /// Drawing hint, the same set as [`ConnectedDevice::category`].
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredDevice {
     /// Canonical MAC address accepted by `bluetooth:pair(mac)`.
     pub mac: String,
@@ -68,8 +78,11 @@ pub struct BluetoothState {
     pub enabled: bool,
     /// Whether discovery is running, which fills [`BluetoothState::discovered_devices`].
     pub discovering: bool,
-    /// Paired, connected devices in BlueZ object order, which is not sorted.
+    /// Paired, connected devices. Unordered: the registry is a `HashMap`, so the order can change
+    /// on any rebuild. Sort before drawing.
     pub connected_devices: Vec<ConnectedDevice>,
+    /// Paired devices that are not connected, unordered like `connected_devices`.
+    pub paired_devices: Vec<PairedDevice>,
     /// Unpaired devices seen by the running scan; empties when discovery stops.
     pub discovered_devices: Vec<DiscoveredDevice>,
 }

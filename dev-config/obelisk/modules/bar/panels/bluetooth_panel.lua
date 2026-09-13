@@ -1,7 +1,8 @@
 -- Mirrors BluetoothPanel.qml: radio switch, then paired and discovered devices in named sections.
 --
--- Discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` keeps an empty string. Paired
--- rows can show battery, disconnect and forget; available rows fall back to MAC and show pair.
+-- Discovered `name` is often `""` (§ 2.6), and Lua's `name or mac` keeps an empty string.
+-- Connected rows show battery, disconnect and forget. Paired rows reconnect on click and show
+-- forget. Available rows fall back to MAC and show pair.
 --
 -- Dropped: the "Visible" tile (`set_discoverable` is unavailable) and codec picker (`codec` is
 -- always `nil`, ADR-0030). Discovery runs while the panel shows (`lib/ui_state.lua`); the header
@@ -46,6 +47,10 @@ local ui = require("lib.ui_state")
 
 local function connected(b)
     return util.sorted_devices(b and b.connected_devices)
+end
+
+local function paired(b)
+    return util.sorted_devices(b and b.paired_devices)
 end
 
 local function discovered(b)
@@ -114,23 +119,28 @@ local function pair_button(device)
 end
 
 -- Paired and available rows share one list so neither section must guess the other's extent. It is
--- empty while the radio is off, matching the mirror's `visible: root.active && ...`.
+-- empty while the radio is off, matching the mirror's `visible: root.active && ...`. Connected
+-- devices lead the paired section, as the mirror's sort puts them. A row keeps its key across
+-- connect and disconnect, so it changes in place rather than leaving and arriving.
 local rows = obelisk.bluetooth:map(function(b)
     local out = {}
     if not enabled(b) then
         return out
     end
-    if #connected(b) > 0 then
-        out[#out + 1] = { kind = "header", label = "paired", key = "header-paired" }
-        for _, device in ipairs(connected(b)) do
-            out[#out + 1] = { kind = "device", device = device, paired = true, key = "paired-" .. tostring(device.mac) }
+    local function add(devices, status)
+        for _, device in ipairs(devices) do
+            out[#out + 1] = { kind = "device", device = device, status = status, key = "device-" .. tostring(device.mac) }
         end
     end
-    if #discovered(b) > 0 then
+    local joined, known, found = connected(b), paired(b), discovered(b)
+    if #joined + #known > 0 then
+        out[#out + 1] = { kind = "header", label = "paired", key = "header-paired" }
+        add(joined, "connected")
+        add(known, "paired")
+    end
+    if #found > 0 then
         out[#out + 1] = { kind = "header", label = "available", key = "header-available" }
-        for _, device in ipairs(discovered(b)) do
-            out[#out + 1] = { kind = "device", device = device, paired = false, key = "found-" .. tostring(device.mac) }
-        end
+        add(found, "available")
     end
     return out
 end)
@@ -141,7 +151,7 @@ local function device_row(item)
     end
     local device = item.device
     local trailing = {}
-    if item.paired then
+    if item.status == "connected" then
         local badge = battery_badge(device)
         if badge then
             trailing[#trailing + 1] = badge
@@ -149,21 +159,27 @@ local function device_row(item)
         trailing[#trailing + 1] = panel_action_icon(icons.disconnect, function()
             obelisk.bluetooth:invoke("disconnect", device.mac)
         end, { slot = "bluetooth-disconnect-" .. tostring(device.mac), tint = theme.RED })
+    end
+    if item.status == "available" then
+        trailing[#trailing + 1] = pair_button(device)
+    else
         trailing[#trailing + 1] = panel_action_icon(icons.trash, function()
             obelisk.bluetooth:invoke("forget", device.mac)
         end, { slot = "bluetooth-forget-" .. tostring(device.mac), tint = theme.RED })
-    else
-        trailing[#trailing + 1] = pair_button(device)
     end
-    -- Neither row is a button (`rowActionEnabled` is false): paired actions are icons, unpaired is
-    -- the word "pair"; the row is for reading.
+    -- Only a paired row is a button, the mirror's `canConnect`. Connected and available rows act
+    -- through their icons and the word "pair".
     return panel_row {
         slot = "bluetooth-device-" .. tostring(device.mac),
         icon = device_icon(device),
         title = display_name(device),
-        subtitle = item.paired and (device.codec and ("connected · " .. device.codec) or "connected") or nil,
-        selected = item.paired,
+        subtitle = item.status == "connected" and (device.codec and ("connected · " .. device.codec) or "connected")
+            or nil,
+        selected = item.status == "connected",
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
+        on_activate = item.status == "paired" and function()
+            obelisk.bluetooth:invoke("connect", device.mac)
+        end or nil,
     }
 end
 
@@ -217,7 +233,7 @@ local body = {
             return b.discovering and "scanning…" or "no devices found"
         end),
         util.shown_when(obelisk.bluetooth, function(b)
-            return not b.enabled or (#connected(b) == 0 and #discovered(b) == 0)
+            return not b.enabled or (#connected(b) == 0 and #paired(b) == 0 and #discovered(b) == 0)
         end),
         { icon = icons.bt_off }
     ),

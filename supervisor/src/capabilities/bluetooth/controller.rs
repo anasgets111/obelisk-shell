@@ -15,7 +15,8 @@ use super::registry::{
     DeviceRegistry, register_device, spawn_adapter_signal_forwarder, spawn_object_manager_forwarder,
 };
 use super::{
-    BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, class_to_category,
+    BluetoothActionError, BluetoothSignal, BluetoothState, ConnectedDevice, DiscoveredDevice, PairedDevice,
+    class_to_category,
 };
 
 /// Proxies needed by `obelisk.bluetooth` writes and state rebuilds. Every field is a cheap zbus
@@ -125,9 +126,10 @@ impl BluetoothController {
                 state.clone()
             }
             BluetoothSignal::DeviceRegistryChanged => {
-                let (connected_devices, discovered_devices) = self.build_device_lists().await;
+                let (connected_devices, paired_devices, discovered_devices) = self.build_device_lists().await;
                 let mut state = self.state.lock().unwrap();
                 state.connected_devices = connected_devices;
+                state.paired_devices = paired_devices;
                 state.discovered_devices = discovered_devices;
                 state.clone()
             }
@@ -161,40 +163,38 @@ impl BluetoothController {
         }
     }
 
-    /// Re-derives both lists from the full registry. `connected_devices` contains entries that
-    /// are both `Paired` and `Connected` (§5); `discovered_devices` contains unpaired entries.
-    /// Failed `Paired`/`Connected` reads exclude an entry from both. Discovery is not session-
-    /// scoped; see `dbus/bluetooth/mod.rs`'s ponytail note.
-    async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<DiscoveredDevice>) {
+    /// Re-derives the three lists from the full registry: paired and connected, paired only, and
+    /// unpaired. A failed `Paired` or `Connected` read counts as `false`. Discovery is not
+    /// session-scoped; see `dbus/bluetooth/mod.rs`'s ponytail note.
+    async fn build_device_lists(&self) -> (Vec<ConnectedDevice>, Vec<PairedDevice>, Vec<DiscoveredDevice>) {
         let snapshot: Vec<(String, Device1Proxy<'static>, Option<Battery1Proxy<'static>>)> = {
             let guard = self.devices.lock().unwrap();
             guard.values().map(|entry| (entry.mac.clone(), entry.device.clone(), entry.battery.clone())).collect()
         };
 
         let mut connected = Vec::new();
+        let mut paired_only = Vec::new();
         let mut discovered = Vec::new();
         for (mac, device, battery) in snapshot {
             let paired = device.paired().await.unwrap_or(false);
             let is_connected = device.connected().await.unwrap_or(false);
             let name = device.name().await.unwrap_or_default();
-            if paired && is_connected {
-                let class = device.class().await.unwrap_or(0);
-                let battery_percent = match &battery {
-                    Some(battery) => battery.percentage().await.map(i32::from).unwrap_or(-1),
-                    None => -1,
-                };
-                connected.push(ConnectedDevice {
-                    mac,
-                    name,
-                    battery: battery_percent,
-                    codec: None,
-                    category: class_to_category(class).to_string(),
-                });
-            } else if !paired {
+            if !paired {
                 discovered.push(DiscoveredDevice { mac, name, paired: false });
+                continue;
             }
+            let category = class_to_category(device.class().await.unwrap_or(0)).to_string();
+            if !is_connected {
+                paired_only.push(PairedDevice { mac, name, category });
+                continue;
+            }
+            let battery_percent = match &battery {
+                Some(battery) => battery.percentage().await.map(i32::from).unwrap_or(-1),
+                None => -1,
+            };
+            connected.push(ConnectedDevice { mac, name, battery: battery_percent, codec: None, category });
         }
-        (connected, discovered)
+        (connected, paired_only, discovered)
     }
 
     /// Synchronously resolves `mac` to its tracked path and `Device1` proxy. No `.await`, so the
@@ -240,28 +240,33 @@ impl BluetoothController {
         }
     }
 
-    /// `bluetooth:pair(mac)`. An unresolvable `mac` is logged and dropped, never guessed
-    /// (ADR-0030).
+    /// `bluetooth:pair(mac)`, then [`connect`](Self::connect), as `BluetoothService.qml`'s
+    /// `connectAfterPairAddress` does. `Pair` returns when pairing ends, so no `Paired` watch is
+    /// needed. An unresolvable `mac` is logged and dropped, never guessed (ADR-0030).
     pub async fn pair(&self, mac: &str) {
-        match self.resolve_device(mac) {
-            Some((_, device)) => {
-                if let Err(err) = device.pair().await {
-                    eprintln!("bluetooth: pair({mac:?}) failed: {err}");
-                }
-            }
-            None => eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice),
+        let Some((_, device)) = self.resolve_device(mac) else {
+            eprintln!("bluetooth: pair({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
+            return;
+        };
+        if let Err(err) = device.pair().await {
+            eprintln!("bluetooth: pair({mac:?}) failed: {err}");
+            return;
         }
+        self.connect(mac).await;
     }
 
-    /// `bluetooth:connect(mac)`.
+    /// `bluetooth:connect(mac)`. Sets `Trusted` first, as `BluetoothService.qml` does, so the device
+    /// can reconnect on its own later without the agent authorizing each service.
     pub async fn connect(&self, mac: &str) {
-        match self.resolve_device(mac) {
-            Some((_, device)) => {
-                if let Err(err) = device.connect().await {
-                    eprintln!("bluetooth: connect({mac:?}) failed: {err}");
-                }
-            }
-            None => eprintln!("bluetooth: connect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice),
+        let Some((_, device)) = self.resolve_device(mac) else {
+            eprintln!("bluetooth: connect({mac:?}) failed: {}", BluetoothActionError::UnknownDevice);
+            return;
+        };
+        if let Err(err) = device.set_trusted(true).await {
+            eprintln!("bluetooth: failed to set Trusted on {mac:?}: {err}");
+        }
+        if let Err(err) = device.connect().await {
+            eprintln!("bluetooth: connect({mac:?}) failed: {err}");
         }
     }
 
