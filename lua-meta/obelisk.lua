@@ -389,7 +389,7 @@
 ---@field available_networks AccessPointInfo[] Last completed scan: SSID-deduplicated, connected first, then strongest, capped at 20. Kept while [`NetworkState::scanning`] is true so the panel does not blank; payload order is ready to draw.
 ---@field connect_error? string Display text for the last failed `network:connect`, or `nil` after success or before any attempt. `AddAndActivateConnection2` returns before the radio tries; this is filled later from the activation's `StateChanged(state, reason)`, where a wrong password is knowable. Sticky until the next attempt, like `UpdatesState::check_error`.
 ---@field connected boolean A connection carries the default route, from `PrimaryConnection` (§2.5). `/` means none, hence offline.
----@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and clears when the attempt reaches either verdict.
+---@field connecting_ssid? string SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and clears when the attempt reaches a verdict or `network:abort_connect` stops it.
 ---@field ethernet_enabled boolean A wired device is activated. This is the setter's read-back; carrier stays up when a cable is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
 ---@field ethernet_ip? string The first activated wired device's IPv4 address without its prefix, or `nil`.
 ---@field ethernet_present boolean At least one wired device exists, cable or not.

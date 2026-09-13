@@ -101,8 +101,8 @@ pub struct NetworkState {
     /// Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown or no
     /// wired link is activated.
     pub ethernet_speed: u32,
-    /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs and
-    /// clears when the attempt reaches either verdict.
+    /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and
+    /// clears when the attempt reaches a verdict or `network:abort_connect` stops it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_ssid: Option<String>,
     /// Display text for the last failed `network:connect`, or `nil` after success or before any
@@ -297,6 +297,15 @@ struct SavedProfile {
     settings: HashMap<String, HashMap<String, OwnedValue>>,
 }
 
+/// A join NM has accepted: the activation that reports its verdict, and the profile it created.
+#[derive(Debug, Clone, PartialEq)]
+struct InFlight {
+    active: OwnedObjectPath,
+    /// Set when `AddAndActivateConnection2` saved a new profile for this join, which an abort
+    /// deletes rather than leaving a half-typed key saved.
+    created: Option<OwnedObjectPath>,
+}
+
 /// Proxies needed by `obelisk.network`, resolved at construction. `Clone` is cheap for zbus handles,
 /// so writes can move a clone into `tokio::spawn` (ADR-0029).
 #[derive(Clone)]
@@ -324,10 +333,10 @@ pub struct NetworkController {
     state: Arc<Mutex<NetworkState>>,
     /// The single pending `network:connect` intent slot, see [`PendingNetworkConnect`].
     pending_connect: Arc<Mutex<Option<PendingNetworkConnect>>>,
-    /// The activation of the attempt `connecting_ssid` names, once NM has accepted it, for
-    /// [`abort_connect`](Self::abort_connect). Written under the state lock, so an abort never sees
-    /// an attempt without also seeing its activation.
-    in_flight: Arc<Mutex<Option<OwnedObjectPath>>>,
+    /// The attempt `connecting_ssid` names, once NM has accepted it, for
+    /// [`abort_connect`](Self::abort_connect) and for matching its verdict. Written under the state
+    /// lock, so an abort never sees an attempt without also seeing its activation.
+    in_flight: Arc<Mutex<Option<InFlight>>>,
     /// Signal sender for [`mark_scanning`](Self::mark_scanning)'s FIFO event and for keeping the
     /// channel open when no Wi-Fi device exists.
     events: UnboundedSender<NetworkSignal>,
@@ -473,6 +482,9 @@ impl NetworkController {
     /// Rescans the device set after NetworkManager added or removed a device, and restarts the
     /// watchers. The new watchers start before the old ones are aborted, so no state change falls
     /// in a gap; the overlap costs at most one extra rebuild.
+    ///
+    /// Returns early when the Wi-Fi and wired devices are the ones already watched. Most additions
+    /// are veth, bridge or VPN devices, and restarting every watcher for them only costs rebuilds.
     async fn refresh_devices(&self) {
         let (wifi, ethernet) = match resolve_devices(&self.connection, &self.nm).await {
             Ok(found) => found,
@@ -481,6 +493,14 @@ impl NetworkController {
                 return;
             }
         };
+        let unchanged = {
+            let current = self.devices.lock().unwrap();
+            current.wifi.as_ref().map(|wifi| &wifi.device_path) == wifi.as_ref().map(|wifi| &wifi.device_path)
+                && current.ethernet.iter().map(|device| &device.path).eq(ethernet.iter().map(|device| &device.path))
+        };
+        if unchanged {
+            return;
+        }
         eprintln!("network: device set changed: wifi={} ethernet={}", wifi.is_some(), ethernet.len());
         let watchers = watch_devices(&self.connection, wifi.as_ref(), &ethernet, &self.events);
         let previous = std::mem::replace(&mut *self.devices.lock().unwrap(), Devices { wifi, ethernet, watchers });
@@ -595,15 +615,15 @@ impl NetworkController {
 
     /// `network:abort_connect()`: stops the join in flight, as `NetworkService.qml`'s
     /// `cancelConnect` does. Clears `connecting_ssid` first, so the activation's late verdict finds
-    /// no attempt to report on, then deactivates that one activation.
+    /// no attempt to report on, then stops that one join with [`stop`](Self::stop).
     ///
     /// The mirror called `Device.Disconnect`, guarded by `wifiOnline` because it would also tear
-    /// down a live session. Deactivating the attempt's own activation needs no guard.
+    /// down a live session. Stopping only the attempt's own join needs no guard.
     ///
     /// No-op without an attempt. An abort that lands before NM accepts the request finds no
-    /// activation yet; `connect` sees the cleared attempt and deactivates it there.
+    /// activation yet; `connect` sees the cleared attempt and stops it there.
     pub fn abort_connect(&self) {
-        let active = {
+        let in_flight = {
             let mut state = self.state.lock().unwrap();
             if state.connecting_ssid.take().is_none() {
                 return;
@@ -613,17 +633,27 @@ impl NetworkController {
         };
         eprintln!("network: the join in flight was aborted");
         let _ = self.events.send(NetworkSignal::Changed);
-        if let Some(active) = active {
+        if let Some(in_flight) = in_flight {
             let controller = self.clone();
             tokio::spawn(async move {
-                controller.deactivate(&active).await;
+                controller.stop(&in_flight).await;
             });
         }
     }
 
-    async fn deactivate(&self, active: &OwnedObjectPath) {
-        if let Err(err) = self.nm.deactivate_connection(active).await {
-            eprintln!("network: failed to deactivate the aborted activation {active}: {err}");
+    /// Stops an aborted join. A profile the join created is deleted, which NM also takes as the end
+    /// of its activation, so a cancelled first join leaves no saved key behind. A join through an
+    /// existing profile is only deactivated.
+    async fn stop(&self, in_flight: &InFlight) {
+        let result = match &in_flight.created {
+            Some(created) => match bind_settings_connection(&self.connection, created.clone()).await {
+                Ok(connection) => connection.delete().await,
+                Err(err) => Err(err),
+            },
+            None => self.nm.deactivate_connection(&in_flight.active).await,
+        };
+        if let Err(err) = result {
+            eprintln!("network: failed to stop the aborted join {}: {err}", in_flight.active);
         }
     }
 
@@ -777,24 +807,24 @@ impl NetworkController {
         drop(secret);
         match result {
             // NM accepted the request, not completed it; the activation reports the verdict.
-            Ok(active) => {
+            Ok(in_flight) => {
                 let aborted = {
                     let state = self.state.lock().unwrap();
                     let aborted = state.connecting_ssid.as_deref() != Some(pending.ssid.as_str());
                     if !aborted {
-                        *self.in_flight.lock().unwrap() = Some(active.clone());
+                        *self.in_flight.lock().unwrap() = Some(in_flight.clone());
                     }
                     aborted
                 };
                 if aborted {
-                    self.deactivate(&active).await;
+                    self.stop(&in_flight).await;
                 } else {
-                    self.watch_activation(active, pending);
+                    self.watch_activation(in_flight.active, pending);
                 }
             }
             Err(err) => {
                 eprintln!("network: connect(ssid={:?}) failed: {err}", pending.ssid);
-                self.finish_connect(&pending, Some(err.to_string()), false);
+                self.finish_connect(&pending, None, Some(err.to_string()), false);
             }
         }
     }
@@ -809,24 +839,37 @@ impl NetworkController {
             // The attempt answers the prompt. Clear here, not only in `secure_submit`, so direct
             // connects also drop bar keyboard focus on Enter.
             state.password_ssid = None;
+            // The new attempt owns no activation until NM accepts it, so an abort before then
+            // cannot stop the previous join.
+            *self.in_flight.lock().unwrap() = None;
         }
         let _ = self.events.send(NetworkSignal::Changed);
     }
 
-    /// Records and pushes an attempt's verdict. Drops a verdict for a different in-flight SSID, so
-    /// an older failure cannot land on a newer spinner; `connect` need not refuse overlap.
+    /// Records and pushes an attempt's verdict. `active` is the activation the verdict came from, or
+    /// `None` when the attempt failed before NM accepted it. The verdict counts only for the attempt
+    /// still in flight, by SSID and by activation, so a verdict from an aborted or older join cannot
+    /// land on a newer spinner; `connect` need not refuse overlap.
     ///
     /// `ask_password` parks the intent again and raises the prompt, keeping `connect_error` so the
     /// prompt can say why it is back.
-    fn finish_connect(&self, pending: &PendingNetworkConnect, error: Option<String>, ask_password: bool) {
+    fn finish_connect(
+        &self,
+        pending: &PendingNetworkConnect,
+        active: Option<&OwnedObjectPath>,
+        error: Option<String>,
+        ask_password: bool,
+    ) {
         {
             let mut state = self.state.lock().unwrap();
-            if state.connecting_ssid.as_deref() != Some(pending.ssid.as_str()) {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let current = in_flight.as_ref().map(|in_flight| &in_flight.active);
+            if state.connecting_ssid.as_deref() != Some(pending.ssid.as_str()) || current != active {
                 return;
             }
             state.connecting_ssid = None;
             state.connect_error = error;
-            *self.in_flight.lock().unwrap() = None;
+            *in_flight = None;
             if ask_password {
                 state.password_ssid = Some(pending.ssid.clone());
                 self.stash_connect_intent(pending.clone());
@@ -860,7 +903,7 @@ impl NetworkController {
                     }
                     Err(_) => (Some("connection timed out".to_string()), false),
                 };
-            controller.finish_connect(&pending, error, ask_password);
+            controller.finish_connect(&pending, Some(&active), error, ask_password);
         });
     }
 
@@ -906,11 +949,7 @@ impl NetworkController {
         Err(None)
     }
 
-    async fn connect_inner(
-        &self,
-        pending: &PendingNetworkConnect,
-        secret: &[u8],
-    ) -> Result<OwnedObjectPath, ConnectError> {
+    async fn connect_inner(&self, pending: &PendingNetworkConnect, secret: &[u8]) -> Result<InFlight, ConnectError> {
         let wifi = self.wifi().ok_or(ConnectError::NoWifiDevice)?;
         let mut intent = connection_intent(&pending.ssid, pending.hidden, secret)?;
         let result = self.activate_intent(&intent, &wifi).await;
@@ -925,19 +964,15 @@ impl NetworkController {
     /// Joins `intent`'s network, reusing a saved profile when present. NM does not deduplicate:
     /// `AddAndActivateConnection2` accepts another profile with the same id and SSID, so creating
     /// unconditionally left stale duplicates that autoconnect could choose. Returns the activation
-    /// path where its outcome is reported.
-    async fn activate_intent(
-        &self,
-        intent: &ConnectionIntent,
-        wifi: &WifiDevice,
-    ) -> Result<OwnedObjectPath, ConnectError> {
+    /// where its outcome is reported, and the profile it created, if it created one.
+    async fn activate_intent(&self, intent: &ConnectionIntent, wifi: &WifiDevice) -> Result<InFlight, ConnectError> {
         let Some(saved) = self.saved_profiles_for_ssid(&intent.ssid, "connect").await.into_iter().next() else {
             let dict = build_connection_dict(intent);
-            let (_, active, _) = self
+            let (created, active, _) = self
                 .nm
                 .add_and_activate_connection2(dict, &wifi.device_path, &root_object_path(), HashMap::new())
                 .await?;
-            return Ok(active);
+            return Ok(InFlight { active, created: Some(created) });
         };
 
         // A typed password corrects the saved key; otherwise a bad profile could only be forgotten
@@ -950,7 +985,8 @@ impl NetworkController {
         {
             saved.connection.update(merge_psk(&saved.settings, psk)).await?;
         }
-        Ok(self.nm.activate_connection(&saved.path, &wifi.device_path, &root_object_path()).await?)
+        let active = self.nm.activate_connection(&saved.path, &wifi.device_path, &root_object_path()).await?;
+        Ok(InFlight { active, created: None })
     }
 
     /// Every saved Wi-Fi profile for `ssid`, paired with the settings dict that matched it.
@@ -1425,7 +1461,7 @@ mod tests {
     async fn a_rejected_key_reopens_the_prompt_for_the_same_network() {
         let (controller, mut receiver, _peer) = attempting("home").await;
 
-        controller.finish_connect(&home(), Some("wrong password".to_string()), true);
+        controller.finish_connect(&home(), None, Some("wrong password".to_string()), true);
 
         let state = controller.state.lock().unwrap().clone();
         assert_eq!(state.connecting_ssid, None);
@@ -1439,7 +1475,7 @@ mod tests {
     async fn a_verdict_for_an_older_attempt_changes_nothing() {
         let (controller, mut receiver, _peer) = attempting("office").await;
 
-        controller.finish_connect(&home(), Some("wrong password".to_string()), true);
+        controller.finish_connect(&home(), None, Some("wrong password".to_string()), true);
 
         let state = controller.state.lock().unwrap().clone();
         assert_eq!(state.connecting_ssid.as_deref(), Some("office"));
@@ -1456,7 +1492,7 @@ mod tests {
         assert_eq!(controller.state.lock().unwrap().connecting_ssid, None, "the spinner stops on the click");
         assert_eq!(receiver.try_recv(), Ok(NetworkSignal::Changed));
 
-        controller.finish_connect(&home(), Some("disconnected".to_string()), false);
+        controller.finish_connect(&home(), None, Some("disconnected".to_string()), false);
         let state = controller.state.lock().unwrap().clone();
         assert_eq!(state.connect_error, None, "a cancelled join is not a failure");
         assert!(receiver.try_recv().is_err());
@@ -1470,5 +1506,36 @@ mod tests {
         controller.abort_connect();
 
         assert!(receiver.try_recv().is_err(), "closing a sheet with nothing in flight pushes nothing");
+    }
+
+    fn activation(n: u32) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(format!("/org/freedesktop/NetworkManager/ActiveConnection/{n}"))
+            .expect("valid object path")
+    }
+
+    #[tokio::test]
+    async fn a_verdict_from_another_activation_is_dropped() {
+        // Abort a join, then join the same SSID again: the first activation's DEACTIVATED must not
+        // end the second attempt.
+        let (controller, mut receiver, _peer) = attempting("home").await;
+        *controller.in_flight.lock().unwrap() = Some(InFlight { active: activation(2), created: None });
+
+        controller.finish_connect(&home(), Some(&activation(1)), Some("disconnected".to_string()), false);
+        assert_eq!(controller.state.lock().unwrap().connecting_ssid.as_deref(), Some("home"));
+        assert!(receiver.try_recv().is_err());
+
+        controller.finish_connect(&home(), Some(&activation(2)), None, false);
+        assert_eq!(controller.state.lock().unwrap().connecting_ssid, None);
+        assert_eq!(*controller.in_flight.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_new_attempt_owns_no_activation_until_nm_accepts_it() {
+        let (controller, _receiver, _peer) = attempting("home").await;
+        *controller.in_flight.lock().unwrap() = Some(InFlight { active: activation(1), created: None });
+
+        controller.begin_connect("office");
+
+        assert_eq!(*controller.in_flight.lock().unwrap(), None, "an abort now must not stop home's join");
     }
 }
