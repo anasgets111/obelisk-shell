@@ -30,8 +30,6 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Rollback**: Preservation of the working scene or generation when a reload fails. _Avoid_: revert, recovery
 
-**Rescue process**: A separate process that displays an evaluation error when no working config can display it. _Avoid_: rescue mode, fallback config, rescue generation
-
 ## Surfaces
 
 **Surface**: A top-level declaration in shell.lua with a fixed role and one or more surface instances. The declared set belongs to a generation. _Avoid_: window, panel, layer

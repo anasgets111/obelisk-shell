@@ -123,13 +123,13 @@ Positional arguments validated by capability dispatch. Read-only capabilities ha
 | `updates` | `check()`, `configure({ interval, checked_at?, packages? })`, `install()` |
 | `power` | `set_profile(name)` |
 | `tray` | `activate(id, x, y)`, `secondary_activate(id, x, y)`, `scroll(id, delta, orientation)`, `menu_will_show(id, submenu_id)`, `activate_menu_item(id, menu_item_id)` |
-| `lock` | `lock()` |
+| `lock` | `lock()`, `set_unlock_animation(ms)` |
 | `polkit` | `cancel()` |
 
 Device, player, app, tray and notification targets use snapshot IDs.
 Volumes use 0–1; percentages use 0–100; layout indices are zero-based.
 MPRIS commands accept `play`, `pause`, `play_pause`, `next`, `previous`; seeks take microseconds.
-File watches take an absolute directory path and optional dot-free extensions.
+File watches take an absolute directory path and optional extensions.
 Session-process signals are named without their `SIG` prefix, from a closed list:
 `TERM`, `INT`, `HUP`, `QUIT`, `USR1`, `USR2`, `KILL`, `STOP`, `CONT`.
 Authentication for `lock` and `polkit` uses native secure submission instead of action arguments.
@@ -145,6 +145,8 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
+| `process.detach(cmd, args)` | Spawns a program in its own session that outlives the shell; no handle, output or exit code |
+| `action(name, handler)` | Declares what `obelisk call <name>` runs; the return is printed as JSON. One evaluation only |
 | `session_process { name, stop_signal? }` | Declares a program whose lifetime is the session's; returns a handle with `running`/`pid`/`started_at`/`exit_code`/`start_error` signals and `start`/`signal`/`stop` methods |
 
 See [idle wrapper](../renderer/src/lua/idle.rs), [timers](../renderer/src/lua/timer.rs),
@@ -275,9 +277,9 @@ See [paint parsing](../renderer/src/layout/node/paint_style.rs).
 | `rect` | `children`; box painting |
 | `row` | `children`, `spacing`, `scroll`; horizontal flow |
 | `column` | `children`, `spacing`, `scroll`; vertical flow |
-| `text` | `content`, `font_size`, `foreground`, `text_align`, `elide`, `wrap`, `max_lines`, `on_link` |
+| `text` | `content`, `font`, `font_size`, `foreground`, `text_align`, `elide`, `wrap`, `max_lines`, `on_link` |
 | `icon` | `name`, `size`, `foreground`; name is a theme name or absolute image path |
-| `image` | `source`, `fit`, `async`; fit is `"cover"` by default, `"contain"` or `"stretch"` |
+| `image` | `source`, `fit`, `async`, `retain`, `transition`; fit is `"cover"` by default, `"contain"` or `"stretch"` |
 | `button` | `children`, `on_click`, `on_drag`, `on_wheel`, `submit` |
 | `list` | `source`, `itemfn`, optional `key`, `direction`, `spacing`, `scroll` |
 | `textfield` | `placeholder`, `font_size`, `foreground`, `text_align`, `autofocus`, `on_change`, `on_submit`, `on_cancel`, `on_navigate`, `secure_submit`, `mask_character` |
@@ -374,6 +376,7 @@ See [wire format and dispatch limits](services.md#13-control-socket-and-wire-for
 | `obelisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
 | `obelisk toggle <name>` | Toggles declared boolean state |
 | `obelisk toggle <name> <value>` | Sets declared state to the value, or back to its declared initial when it already holds it; one keybind for a modal whose state names the one showing |
+| `obelisk call <name> [args...]` | Runs the config's `action(name)` with JSON-or-string arguments, prints its return; non-zero exit on failure |
 
 `check` does not validate live service behavior or rendered layout.
 See [CLI](../supervisor/src/cli.rs) and [check implementation](../renderer/src/check.rs).

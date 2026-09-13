@@ -26,7 +26,7 @@ state and reconciling the retained scene.
 | Blur | `ext-background-effect-v1`, ignored where absent |
 | Workspaces, keyboard layout | niri or Hyprland |
 | Updates capability | pacman, through libalpm |
-| Linked at build | PipeWire, PAM, udev, evdev, EGL, fontconfig |
+| Linked at build | PipeWire, PAM, udev, EGL, xkbcommon, libwayland-client |
 
 Lua 5.4 is vendored, so no system Lua is needed.
 
@@ -77,7 +77,7 @@ signal, so the `:map` above re-resolves that clock without re-running the config
 and stays for the session.
 
 applications, audio, battery, bluetooth, brightness, files, idle, keyboard, lock, mpris, network,
-notifications, power, privacy, processes, storage, sysinfo, system, tray, updates, workspaces.
+notifications, polkit, power, privacy, processes, storage, sysinfo, system, tray, updates, workspaces.
 
 ## Keybinds
 

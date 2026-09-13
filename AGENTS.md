@@ -39,5 +39,5 @@ Before writing code, trace the real flow end to end, then stop at the first rung
 ## Testing
 
 - **Never hardcode `/sys` or `/proc`.** Readers take `sys_root`/`proc_root`; tests point them at a tempdir.
-- **Tests live beside the code** in `#[cfg(test)] mod tests`. Only `shared/tests` checks wire types from outside.
+- **Tests live beside the code** in `#[cfg(test)] mod tests`; `shared/tests` is the one exception.
 - **D-Bus tests use `p2p_pair()`** (`capabilities/test_support.rs`), never the session bus.

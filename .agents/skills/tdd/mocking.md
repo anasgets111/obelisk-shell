@@ -6,7 +6,7 @@ your own modules.
 How this repo does it:
 
 - **sysfs/procfs and D-Bus:** see `AGENTS.md` § Testing.
-- **Environment:** pass the values in (`shared::paths::config_dir_from`); `set_var` races every concurrent
+- **Environment:** pass the values in (`config_dir_from` in `shared/src/paths.rs`); `set_var` races every concurrent
   `getenv`.
 - **Lua:** evaluate an inline fixture in a tempdir, never `dev-config`.
 

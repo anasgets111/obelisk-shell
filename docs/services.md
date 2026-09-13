@@ -10,7 +10,7 @@ supports it; the clock, hardware telemetry and update checks use their own sched
 Lua owns presentation and user policy.
 
 Capability commands use `obelisk.<name>:invoke("action", ...)`. The exceptions are the
-dedicated idle methods, `persistent_table` and `process.run`.
+dedicated idle methods, `persistent_table`, `session_process`, `process.run` and `process.detach`.
 
 ## 1. Notifications
 
@@ -81,7 +81,7 @@ Scanning is asynchronous. Results merge duplicate SSIDs and retain the connected
 networks, then the strongest alternatives, capped at 20. Frequency supplies the band. Scan progress is published.
 
 Saved profiles activate without duplication. Open networks need no credential. Secured connections
-request native secure submission; credentials never enter Lua.
+request native secure submission; credentials never enter Lua. `forget` and `disconnect_wifi` are also supported.
 See [network](../supervisor/src/capabilities/network/mod.rs) and
 [connection handling](../supervisor/src/capabilities/network/connect.rs).
 
@@ -94,7 +94,7 @@ Supported actions are enable, visibility, start/stop discovery, pair, connect, d
 and answering a pairing prompt. The agent registers as `DisplayYesNo` and puts each confirmation,
 authorization or code display in `pairing_request` for the user, but only while the adapter is
 visible or this shell is pairing that device.
-Stopping discovery preserves the last discovered list; starting it clears that list.
+Starting discovery clears the discovered list, and the list empties when discovery stops.
 
 ### 5.2 Battery and category
 
@@ -126,12 +126,12 @@ equal durations share a Wayland listener. Registrations reset on re-evaluation.
 
 `obelisk.idle:inhibit(reason)` and `release_inhibit()` refcount one logind
 `Inhibit(what="idle", mode="block")` fd across generation holds. Logind idle inhibition suppresses
-threshold events and resumes reported thresholds. `idle.inhibited` reflects shell holds;
+threshold events and resumes reported thresholds. `idle.inhibited` reflects any logind or compositor idle hold;
 `idle.inhibitors` names external holders.
 
 Logind's session Lock signal and config lock commands request the session lock flow. The Supervisor
 owns lock decisions; the Renderer owns protocol surfaces. Only successful authentication authorizes
-unlock. Renderer crashes cannot unlock the compositor.
+unlock; `set_unlock_animation` keeps the lock up for at most 600 ms after it. Renderer crashes cannot unlock the compositor.
 
 Polkit agent registration is on-demand. Challenge state and cancel actions belong to the Supervisor;
 secrets route directly from native input to the authentication helper.
@@ -162,7 +162,8 @@ See [sysinfo](../supervisor/src/capabilities/sysinfo/mod.rs).
 
 `process.run(cmd, args, out_cb, exit_cb)` spawns a separate process group and streams newline-stripped
 lines. `out_cb(line, stream)` identifies the stream; `exit_cb(code)` uses nil for a signal exit.
-The handle exposes `kill()`.
+The handle exposes `kill()`. `process.detach(cmd, args)` starts a program in its own session with no
+handle; nothing reaps it.
 
 Generation retirement and Supervisor shutdown reap managed children using SIGTERM and a 100 ms grace
 before SIGKILL. In-place reload preserves the generation without restarting processes.
@@ -172,7 +173,7 @@ See [process registry](../supervisor/src/process/registry.rs).
 than by a generation, so the retirement sweep never sees them; they survive every reload and are
 reaped only at shutdown, with the signal each declaration named and a five-second grace before
 SIGKILL. The longer grace is deliberate: a program is declared this way because it is doing
-something long, and the first one to use it writes a video container it has to close on the way out.
+something long.
 
 One task per running program owns its `Child` and is the only place its pid is signalled, so no
 signal can reach a recycled pid. That is what replaces the pid-plus-kernel-start-time bookkeeping a
@@ -227,8 +228,8 @@ Commands carry generation and revision metadata:
 ```
 
 Inbound frames are tagged with the connection's generation ID.
-Ordinary command dispatch does not currently enforce sender authority or the envelope's
-generation/revision claims. These fields are not authorization guarantees.
+Frames from a non-authoritative generation, or naming another generation, are dropped. Nothing checks
+`expected_revision`, so it is not an authorization guarantee.
 See [wire types](../shared/src/lib.rs), [socket](../supervisor/src/socket.rs) and
 [dispatch](../supervisor/src/supervisor.rs).
 
