@@ -16,11 +16,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::capabilities::audio::master;
 
+use super::PropsLookup;
 use super::state::{
     AudioCommand, AudioState, BluezCard, DEFAULT_AUDIO_SINK_KEY, DEFAULT_AUDIO_SOURCE_KEY, DefaultDevice, DeviceEntry,
-    DeviceRoute, MixerState, NodeKind, PrivacySources, PropsLookup, apply_capture_info_event, apply_info_event,
-    apply_video_info_event, classify, device_names,
+    DeviceRoute, MixerState, PrivacySources, device_names,
 };
+use super::streams::{NodeKind, apply_capture_info_event, apply_info_event, apply_video_info_event, classify};
 use super::write::apply_command;
 
 /// Runs the listener until process exit. Sends [`AudioState`] on every relevant

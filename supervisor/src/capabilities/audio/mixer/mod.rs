@@ -32,10 +32,33 @@
 
 mod registry;
 mod state;
+mod streams;
 mod write;
 
 pub use registry::{AudioCommandSender, command_channel, run};
-pub use state::{AudioCommand, CaptureApp, PrivacySources, VideoSourceApp};
+pub use state::{AudioCommand, PrivacySources};
+pub use streams::{CaptureApp, VideoSourceApp};
 // `main.rs` names this on `ensure_mixer_thread`'s sender: lazy start (ADR-0070) leaves the
 // channel alive beyond thread construction, so `run` no longer supplies the item type.
 pub use state::AudioState;
+
+use std::collections::HashMap;
+
+use pipewire::spa::utils::dict::DictRef;
+
+/// String lookup shared by live PipeWire dicts and recorded `pw-dump` maps in tests.
+pub(super) trait PropsLookup {
+    fn get_prop(&self, key: &str) -> Option<&str>;
+}
+
+impl PropsLookup for DictRef {
+    fn get_prop(&self, key: &str) -> Option<&str> {
+        self.get(key)
+    }
+}
+
+impl PropsLookup for HashMap<String, String> {
+    fn get_prop(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
