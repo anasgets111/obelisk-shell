@@ -312,7 +312,7 @@ See [list construction](../renderer/src/layout/node/spec.rs).
 A click fires on release inside the pressed target. Drag ends on release or surface leave;
 a left click can also fire after drag end. The innermost wheel handler or scrolling container wins.
 A button with `submit = true` submits the scope's armed `secure_submit` field.
-See [input handling](../renderer/src/wayland/input.rs).
+See [input handling](../renderer/src/wayland/input/mod.rs).
 
 Ordinary text fields expose their full draft through `on_change(text)` and `on_submit(text)`.
 Submit empties the draft; losing focus preserves it. Escape clears it, and `on_cancel` also drops
