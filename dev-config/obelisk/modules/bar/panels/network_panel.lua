@@ -57,7 +57,7 @@ local function speed_text(mbps)
 end
 
 local function radio_on(n)
-    return n ~= nil and n.networking_enabled and n.wifi_enabled
+    return n ~= nil and n.networking_enabled and n.wifi_present and n.wifi_enabled
 end
 
 -- Header subtitle, in priority order: an off stack speaks before its radios. No payload at all means
@@ -290,7 +290,12 @@ local body = {
             panel_toggle_card {
                 slot = "network-wifi-tile",
                 icon = icons.wifi[4],
-                label = "wi-fi",
+                label = util.label(obelisk.network, function(n)
+                    return n.wifi_present and "wi-fi" or "no wi-fi"
+                end),
+                disabled = util.shown_when(obelisk.network, function(n)
+                    return not n.wifi_present
+                end),
                 -- Keyed on the association, not `ssid`. A docked laptop's joined radio still has an
                 -- address while `ssid` names the cable.
                 detail = util.label(obelisk.network, function(n)
@@ -311,7 +316,12 @@ local body = {
             panel_toggle_card {
                 slot = "network-ethernet-tile",
                 icon = icons.ethernet,
-                label = "ethernet",
+                label = util.label(obelisk.network, function(n)
+                    return n.ethernet_present and "ethernet" or "no ethernet"
+                end),
+                disabled = util.shown_when(obelisk.network, function(n)
+                    return not n.ethernet_present
+                end),
                 detail = util.label(obelisk.network, function(n)
                     return n.ethernet_enabled and detail_line(table.pack(n.ethernet_ip, speed_text(n.ethernet_speed)))
                         or ""
@@ -487,6 +497,8 @@ local body = {
                 return "network unavailable"
             elseif not n.networking_enabled then
                 return "networking off"
+            elseif not n.wifi_present then
+                return "no wi-fi adapter"
             elseif not n.wifi_enabled then
                 return "wi-fi off"
             elseif n.scanning then

@@ -78,6 +78,11 @@ pub struct NetworkState {
     /// Wi-Fi radio power, from `WirelessEnabled`; distinguishes radio-off from radio-on with no
     /// association.
     pub wifi_enabled: bool,
+    /// A Wi-Fi device exists. `wifi_enabled` alone cannot say so, because NetworkManager reports
+    /// the radio switch with no hardware behind it.
+    pub wifi_present: bool,
+    /// At least one wired device exists, cable or not.
+    pub ethernet_present: bool,
     /// Whether NetworkManager manages networking, from `NetworkingEnabled`. `false` means the
     /// other fields describe a switched-off stack.
     pub networking_enabled: bool,
@@ -418,6 +423,8 @@ impl NetworkController {
             ssid: resolve_ssid(wired, associated),
             strength: associated.map_or(0, |ap| ap.strength),
             wifi_enabled: self.nm.wireless_enabled().await.unwrap_or_default(),
+            wifi_present: self.wifi.is_some(),
+            ethernet_present: !self.ethernet.is_empty(),
             networking_enabled: self.nm.networking_enabled().await.unwrap_or_default(),
             ethernet_enabled: ethernet.is_some(),
             wifi_ip,

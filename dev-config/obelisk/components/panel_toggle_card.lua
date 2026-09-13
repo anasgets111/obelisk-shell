@@ -12,11 +12,12 @@ local util = require("lib.util")
 ---@field slot string The hover region's name; one per tile.
 ---@field icon? string|Bound Omitted draws the label alone. `PanelToggleCard.qml` takes `modelData.icon ?? ""`, so a group whose options have no glyph -- the recorder's frame rates -- draws an empty line above each word there; a missing line is the same intent without the gap.
 ---@field height? integer The tile's height. Default `theme.panel_toggle_height`, which is the radio pair in the power menu; a four-across settings group is `control.lg`, as the mirror sets.
----@field label string
+---@field label string|Bound
 ---@field detail? string|Bound A second line under the label -- a band, an address. Hidden while it reads empty.
 ---@field signal Signal The capability whose payload `read` inspects.
 ---@field read fun(payload: any): boolean
 ---@field on_change fun(checked: boolean)
+---@field disabled? Signal The mirror's `active: false`. The tile dims and ignores clicks, for hardware that is not there.
 
 local function read_bool(value, read)
     if value == nil then
@@ -80,8 +81,11 @@ return function(opts)
         background = ground,
         border_width = theme.border_width,
         border_color = ring,
+        opacity = opts.disabled and opts.disabled:map(function(off)
+            return off and theme.opacity.disabled or 1
+        end) or nil,
         on_click = function(_, mouse_button)
-            if mouse_button ~= "left" then
+            if mouse_button ~= "left" or (opts.disabled and opts.disabled:get()) then
                 return
             end
             opts.on_change(not read_bool(opts.signal:get(), opts.read))
