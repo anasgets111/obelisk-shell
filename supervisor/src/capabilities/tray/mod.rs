@@ -102,8 +102,8 @@ fn unix_timestamp_u32() -> u32 {
 /// `tray:activate(id, x, y)`'s `arguments: [id, x, y]`.
 pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i32, i32)> {
     let id = arguments.first()?.as_str()?.to_string();
-    let x = arguments.get(1)?.as_i64()? as i32;
-    let y = arguments.get(2)?.as_i64()? as i32;
+    let x = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
+    let y = i32::try_from(arguments.get(2)?.as_i64()?).ok()?;
     Some((id, x, y))
 }
 
@@ -111,7 +111,7 @@ pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i
 /// [`parse_activate_args`] because the third argument is a string, not a coordinate.
 pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32, String)> {
     let id = arguments.first()?.as_str()?.to_string();
-    let delta = arguments.get(1)?.as_i64()? as i32;
+    let delta = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
     let orientation = arguments.get(2)?.as_str()?.to_string();
     Some((id, delta, orientation))
 }
@@ -120,7 +120,7 @@ pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32
 /// Also `tray:menu_will_show(id, submenu_id)`: the wire shape is the same `[id, i32]` pair.
 pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
     let id = arguments.first()?.as_str()?.to_string();
-    let menu_item_id = arguments.get(1)?.as_i64()? as i32;
+    let menu_item_id = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
     Some((id, menu_item_id))
 }
 
@@ -251,6 +251,8 @@ mod tests {
             None,
             "x is not a number"
         );
+        let too_wide = [serde_json::json!("1.42"), serde_json::json!(1u64 << 31), serde_json::json!(20)];
+        assert_eq!(parse_activate_args(&too_wide), None, "x does not fit an i32");
     }
 
     #[test]
@@ -265,6 +267,7 @@ mod tests {
     fn parse_activate_menu_item_args_rejects_a_malformed_shape() {
         assert_eq!(parse_activate_menu_item_args(&[]), None);
         assert_eq!(parse_activate_menu_item_args(&[serde_json::json!("1.42")]), None, "missing menu_item_id");
+        assert_eq!(parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(i64::MIN)]), None);
     }
 
     #[test]

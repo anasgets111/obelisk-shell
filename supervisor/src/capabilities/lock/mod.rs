@@ -441,11 +441,12 @@ pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope)
     let Some(action) = crate::parse_action::<LockAction>(params) else { return };
     match action {
         LockAction::Lock => controller.lock(),
-        // A malformed or missing argument is no animation rather than a refusal: the lock screen
-        // still comes down, which is the property that matters. The clamp is the setter's.
+        // A missing argument is no animation. The clamp is the setter's.
         LockAction::SetUnlockAnimation => {
-            let millis = params.arguments.first().and_then(serde_json::Value::as_u64).unwrap_or(0);
-            controller.set_unlock_animation(Duration::from_millis(millis));
+            match params.arguments.first().filter(|ms| !ms.is_null()).map_or(Some(0), serde_json::Value::as_u64) {
+                Some(millis) => controller.set_unlock_animation(Duration::from_millis(millis)),
+                None => crate::log_malformed_command(params),
+            }
         }
     }
 }

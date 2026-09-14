@@ -72,6 +72,8 @@ pub fn parse_start_args(arguments: &[serde_json::Value]) -> Option<(String, Stri
     }
     let args = match arguments.get(2) {
         None | Some(serde_json::Value::Null) => Vec::new(),
+        // mlua marshals an empty Lua table as `{}`, and the `start(cmd)` wrapper sends one.
+        Some(serde_json::Value::Object(fields)) if fields.is_empty() => Vec::new(),
         Some(value) => {
             value.as_array()?.iter().map(|arg| arg.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?
         }
@@ -156,6 +158,10 @@ mod tests {
     fn start_without_arguments_is_a_bare_command_and_an_empty_one_is_refused() {
         assert_eq!(
             parse_start_args(&[json!("recorder"), json!("true")]),
+            Some(("recorder".to_string(), "true".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            parse_start_args(&[json!("recorder"), json!("true"), json!({})]),
             Some(("recorder".to_string(), "true".to_string(), Vec::new()))
         );
         assert_eq!(parse_start_args(&[json!("recorder"), json!("")]), None);
