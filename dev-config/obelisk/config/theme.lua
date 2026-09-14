@@ -301,9 +301,8 @@ theme.item_width                = s(34, 20)
 theme.item_radius               = s(18, 6)
 -- The mirror's `batteryPillWidth`, enough for a glyph and "100%"; the bar's non-circular item.
 theme.battery_pill_width        = s(80, 60)
--- Width when the pointer hovers the volume control; it leaves room for the percentage. Collapsed
--- width is `item_width`.
-theme.volume_expanded_width     = s(120, 90)
+-- Hovered volume control: holds "150%" plus a drag track.
+theme.volume_expanded_width     = s(220, 140)
 -- `Theme.qml`'s `animationDuration`, in ms, for a node's `animate` table (ADR-0145). The engine's
 -- default is `InOutQuad`; `animation_fast_ms` mirrors `animationFast` for hover zooms.
 theme.animation_ms              = 147

@@ -60,6 +60,7 @@ local screen_recorder_tooltip = require("modules.bar.indicators.screen_recorder"
 local idle_tooltip = require("modules.bar.indicators.idle_inhibitor").tooltip
 -- One glyph carries five update states; the tooltip names the one it is in.
 local updates_tooltip = require("modules.bar.indicators.updates").tooltip
+local audio_panel = require("modules.bar.panels.audio_panel")
 local lock_screen = require("modules.global.lock")
 local polkit_dialog = require("modules.global.polkit")
 local bluetooth_pairing = require("modules.global.bluetooth_pairing")
@@ -88,6 +89,8 @@ return {
     screen_recorder_tooltip,
     idle_tooltip,
     updates_tooltip,
+    audio_panel.output_tooltip,
+    audio_panel.input_tooltip,
     modal_host,
     lock_screen,
     polkit_dialog,

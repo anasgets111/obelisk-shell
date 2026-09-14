@@ -120,15 +120,19 @@ end
 
 -- The MAC whose codec list is open in the bluetooth panel, or `""`; cleared when the panel closes.
 local bluetooth_codec_for = state("bluetooth_codec_for", "")
+-- Whether the audio panel's device pickers are expanded.
+local audio_output_picker = state("audio_output_picker", false)
+local audio_input_picker = state("audio_input_picker", false)
 
--- Discovery runs while the bluetooth panel shows, as `BluetoothPanel.qml`'s `shouldDiscover`. The
--- literal kind, like `"notifications"` below: requiring the panel here would be a cycle. Both edges
--- are sent, not only a change of `discovering`: the Supervisor keeps it as intent and matches BlueZ
--- to it, so a close before the start is reported still stops the scan.
-local function leave_bluetooth_panel()
-    if panel_open:get() and panel_kind:get() == "bluetooth" then
+-- Leaving bluetooth stops discovery and closes its codec list; leaving audio collapses its pickers.
+local function leave_panel()
+    local kind = panel_open:get() and panel_kind:get()
+    if kind == "bluetooth" then
         obelisk.bluetooth:invoke("stop_discovery")
         bluetooth_codec_for:set("")
+    elseif kind == "audio" then
+        audio_output_picker:set(false)
+        audio_input_picker:set(false)
     end
 end
 
@@ -143,7 +147,7 @@ local function close_panel()
     if panel_open:get() and panel_kind:get() == "notifications" then
         mark_popups_seen()
     end
-    leave_bluetooth_panel()
+    leave_panel()
     panel_open:set(false)
     clear_network_prompts()
 end
@@ -168,7 +172,7 @@ local function toggle_panel(kind, rect)
     -- Switching panels ends the network panel's prompts as surely as closing does. Left standing,
     -- a pending password would keep this surface `Exclusive` over a panel that has no field in it.
     clear_network_prompts()
-    leave_bluetooth_panel()
+    leave_panel()
     -- A panel and a modal never share the screen (`openPanel` clears `activeModal`).
     active_modal:set("")
     popup_anchor:set(rect)
@@ -317,6 +321,8 @@ return {
     toggle_panel = toggle_panel,
     close_panel = close_panel,
     bluetooth_codec_for = bluetooth_codec_for,
+    audio_output_picker = audio_output_picker,
+    audio_input_picker = audio_input_picker,
     hidden_prompt = hidden_prompt,
     hidden_draft = hidden_draft,
     hidden_ssid = hidden_ssid,

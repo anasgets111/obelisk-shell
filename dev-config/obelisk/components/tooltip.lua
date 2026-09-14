@@ -8,7 +8,7 @@
 -- so their hover states do not fight. Moving down closes it when leaving the bar turns hover off.
 -- A hover-open panel needs its own hover region, OR-ed with the bar's, so the pointer can enter it.
 --
--- Nothing opens while a panel is up. `DateTimeDisplay.qml` gates its loader with
+-- Nothing parented to the bar opens while a panel is up. `DateTimeDisplay.qml` gates its loader with
 -- (`requested: mouseArea.containsMouse && !panelOpen`) because the panel card hangs under every
 -- slot. Gate on any panel: its position collides, not its subject.
 --
@@ -36,7 +36,7 @@ return function(opts)
         parent = opts.parent or "bar",
         anchor_rect = hover_rect(opts.slot),
         visible = computed({ hover(opts.slot), ui_state.panel_open }, function(is_hovered, panel_open)
-            return is_hovered and not panel_open
+            return is_hovered and ((opts.parent or "bar") ~= "bar" or not panel_open)
         end),
         -- The surface is the card's own box. `date_time.lua` is the one caller that still declares
         -- width and height because its rows fill the card rather than sizing it.

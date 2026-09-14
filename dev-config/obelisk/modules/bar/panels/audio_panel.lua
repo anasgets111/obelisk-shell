@@ -3,7 +3,6 @@
 --
 -- Sliders use `components/slider.lua` and `button`'s `on_drag`/`on_wheel` (ADR-0116). Device
 -- pickers and the mixer expand on click through `PanelRow.expandable` and three `state()` signals.
--- Unlike the mirror, closing the panel leaves an open picker open.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -15,14 +14,15 @@ local panel_header = require("components.panel_header")
 local panel_card = require("components.panel_card")
 local panel_row = require("components.panel_row")
 local slider = require("components.slider")
+local tooltip = require("components.tooltip")
+local ui_state = require("lib.ui_state")
 
 local KIND = "audio"
 local SLIDER_HEIGHT = theme.s(20, 16)
 local STREAM_SLIDER_HEIGHT = theme.s(16, 12)
 local MIXER_SCROLL = scroll("audio_mixer")
 
-local output_picker_open = state("audio_output_picker", false)
-local input_picker_open = state("audio_input_picker", false)
+local tooltips = {}
 local mixer_open = state("audio_mixer_open", false)
 
 local function percent(value)
@@ -35,11 +35,10 @@ local function device_name(device)
         return nil
     end
     local name = device.name or ""
-    name = name:gsub("%s*[Hh]igh [Dd]efinition [Aa]udio [Cc]ontroller", "")
-    name = name:gsub("%s*HD [Aa]udio [Cc]ontroller", "")
+    name = name:gsub("%s*[Hh]igh [Dd]efinition [Aa]udio [Cc]ontroller", ""):gsub("%s*H?D? ?[Aa]udio [Cc]ontroller", "")
     name = name:gsub("%s*[Dd]igital [Ss]tereo", ""):gsub("%s*[Aa]nalog [Ss]tereo", "")
-    name = name:gsub("%s*%(HDMI%)", " HDMI"):gsub("%s+", " ")
-    name = name:match("^%s*(.-)%s*$")
+    name = name:gsub("%s*%(HDMI%)", " HDMI"):gsub("%s*%(S/PDIF%)", " S/PDIF"):gsub("%s*%(IEC958%)", " S/PDIF")
+    name = name:gsub("%s+", " "):match("^%s*(.-)%s*$")
     return name ~= "" and name or device.name
 end
 
@@ -77,6 +76,14 @@ local function audio_control(opts)
         return a and not opts.muted(a) and util.audio_device_glyph(opts.device(a), opts.is_input) or fallback
     end)
     local held = state("audio_pending_" .. opts.name, -1)
+    tooltips[opts.name] = tooltip({
+        id = "audio_mute_" .. opts.name .. "_tooltip",
+        parent = "panel_host",
+        slot = "audio-mute-" .. opts.name,
+        children = { cell(is_muted:map(function(m)
+            return m and "unmute" or "mute"
+        end), theme.FG, theme.font.sm) },
+    })
 
     local children = {
         row {
@@ -292,7 +299,7 @@ local body = {
         under = {
             device_picker {
                 name = "output",
-                open = output_picker_open,
+                open = ui_state.audio_output_picker,
                 list = function(a)
                     return a.sinks
                 end,
@@ -318,12 +325,12 @@ local body = {
         set_volume = "set_source_volume",
         toggle_mute = "toggle_source_mute",
         visible = util.shown_when(obelisk.audio, function(a)
-            return #(a.sources or {}) > 0
+            return util.active_device(a.sources) ~= nil
         end),
         under = {
             device_picker {
                 name = "input",
-                open = input_picker_open,
+                open = ui_state.audio_input_picker,
                 is_input = true,
                 list = function(a)
                     return a.sources
@@ -372,4 +379,4 @@ local body = {
     }),
 }
 
-return { kind = KIND, body = body }
+return { kind = KIND, body = body, output_tooltip = tooltips.output, input_tooltip = tooltips.input }
