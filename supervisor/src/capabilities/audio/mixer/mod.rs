@@ -5,16 +5,17 @@
 //! `pipewire-pulse` Client pid, not the routed application's). It matches `/proc/{pid}/comm` in
 //! every checked case (ADR-0016).
 //!
-//! `media.class == "Stream/Output/Audio"` identifies playback streams (verified in `pw-dump`).
+//! `media.class` `Stream/Output/Audio` (playback) or `Stream/Input/Audio` (recording) identifies a
+//! mixer stream (verified in `pw-dump`).
 //!
 //! `on_global` filters only `media.class` and binds immediately. A `pipewire-pulse` stream's
 //! `global` event precedes its `application.process.id`/`application.name`; filtering on the full
 //! parse misses every such stream. The pid arrives moments later in `info`, parsed by
-//! `state::build_app_stream`.
+//! `streams::parse_stream_props`.
 //!
 //! `info` also fires for RUNNING/IDLE/SUSPENDED, params, and ports. `props()` is `Some` every time,
 //! but PipeWire's C marshaller fills it only when `change_mask` has `PW_NODE_CHANGE_MASK_PROPS`;
-//! other events carry a non-null empty dict. The listener gates `build_app_stream` on
+//! other events carry a non-null empty dict. The listener gates `parse_stream_props` on
 //! `NodeChangeMask::PROPS` so those events do not look like a vanished stream.
 //!
 //! The first `info` after `registry.bind()` is guaranteed to have PROPS: upstream `global_bind`

@@ -3,8 +3,7 @@
 --
 -- Sliders use `components/slider.lua` and `button`'s `on_drag`/`on_wheel` (ADR-0116). Device
 -- pickers and the mixer expand on click through `PanelRow.expandable` and three `state()` signals.
--- Unlike the mirror, closing the panel leaves an open picker open. Stream icons use
--- `obelisk.applications` and `app_id`, falling back to a note glyph.
+-- Unlike the mirror, closing the panel leaves an open picker open.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -201,11 +200,26 @@ end
 -- One mixer stream, the mirror's `StreamItem`: app icon/name, percentage, mute glyph, and thin
 -- slider.
 local function stream_row(app)
-    local name = app.name or app.process_name or "unknown"
-    local entry = util.app_entry(obelisk.applications:get(), app.process_name or app.name)
-    local leading = entry and entry.icon and icon { name = entry.icon, size = theme.icon.md, align_v = "Center" }
-        or glyph(icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
+    local applications = obelisk.applications:get()
+    local entry = util.app_entry(applications, app.binary)
+        or util.app_entry(applications, app.process_name)
+        or util.app_entry(applications, app.name)
+    local name = entry and entry.name or app.name or app.process_name or "unknown"
+    local icon_name = entry and entry.icon or app.icon
+    local leading = icon_name and icon { name = icon_name, size = theme.icon.md, align_v = "Center" }
+        or glyph(app.recording and icons.mic_on or icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
     local tint = app.muted and theme.DIM or theme.ACCENT
+    local controls = {
+        leading,
+        cell(name, theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
+        cell(percent(app.volume), tint, theme.font.sm, { align_v = "Center" }),
+        panel_action_icon(app.muted and icons.vol_muted or icons.vol_high, app.volume and function()
+            obelisk.audio:invoke("set_app_muted", app.id, not app.muted)
+        end, { slot = "audio-stream-mute-" .. tostring(app.id), tint = tint }),
+    }
+    if app.recording and icon_name then
+        table.insert(controls, 3, glyph(icons.mic_on, theme.DIM, theme.font.sm, { align_v = "Center" }))
+    end
     return column {
         width = "Fill",
         spacing = theme.spacing.xs,
@@ -216,14 +230,7 @@ local function stream_row(app)
                 spacing = theme.spacing.sm,
                 align_v = "Center",
                 opacity = (app.muted or app.volume == nil) and theme.opacity.muted or nil,
-                children = {
-                    leading,
-                    cell(name, theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
-                    cell(percent(app.volume), tint, theme.font.sm, { align_v = "Center" }),
-                    panel_action_icon(app.muted and icons.vol_muted or icons.vol_high, app.volume and function()
-                        obelisk.audio:invoke("set_app_muted", app.id, not app.muted)
-                    end, { slot = "audio-stream-mute-" .. tostring(app.id), tint = tint }),
-                },
+                children = controls,
             },
             slider {
                 name = "audio_pending_app_" .. tostring(app.id),
@@ -326,7 +333,7 @@ local body = {
             title = "application mixer",
             subtitle = util.label(streams, function(list)
                 if #list == 0 then
-                    return "no applications playing audio"
+                    return "no applications using audio"
                 end
                 return string.format("%d active", #list)
             end),

@@ -62,13 +62,16 @@
 ---@field title string Window title, e.g. `"src/main.rs - Neovim"`; empty when unset.
 
 ---@class AppStream
----A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
----ADR-0053 decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
+---A `Stream/Output/Audio` or `Stream/Input/Audio` node resolved to its owning process. ADR-0053
+---decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
+---@field binary? string `application.process.binary`, e.g. `"firefox"`.
+---@field icon? string XDG icon name from `application.icon-name`, else `media.icon-name`, e.g. `"firefox"`.
 ---@field id integer PipeWire registry id, the `MixerState::apps` key.
 ---@field muted boolean Per-app mute, from the same `Props` as `volume`.
 ---@field name? string `application.name`, if the client set one.
 ---@field pid integer `application.process.id` recorded for the owning process.
 ---@field process_name? string `/proc/{pid}/comm`, if the process still existed when observed.
+---@field recording boolean A recording stream (`Stream/Input/Audio`), e.g. a call's microphone, rather than playback.
 ---@field volume? number Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `nil` until then.
 
 ---@class AppSummary
@@ -320,7 +323,7 @@
 
 ---@class AudioState
 ---Full `obelisk.audio` payload (ADR-0053 decision 3).
----@field apps AppStream[] One entry per app playing audio; empty is normal.
+---@field apps AppStream[] One entry per app playing or recording audio; empty is normal.
 ---@field bluetooth BluetoothCodecs[] One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device; `:invoke("set_default_sink", id)` takes `AudioDevice::id`.

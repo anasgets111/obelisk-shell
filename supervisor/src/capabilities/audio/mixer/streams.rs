@@ -1,5 +1,5 @@
 //! PipeWire stream nodes for `obelisk.audio` and `obelisk.privacy`: classifying a node by
-//! `media.class`, and tracking playback streams, cameras, and microphone and screen captures from
+//! `media.class`, and tracking audio streams, cameras, and microphone and screen captures from
 //! their `info` events.
 
 use std::collections::BTreeMap;
@@ -28,13 +28,13 @@ const STREAM_INPUT_AUDIO: &str = "Stream/Input/Audio";
 /// them needs compositor-reported screencopy clients, which niri-ipc does not provide.
 const STREAM_OUTPUT_VIDEO: &str = "Stream/Output/Video";
 
-/// PipeWire's marker for a capture stream reading a sink monitor (`PW_KEY_STREAM_CAPTURE_SINK`).
-/// cava and every other visualiser sets it; filtering the property avoids lighting a microphone
-/// indicator for a spectrum analyser (the mirror only excludes cava by name).
-const STREAM_CAPTURE_SINK: &str = "stream.capture.sink";
+/// A capture reading a sink monitor, as cava and every visualiser does; the property beats a name list.
+fn is_monitor_capture(props: &impl PropsLookup) -> bool {
+    props.get_prop(*keys::STREAM_CAPTURE_SINK) == Some("true")
+}
 
-/// A `Stream/Output/Audio` node resolved to its owning process. `main.rs` publishes it unchanged;
-/// ADR-0053 decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
+/// A `Stream/Output/Audio` or `Stream/Input/Audio` node resolved to its owning process. ADR-0053
+/// decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AppStream {
     /// PipeWire registry id, the `MixerState::apps` key.
@@ -45,19 +45,20 @@ pub struct AppStream {
     pub name: Option<String>,
     /// `/proc/{pid}/comm`, if the process still existed when observed.
     pub process_name: Option<String>,
+    /// `application.process.binary`, e.g. `"firefox"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// XDG icon name from `application.icon-name`, else `media.icon-name`, e.g. `"firefox"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// A recording stream (`Stream/Input/Audio`), e.g. a call's microphone, rather than playback.
+    pub recording: bool,
     /// Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master
     /// sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `nil` until then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<f32>,
     /// Per-app mute, from the same `Props` as `volume`.
     pub muted: bool,
-}
-
-/// Parsed stream `media.class`/pid/name, before process-name resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedStream {
-    pid: i32,
-    app_name: Option<String>,
 }
 
 /// Node kind chosen at `global` time and carried into `info`; state-only `info` props can be empty.
@@ -80,15 +81,36 @@ pub(super) fn classify(props: &impl PropsLookup) -> Option<NodeKind> {
     }
 }
 
-/// Parses a `Stream/Output/Audio` with a valid `application.process.id`; `None` also covers a
-/// node PipeWire has not finished populating (see [`apply_info_event`]).
-fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
-    if classify(props) != Some(NodeKind::Audio) {
+/// Parses an audio stream with a valid `application.process.id` and resolves its process name.
+/// `None` also covers a node PipeWire has not finished populating (see [`apply_info_event`]), a
+/// monitor capture, a peak meter (`stream.monitor`), and a notification sound, which pipewire-pulse
+/// maps the `event` role to.
+fn parse_stream_props(proc_root: &Path, node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
+    let recording = match classify(props)? {
+        NodeKind::Audio => false,
+        NodeKind::Microphone => true,
+        _ => return None,
+    };
+    if is_monitor_capture(props)
+        || props.get_prop(*keys::STREAM_MONITOR) == Some("true")
+        || props.get_prop(*keys::MEDIA_ROLE) == Some("Notification")
+    {
         return None;
     }
+    // ponytail: pid-less (portal-owned) streams stay out; `portal.app_id` on their Client is the upgrade.
     let pid = props.get_prop(*keys::APP_PROCESS_ID)?.parse().ok()?;
-    let app_name = props.get_prop(*keys::APP_NAME).map(str::to_string);
-    Some(ParsedStream { pid, app_name })
+    let prop = |key: &str| props.get_prop(key).map(str::to_string);
+    Some(AppStream {
+        id: node_id,
+        pid,
+        name: prop(*keys::APP_NAME),
+        process_name: resolve_process_name(proc_root, pid),
+        binary: prop(*keys::APP_PROCESS_BINARY),
+        icon: prop(*keys::APP_ICON_NAME).or_else(|| prop(*keys::MEDIA_ICON_NAME)),
+        recording,
+        volume: None,
+        muted: false,
+    })
 }
 
 /// Reads `{proc_root}/{pid}/comm`; `None` if the process exited or procfs is unreadable.
@@ -98,13 +120,6 @@ fn parse_stream_props(props: &impl PropsLookup) -> Option<ParsedStream> {
 /// `privacy::video::read_comm`, which was already built that way.
 fn resolve_process_name(proc_root: &Path, pid: i32) -> Option<String> {
     crate::capabilities::privacy::video::read_comm(proc_root, pid.try_into().ok()?)
-}
-
-/// Parses `props` and resolves the owning process name for both registry and `info` handlers.
-fn build_app_stream(proc_root: &Path, node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
-    let parsed = parse_stream_props(props)?;
-    let process_name = resolve_process_name(proc_root, parsed.pid);
-    Some(AppStream { id: node_id, pid: parsed.pid, name: parsed.app_name, process_name, volume: None, muted: false })
 }
 
 /// Applies a bound node's `info`. Gate upsert/remove on `NodeChangeMask::PROPS`: state-only events
@@ -119,7 +134,7 @@ pub(super) fn apply_info_event(
     if !has_props_change {
         return;
     }
-    match props.and_then(|props| build_app_stream(proc_root, node_id, props)) {
+    match props.and_then(|props| parse_stream_props(proc_root, node_id, props)) {
         Some(app) => apps.insert(node_id, app),
         None => apps.remove(&node_id),
     };
@@ -183,7 +198,7 @@ fn parse_capture_props(node_id: u32, kind: NodeKind, props: &impl PropsLookup) -
     if classify(props) != Some(kind) {
         return None;
     }
-    if kind == NodeKind::Microphone && props.get_prop(STREAM_CAPTURE_SINK) == Some("true") {
+    if kind == NodeKind::Microphone && is_monitor_capture(props) {
         return None;
     }
     Some(CaptureApp {
@@ -418,9 +433,30 @@ mod tests {
 
     #[test]
     fn parse_stream_props_matches_a_real_stream_output_audio_node() {
-        let parsed = parse_stream_props(&zen_browser_stream_props()).expect("should parse as an audio stream");
+        let parsed = parse_stream_props(Path::new("/proc"), 1, &zen_browser_stream_props())
+            .expect("should parse as an audio stream");
         assert_eq!(parsed.pid, 1538319);
-        assert_eq!(parsed.app_name, Some("Zen".to_string()));
+        assert_eq!(parsed.name, Some("Zen".to_string()));
+        assert_eq!(parsed.binary, Some("zen-bin".to_string()));
+        assert!(!parsed.recording);
+    }
+
+    #[test]
+    fn parse_stream_props_marks_an_input_stream_as_recording() {
+        let parsed = parse_stream_props(Path::new("/proc"), 1, &capture_props("Stream/Input/Audio"))
+            .expect("a call's mic parses");
+        assert!(parsed.recording);
+    }
+
+    #[test]
+    fn parse_stream_props_rejects_a_peak_meter_and_a_notification_sound() {
+        let mut meter = capture_props("Stream/Input/Audio");
+        meter.insert("stream.monitor".to_string(), "true".to_string());
+        assert!(parse_stream_props(Path::new("/proc"), 1, &meter).is_none(), "a level meter is not a mixer row");
+
+        let mut notification = zen_browser_stream_props();
+        notification.insert("media.role".to_string(), "Notification".to_string());
+        assert!(parse_stream_props(Path::new("/proc"), 1, &notification).is_none());
     }
 
     #[test]
@@ -429,13 +465,13 @@ mod tests {
             ("media.class".to_string(), "Audio/Sink".to_string()),
             ("application.process.id".to_string(), "1234".to_string()),
         ]);
-        assert!(parse_stream_props(&props).is_none());
+        assert!(parse_stream_props(Path::new("/proc"), 1, &props).is_none());
     }
 
     #[test]
     fn parse_stream_props_rejects_a_stream_missing_the_pid() {
         let props = HashMap::from([("media.class".to_string(), "Stream/Output/Audio".to_string())]);
-        assert!(parse_stream_props(&props).is_none());
+        assert!(parse_stream_props(Path::new("/proc"), 1, &props).is_none());
     }
 
     #[test]
@@ -444,7 +480,7 @@ mod tests {
             ("media.class".to_string(), "Stream/Output/Audio".to_string()),
             ("application.process.id".to_string(), "not-a-pid".to_string()),
         ]);
-        assert!(parse_stream_props(&props).is_none());
+        assert!(parse_stream_props(Path::new("/proc"), 1, &props).is_none());
     }
 
     #[test]
@@ -453,8 +489,8 @@ mod tests {
             ("media.class".to_string(), "Stream/Output/Audio".to_string()),
             ("application.process.id".to_string(), "1234".to_string()),
         ]);
-        let parsed = parse_stream_props(&props).expect("pid alone is enough to parse");
-        assert_eq!(parsed.app_name, None);
+        let parsed = parse_stream_props(Path::new("/proc"), 1, &props).expect("pid alone is enough to parse");
+        assert_eq!(parsed.name, None);
     }
 
     #[test]
@@ -473,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn build_app_stream_combines_parsing_and_pid_resolution() {
+    fn parse_stream_props_resolves_the_process_name() {
         let pid = std::process::id();
         let expected_process_name = resolve_process_name(Path::new("/proc"), pid as i32);
 
@@ -483,7 +519,7 @@ mod tests {
             ("application.name".to_string(), "Test App".to_string()),
         ]);
 
-        let app = build_app_stream(Path::new("/proc"), 42, &props).expect("should build an AppStream");
+        let app = parse_stream_props(Path::new("/proc"), 42, &props).expect("should build an AppStream");
         assert_eq!(app.id, 42);
         assert_eq!(app.pid, pid as i32);
         assert_eq!(app.name, Some("Test App".to_string()));
@@ -491,12 +527,6 @@ mod tests {
         // Identity comes from properties; volume lives on a param and joins in publish_audio.
         assert_eq!(app.volume, None);
         assert!(!app.muted);
-    }
-
-    #[test]
-    fn build_app_stream_rejects_a_non_audio_node() {
-        let props = HashMap::from([("media.class".to_string(), "Video/Source".to_string())]);
-        assert!(build_app_stream(Path::new("/proc"), 1, &props).is_none());
     }
 
     #[test]
@@ -519,7 +549,7 @@ mod tests {
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&zen_browser_stream_props()));
         assert_eq!(
             apps.values().cloned().collect::<Vec<_>>(),
-            vec![build_app_stream(Path::new("/proc"), 1, &zen_browser_stream_props()).unwrap()]
+            vec![parse_stream_props(Path::new("/proc"), 1, &zen_browser_stream_props()).unwrap()]
         );
     }
 
@@ -533,30 +563,5 @@ mod tests {
         apply_info_event(Path::new("/proc"), &mut apps, 1, true, Some(&non_stream_props));
 
         assert!(apps.is_empty(), "a PROPS-bearing event that no longer parses as a stream should remove it");
-    }
-
-    #[test]
-    fn app_stream_serializes_with_the_spec_field_spelling() {
-        // ADR-0053 decision 3: node_id -> id, app_name -> name; keep pid/process_name (ADR-0016).
-        let stream = AppStream {
-            id: 7,
-            pid: 999,
-            name: Some("Zen".to_string()),
-            process_name: None,
-            volume: Some(1.0),
-            muted: false,
-        };
-        let json = serde_json::to_value(&stream).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "id": 7,
-                "pid": 999,
-                "name": "Zen",
-                "process_name": null,
-                "volume": 1.0,
-                "muted": false,
-            })
-        );
     }
 }

@@ -32,7 +32,7 @@ pub struct AudioState {
     pub sinks: Vec<AudioDevice>,
     /// Every input device, on the same terms as [`AudioState::sinks`].
     pub sources: Vec<AudioDevice>,
-    /// One entry per app playing audio; empty is normal.
+    /// One entry per app playing or recording audio; empty is normal.
     pub apps: Vec<AppStream>,
     /// One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
     pub bluetooth: Vec<BluetoothCodecs>,
@@ -104,7 +104,7 @@ pub(super) struct MixerState {
     pub(super) bluez_cards: HashMap<u32, BluezCard>,
     /// Bound BlueZ `Device` proxies/listeners, separate from `bluez_cards` so state stays plain.
     pub(super) bluez_devices: HashMap<u32, (Rc<pw::device::Device>, pw::device::DeviceListener)>,
-    /// `Stream/Output/Audio` id -> raw `Props`, using the sink's pod shape and parser.
+    /// Audio stream id -> raw `Props`, using the sink's pod shape and parser.
     pub(super) app_props: HashMap<u32, master::RawSinkProps>,
     /// Names selected by `default.audio.sink`/`default.audio.source`, or `None` before arrival.
     pub(super) default_sink_name: Option<String>,
@@ -245,6 +245,9 @@ mod tests {
             pid: 100 + node_id as i32,
             name: Some(format!("app-{node_id}")),
             process_name: None,
+            binary: None,
+            icon: None,
+            recording: false,
             volume: None,
             muted: false,
         }
@@ -311,6 +314,7 @@ mod tests {
                     "pid": stream.pid,
                     "name": stream.name,
                     "process_name": stream.process_name,
+                    "recording": false,
                     "muted": stream.muted,
                 }],
                 "bluetooth": [{

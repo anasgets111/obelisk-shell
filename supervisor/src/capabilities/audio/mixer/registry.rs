@@ -251,31 +251,28 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
         .info(move |info| {
             let mut state_mut = state_for_info.borrow_mut();
             let has_props_change = info.change_mask().contains(pw::node::NodeChangeMask::PROPS);
-            match kind {
-                NodeKind::Audio => {
-                    apply_info_event(
-                        std::path::Path::new("/proc"),
-                        &mut state_mut.apps,
-                        node_id,
-                        has_props_change,
-                        info.props(),
-                    );
-                    state_mut.publish_audio();
-                }
+            if matches!(kind, NodeKind::Audio | NodeKind::Microphone) {
+                apply_info_event(
+                    std::path::Path::new("/proc"),
+                    &mut state_mut.apps,
+                    node_id,
+                    has_props_change,
+                    info.props(),
+                );
+                state_mut.publish_audio();
+            }
+            let apps = match kind {
+                NodeKind::Audio => return,
                 NodeKind::Video => {
                     apply_video_info_event(&mut state_mut.video_sources, node_id, has_props_change, info.props());
-                    state_mut.publish_privacy();
+                    return state_mut.publish_privacy();
                 }
-                NodeKind::Microphone | NodeKind::Screencast => {
-                    let running = matches!(info.state(), pw::node::NodeState::Running);
-                    let apps = match kind {
-                        NodeKind::Microphone => &mut state_mut.microphones,
-                        _ => &mut state_mut.screencasts,
-                    };
-                    apply_capture_info_event(apps, node_id, kind, has_props_change, info.props(), running);
-                    state_mut.publish_privacy();
-                }
-            }
+                NodeKind::Microphone => &mut state_mut.microphones,
+                NodeKind::Screencast => &mut state_mut.screencasts,
+            };
+            let running = matches!(info.state(), pw::node::NodeState::Running);
+            apply_capture_info_event(apps, node_id, kind, has_props_change, info.props(), running);
+            state_mut.publish_privacy();
         })
         // Per-app streams carry the same channelVolumes/mute pod, parser, and cube-root conversion
         // as master sinks (verified live).
@@ -299,7 +296,7 @@ fn on_node_global(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Regi
         })
         .register();
 
-    if kind == NodeKind::Audio {
+    if matches!(kind, NodeKind::Audio | NodeKind::Microphone) {
         node.subscribe_params(&[pw::spa::param::ParamType::Props]);
     }
 
