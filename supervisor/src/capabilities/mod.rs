@@ -374,7 +374,8 @@ impl Capabilities {
                         Some(BluetoothController::new(self.connection.clone(), self.senders.bluetooth.clone()).await);
                 }
             }
-            // Own session bus; missing it yields `inert`.
+            // Own session bus; missing it yields `inert`. Tray, Notifications and Mpris push once when
+            // built: with no item, notification or player they never speak.
             Capability::Tray => {
                 if self.tray.is_none() {
                     self.tray = Some(match with_call_timeout(zbus::connection::Builder::session()).await {
@@ -386,6 +387,7 @@ impl Capabilities {
                             TrayController::inert(self.senders.tray.clone())
                         }
                     });
+                    let _ = self.senders.tray.send(TraySignal::RegistryChanged);
                 }
             }
             // Own session bus (ADR-0033); an existing notification owner makes this inert via
@@ -404,6 +406,7 @@ impl Capabilities {
                             NotificationsController::inert(self.senders.notifications.clone(), self.sound_tx.clone())
                         }
                     });
+                    let _ = self.senders.notifications.send(NotificationsSignal::Changed);
                 }
             }
             // Own session bus (ADR-0036); `new` spawns discovery and returns.
@@ -418,6 +421,7 @@ impl Capabilities {
                             MprisController::inert()
                         }
                     });
+                    let _ = self.senders.mpris.send(MprisSignal::Changed);
                 }
             }
             // Three dormant poll tasks until `sysinfo:configure` (ADR-0035).
