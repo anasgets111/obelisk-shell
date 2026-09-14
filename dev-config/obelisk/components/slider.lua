@@ -129,6 +129,7 @@ return function(opts)
     local function percent(value)
         return string.format("%d%%", math.floor(value / max * 100 + 0.5))
     end
+    -- The track's rounded clip cuts both bars, so a short fill follows its arc.
     local function bar(width, color)
         return rect {
             width = width,
@@ -139,28 +140,24 @@ return function(opts)
         }
     end
     local split = opts.split_at or max
-    local children = { row {
-        width = "Fill",
-        height = "Fill",
-        children = {
-            bar(fill:map(function(value)
-                return percent(math.min(value, split))
-            end), opts.color or theme.ACCENT),
-            bar(fill:map(function(value)
-                return percent(math.max(0, value - split))
-            end), opts.headroom_color or theme.RED),
-        },
-    } }
-    if opts.marker then
-        children[2] = row {
+    local children = {
+        -- Headroom under the fill, drawn only past `split`: the fill's rounded end caps it.
+        bar(fill:map(function(value)
+            return percent(value > split and value or 0)
+        end), opts.headroom_color or theme.RED),
+        bar(fill:map(function(value)
+            return percent(math.min(value, split))
+        end), opts.color or theme.ACCENT),
+        row {
             width = "Fill",
             height = "Fill",
             children = {
                 rect { width = percent(split) },
-                rect { width = 1, height = "Fill", background = theme.with_opacity(theme.FG, theme.opacity.medium) },
+                -- A zero-width box paints nothing.
+                rect { width = opts.marker and 1 or 0, height = "Fill", background = theme.with_opacity(theme.FG, theme.opacity.medium) },
             },
-        }
-    end
+        },
+    }
     for _, child in ipairs(opts.children or {}) do
         children[#children + 1] = child
     end
@@ -170,6 +167,7 @@ return function(opts)
         height = opts.height or theme.s(16, 12),
         align_v = opts.align_v,
         radius = opts.radius or theme.radius.sm,
+        clip = "Rounded",
         background = opts.background or opts.track or theme.SURFACE,
         border_width = opts.border_width,
         border_color = opts.border_color,

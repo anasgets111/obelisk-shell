@@ -872,6 +872,10 @@ fn box_path(rect: LogicalRect, radius: f32) -> Path {
 /// The background fill, rounded when the node asked for it. See [`box_path`] for why a radius at
 /// half the box is its own shape rather than a `rounded_rect` argument.
 fn fill_rect(canvas: &mut Canvas<OpenGl>, rect: LogicalRect, radius: f32, color: Rgba) {
+    // femtovg's antialias fringe paints an empty path as a 1px line.
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
     let path = box_path(rect, radius);
     canvas.fill_path(&path, &Paint::color(Color::rgbaf(color.r, color.g, color.b, color.a)));
 }
@@ -2641,6 +2645,22 @@ mod tests {
             canvas.flush();
             assert_eq!(pixel_at(canvas, 9, 9), (0, 0, 0, 255), "{name}: the corner outside the circle stays black");
             assert_eq!(pixel_at(canvas, 24, 24), (255, 255, 255, 255), "{name}: the centre is filled");
+        }
+    }
+
+    /// A slider's fill at 0% is a zero-width box; it once drew a 1px line.
+    #[test]
+    fn a_zero_width_box_paints_nothing() {
+        let Some(instance) = init_headless_egl(64, 48) else { return };
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 64, 48) else { return };
+        let canvas = painter.canvas_mut();
+        canvas.clear_rect(0, 0, 64, 48, Color::rgbaf(0.0, 0.0, 0.0, 1.0));
+        let white = Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        fill_rect(canvas, LogicalRect { x: 24.0, y: 8.0, width: 0.0, height: 32.0 }, 6.0, white);
+        canvas.flush();
+        for x in 22..27 {
+            assert_eq!(pixel_at(canvas, x, 24), (0, 0, 0, 255), "column {x} stays black");
         }
     }
 
