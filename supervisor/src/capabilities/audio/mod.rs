@@ -15,7 +15,7 @@ use mixer::{AudioCommand, AudioCommandSender};
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioAction {
-    /// (volume: number) Sets master output volume, clamped to `[0.0, 1.0]`.
+    /// (volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.
     SetVolume,
     /// (muted: boolean) Sets master output mute.
     SetMuted,
@@ -77,7 +77,7 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
     }
 }
 
-/// Parses `[vol]`; the `[0.0, 1.0]` range is clamped in `master::cubed_channel_volumes`.
+/// Parses `[vol]`; the range is clamped in `master::cubed_channel_volumes`.
 fn parse_volume_arg(arguments: &[serde_json::Value]) -> Option<f32> {
     Some(arguments.first()?.as_f64()? as f32)
 }

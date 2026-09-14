@@ -1,4 +1,4 @@
--- Fraction-filled track matching `Components/Slider.qml`: drag sets value anywhere; wheel steps it.
+-- Value-filled track matching `Components/Slider.qml`: drag sets value anywhere; wheel steps it.
 -- `button`'s `on_drag`/`on_wheel` provide track-local coordinates and wheel notches (ADR-0116).
 --
 -- During a drag, `state()` `pending` keeps fill local and avoids a Supervisor round trip per pixel.
@@ -10,16 +10,20 @@
 -- A one-second timer releases it if the snapshot never matches: another writer or a clamped write.
 -- Plain `state` without `on_change` clears on release.
 -- `pending` is numeric because `state()` fixes its type at creation; `nil` has none.
--- `-1` means "nothing held", outside the fraction range. `children` stack over the fill;
+-- `-1` means "nothing held", outside the value range. `children` stack over the fill;
 -- `Volume.qml` fills the whole control.
 local theme = require("config.theme")
 
 ---@class SliderOpts
 ---@field name string The `state()` name for the held drag. Unique per slider.
 ---@field signal Signal|Capability<any> The capability or state the value is read from.
----@field read fun(payload: any): number The fraction, `0` to `1`, off one payload.
----@field on_commit fun(fraction: number) Called once per drag, on release, and once per wheel step.
----@field steps? integer How many positions the track has, `Slider.qml`'s `steps`: a drag lands on the nearest one and a wheel notch moves one. Default `20`, which is 5% steps over a `0` to `1` range; `0` is continuous.
+---@field read fun(payload: any): number The value, `0` to `max`, off one payload.
+---@field on_commit fun(value: number) Called once per drag, on release, and once per wheel step.
+---@field max? number The full track's value. Default `1`.
+---@field steps? number How many positions the track has across `0` to `max`, `Slider.qml`'s `steps`: a drag lands on the nearest one and a wheel notch moves one. Default `20 * max`, 5% steps; `0` is continuous.
+---@field split_at? number The value past which the fill takes `headroom_color`. Default `max`.
+---@field headroom_color? Color|Bound The fill past `split_at`. Default `theme.RED`.
+---@field marker? boolean A 1px line at `split_at`.
 ---@field color? Color|Bound The fill. Default accent.
 ---@field track? Color|Bound The ground under the fill. Default `theme.SURFACE`.
 ---@field fill_visible? boolean|Bound Hides the fill and keeps the track and the input.
@@ -32,24 +36,25 @@ local theme = require("config.theme")
 ---@field border_color? Color|Bound
 ---@field animate? Animations|Bound Eases the track's own properties; the fill follows the value and is not eased.
 ---@field hover? Signal
+---@field pending? StateSignal<number> The held value, `-1` when none. Default `state(name)`.
 ---@field dragging? StateSignal<boolean> True while a drag is held. Default `state(name .. "_dragging")`.
 ---@field visible? boolean|Bound
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") The left click still lands after the drag ends.
 ---@field children? Node[] Drawn over the fill.
 
-local function clamp(fraction)
-    return math.max(0, math.min(1, fraction))
+local function clamp(value, max)
+    return math.max(0, math.min(max, value))
 end
 
 -- Snap to the nearest `steps` position: a 79% drag commits 80%, as in the mirror.
-local function quantize(fraction, steps)
-    if steps == nil or steps <= 0 then
-        return clamp(fraction)
+local function quantize(value, steps, max)
+    if steps <= 0 then
+        return clamp(value, max)
     end
-    return clamp(math.floor(fraction * steps + 0.5) / steps)
+    return clamp(math.floor(value / max * steps + 0.5) * max / steps, max)
 end
 
-local function fraction_of(read, payload)
+local function value_of(read, payload, max)
     if payload == nil then
         return 0
     end
@@ -57,7 +62,7 @@ local function fraction_of(read, payload)
     if not ok or type(value) ~= "number" then
         return 0
     end
-    return clamp(value)
+    return clamp(value, max)
 end
 
 -- Per name, as `list` rebuilds rows: `on_change` registers once; `timer` and wheel `rest` persist.
@@ -65,11 +70,12 @@ local per_name = {}
 
 ---@param opts SliderOpts
 return function(opts)
-    local pending = state(opts.name, -1)
+    local pending = opts.pending or state(opts.name, -1)
     local dragging = opts.dragging or state(opts.name .. "_dragging", false)
-    local steps = opts.steps or 20
+    local max = opts.max or 1
+    local steps = opts.steps or (20 * max)
     -- Continuous: half a displayed percent.
-    local tolerance = steps > 0 and 0.5 / steps or 0.005
+    local tolerance = (steps > 0 and 0.5 / steps or 0.005) * max
     local on_change = opts.signal.on_change
 
     local entry = per_name[opts.name]
@@ -83,8 +89,8 @@ return function(opts)
                     return
                 end
                 -- Landed, or another writer moved away from `held`; ours move toward it.
-                local off = math.abs(fraction_of(opts.read, current) - held)
-                local was = math.abs(fraction_of(opts.read, previous) - held)
+                local off = math.abs(value_of(opts.read, current, max) - held)
+                local was = math.abs(value_of(opts.read, previous, max) - held)
                 if off <= tolerance or off > was + tolerance then
                     pending:set(-1)
                 end
@@ -92,12 +98,12 @@ return function(opts)
         end
     end
 
-    local function hold(fraction)
+    local function hold(value)
         if not on_change then
             pending:set(-1)
             return
         end
-        pending:set(fraction)
+        pending:set(value)
         if entry.timer then
             entry.timer:cancel()
         end
@@ -112,21 +118,45 @@ return function(opts)
         if held >= 0 then
             return held
         end
-        return fraction_of(opts.read, payload)
+        return value_of(opts.read, payload, max)
     end)
 
-    local children = {
-        rect {
-            width = fill:map(function(fraction)
-                -- `%d` raises on a float in Lua 5.4; see `components/meter.lua`.
-                return string.format("%d%%", math.floor(fraction * 100 + 0.5))
-            end),
+    -- `%d` raises on a float in Lua 5.4; see `components/meter.lua`.
+    local function percent(value)
+        return string.format("%d%%", math.floor(value / max * 100 + 0.5))
+    end
+    local function bar(width, color)
+        return rect {
+            width = width,
             height = "Fill",
             radius = opts.radius or theme.radius.sm,
-            background = opts.color or theme.ACCENT,
+            background = color,
             visible = opts.fill_visible,
+        }
+    end
+    local split = opts.split_at or max
+    local children = { row {
+        width = "Fill",
+        height = "Fill",
+        children = {
+            bar(fill:map(function(value)
+                return percent(math.min(value, split))
+            end), opts.color or theme.ACCENT),
+            bar(fill:map(function(value)
+                return percent(math.max(0, value - split))
+            end), opts.headroom_color or theme.RED),
         },
-    }
+    } }
+    if opts.marker then
+        children[2] = row {
+            width = "Fill",
+            height = "Fill",
+            children = {
+                rect { width = percent(split) },
+                rect { width = 1, height = "Fill", background = theme.with_opacity(theme.FG, theme.opacity.medium) },
+            },
+        }
+    end
     for _, child in ipairs(opts.children or {}) do
         children[#children + 1] = child
     end
@@ -144,15 +174,15 @@ return function(opts)
         visible = opts.visible,
         on_click = opts.on_click,
         on_drag = function(rect, pointer, phase)
-            local fraction = quantize(pointer.x / rect.width, steps)
+            local value = quantize(pointer.x / rect.width * max, steps, max)
             if phase ~= "end" then
                 dragging:set(true)
-                pending:set(fraction)
+                pending:set(value)
                 return
             end
             dragging:set(false)
-            hold(fraction)
-            opts.on_commit(fraction)
+            hold(value)
+            opts.on_commit(value)
         end,
         on_wheel = function(_, notches)
             if steps <= 0 then
@@ -166,11 +196,11 @@ return function(opts)
                 return
             end
             local held = pending:get()
-            local current = held >= 0 and held or fraction_of(opts.read, opts.signal:get())
+            local current = held >= 0 and held or value_of(opts.read, opts.signal:get(), max)
             -- Snap first: a 79% value from another mixer steps to 80% then 85%, not 84%.
-            local next_fraction = quantize(quantize(current, steps) + whole / steps, steps)
-            hold(next_fraction)
-            opts.on_commit(next_fraction)
+            local next_value = quantize(quantize(current, steps, max) + whole * max / steps, steps, max)
+            hold(next_value)
+            opts.on_commit(next_value)
         end,
         children = children,
     }

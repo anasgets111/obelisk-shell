@@ -32,7 +32,7 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
                 eprintln!("audio: set_app_volume({id}, {volume}) names a stream with no known Props; ignored");
                 return;
             };
-            let Some(channel_volumes) = master::cubed_channel_volumes(volume, current.channel_volumes.len()) else {
+            let Some(channel_volumes) = master::cubed_channel_volumes(volume, &current.channel_volumes, 1.0) else {
                 eprintln!("audio: set_app_volume({id}, {volume}) names a stream that reports no channels; ignored");
                 return;
             };
@@ -52,13 +52,23 @@ fn set_default_volume(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice, volu
         eprintln!("audio: a {kind:?} volume of {volume} has no resolved default device to write to; ignored");
         return;
     };
-    let Some(channel_volumes) = master::cubed_channel_volumes(volume, current.channel_volumes.len()) else {
+    let max = if kind == DefaultDevice::Sink { master::SINK_MAX_VOLUME } else { 1.0 };
+    let Some(channel_volumes) = master::cubed_channel_volumes(volume, &current.channel_volumes, max) else {
         eprintln!(
             "audio: a {kind:?} volume of {volume} resolved to node {node_id}, which reports no channels; ignored"
         );
         return;
     };
     write_device_volume(state, kind, node_id, Some(channel_volumes), None);
+}
+
+/// Pulls the default sink back to the cap when another client (`wpctl set-volume 5%+`) raised it past.
+pub(super) fn cap_default_sink(state: &Rc<RefCell<MixerState>>) {
+    let Some((_, current)) = resolve_default(state, DefaultDevice::Sink) else { return };
+    // The slack stops a loop: 1.5 written as 3.375 reads back as 1.4999999.
+    if master::master_volume_from_props(&current).volume > master::SINK_MAX_VOLUME + 1e-3 {
+        set_default_volume(state, DefaultDevice::Sink, master::SINK_MAX_VOLUME);
+    }
 }
 
 /// Sets or toggles one direction's mute. `None` toggles using resolved `Props`; a set needs no

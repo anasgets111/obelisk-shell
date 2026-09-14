@@ -122,6 +122,9 @@ function util.app_entry(applications, app_id)
     return by_app_id[app_id] or by_app_id[string.lower(app_id)]
 end
 
+-- The engine's `set_volume` clamp.
+util.MAX_VOLUME = 1.5
+
 -- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`. It
 -- takes raw `obelisk.audio`, not a signal, so callers choose their `nil` behavior. Muted, then four
 -- steps by level, as Nerd Font glyphs rather than themed icon names: the OSD accent-tints them and

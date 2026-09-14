@@ -3,10 +3,8 @@
 --
 -- Sliders use `components/slider.lua` and `button`'s `on_drag`/`on_wheel` (ADR-0116). Device
 -- pickers and the mixer expand on click through `PanelRow.expandable` and three `state()` signals.
--- Unlike the mirror, closing the panel leaves an open picker open.
---
--- Dropped 150% headroom with a 100% marker (`set_volume` clamps to `[0.0, 1.0]`). Stream
--- icons use `obelisk.applications` and `app_id`, falling back to a note glyph.
+-- Unlike the mirror, closing the panel leaves an open picker open. Stream icons use
+-- `obelisk.applications` and `app_id`, falling back to a note glyph.
 local theme = require("config.theme")
 local icons = require("config.icons")
 local util = require("lib.util")
@@ -28,8 +26,8 @@ local output_picker_open = state("audio_output_picker", false)
 local input_picker_open = state("audio_input_picker", false)
 local mixer_open = state("audio_mixer_open", false)
 
-local function percent(fraction)
-    return string.format("%d%%", math.floor((fraction or 0) * 100 + 0.5))
+local function percent(value)
+    return string.format("%d%%", math.floor((value or 0) * 100 + 0.5))
 end
 
 local function active_device(devices)
@@ -77,7 +75,8 @@ end
 ---@field volume fun(a: AudioState): number
 ---@field muted fun(a: AudioState): boolean
 ---@field device fun(a: AudioState): AudioDevice? The active device, for the subtitle.
----@field set_volume string The `obelisk.audio` action taking one fraction.
+---@field set_volume string The `obelisk.audio` action taking one volume.
+---@field headroom? boolean Past 100%: a red fill and a marker at 100%.
 ---@field toggle_mute string The `obelisk.audio` action taking nothing.
 ---@field visible? Bound
 ---@field under? Node[]
@@ -93,6 +92,7 @@ local function audio_control(opts)
     local tint = is_muted:map(function(m)
         return m and theme.DIM or theme.ACCENT
     end)
+    local held = state("audio_pending_" .. opts.name, -1)
 
     local children = {
         row {
@@ -111,10 +111,8 @@ local function audio_control(opts)
                         end), theme.DIM, theme.font.xs, { width = "Fill" }),
                     },
                 },
-                cell(util.label(obelisk.audio, function(a)
-                    return percent(opts.volume(a))
-                end):map(function(s)
-                    return { { text = s, bold = true } }
+                cell(computed({ obelisk.audio, held }, function(a, h)
+                    return { { text = a and percent(h >= 0 and h or opts.volume(a)) or "--", bold = true } }
                 end), tint, theme.font.sm, { align_v = "Center" }),
                 icon_button(mute_glyph, function()
                     obelisk.audio:invoke(opts.toggle_mute)
@@ -132,9 +130,16 @@ local function audio_control(opts)
             name = "audio_pending_" .. opts.name,
             signal = obelisk.audio,
             read = opts.volume,
-            on_commit = function(fraction)
-                obelisk.audio:invoke(opts.set_volume, fraction)
+            on_commit = function(value)
+                obelisk.audio:invoke(opts.set_volume, value)
             end,
+            pending = held,
+            max = opts.headroom and util.MAX_VOLUME or nil,
+            split_at = opts.headroom and 1 or nil,
+            marker = opts.headroom,
+            headroom_color = is_muted:map(function(m)
+                return m and theme.INACTIVE or theme.RED
+            end),
             height = SLIDER_HEIGHT,
             color = is_muted:map(function(m)
                 return m and theme.INACTIVE or theme.ACCENT
@@ -242,8 +247,8 @@ local function stream_row(app)
                     end
                     return 0
                 end,
-                on_commit = function(fraction)
-                    obelisk.audio:invoke("set_app_volume", app.id, fraction)
+                on_commit = function(value)
+                    obelisk.audio:invoke("set_app_volume", app.id, value)
                 end,
                 height = STREAM_SLIDER_HEIGHT,
                 color = tint,
@@ -281,6 +286,7 @@ local body = {
         end,
         set_volume = "set_volume",
         toggle_mute = "toggle_mute",
+        headroom = true,
         under = {
             device_picker {
                 name = "output",

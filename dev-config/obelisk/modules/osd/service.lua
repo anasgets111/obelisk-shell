@@ -67,7 +67,7 @@ obelisk.audio:on_change(function(a, previous)
         osd.show("volume", {
             glyph = util.volume_glyph(a),
             text = a.muted and "muted" or string.format("%d%%", percent),
-            level = a.muted and 0 or percent,
+            level = a.muted and 0 or percent / util.MAX_VOLUME,
             color = theme.ACCENT,
         })
     end

@@ -15,8 +15,11 @@ local glyph = require("components.glyph")
 local slider = require("components.slider")
 
 local SLOT = "volume"
+local SPLIT = 1
 local hovered = hover(SLOT)
 local dragging = state("volume_dragging", false)
+-- The slider's held value, `-1` when none; the readout follows a drag before PipeWire answers.
+local held = state("volume_pending", -1)
 local expanded = computed({ hovered, dragging }, function(h, d)
     return h or d
 end)
@@ -44,14 +47,21 @@ end)
 local fill = obelisk.audio:map(function(a)
     return muted(a) and theme.INACTIVE or theme.ACCENT
 end)
+local headroom = obelisk.audio:map(function(a)
+    return muted(a) and theme.INACTIVE or theme.RED
+end)
+
+local level = computed({ obelisk.audio, held }, function(a, h)
+    return h >= 0 and h or volume(a)
+end)
 
 -- `Volume.qml`'s `foregroundAt`: contrast against the fill once it reaches the glyph or percentage,
 -- otherwise against the ground. Their thresholds are the first and last quarters of the expanded
 -- control.
 local function foreground_past(threshold)
-    return computed({ obelisk.audio, expanded, ground, fill }, function(a, is_expanded, ground_color, fill_color)
-        if is_expanded and volume(a) >= threshold then
-            return theme.text_contrast(fill_color)
+    return computed({ level, expanded, ground, fill, headroom }, function(v, open, ground_color, fill_color, over)
+        if open and v / util.MAX_VOLUME >= threshold then
+            return theme.text_contrast(threshold * util.MAX_VOLUME > SPLIT and over or fill_color)
         end
         return theme.text_contrast(ground_color)
     end)
@@ -61,9 +71,13 @@ return slider {
     name = "volume_pending",
     signal = obelisk.audio,
     read = volume,
-    on_commit = function(fraction)
-        obelisk.audio:invoke("set_volume", fraction)
+    on_commit = function(value)
+        obelisk.audio:invoke("set_volume", value)
     end,
+    max = util.MAX_VOLUME,
+    split_at = SPLIT,
+    pending = held,
+    headroom_color = headroom,
     width = expanded:map(function(is_expanded)
         return is_expanded and theme.volume_expanded_width or theme.item_width
     end),
@@ -100,11 +114,13 @@ return slider {
             glyph(obelisk.audio:map(util.volume_glyph), foreground_past(0.25), theme.icon.lg, { align_v = "Center" }),
             -- A hidden percentage costs no width or spacing: `layout::scene` sums visible child
             -- footprints and multiplies spacing by their count.
-            cell(util.label(obelisk.audio, function(a)
-                if a.muted then
+            cell(computed({ obelisk.audio, level }, function(a, v)
+                if a == nil then
+                    return "--"
+                elseif a.muted then
                     return "muted"
                 end
-                return string.format("%d%%", math.floor(a.volume * 100 + 0.5))
+                return string.format("%d%%", math.floor(v * 100 + 0.5))
             end), foreground_past(0.75), theme.font.sm, { align_v = "Center", visible = expanded }),
         },
     } },

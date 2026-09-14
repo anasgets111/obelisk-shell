@@ -23,7 +23,7 @@ use super::state::{
     PrivacySources,
 };
 use super::streams::{NodeKind, apply_capture_info_event, apply_info_event, apply_video_info_event, classify};
-use super::write::apply_command;
+use super::write::{apply_command, cap_default_sink};
 
 /// Runs the listener until process exit. Sends [`AudioState`] on every relevant
 /// node-added/-properties-changed/-removed/param-changed event, and [`PrivacySources`] on the
@@ -346,10 +346,13 @@ fn bind_device_node(
                 return;
             };
             let mut state_mut = state_for_param.borrow_mut();
-            if let Some(entry) = state_mut.device_entries_mut(kind).get_mut(&node_id) {
-                entry.props = Some(raw);
-            }
+            let entry = state_mut.device_entries_mut(kind).get_mut(&node_id);
+            let changed = entry.is_some_and(|entry| entry.props.replace(raw.clone()) != Some(raw));
             state_mut.publish_audio();
+            drop(state_mut);
+            if changed && kind == DefaultDevice::Sink {
+                cap_default_sink(&state_for_param);
+            }
         })
         // Route data comes from info: global props have media.class/node.name but not device.id or
         // card.profile.device. Reading them at global time would silently drop writes.
@@ -424,6 +427,10 @@ fn bind_default_metadata(
                 DefaultDevice::Source => state_mut.default_source_name = name,
             }
             state_mut.publish_audio();
+            drop(state_mut);
+            if field == DefaultDevice::Sink {
+                cap_default_sink(&state_for_property);
+            }
             0
         })
         .register();
@@ -472,7 +479,9 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
             let Some((profile_device, index)) = master::extract_route_target(&value) else {
                 return;
             };
-            state_for_param.borrow_mut().device_routes.insert((device_id, profile_device), index);
+            if state_for_param.borrow_mut().device_routes.insert((device_id, profile_device), index) != Some(index) {
+                cap_default_sink(&state_for_param);
+            }
         })
         // Re-asks on every param change, including the first `info` a bind always answers with.
         // A profile switch or a plugged headset moves the active route.

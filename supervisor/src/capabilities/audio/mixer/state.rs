@@ -15,7 +15,7 @@ use crate::capabilities::audio::master;
 /// Full `obelisk.audio` payload (ADR-0053 decision 3).
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
-    /// Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
+    /// Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`.
     pub volume: f32,
     /// Master output mute.
     pub muted: bool,
@@ -196,7 +196,7 @@ impl MixerState {
             })
             .collect();
         let state = AudioState {
-            volume: master.volume,
+            volume: master.volume.min(master::SINK_MAX_VOLUME),
             muted: master.muted,
             source_volume: source.volume,
             source_muted: source.muted,
@@ -332,10 +332,7 @@ mod tests {
 
     /// Raw `Props` at a linear volume, so tests name the linear value rather than its cube.
     fn props_at(linear: f32, muted: bool) -> master::RawSinkProps {
-        master::RawSinkProps {
-            mute: muted,
-            channel_volumes: master::cubed_channel_volumes(linear, 2).expect("two channels is not zero"),
-        }
+        master::RawSinkProps { mute: muted, channel_volumes: vec![linear.powi(3); 2] }
     }
 
     /// `publish_audio` fixture with empty proxy maps; tests fill only fields they exercise.

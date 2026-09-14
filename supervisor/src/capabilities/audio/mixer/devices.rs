@@ -131,7 +131,7 @@ impl DeviceNames {
 #[derive(Debug, Clone, Default)]
 pub(super) struct DeviceEntry {
     pub(super) names: DeviceNames,
-    /// Last raw `Props`, or `None` before the first `param`; writes need channel count and mute.
+    /// Last raw `Props`, or `None` before the first `param`; writes scale its channels and toggle its mute.
     pub(super) props: Option<master::RawSinkProps>,
     /// Hardware route, or `None` for a virtual/null node whose volume is node-owned.
     pub(super) route: Option<DeviceRoute>,

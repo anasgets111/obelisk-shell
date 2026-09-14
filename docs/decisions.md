@@ -2064,6 +2064,9 @@ A brief old-snapshot snap-back remains possible. Microphone OSD and deeper app-i
 Amendment to decision 2: notches come from `value120` when the compositor sends it, and from
 pixels only without it (touchpads). Hyprland sends both, and its ~15px per notch arrived as 0.385.
 
+Amendment to decision 6: output volume reads and writes up to 1.5 with channel balance kept, and the
+default sink is written back to 1.5 when another client raises it past.
+
 ## 0117. A workspace knows whether it is empty and what runs on it
 
 1. Add populated and one representative app ID per workspace: focused window, else lowest window

@@ -67,6 +67,9 @@ pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
     Some(RawSinkProps { mute, channel_volumes: channel_volumes? })
 }
 
+/// ponytail: a fixed output ceiling; upgrade path is a config-set one through an audio action.
+pub const SINK_MAX_VOLUME: f32 = 1.5;
+
 /// Converts raw `Props` to the reported value: the cube root of the loudest channel. Empty channels
 /// report `0.0` instead of panicking.
 pub fn master_volume_from_props(props: &RawSinkProps) -> MasterVolume {
@@ -107,7 +110,7 @@ pub fn resolve_default_device<'a>(
 
 /// Combines default-name resolution with tracked [`RawSinkProps`]. Returns
 /// [`MasterVolume::default`] when resolution or `Props` is still missing; the maps update from
-/// separate PipeWire events. The raw props stay tracked because writes need channel count.
+/// separate PipeWire events. The raw props stay tracked because writes scale the current channels.
 pub fn compute_master<'a>(
     default_name: Option<&str>,
     names: impl Iterator<Item = (u32, &'a str)>,
@@ -119,18 +122,19 @@ pub fn compute_master<'a>(
         .unwrap_or_default()
 }
 
-/// Inverse of [`master_volume_from_props`]'s cube root, spread across `channels`. PipeWire stores
-/// `channelVolumes` cubed, so skipping this wrote 30% as 67%, the read mistake (ADR-0053).
-/// Clamps `linear` to `[0.0, 1.0]`. There is one volume per device, so every channel gets
-/// the same value, flattening balance.
-pub fn cubed_channel_volumes(linear: f32, channels: usize) -> Option<Vec<f32>> {
-    if channels == 0 {
+/// Inverse of [`master_volume_from_props`]'s cube root: scales `current` so its loudest channel
+/// reads `target`, clamped to `[0.0, max]`; all-silent channels spread evenly, having no balance to
+/// keep. PipeWire stores `channelVolumes` cubed, so skipping this wrote 30% as 67%, the read mistake
+/// (ADR-0053).
+pub fn cubed_channel_volumes(target: f32, current: &[f32], max: f32) -> Option<Vec<f32>> {
+    if current.is_empty() {
         // PipeWire accepts and ignores an empty channelVolumes array, so set_volume would report
         // success without changing anything. Refuse it so the caller can report failure.
         return None;
     }
-    let clamped = linear.clamp(0.0, 1.0);
-    Some(vec![clamped * clamped * clamped; channels])
+    let cubed = target.clamp(0.0, max).powi(3);
+    let peak = current.iter().copied().fold(0.0_f32, f32::max);
+    Some(current.iter().map(|c| if peak > 0.0 { c * cubed / peak } else { cubed }).collect())
 }
 
 /// Builds the partial `SPA_PARAM_Props` object accepted by `Node::set_param`. Live
@@ -445,25 +449,26 @@ mod tests {
 
     #[test]
     fn cubed_channel_volumes_is_the_exact_inverse_of_the_read_direction() {
-        let volumes = cubed_channel_volumes(0.3, 2).expect("two channels is not zero");
+        let volumes = cubed_channel_volumes(0.3, &[1.0, 1.0], 1.0).expect("two channels is not zero");
         let read_back = master_volume_from_props(&RawSinkProps { mute: false, channel_volumes: volumes });
         assert!((read_back.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", read_back.volume);
     }
 
     #[test]
-    fn cubed_channel_volumes_writes_one_entry_per_channel() {
-        assert_eq!(cubed_channel_volumes(1.0, 6).map(|v| v.len()), Some(6));
+    fn cubed_channel_volumes_keeps_balance_and_spreads_evenly_over_silent_channels() {
+        assert_eq!(cubed_channel_volumes(0.5, &[0.125, 1.0], 1.0), Some(vec![0.015625, 0.125]));
+        assert_eq!(cubed_channel_volumes(0.5, &[0.0; 6], 1.0), Some(vec![0.125; 6]));
     }
 
     #[test]
     fn cubed_channel_volumes_clamps_a_value_outside_the_specified_range() {
-        assert_eq!(cubed_channel_volumes(2.0, 1), Some(vec![1.0]));
-        assert_eq!(cubed_channel_volumes(-0.5, 1), Some(vec![0.0]));
+        assert_eq!(cubed_channel_volumes(2.0, &[1.0], 1.0), Some(vec![1.0]));
+        assert_eq!(cubed_channel_volumes(-0.5, &[1.0], 1.0), Some(vec![0.0]));
     }
 
     #[test]
     fn cubed_channel_volumes_refuses_a_device_reporting_no_channels() {
-        assert_eq!(cubed_channel_volumes(0.5, 0), None);
+        assert_eq!(cubed_channel_volumes(0.5, &[], 1.0), None);
     }
 
     #[test]

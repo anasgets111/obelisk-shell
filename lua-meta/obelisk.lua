@@ -324,7 +324,7 @@
 ---@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators.
 ---@field source_volume number Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or with no input device.
 ---@field sources AudioDevice[] Every input device, on the same terms as `AudioState::sinks`.
----@field volume number Master output volume, range `[0.0, 1.0]`, derived from the default sink's `channelVolumes`.
+---@field volume number Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`.
 
 ---@class BatteryState
 ---`obelisk.battery`'s full payload. Field names are the `StateSnapshot` JSON keys verbatim
@@ -501,7 +501,7 @@
 ---@field invoke fun(self: ApplicationsCapability, command: ApplicationsAction, ...: any)
 
 ---@alias AudioAction
----| "set_volume" # (volume: number) Sets master output volume, clamped to `[0.0, 1.0]`.
+---| "set_volume" # (volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.
 ---| "set_muted" # (muted: boolean) Sets master output mute.
 ---| "toggle_mute" # () Toggles master output mute.
 ---| "set_default_sink" # (id: integer) Makes this `sinks[].id` the default output.
