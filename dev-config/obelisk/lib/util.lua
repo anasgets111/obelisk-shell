@@ -125,6 +125,41 @@ end
 -- The engine's `set_volume` clamp.
 util.MAX_VOLUME = 1.5
 
+-- The `active` entry of `obelisk.audio.sinks` or `sources`, or `nil`.
+function util.active_device(devices)
+    for _, device in ipairs(devices or {}) do
+        if device.active then
+            return device
+        end
+    end
+end
+
+-- `util.audio_device_glyph`'s hints, strongest first: `{ field, pattern, glyph, input glyph? }`.
+local AUDIO_DEVICE_HINTS = {
+    { "port",        "headset",     "headset" },
+    { "port",        "headphones",  "headphones" },
+    { "port",        "hdmi",        "television" },
+    { "port",        "displayport", "television" },
+    { "form_factor", "headset",     "headset" },
+    { "form_factor", "hands%-free", "headset" },
+    { "form_factor", "headphone",   "headphones", "headset" },
+    { "form_factor", "tv",          "television" },
+    { "form_factor", "webcam",      "webcam" },
+    { "form_factor", "handset",     "phone" },
+    { "bus",         "usb",         "usb" },
+}
+
+-- Glyph for an `AudioDevice`, or `nil` when nothing names one; callers supply the fallback.
+function util.audio_device_glyph(device, is_input)
+    local icons = require("config.icons")
+    for _, hint in ipairs(AUDIO_DEVICE_HINTS) do
+        local value = device and device[hint[1]]
+        if value and value:find(hint[2]) then
+            return icons[is_input and hint[4] or hint[3]]
+        end
+    end
+end
+
 -- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`. It
 -- takes raw `obelisk.audio`, not a signal, so callers choose their `nil` behavior. `--` without a
 -- volume, muted, then four steps by level, as Nerd Font glyphs rather than themed icon names: the

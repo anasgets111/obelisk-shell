@@ -11,7 +11,7 @@ use crate::capabilities::audio::master;
 
 /// One `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
 /// `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AudioDevice {
     /// PipeWire registry id, the argument of `:invoke("set_default_sink", id)`.
     pub id: u32,
@@ -19,10 +19,18 @@ pub struct AudioDevice {
     pub name: String,
     /// Whether `default.audio.sink`/`default.audio.source` currently routes here.
     pub active: bool,
-    /// PipeWire's `device.icon-name` hint, such as `"audio-card-analog"`; not resolved here.
-    /// `None` means the node carried no hint, as with a virtual sink.
+    /// PipeWire's `device.icon-name` hint, e.g. `"audio-card-analog"`; not resolved here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// The active card route's `port.type`, e.g. `"headphones"`, `"hdmi"`, `"mic"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    /// `device.bus`, e.g. `"pci"`, `"usb"`, `"bluetooth"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
+    /// `device.form-factor`, e.g. `"headset"`; PCI cards carry none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form_factor: Option<String>,
 }
 
 /// One BlueZ audio device's codec choices, joined to `obelisk.bluetooth` by MAC.
@@ -109,12 +117,13 @@ pub(super) fn bluetooth_codecs(cards: &HashMap<u32, BluezCard>) -> Vec<Bluetooth
 }
 
 /// Device routing name and display description; metadata routes by `node_name`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct DeviceNames {
     pub(super) node_name: String,
     pub(super) description: Option<String>,
-    /// [`AudioDevice::icon`], read from the same `global` event.
     pub(super) icon: Option<String>,
+    pub(super) bus: Option<String>,
+    pub(super) form_factor: Option<String>,
 }
 
 impl DeviceNames {
@@ -146,18 +155,25 @@ pub(super) struct DeviceRoute {
 }
 
 /// Builds a device array, ordered by registry id for deterministic publishes.
-pub(super) fn device_list<'a>(
-    devices: impl Iterator<Item = (u32, &'a DeviceNames)> + Clone,
+pub(super) fn device_list(
+    entries: &HashMap<u32, DeviceEntry>,
+    routes: &HashMap<(u32, i32), master::ActiveRoute>,
     default_name: Option<&str>,
 ) -> Vec<AudioDevice> {
-    let active =
-        master::resolve_default_device(default_name, devices.clone().map(|(id, names)| (id, names.node_name.as_str())));
-    let mut list: Vec<AudioDevice> = devices
-        .map(|(id, names)| AudioDevice {
+    let active = master::resolve_default_device(
+        default_name,
+        entries.iter().map(|(&id, entry)| (id, entry.names.node_name.as_str())),
+    );
+    let mut list: Vec<AudioDevice> = entries
+        .iter()
+        .map(|(&id, entry)| AudioDevice {
             id,
-            name: names.display(),
+            name: entry.names.display(),
             active: active == Some(id),
-            icon: names.icon.clone(),
+            icon: entry.names.icon.clone(),
+            port: entry.route.and_then(|route| routes.get(&(route.device_id, route.profile_device))?.port.clone()),
+            bus: entry.names.bus.clone(),
+            form_factor: entry.names.form_factor.clone(),
         })
         .collect();
     list.sort_by_key(|device| device.id);
@@ -174,12 +190,15 @@ pub(super) fn device_display_name(props: &impl PropsLookup) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Reads [`DeviceNames`] from `global` props; `None` if `node.name` is absent.
+/// Reads [`DeviceNames`] from `global` or `info` props; `None` if `node.name` is absent.
 pub(super) fn device_names(props: &impl PropsLookup) -> Option<DeviceNames> {
+    let hint = |key: &str| props.get_prop(key).map(str::to_string);
     Some(DeviceNames {
         node_name: props.get_prop(*keys::NODE_NAME)?.to_string(),
         description: device_display_name(props),
-        icon: props.get_prop(*keys::DEVICE_ICON_NAME).map(str::to_string),
+        icon: hint(*keys::DEVICE_ICON_NAME),
+        bus: hint(*keys::DEVICE_BUS),
+        form_factor: hint(*keys::DEVICE_FORM_FACTOR),
     })
 }
 
@@ -217,32 +236,34 @@ mod tests {
         assert_eq!(device_display_name(&props), None);
     }
 
-    fn tracked(entries: &[(u32, &str, Option<&str>)]) -> HashMap<u32, DeviceNames> {
+    fn tracked(entries: &[(u32, &str, Option<&str>)]) -> HashMap<u32, DeviceEntry> {
         entries
             .iter()
             .map(|(id, node_name, description)| {
-                (
-                    *id,
-                    DeviceNames {
-                        node_name: node_name.to_string(),
-                        description: description.map(str::to_string),
-                        icon: None,
-                    },
-                )
+                let names = DeviceNames {
+                    node_name: node_name.to_string(),
+                    description: description.map(str::to_string),
+                    ..DeviceNames::default()
+                };
+                (*id, DeviceEntry { names, ..DeviceEntry::default() })
             })
             .collect()
     }
 
     #[test]
-    fn device_names_reads_the_icon_hint_beside_the_two_names_and_needs_only_the_node_name() {
+    fn device_names_reads_the_hints_beside_the_two_names_and_needs_only_the_node_name() {
         let props = HashMap::from([
-            ("node.name".to_string(), "alsa_input.pci-0000_00_1f.3.analog-stereo".to_string()),
-            ("node.description".to_string(), "Built-in Audio Analog Stereo".to_string()),
-            ("device.icon-name".to_string(), "audio-card-analog".to_string()),
+            ("node.name".to_string(), "bluez_output.AA_BB_CC_DD_EE_FF.1".to_string()),
+            ("node.description".to_string(), "WH-1000XM4".to_string()),
+            ("device.icon-name".to_string(), "audio-headphones-bluetooth".to_string()),
+            ("device.bus".to_string(), "bluetooth".to_string()),
+            ("device.form-factor".to_string(), "headphone".to_string()),
         ]);
         let names = device_names(&props).expect("a node with a name is trackable");
-        assert_eq!(names.description.as_deref(), Some("Built-in Audio Analog Stereo"));
-        assert_eq!(names.icon.as_deref(), Some("audio-card-analog"));
+        assert_eq!(names.description.as_deref(), Some("WH-1000XM4"));
+        assert_eq!(names.icon.as_deref(), Some("audio-headphones-bluetooth"));
+        assert_eq!(names.bus.as_deref(), Some("bluetooth"));
+        assert_eq!(names.form_factor.as_deref(), Some("headphone"));
 
         let bare = HashMap::from([("node.name".to_string(), "null-sink".to_string())]);
         assert_eq!(device_names(&bare).map(|names| names.icon), Some(None), "no icon is an answer, not a failure");
@@ -251,37 +272,49 @@ mod tests {
 
     #[test]
     fn device_list_marks_the_metadata_named_device_active_and_orders_by_id() {
-        let names = tracked(&[
+        let mut entries = tracked(&[
             (70, "bluez_output.headset", Some("WH-1000XM4")),
             (59, "alsa_output.analog", Some("Built-in Audio Analog Stereo")),
         ]);
+        entries.get_mut(&59).unwrap().route = Some(DeviceRoute { device_id: 51, profile_device: 3 });
+        let routes = HashMap::from([((51, 3), master::ActiveRoute { index: 5, port: Some("hdmi".to_string()) })]);
 
-        let devices = device_list(names.iter().map(|(&id, names)| (id, names)), Some("bluez_output.headset"));
+        let devices = device_list(&entries, &routes, Some("bluez_output.headset"));
 
         assert_eq!(
             devices,
             vec![
-                AudioDevice { id: 59, name: "Built-in Audio Analog Stereo".to_string(), active: false, icon: None },
-                AudioDevice { id: 70, name: "WH-1000XM4".to_string(), active: true, icon: None },
+                AudioDevice {
+                    id: 59,
+                    name: "Built-in Audio Analog Stereo".to_string(),
+                    port: Some("hdmi".to_string()),
+                    ..AudioDevice::default()
+                },
+                AudioDevice { id: 70, name: "WH-1000XM4".to_string(), active: true, ..AudioDevice::default() },
             ]
         );
     }
 
     #[test]
     fn device_list_falls_back_to_the_node_name_when_no_description_was_seen() {
-        let names = tracked(&[(59, "alsa_output.analog", None)]);
+        let entries = tracked(&[(59, "alsa_output.analog", None)]);
 
-        let devices = device_list(names.iter().map(|(&id, names)| (id, names)), None);
+        let devices = device_list(&entries, &HashMap::new(), None);
 
         assert_eq!(
             devices,
-            vec![AudioDevice { id: 59, name: "alsa_output.analog".to_string(), active: true, icon: None }]
+            vec![AudioDevice {
+                id: 59,
+                name: "alsa_output.analog".to_string(),
+                active: true,
+                ..AudioDevice::default()
+            }]
         );
     }
 
     #[test]
     fn device_list_is_empty_with_nothing_tracked() {
-        assert_eq!(device_list(std::iter::empty(), Some("anything")), Vec::new());
+        assert_eq!(device_list(&HashMap::new(), &HashMap::new(), Some("anything")), Vec::new());
     }
 
     #[test]

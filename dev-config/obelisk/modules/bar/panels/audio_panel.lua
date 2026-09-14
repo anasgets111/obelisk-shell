@@ -30,28 +30,6 @@ local function percent(value)
     return value and string.format("%d%%", math.floor(value * 100 + 0.5)) or "--"
 end
 
-local function active_device(devices)
-    for _, device in ipairs(devices or {}) do
-        if device.active then
-            return device
-        end
-    end
-    return nil
-end
-
--- `AudioService.deviceIconFor`: match PipeWire's `device.icon-name`; no hint uses default glyph.
-local function device_glyph(device, default)
-    local hint = (device and device.icon) or ""
-    if hint:find("headset") or hint:find("hands%-free") then
-        return icons.headset
-    elseif hint:find("headphone") then
-        return icons.headphones
-    elseif hint:find("phone") or hint:find("portable") then
-        return icons.phone
-    end
-    return default
-end
-
 -- `AudioService.normalizeDeviceName`: remove redundant ALSA description words.
 local function device_name(device)
     if device == nil then
@@ -74,7 +52,8 @@ end
 ---@field glyph_off string
 ---@field volume fun(a: AudioState): number?
 ---@field muted fun(a: AudioState): boolean
----@field device fun(a: AudioState): AudioDevice? The active device, for the subtitle.
+---@field device fun(a: AudioState): AudioDevice? The active device, for the subtitle and leading glyph.
+---@field is_input? boolean
 ---@field set_volume string The `obelisk.audio` action taking one volume.
 ---@field headroom? boolean Past 100%: a red fill and a marker at 100%.
 ---@field toggle_mute string The `obelisk.audio` action taking nothing.
@@ -95,6 +74,9 @@ local function audio_control(opts)
     local tint = is_muted:map(function(m)
         return m and theme.DIM or theme.ACCENT
     end)
+    local leading_glyph = computed({ obelisk.audio, mute_glyph }, function(a, fallback)
+        return a and not opts.muted(a) and util.audio_device_glyph(opts.device(a), opts.is_input) or fallback
+    end)
     local held = state("audio_pending_" .. opts.name, -1)
 
     local children = {
@@ -103,7 +85,7 @@ local function audio_control(opts)
             spacing = theme.spacing.sm,
             align_v = "Center",
             children = {
-                glyph(mute_glyph, tint, theme.icon.lg, { align_v = "Center" }),
+                glyph(leading_glyph, tint, theme.icon.lg, { align_v = "Center" }),
                 column {
                     width = "Fill",
                     align_v = "Center",
@@ -197,7 +179,8 @@ local function device_picker(opts)
                 itemfn = function(device)
                     return panel_row {
                         slot = "audio-device-" .. opts.name .. "-" .. tostring(device.id),
-                        icon = device_glyph(device, opts.default_glyph),
+                        icon = util.audio_device_glyph(device, opts.is_input)
+                            or (opts.is_input and icons.mic_on or icons.speaker),
                         title = device_name(device) or "?",
                         selected = device.active,
                         trailing = glyph(icons.check, device.active and theme.ACCENT or "#00000000", theme.font.sm),
@@ -287,7 +270,7 @@ local body = {
             return a.muted
         end,
         device = function(a)
-            return active_device(a.sinks)
+            return util.active_device(a.sinks)
         end,
         set_volume = "set_volume",
         toggle_mute = "toggle_mute",
@@ -296,7 +279,6 @@ local body = {
             device_picker {
                 name = "output",
                 open = output_picker_open,
-                default_glyph = icons.speaker,
                 list = function(a)
                     return a.sinks
                 end,
@@ -316,8 +298,9 @@ local body = {
             return a.source_muted
         end,
         device = function(a)
-            return active_device(a.sources)
+            return util.active_device(a.sources)
         end,
+        is_input = true,
         set_volume = "set_source_volume",
         toggle_mute = "toggle_source_mute",
         visible = util.shown_when(obelisk.audio, function(a)
@@ -327,7 +310,7 @@ local body = {
             device_picker {
                 name = "input",
                 open = input_picker_open,
-                default_glyph = icons.mic_on,
+                is_input = true,
                 list = function(a)
                     return a.sources
                 end,

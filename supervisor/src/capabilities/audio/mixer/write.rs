@@ -140,7 +140,9 @@ fn write_device_route(
     channel_volumes: Option<Vec<f32>>,
     muted: Option<bool>,
 ) {
-    let Some(index) = state.borrow().device_routes.get(&(route.device_id, route.profile_device)).copied() else {
+    let Some(index) =
+        state.borrow().device_routes.get(&(route.device_id, route.profile_device)).map(|active| active.index)
+    else {
         eprintln!(
             "audio: sink {node_id} routes through device {} port {}, whose active Route index has not been seen; ignored",
             route.device_id, route.profile_device

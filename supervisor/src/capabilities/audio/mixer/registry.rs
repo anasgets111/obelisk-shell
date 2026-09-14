@@ -353,15 +353,19 @@ fn bind_device_node(
                 cap_default_sink(&state_for_param);
             }
         })
-        // Route data comes from info: global props have media.class/node.name but not device.id or
-        // card.profile.device. Reading them at global time would silently drop writes.
+        // Only info props carry device.id, card.profile.device and the device hints; global ones never do.
         .info(move |info| {
             if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
                 return;
             }
-            let Some(route) = info.props().and_then(parse_device_route) else { return };
-            if let Some(entry) = state_for_info.borrow_mut().device_entries_mut(kind).get_mut(&node_id) {
-                entry.route = Some(route);
+            let Some(props) = info.props() else { return };
+            let (route, Some(names)) = (parse_device_route(props), device_names(props)) else { return };
+            let mut state_mut = state_for_info.borrow_mut();
+            let Some(entry) = state_mut.device_entries_mut(kind).get_mut(&node_id) else { return };
+            if entry.names != names || entry.route != route {
+                entry.names = names;
+                entry.route = route;
+                state_mut.publish_audio();
             }
         })
         .register();
@@ -439,8 +443,9 @@ fn bind_default_metadata(
     state_mut.metadata = Some((metadata, listener));
 }
 
-/// Binds ALSA `Device` globals for their `Route` active index, solely for writes. Without this,
-/// hardware-sink `set_volume` is silently dropped. `v4l2`/`libcamera` devices have no audio routes.
+/// Binds ALSA `Device` globals for their active `Route`: its index for writes, its port for device
+/// glyphs. Without this, hardware-sink `set_volume` is silently dropped. `v4l2`/`libcamera` devices
+/// have no audio routes.
 ///
 /// Enumerated from `info`, not subscribed to: `subscribe_params` delivers only what exists when it
 /// is called, and a `Route` appearing later is pushed to nobody. A shell started before its card
@@ -475,10 +480,17 @@ fn bind_device(state: &Rc<RefCell<MixerState>>, registry: &pw::registry::Registr
             let Ok((_, value)) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes()) else {
                 return;
             };
-            let Some((profile_device, index)) = master::extract_route_target(&value) else {
+            let Some((profile_device, route)) = master::extract_route_target(&value) else {
                 return;
             };
-            if state_for_param.borrow_mut().device_routes.insert((device_id, profile_device), index) != Some(index) {
+            let previous =
+                state_for_param.borrow_mut().device_routes.insert((device_id, profile_device), route.clone());
+            if previous.as_ref() == Some(&route) {
+                return;
+            }
+            // ponytail: the first push can lack `port` until Route answers; upgrade: fold Route into hydration.
+            state_for_param.borrow().publish_audio();
+            if previous.map(|previous| previous.index) != Some(route.index) {
                 cap_default_sink(&state_for_param);
             }
         })

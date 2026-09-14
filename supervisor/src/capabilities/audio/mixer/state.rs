@@ -98,8 +98,8 @@ pub(super) struct MixerState {
     /// Bound ALSA `Device` proxies/listeners for writes. Hardware volume lives on `Route`, not
     /// the node; without these, `set_volume` is accepted and silently discarded.
     pub(super) devices: HashMap<u32, (Rc<pw::device::Device>, pw::device::DeviceListener)>,
-    /// `(device global id, card.profile.device)` -> active `Route` index from the device.
-    pub(super) device_routes: HashMap<(u32, i32), i32>,
+    /// `(device global id, card.profile.device)` -> active `Route` from the device.
+    pub(super) device_routes: HashMap<(u32, i32), master::ActiveRoute>,
     /// BlueZ `Device` id -> its MAC and profiles, for [`AudioState::bluetooth`].
     pub(super) bluez_cards: HashMap<u32, BluezCard>,
     /// Bound BlueZ `Device` proxies/listeners, separate from `bluez_cards` so state stays plain.
@@ -199,14 +199,8 @@ impl MixerState {
             muted: master.is_some_and(|m| m.muted),
             source_volume: source.map(|s| s.volume),
             source_muted: source.is_some_and(|s| s.muted),
-            sinks: device_list(
-                self.sinks.iter().map(|(&id, sink)| (id, &sink.names)),
-                self.default_sink_name.as_deref(),
-            ),
-            sources: device_list(
-                self.sources.iter().map(|(&id, source)| (id, &source.names)),
-                self.default_source_name.as_deref(),
-            ),
+            sinks: device_list(&self.sinks, &self.device_routes, self.default_sink_name.as_deref()),
+            sources: device_list(&self.sources, &self.device_routes, self.default_source_name.as_deref()),
             apps,
             bluetooth: bluetooth_codecs(&self.bluez_cards),
         };
@@ -261,7 +255,7 @@ mod tests {
             names: DeviceNames {
                 node_name: node_name.to_string(),
                 description: description.map(str::to_string),
-                icon: None,
+                ..DeviceNames::default()
             },
             props,
             route: None,
@@ -282,12 +276,13 @@ mod tests {
                 name: "Built-in Audio Analog Stereo".to_string(),
                 active: true,
                 icon: Some("audio-card-analog".to_string()),
+                ..AudioDevice::default()
             }],
             sources: vec![AudioDevice {
                 id: 60,
                 name: "Built-in Audio Analog Stereo".to_string(),
                 active: true,
-                icon: None,
+                ..AudioDevice::default()
             }],
             apps: vec![stream.clone()],
             bluetooth: vec![BluetoothCodecs {
@@ -491,7 +486,12 @@ mod tests {
         assert_eq!(published.sinks[1].name, "WH-1000XM4");
         assert_eq!(
             published.sources,
-            vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true, icon: None }]
+            vec![AudioDevice {
+                id: 60,
+                name: "Built-in Microphone".to_string(),
+                active: true,
+                ..AudioDevice::default()
+            }]
         );
         // The source's Props use the master's cube-root conversion.
         assert!((published.source_volume.unwrap() - 0.6).abs() < 1e-6, "got {:?}", published.source_volume);

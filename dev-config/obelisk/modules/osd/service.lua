@@ -47,14 +47,6 @@ local function toggle(kind, on, glyph_on, glyph_off, what)
     osd.show(kind, { glyph = on and glyph_on or glyph_off, text = what .. (on and " on" or " off") })
 end
 
-local function active_name(devices)
-    for _, device in ipairs(devices or {}) do
-        if device.active then
-            return device.name
-        end
-    end
-end
-
 -- Every handler skips the first push (`previous == nil`): like the mirror's `initialized` timer, it
 -- reports learned state, not a change.
 
@@ -72,9 +64,9 @@ obelisk.audio:on_change(function(a, previous)
             color = theme.ACCENT,
         })
     end
-    local sink = active_name(a.sinks)
-    if sink and sink ~= active_name(previous.sinks) then
-        osd.show("audio_device", { glyph = icons.speaker, text = sink })
+    local sink, was = util.active_device(a.sinks), util.active_device(previous.sinks)
+    if sink and sink.name ~= (was and was.name) then
+        osd.show("audio_device", { glyph = util.audio_device_glyph(sink, false) or icons.speaker, text = sink.name })
     end
 end)
 

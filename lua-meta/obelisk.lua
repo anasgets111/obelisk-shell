@@ -85,9 +85,12 @@
 ---One `sinks`/`sources` entry. `name` is the user-facing `node.description`, not routing
 ---`node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
 ---@field active boolean Whether `default.audio.sink`/`default.audio.source` currently routes here.
----@field icon? string PipeWire's `device.icon-name` hint, such as `"audio-card-analog"`; not resolved here. `None` means the node carried no hint, as with a virtual sink.
+---@field bus? string `device.bus`, e.g. `"pci"`, `"usb"`, `"bluetooth"`.
+---@field form_factor? string `device.form-factor`, e.g. `"headset"`; PCI cards carry none.
+---@field icon? string PipeWire's `device.icon-name` hint, e.g. `"audio-card-analog"`; not resolved here.
 ---@field id integer PipeWire registry id, the argument of `:invoke("set_default_sink", id)`.
 ---@field name string Device description, e.g. `"Built-in Audio Analog Stereo"`; neither is reboot-stable.
+---@field port? string The active card route's `port.type`, e.g. `"headphones"`, `"hdmi"`, `"mic"`.
 
 ---@alias BatteryStatus
 ---| "Unknown" # UPower has no answer, including hosts whose display device is not a battery.

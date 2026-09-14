@@ -50,6 +50,9 @@ icons.music_note      = "\u{F075A}"
 icons.headphones      = "\u{F02CB}"
 icons.headset         = "\u{F02CE}"
 icons.phone           = "\u{F03F2}"
+icons.television      = "\u{F0502}"
+icons.usb             = "\u{F0553}"
+icons.webcam          = "\u{F05A0}"
 
 -- Audio levels, plus the muted toggle glyph.
 icons.vol_muted       = "\u{F075F}"
