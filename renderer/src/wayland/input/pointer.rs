@@ -5,24 +5,28 @@ use super::keyboard::{FieldTarget, focused_field};
 use super::*;
 
 /// Mouse-wheel notch size in logical pixels (ADR-0069 decision 6): flat 39, about three
-/// lines of 13px text. A per-container step would need a font size; touchpads
-/// report pixels and never use it.
+/// lines of 13px text. A per-container step would need a font size. Touchpad pixels divide by it
+/// only for `on_wheel` fractions.
 const WHEEL_STEP_PIXELS: f32 = 39.0;
+
+const VALUE120_PER_NOTCH: f32 = 120.0;
 
 /// Scroll distance in logical pixels (ADR-0069 decision 6). Use touchpad `pixels` as sent; use
 /// `value120` (120 per notch) only without pixels, or compositors sending both double the motion.
-fn wheel_delta(pixels: f64, steps: i32) -> f32 {
+fn wheel_delta(pixels: f64, value120: i32) -> f32 {
     if pixels != 0.0 {
         return pixels as f32;
     }
-    steps as f32 / 120.0 * WHEEL_STEP_PIXELS
+    value120 as f32 / VALUE120_PER_NOTCH * WHEEL_STEP_PIXELS
 }
 
-/// `on_wheel`'s notch value (ADR-0116 decision 2): positive away from the user. Negate Wayland's
-/// positive-towards-user axis and divide by 39; touchpad pixels therefore produce fractional,
-/// smooth slider motion.
-fn wheel_steps(pixels: f64, steps: i32) -> f32 {
-    -wheel_delta(pixels, steps) / WHEEL_STEP_PIXELS
+/// `on_wheel`'s notches (ADR-0116 decision 2 amendment), positive away from the user. `value120`
+/// wins: a wheel's pixels are not `WHEEL_STEP_PIXELS` per notch.
+fn wheel_steps(pixels: f64, value120: i32) -> f32 {
+    if value120 != 0 {
+        return -(value120 as f32) / VALUE120_PER_NOTCH;
+    }
+    -(pixels as f32) / WHEEL_STEP_PIXELS
 }
 
 /// One press waiting for its release (ADR-0050 decision 2). The rect stands in for identity:
@@ -682,6 +686,7 @@ mod tests {
         assert_eq!(wheel_steps(0.0, 240), -2.0, "two notches down are -2");
         assert_eq!(wheel_steps(-WHEEL_STEP_PIXELS as f64 / 2.0, 0), 0.5, "a touchpad swipe is a fraction of a notch");
         assert_eq!(wheel_steps(0.0, 0), 0.0);
+        assert_eq!(wheel_steps(15.0, 120), -1.0, "value120 wins over pixels sent with it");
     }
 
     #[test]

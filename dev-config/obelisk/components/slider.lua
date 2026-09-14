@@ -7,6 +7,7 @@
 -- Keep `pending` until the capability snapshot carries the value.
 -- Clear it with one `on_change` per slider name. Clearing on release showed the old value during a
 -- PipeWire round trip showed old value, then flashed new, old, new.
+-- A one-second timer releases it if the snapshot never matches: another writer or a clamped write.
 -- Plain `state` without `on_change` clears on release.
 -- `pending` is numeric because `state()` fixes its type at creation; `nil` has none.
 -- `-1` means "nothing held", outside the fraction range. `children` stack over the fill;
@@ -31,6 +32,7 @@ local theme = require("config.theme")
 ---@field border_color? Color|Bound
 ---@field animate? Animations|Bound Eases the track's own properties; the fill follows the value and is not eased.
 ---@field hover? Signal
+---@field dragging? StateSignal<boolean> True while a drag is held. Default `state(name .. "_dragging")`.
 ---@field visible? boolean|Bound
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") The left click still lands after the drag ends.
 ---@field children? Node[] Drawn over the fill.
@@ -58,27 +60,49 @@ local function fraction_of(read, payload)
     return clamp(value)
 end
 
--- `watched` prevents duplicate `on_change` handlers when a `list` rebuilds rows and sliders.
--- One named `state()` signal needs only one handler.
-local watched = {}
+-- Per name, as `list` rebuilds rows: `on_change` registers once; `timer` and wheel `rest` persist.
+local per_name = {}
 
 ---@param opts SliderOpts
 return function(opts)
     local pending = state(opts.name, -1)
+    local dragging = opts.dragging or state(opts.name .. "_dragging", false)
     local steps = opts.steps or 20
-    local dragging = false
-
+    -- Continuous: half a displayed percent.
+    local tolerance = steps > 0 and 0.5 / steps or 0.005
     local on_change = opts.signal.on_change
-    if on_change and not watched[opts.name] then
-        watched[opts.name] = true
-        on_change(opts.signal, function(current, previous)
-            local held = pending:get()
-            if dragging or held < 0 then
-                return
-            end
-            local now = fraction_of(opts.read, current)
-            -- The commit landed, or another writer moved it; the snapshot is authoritative again.
-            if quantize(now, steps) == held or now ~= fraction_of(opts.read, previous) then
+
+    local entry = per_name[opts.name]
+    if not entry then
+        entry = { rest = 0 }
+        per_name[opts.name] = entry
+        if on_change then
+            on_change(opts.signal, function(current, previous)
+                local held = pending:get()
+                if dragging:get() or held < 0 then
+                    return
+                end
+                -- Landed, or another writer moved away from `held`; ours move toward it.
+                local off = math.abs(fraction_of(opts.read, current) - held)
+                local was = math.abs(fraction_of(opts.read, previous) - held)
+                if off <= tolerance or off > was + tolerance then
+                    pending:set(-1)
+                end
+            end)
+        end
+    end
+
+    local function hold(fraction)
+        if not on_change then
+            pending:set(-1)
+            return
+        end
+        pending:set(fraction)
+        if entry.timer then
+            entry.timer:cancel()
+        end
+        entry.timer = timer(1000, function()
+            if not dragging:get() then
                 pending:set(-1)
             end
         end)
@@ -121,23 +145,31 @@ return function(opts)
         on_click = opts.on_click,
         on_drag = function(rect, pointer, phase)
             local fraction = quantize(pointer.x / rect.width, steps)
-            dragging = phase ~= "end"
-            pending:set(on_change and fraction or (dragging and fraction or -1))
-            if not dragging then
-                opts.on_commit(fraction)
+            if phase ~= "end" then
+                dragging:set(true)
+                pending:set(fraction)
+                return
             end
+            dragging:set(false)
+            hold(fraction)
+            opts.on_commit(fraction)
         end,
         on_wheel = function(_, notches)
             if steps <= 0 then
                 return
             end
+            -- Touchpad fractions accumulate, reset on reversal; 1e-4 rounds f32 0.9999... up.
+            local total = (entry.rest * notches < 0 and 0 or entry.rest) + notches
+            local whole = math.modf(total + (total < 0 and -1e-4 or 1e-4))
+            entry.rest = total - whole
+            if whole == 0 then
+                return
+            end
             local held = pending:get()
             local current = held >= 0 and held or fraction_of(opts.read, opts.signal:get())
             -- Snap first: a 79% value from another mixer steps to 80% then 85%, not 84%.
-            local next_fraction = quantize(quantize(current, steps) + notches / steps, steps)
-            if on_change then
-                pending:set(next_fraction)
-            end
+            local next_fraction = quantize(quantize(current, steps) + whole / steps, steps)
+            hold(next_fraction)
             opts.on_commit(next_fraction)
         end,
         children = children,

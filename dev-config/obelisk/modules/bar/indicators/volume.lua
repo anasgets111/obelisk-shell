@@ -1,9 +1,9 @@
 -- Mirrors Volume.qml: a glyph circle expands to a slider on hover. Drag and wheel set volume;
 -- middle-click mutes, and right-click opens the audio panel.
 --
--- `hover` is an engine signal (ADR-0062); `width` and `visible` use it. Width and ground ease over
--- the mirror's 147ms through `animate` (ADR-0145); percentage appears at once because `visible` is
--- not a property a tween carries.
+-- `hover` is an engine signal (ADR-0062); `width` and `visible` follow it or a held drag. Width and
+-- ground ease over the mirror's 147ms through `animate` (ADR-0145); percentage appears at once
+-- because `visible` is not a property a tween carries.
 --
 -- `components/slider.lua` matches `Slider`; its accent fill runs under glyph and percentage
 -- only while expanded.
@@ -16,6 +16,10 @@ local slider = require("components.slider")
 
 local SLOT = "volume"
 local hovered = hover(SLOT)
+local dragging = state("volume_dragging", false)
+local expanded = computed({ hovered, dragging }, function(h, d)
+    return h or d
+end)
 local panel_open = ui_state.panel_showing("audio")
 
 local function muted(a)
@@ -45,8 +49,8 @@ end)
 -- otherwise against the ground. Their thresholds are the first and last quarters of the expanded
 -- control.
 local function foreground_past(threshold)
-    return computed({ obelisk.audio, hovered, ground, fill }, function(a, is_hovered, ground_color, fill_color)
-        if is_hovered and volume(a) >= threshold then
+    return computed({ obelisk.audio, expanded, ground, fill }, function(a, is_expanded, ground_color, fill_color)
+        if is_expanded and volume(a) >= threshold then
             return theme.text_contrast(fill_color)
         end
         return theme.text_contrast(ground_color)
@@ -60,16 +64,17 @@ return slider {
     on_commit = function(fraction)
         obelisk.audio:invoke("set_volume", fraction)
     end,
-    width = hovered:map(function(is_hovered)
-        return is_hovered and theme.volume_expanded_width or theme.item_width
+    width = expanded:map(function(is_expanded)
+        return is_expanded and theme.volume_expanded_width or theme.item_width
     end),
     height = theme.item_height,
     align_v = "Center",
     hover = hovered,
+    dragging = dragging,
     radius = theme.item_radius,
     background = ground,
     color = fill,
-    fill_visible = hovered,
+    fill_visible = expanded,
     animate = { width = theme.animation_ms, background = theme.animation_ms, border_color = theme.animation_ms },
     border_width = theme.border_width,
     border_color = computed({ hovered, panel_open }, function(is_hovered, open)
@@ -100,7 +105,7 @@ return slider {
                     return "muted"
                 end
                 return string.format("%d%%", math.floor(a.volume * 100 + 0.5))
-            end), foreground_past(0.75), theme.font.sm, { align_v = "Center", visible = hovered }),
+            end), foreground_past(0.75), theme.font.sm, { align_v = "Center", visible = expanded }),
         },
     } },
 }
