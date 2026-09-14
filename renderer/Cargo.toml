@@ -54,17 +54,18 @@ nix = { workspace = true, features = ["poll", "resource", "time"] }
 resvg = { version = "0.48.1", default-features = false }
 serde_json.workspace = true
 shared.workspace = true
-smithay-client-toolkit = "0.21.1"
+# No `calloop`: the event loop is our own poll (`wake.rs`). 154 to 150.
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
 taffy = { version = "0.14.0", default-features = false, features = ["std", "flexbox", "grid", "taffy_tree"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "macros", "sync"] }
 wayland-client.workspace = true
 wayland-egl = "0.32.11"
-wayland-protocols = { workspace = true, features = ["client", "staging", "unstable"] }
-wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+wayland-protocols = { workspace = true, features = ["client", "staging"] }
 md5 = "0.8"
 png.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-ttf-parser = "0.25.1"
+# `time` is test-only (`socket.rs` timeouts).
+tokio = { workspace = true, features = ["time"] }

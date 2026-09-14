@@ -1215,9 +1215,14 @@ mod tests {
         let handle = ShapingHandle::spawn();
         let chain = handle.font_chain_data();
         assert!(!chain.is_empty(), "the default chain must resolve to at least one loaded face");
+        use cosmic_text::skrifa::{FontRef, raw::TableProvider};
         for data in &chain {
-            ttf_parser::Face::parse(data.data.as_ref(), 0)
+            let font = FontRef::from_index(data.data.as_ref(), data.index)
                 .expect("every chain entry's bytes should parse as a font face");
+            assert!(
+                font.head().is_ok() && font.hhea().is_ok() && font.maxp().is_ok(),
+                "every chain entry should have the head, hhea and maxp tables a face needs"
+            );
         }
     }
 
