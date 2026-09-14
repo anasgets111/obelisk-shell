@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use futures_util::{Stream, StreamExt, stream, stream_select};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio_stream::StreamExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::BluetoothSignal;
@@ -161,14 +161,14 @@ fn spawn_device_signal_forwarder(
             Some(battery) => Some(battery.receive_percentage_changed().await.map(drop)),
             None => None,
         };
-        let mut changes = device
-            .receive_connected_changed()
-            .await
-            .map(drop)
-            .merge(device.receive_paired_changed().await.map(drop))
-            .merge(device.receive_name_changed().await.map(drop))
-            .merge(device.receive_blocked_changed().await.map(drop))
-            .merge(futures_util::StreamExt::flatten(futures_util::stream::iter(percentage)));
+        // `stream_select!` can re-poll a stream that already ended, so each input is fused.
+        let mut changes = stream_select!(
+            device.receive_connected_changed().await.map(drop).fuse(),
+            device.receive_paired_changed().await.map(drop).fuse(),
+            device.receive_name_changed().await.map(drop).fuse(),
+            device.receive_blocked_changed().await.map(drop).fuse(),
+            stream::iter(percentage).flatten().fuse()
+        );
         while changes.next().await.is_some() && events.send(BluetoothSignal::DeviceRegistryChanged).is_ok() {}
     })
 }
@@ -189,8 +189,8 @@ pub(super) fn spawn_object_manager_forwarder<A, R>(
     adapter: AdapterSlot,
     events: UnboundedSender<BluetoothSignal>,
 ) where
-    A: tokio_stream::Stream<Item = zbus::fdo::InterfacesAdded> + Unpin + Send + 'static,
-    R: tokio_stream::Stream<Item = zbus::fdo::InterfacesRemoved> + Unpin + Send + 'static,
+    A: Stream<Item = zbus::fdo::InterfacesAdded> + Unpin + Send + 'static,
+    R: Stream<Item = zbus::fdo::InterfacesRemoved> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
@@ -236,12 +236,11 @@ fn spawn_adapter_signal_forwarder(
     events: UnboundedSender<BluetoothSignal>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut changes = adapter
-            .receive_powered_changed()
-            .await
-            .map(drop)
-            .merge(adapter.receive_discovering_changed().await.map(drop))
-            .merge(adapter.receive_discoverable_changed().await.map(drop));
+        let mut changes = stream_select!(
+            adapter.receive_powered_changed().await.map(drop).fuse(),
+            adapter.receive_discovering_changed().await.map(drop).fuse(),
+            adapter.receive_discoverable_changed().await.map(drop).fuse()
+        );
         while changes.next().await.is_some() && events.send(BluetoothSignal::AdapterChanged).is_ok() {}
     })
 }

@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::task::JoinHandle;
-use tokio_stream::StreamExt;
 
 use super::MprisSignal;
 use super::metadata::{TrackIdentity, parse_metadata, resolve_album_art_path};

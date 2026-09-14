@@ -4,8 +4,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::StreamExt;
 
 use crate::compositor::{CompositorKind, detect_compositor, hyprland_signature, unsupported_session_report};
 

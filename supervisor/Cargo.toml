@@ -34,7 +34,6 @@ shared.workspace = true
 tempfile.workspace = true
 # `full` minus `fs` and `parking_lot`, which nothing here uses.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "io-std"] }
-tokio-stream = "0.1.19"
 udev = { version = "0.9.3", features = ["send"] }
 wayland-client.workspace = true
 wayland-protocols = { workspace = true, features = ["client", "staging"] }

@@ -2,8 +2,8 @@
 //! accepts and its verdict, and the pure helpers that shape an intent into NetworkManager's dict.
 use std::collections::HashMap;
 
+use futures_util::StreamExt;
 use shared::Zeroize;
-use tokio_stream::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::devices::WifiDevice;

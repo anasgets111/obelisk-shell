@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio_stream::StreamExt;
 use zbus::names::{BusName, OwnedUniqueName};
 use zbus::zvariant::OwnedObjectPath;
 

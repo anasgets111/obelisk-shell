@@ -5,8 +5,8 @@
 //! departures under the same prefix (ADR-0036, independently validated by Quickshell's
 //! `MprisWatcher`).
 
+use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::StreamExt;
 
 use super::MprisSignal;
 use super::player::{PlayerRegistry, register_player, unregister_player};

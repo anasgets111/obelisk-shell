@@ -1,8 +1,8 @@
 //! NetworkManager devices for `obelisk.network`: resolving the Wi-Fi and wired devices, and the
 //! forwarder tasks that turn their signals, and the manager's, into [`NetworkSignal`]s.
 
+use futures_util::{Stream, StreamExt, stream, stream_select};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::{Stream, StreamExt};
 use zbus::zvariant::OwnedObjectPath;
 
 use super::proxies::{
@@ -118,7 +118,7 @@ fn spawn_wifi_forwarder(
     tokio::spawn(async move {
         let ap_set = tokio::try_join!(wireless.receive_access_point_added(), wireless.receive_access_point_removed());
         let mut ap_set_changed = match ap_set {
-            Ok((added, removed)) => added.map(drop).merge(removed.map(drop)),
+            Ok((added, removed)) => stream::select(added.map(drop), removed.map(drop)),
             Err(err) => {
                 eprintln!("network: failed to subscribe to AccessPointAdded/AccessPointRemoved: {err}");
                 return;
@@ -199,12 +199,12 @@ fn spawn_device_state_forwarder(
 /// can move between two activated devices.
 pub(super) fn spawn_manager_forwarder(nm: NetworkManagerProxy<'static>, events: UnboundedSender<NetworkSignal>) {
     tokio::spawn(async move {
-        let mut changes = nm
-            .receive_wireless_enabled_changed()
-            .await
-            .map(drop)
-            .merge(nm.receive_networking_enabled_changed().await.map(drop))
-            .merge(nm.receive_primary_connection_changed().await.map(drop));
+        // `stream_select!` can re-poll a stream that already ended, so each input is fused.
+        let mut changes = stream_select!(
+            nm.receive_wireless_enabled_changed().await.map(drop).fuse(),
+            nm.receive_networking_enabled_changed().await.map(drop).fuse(),
+            nm.receive_primary_connection_changed().await.map(drop).fuse()
+        );
         while changes.next().await.is_some() && events.send(NetworkSignal::Changed).is_ok() {}
     });
 }
@@ -226,7 +226,7 @@ pub(super) fn forward<A, B>(
             return eprintln!("network: failed to subscribe for {signal:?}; those changes need a restart: {err}");
         }
     };
-    let mut changes = added.map(drop).merge(removed.map(drop));
+    let mut changes = stream::select(added.map(drop), removed.map(drop));
     tokio::spawn(async move { while changes.next().await.is_some() && events.send(signal).is_ok() {} });
 }
 
