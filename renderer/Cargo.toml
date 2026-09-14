@@ -14,8 +14,9 @@ workspace = true
 
 [dependencies]
 # cosmic-text is reached only from `text/shaping.rs` and `text/fonts.rs`, for shaping and
-# measurement; its default features drag in a rasterizer nothing here calls. 157 to 151.
-cosmic-text = { version = "0.19.0", default-features = false, features = ["std", "fontconfig"] }
+# measurement; its default features drag in a rasterizer nothing here calls. 157 to 151. No
+# `fontconfig` either: fonts resolve through `fc-match` (`text/fonts.rs`), not fontconfig's XML.
+cosmic-text = { version = "0.19.0", default-features = false, features = ["std"] }
 # `swash` is what makes the text look hinted. Without the feature femtovg falls back to
 # `render_glyph`: it tessellates the `ttf-parser` outline and supersamples it 8x on the GPU, which
 # runs no hinting bytecode and throws the subpixel position away, so every stem lands as two
@@ -25,10 +26,10 @@ cosmic-text = { version = "0.19.0", default-features = false, features = ["std",
 # machine's bar clock at 11px: whole-lit pixels 4.4% to 6.3% of the box for the same ink.
 #
 # Three crates, and only in this crate's tree: swash, zeno, yazi. skrifa, read-fonts and font-types
-# arrive with cosmic-text either way, and sharing one swash across both actually unifies three
-# duplicate versions out of the workspace lock.
+# arrive with cosmic-text too, at 0.40 where swash takes 0.44, until cosmic-text moves up.
 femtovg = { version = "0.27.0", features = ["swash"] }
-fontdb = "0.23.0"
+# Default features minus `fontconfig`, as for cosmic-text.
+fontdb = { version = "0.23.0", default-features = false, features = ["std", "fs", "memmap"] }
 # A wrapped line's own direction, for `layout::scene`'s direction mark (ADR-0211).
 unicode-bidi = "0.3.18"
 freedesktop-icons = "0.4.0"
