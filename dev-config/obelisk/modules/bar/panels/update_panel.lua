@@ -153,7 +153,7 @@ end
 -- Moved off `indicators/updates.lua`'s install edge: only this file knows when the last tool exited.
 local function report_run(u, failures)
     if install_failed(u) then
-        return toast("critical", "Update failed", "the updates panel has pacman's output")
+        return toast("critical", "Update failed", "The updates panel has pacman's output")
     end
     if #failures > 0 then
         return toast("critical", "Update finished with failures", table.concat(failures, ", "))
@@ -161,7 +161,7 @@ local function report_run(u, failures)
     local count = (u and u.install_total_steps) or 0
     toast("normal", "Update complete", count > 0
         and string.format("%d package%s updated", count, count == 1 and "" or "s")
-        or "developer tooling updated")
+        or "Developer tooling updated")
 end
 
 -- Walks `config/dev_tools.lua`, carrying the failures so far. `command -v` takes the name as `$1`
@@ -224,19 +224,19 @@ end
 -- Replaces `_detectErrorMessage`: pacman's output supplies the reason, and this file turns it into
 -- actionable wording. Falls back to the exit code, which is at least true.
 local FAILURE_PHRASES = {
-    { match = "failed retrieving",            say = "could not download; check the connection" },
-    { match = "could not resolve host",       say = "could not download; check the connection" },
-    { match = "connection refused",           say = "could not download; check the connection" },
-    { match = "not enough free disk space",   say = "not enough disk space" },
-    { match = "invalid or corrupted package", say = "a package failed its signature check" },
-    { match = "signature from",               say = "a package failed its signature check" },
-    { match = "conflicting files",            say = "files conflict with another package" },
-    { match = "authentication",               say = "authentication failed" },
+    { match = "failed retrieving",            say = "Could not download; check the connection" },
+    { match = "could not resolve host",       say = "Could not download; check the connection" },
+    { match = "connection refused",           say = "Could not download; check the connection" },
+    { match = "not enough free disk space",   say = "Not enough disk space" },
+    { match = "invalid or corrupted package", say = "A package failed its signature check" },
+    { match = "signature from",               say = "A package failed its signature check" },
+    { match = "conflicting files",            say = "Files conflict with another package" },
+    { match = "authentication",               say = "Authentication failed" },
 }
 
 local function failure_reason(u)
     if u == nil then
-        return "the install failed"
+        return "The install failed"
     end
     for _, line in ipairs(u.install_log or {}) do
         local lowered = line:lower()
@@ -247,7 +247,7 @@ local function failure_reason(u)
         end
     end
     if u.install_error ~= nil then
-        return "the updater could not be started"
+        return "The updater could not be started"
     end
     if u.install_exit_code == nil then
         return "pacman was killed before it finished"
@@ -272,28 +272,28 @@ end
 -- the buttons under it had gone.
 local function status_line(u, is_dismissed, tool)
     if u == nil then
-        return "waiting for the updater"
+        return "Waiting for the updater"
     end
     if tool ~= "" then
-        return "updating " .. tool
+        return "Updating " .. tool
     end
     if u.installing then
         local package = u.install_current_package
-        return (package ~= nil and package ~= "") and ("installing " .. package) or "starting the install"
+        return (package ~= nil and package ~= "") and ("Installing " .. package) or "Starting the install"
     end
     if not is_dismissed and install_ended(u) then
-        return install_failed(u) and "update failed" or "update complete"
+        return install_failed(u) and "Update failed" or "Update complete"
     end
     if u.checking then
-        return "checking"
+        return "Checking"
     end
     if u.check_error ~= nil then
-        return "check failed"
+        return "Check failed"
     end
     if (u.count or 0) > 0 then
         return string.format("%d update%s available", u.count, u.count == 1 and "" or "s")
     end
-    return "up to date"
+    return "Up to date"
 end
 
 local function detail_line(u, is_dismissed, tool)
@@ -301,17 +301,17 @@ local function detail_line(u, is_dismissed, tool)
         return ""
     end
     if tool ~= "" then
-        return "developer tooling"
+        return "Developer tooling"
     end
     if u.installing then
         local total = u.install_total_steps or 0
         if total > 0 then
-            return string.format("package %d of %d", u.install_current_step or 0, total)
+            return string.format("Package %d of %d", u.install_current_step or 0, total)
         end
         -- No step line yet means pacman is downloading, and it prints nothing per package without a
         -- tty. `alpm` already sized the transaction, so say what is being fetched rather than that
         -- we were not told.
-        return string.format("downloading %d package%s · %s", u.count, u.count == 1 and "" or "s",
+        return string.format("Downloading %d package%s · %s", u.count, u.count == 1 and "" or "s",
             human_bytes(download_total(u)))
     end
     if not is_dismissed and install_ended(u) then
@@ -322,21 +322,21 @@ local function detail_line(u, is_dismissed, tool)
         local noted = warnings > 0 and string.format(" · %d warning%s", warnings, warnings == 1 and "" or "s") or ""
         local seconds = u.install_finished_at - (started_at:get() or 0)
         if (started_at:get() or 0) > 0 and seconds >= 0 then
-            return string.format("took %d min %d sec%s", math.floor(seconds / 60), seconds % 60, noted)
+            return string.format("Took %d min %d sec%s", math.floor(seconds / 60), seconds % 60, noted)
         end
-        return "finished" .. noted
+        return "Finished" .. noted
     end
     -- A failed check keeps the last good list, so say which list is shown.
     if u.check_error ~= nil then
         local failures = u.consecutive_check_failures or 0
         -- Five consecutive failures is the warning threshold.
         local repeated = failures >= 5 and string.format(" · %d in a row", failures) or ""
-        return "showing the last result" .. repeated
+        return "Showing the last result" .. repeated
     end
     if (u.count or 0) > 0 then
         return string.format("%s to download", human_bytes(download_total(u)))
     end
-    return "nothing pending"
+    return "Nothing pending"
 end
 
 -- Include the date when the check is not today. "checked 07:08" in a shell running since Tuesday
@@ -346,12 +346,12 @@ end
 -- it old. The mirror's `isStale` without its error half, which `detail_line` already covers.
 local function last_check_line(u, now)
     if u == nil or u.last_successful_check == nil then
-        return "never checked"
+        return "Never checked"
     end
     local at = u.last_successful_check
     local when = os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d") and os.date("%H:%M", at)
         or os.date("%b %d, %H:%M", at)
-    return "checked " .. when .. (now - at > CHECK_INTERVAL * 2 and " · stale" or "")
+    return "Checked " .. when .. (now - at > CHECK_INTERVAL * 2 and " · stale" or "")
 end
 
 -- Sort by name; `alpm`'s installed-database order has no useful reading order.
@@ -505,7 +505,7 @@ end)
 
 local body = {
     panel_header {
-        title = "updates",
+        title = "Updates",
         icon = obelisk.updates:map(function(u)
             if u ~= nil and u.installing then
                 return icons.updating
@@ -523,7 +523,7 @@ local body = {
         end),
         trailing = {
             -- Show only when relevant; a reboot badge after no install warns about nothing.
-            cell("reboot pending", theme.PEACH, theme.font.xs, {
+            cell("Reboot pending", theme.PEACH, theme.font.xs, {
                 align_v = "Center",
                 visible = util.shown_when(obelisk.updates, function(u)
                     return u.reboot_required == true
@@ -570,7 +570,7 @@ local body = {
             spacing = theme.spacing.sm,
             align_v = "Center",
             visible = working,
-            children = { spinner(working, theme.control.sm), cell("working…", theme.DIM, theme.font.xs) },
+            children = { spinner(working, theme.control.sm), cell("Working…", theme.DIM, theme.font.xs) },
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", spacing = theme.spacing.xs }),
     -- List: name left, old/new versions in fixed columns, arrow between them. A heading row would
@@ -627,8 +627,8 @@ local body = {
             end,
         },
     }, { background = theme.GLASS_CONTENT, width = "Fill", visible = log_showing }),
-    panel_empty_state("nothing to update", empty_showing, { icon = icons.up_to_date }),
-    panel_empty_state("checking…", checking_showing, { icon = spinner(checking_showing, theme.control.sm) }),
+    panel_empty_state("Nothing to update", empty_showing, { icon = icons.up_to_date }),
+    panel_empty_state("Checking…", checking_showing, { icon = spinner(checking_showing, theme.control.sm) }),
     panel_card({ section_header("run with package updates"), column {
         width = "Fill",
         children = tool_rows,
@@ -639,7 +639,7 @@ local body = {
         children = {
             action_button(
                 computed({ obelisk.updates, result_showing }, function(u, showing)
-                    return (showing and install_failed(u)) and "retry" or "update"
+                    return (showing and install_failed(u)) and "Retry" or "Update"
                 end),
                 install,
                 "updates-install",
@@ -654,7 +654,7 @@ local body = {
                     end),
                 }
             ),
-            action_button("view log", function()
+            action_button("View log", function()
                 log_open:set(true)
             end, "updates-log", {
                 tone = "quiet",
@@ -663,7 +663,7 @@ local body = {
                     return showing and not open and not install_failed(u)
                 end),
             }),
-            action_button("close", function()
+            action_button("Close", function()
                 dismissed:set(true)
                 log_open:set(false)
             end, "updates-dismiss", { tone = "quiet", width = "Fill", visible = result_showing }),

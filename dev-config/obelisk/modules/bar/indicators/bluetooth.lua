@@ -42,20 +42,20 @@ local bluetooth_tooltip = tooltip({
     children = {
         cell(obelisk.bluetooth:map(function(b)
             if b ~= nil and not b.available then
-                return "bluetooth unavailable"
+                return "Bluetooth unavailable"
             elseif b == nil or not b.enabled then
-                return "bluetooth off"
+                return "Bluetooth off"
             end
             local devices = connected(b)
             if #devices == 0 then
-                return "bluetooth on"
+                return "Bluetooth on"
             end
-            return string.format("connected (%d)", #devices)
+            return string.format("Connected (%d)", #devices)
         end), theme.FG, theme.font.sm),
         cell(obelisk.bluetooth:map(function(b)
             local first = connected(b)[1]
             if first == nil then
-                return "no device connected"
+                return "No device connected"
             end
             if first.battery and first.battery >= 0 then
                 return string.format("%s -- %d%%", first.name or "?", first.battery)

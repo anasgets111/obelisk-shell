@@ -16,10 +16,10 @@ local function focused(workspaces)
     return workspaces and workspaces.active_client
 end
 
--- `text: hasActive ? baseLabel : "Desktop"`, lowercased here. The mirror captions an empty desktop.
+-- `text: hasActive ? baseLabel : "Desktop"`. The mirror captions an empty desktop.
 -- `CenterSide.qml` anchors this node unconditionally; hiding it moves the midpoint when the last
 -- window closed.
-local EMPTY_LABEL = "desktop"
+local EMPTY_LABEL = "Desktop"
 
 -- `iconSource`'s fallback, `resolveIconSource("", "", "applications-system")`.
 local EMPTY_ICON = "applications-system"

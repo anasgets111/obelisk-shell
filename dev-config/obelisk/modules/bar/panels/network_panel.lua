@@ -52,24 +52,24 @@ end
 -- NetworkManager never answered (the capability stays down for the run), the mirror's `!ready`.
 local function state_line(n)
     if n == nil then
-        return "unavailable"
+        return "Unavailable"
     end
     if not n.networking_enabled then
-        return "off"
+        return "Off"
     end
     if n.connecting_ssid then
-        return "connecting to " .. n.connecting_ssid
+        return "Connecting to " .. n.connecting_ssid
     end
     if n.ssid == "Ethernet" then
-        return "ethernet connected"
+        return "Ethernet connected"
     end
     if n.ssid then
         return n.ssid
     end
     if not n.wifi_enabled then
-        return "wi-fi off"
+        return "Wi-Fi off"
     end
-    return n.scanning and "scanning…" or "not connected"
+    return n.scanning and "Scanning…" or "Not connected"
 end
 
 local function header_glyph(n)
@@ -181,7 +181,7 @@ local function access_point_row(entry)
         slot = "network-ap-" .. tostring(ap.ssid),
         leading = row { align_v = "Center", children = leading },
         title = ap.ssid or "?",
-        subtitle = entry.connecting and "connecting…" or nil,
+        subtitle = entry.connecting and "Connecting…" or nil,
         selected = ap.active,
         opacity = entry.blocked and theme.opacity.disabled or nil,
         trailing = row { spacing = theme.spacing.xs, align_v = "Center", children = trailing },
@@ -218,13 +218,13 @@ end
 local sheet_title = computed({ step, ui.hidden_ssid, obelisk.network }, function(current, name, n)
     local target = (n and n.password_ssid) or name
     if current == "name" then
-        return { { text = "hidden network", bold = true } }
+        return { { text = "Hidden network", bold = true } }
     elseif current == "waiting" then
-        return { { text = string.format("connecting to “%s”", target), bold = true } }
+        return { { text = string.format("Connecting to “%s”", target), bold = true } }
     elseif current == "failed" then
-        return { { text = string.format("could not join “%s”", target), bold = true } }
+        return { { text = string.format("Could not join “%s”", target), bold = true } }
     end
-    return { { text = string.format("connect to “%s”", target), bold = true } }
+    return { { text = string.format("Connect to “%s”", target), bold = true } }
 end)
 
 -- The mirror's `OInput`: a glass box with a ring, which `textfield` cannot draw itself. The ring is
@@ -291,7 +291,7 @@ end
 
 local body = {
     panel_header {
-        title = "network",
+        title = "Network",
         icon = obelisk.network:map(header_glyph),
         active = obelisk.network:map(function(n)
             return n ~= nil and n.networking_enabled
@@ -333,7 +333,7 @@ local body = {
                 slot = "network-wifi-tile",
                 icon = icons.wifi[4],
                 label = util.label(obelisk.network, function(n)
-                    return n.wifi_present and "wi-fi" or "no wi-fi"
+                    return n.wifi_present and "Wi-Fi" or "No Wi-Fi"
                 end),
                 disabled = util.shown_when(obelisk.network, function(n)
                     return not n.wifi_present
@@ -359,7 +359,7 @@ local body = {
                 slot = "network-ethernet-tile",
                 icon = icons.ethernet,
                 label = util.label(obelisk.network, function(n)
-                    return n.ethernet_present and "ethernet" or "no ethernet"
+                    return n.ethernet_present and "Ethernet" or "No Ethernet"
                 end),
                 disabled = util.shown_when(obelisk.network, function(n)
                     return not n.ethernet_present
@@ -431,7 +431,7 @@ local body = {
                 width = "Fill",
                 height = "Fill",
                 autofocus = true,
-                placeholder = "network name",
+                placeholder = "Network name",
                 font_size = theme.font.sm,
                 foreground = theme.FG,
                 on_change = function(typed)
@@ -445,7 +445,7 @@ local body = {
             field_box(during("password"), textfield {
                 width = "Fill",
                 height = "Fill",
-                placeholder = "password",
+                placeholder = "Password",
                 mask_character = "*",
                 secure_submit = { capability = "network", action = "connect" },
                 font_size = theme.font.sm,
@@ -455,7 +455,7 @@ local body = {
                 spacing = theme.spacing.xs,
                 align_v = "Center",
                 visible = during("waiting"),
-                children = { spinner(during("waiting"), theme.icon.md), cell("connecting…", theme.DIM, theme.font.xs) },
+                children = { spinner(during("waiting"), theme.icon.md), cell("Connecting…", theme.DIM, theme.font.xs) },
             },
             -- `⚠ errorMessage` under the field, not at the card's top, where the mirror puts it:
             -- the error belongs to the network being asked about. A password step carries one
@@ -479,11 +479,11 @@ local body = {
                 align_h = "End",
                 spacing = theme.spacing.sm,
                 children = {
-                    action_button("cancel", ui.cancel_network_join, "network-sheet-cancel", { tone = "quiet" }),
+                    action_button("Cancel", ui.cancel_network_join, "network-sheet-cancel", { tone = "quiet" }),
                     -- Hidden rather than disabled while the name is empty: `action_button` has no
                     -- disabled tone, and a useless button is better absent than greyed.
                     -- Enter does the same thing for anyone already typing.
-                    action_button("next", submit_hidden_name, "network-sheet-next", {
+                    action_button("Next", submit_hidden_name, "network-sheet-next", {
                         tone = "solid",
                         visible = computed({ step, ui.hidden_draft }, function(current, draft)
                             return current == "name" and draft:match("^%s*(.-)%s*$") ~= ""
@@ -491,12 +491,12 @@ local body = {
                     }),
                     -- No `on_activate`: its click *is* the field's Enter (ADR-0114), which is the
                     -- only path a password has out of the Renderer.
-                    action_button("connect", nil, "network-sheet-connect", {
+                    action_button("Connect", nil, "network-sheet-connect", {
                         tone = "solid",
                         submit = true,
                         visible = during("password"),
                     }),
-                    action_button("retry", retry_hidden, "network-sheet-retry", {
+                    action_button("Retry", retry_hidden, "network-sheet-retry", {
                         tone = "solid",
                         glyph = icons.warning,
                         visible = during("failed"),
@@ -527,7 +527,7 @@ local body = {
     panel_row {
         slot = "network-hidden",
         icon = icons.wifi_hidden,
-        title = "hidden network…",
+        title = "Hidden network…",
         visible = radio_up_and_idle,
         trailing = glyph(icons.chevron_right, theme.DIM, theme.font.sm, { align_v = "Center" }),
         on_activate = ui.open_hidden_prompt,
@@ -535,17 +535,17 @@ local body = {
     panel_empty_state(
         obelisk.network:map(function(n)
             if n == nil then
-                return "network unavailable"
+                return "Network unavailable"
             elseif not n.networking_enabled then
-                return "networking off"
+                return "Networking off"
             elseif not n.wifi_present then
-                return "no wi-fi adapter"
+                return "No Wi-Fi adapter"
             elseif not n.wifi_enabled then
-                return "wi-fi off"
+                return "Wi-Fi off"
             elseif n.scanning then
-                return "scanning…"
+                return "Scanning…"
             end
-            return "no networks found"
+            return "No networks found"
         end),
         computed({ obelisk.network, ui.hidden_join }, function(n, joining)
             return not radio_on(n) or (not joining and #access_points(n) == 0)

@@ -26,8 +26,8 @@ local wallpaper_tooltip = tooltip({
     id = "wallpaper_tooltip",
     slot = SLOT,
     children = {
-        cell("open the wallpaper picker", theme.FG, theme.font.sm),
-        cell("right-click for a random one everywhere", theme.DIM, theme.font.xs),
+        cell("Open the wallpaper picker", theme.FG, theme.font.sm),
+        cell("Right-click for a random one everywhere", theme.DIM, theme.font.xs),
     },
 })
 

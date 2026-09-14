@@ -59,7 +59,7 @@ obelisk.audio:on_change(function(a, previous)
     if percent and was and (a.muted ~= previous.muted or percent ~= was) then
         osd.show("volume", {
             glyph = util.volume_glyph(a),
-            text = a.muted and "muted" or string.format("%d%%", percent),
+            text = a.muted and "Muted" or string.format("%d%%", percent),
             level = a.muted and 0 or percent / util.MAX_VOLUME,
             color = theme.ACCENT,
         })
@@ -83,19 +83,19 @@ end)
 
 obelisk.network:on_change(function(n, previous)
     if previous and n.networking_enabled ~= previous.networking_enabled then
-        toggle("networking", n.networking_enabled, icons.lan, icons.lan_off, "networking")
+        toggle("networking", n.networking_enabled, icons.lan, icons.lan_off, "Networking")
     end
 end)
 
 obelisk.bluetooth:on_change(function(b, previous)
     if previous and b.enabled ~= previous.enabled then
-        toggle("bluetooth", b.enabled, icons.bt_on, icons.bt_off, "bluetooth")
+        toggle("bluetooth", b.enabled, icons.bt_on, icons.bt_off, "Bluetooth")
     end
 end)
 
 obelisk.notifications:on_change(function(n, previous)
     if previous and n.dnd ~= previous.dnd then
-        toggle("dnd", n.dnd, icons.bell_off, icons.bell, "do not disturb")
+        toggle("dnd", n.dnd, icons.bell_off, icons.bell, "Do not disturb")
     end
 end)
 
@@ -104,16 +104,16 @@ obelisk.keyboard:on_change(function(k, previous)
         return
     end
     if k.active_layout ~= previous.active_layout and k.active_layout ~= "" then
-        osd.show("layout", { glyph = icons.keyboard, text = "layout: " .. k.active_layout })
+        osd.show("layout", { glyph = icons.keyboard, text = "Layout: " .. k.active_layout })
     end
     if k.caps_lock ~= previous.caps_lock then
-        toggle("locks", k.caps_lock, icons.caps_lock, icons.caps_lock, "caps lock")
+        toggle("locks", k.caps_lock, icons.caps_lock, icons.caps_lock, "Caps lock")
     end
     if k.num_lock ~= previous.num_lock then
-        toggle("locks", k.num_lock, icons.num_lock, icons.num_lock, "num lock")
+        toggle("locks", k.num_lock, icons.num_lock, icons.num_lock, "Num lock")
     end
     if k.scroll_lock ~= previous.scroll_lock then
-        toggle("locks", k.scroll_lock, icons.keyboard, icons.keyboard, "scroll lock")
+        toggle("locks", k.scroll_lock, icons.keyboard, icons.keyboard, "Scroll lock")
     end
     if k.backlight_pct >= 0 and k.backlight_pct ~= previous.backlight_pct then
         osd.show("backlight", {

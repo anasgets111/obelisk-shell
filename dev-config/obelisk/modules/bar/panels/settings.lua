@@ -28,14 +28,14 @@ return window {
     -- Set `radius = 0`.
     child = panel_card({
         panel_header {
-            title = "obelisk settings",
+            title = "Obelisk settings",
             on_close = function()
                 ui_state.settings_open:set(false)
             end,
         },
         section_header("system"),
         cell(util.label(obelisk.system, function(s)
-            return "up since " .. os.date("%H:%M:%S", s.time)
+            return "Up since " .. os.date("%H:%M:%S", s.time)
         end), theme.DIM, theme.font.xs),
         cell(util.label(obelisk.audio, function(a)
             return string.format("%d audio stream(s)", #(a.apps or {}))

@@ -90,7 +90,7 @@ return panel {
                 -- The mirror says "Authentication Failed"; ours carries PAM's reason. With no
                 -- animation, "checking" is the spinner's text.
                 cell(read(function(p)
-                    return p.authenticating and "checking..." or p.error
+                    return p.authenticating and "Checking..." or p.error
                 end), obelisk.polkit:map(function(p)
                     return (p and p.authenticating) and theme.DIM or theme.RED
                 end), theme.font.sm, {
@@ -104,10 +104,10 @@ return panel {
                     align_h = "End",
                     spacing = theme.spacing.sm,
                     children = {
-                        action_button("cancel", function()
+                        action_button("Cancel", function()
                             obelisk.polkit:invoke("cancel")
                         end, "polkit-cancel", { tone = "quiet" }),
-                        action_button("authenticate", nil, "polkit-authenticate", { tone = "solid", submit = true }),
+                        action_button("Authenticate", nil, "polkit-authenticate", { tone = "solid", submit = true }),
                     },
                 },
             }, {

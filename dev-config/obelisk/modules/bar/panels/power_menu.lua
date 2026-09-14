@@ -256,14 +256,14 @@ local body = {
     section_header("session"),
     cell(util.label(obelisk.battery, function(b)
         if not b.present then
-            return "on ac power"
+            return "On AC power"
         end
-        return string.format("battery %d%% %s%s", b.percent, util.battery_phrase(b.state), util.battery_eta(b))
+        return string.format("Battery %d%% %s%s", b.percent, util.battery_phrase(b.state), util.battery_eta(b))
     end), theme.DIM, theme.font.xs),
     panel_row {
         slot = "power-lock",
         icon = icons.lock,
-        title = "lock session",
+        title = "Lock session",
         color = theme.MAUVE,
         on_activate = function()
             -- Direct capability call, with no confirmation or countdown. Quickshell's ten-second
@@ -274,7 +274,7 @@ local body = {
     panel_row {
         slot = "power-sleep",
         icon = icons.sleep,
-        title = "sleep",
+        title = "Sleep",
         color = theme.MAUVE,
         on_activate = function()
             process.detach("systemctl", { "suspend" })
@@ -283,7 +283,7 @@ local body = {
     panel_row {
         slot = "power-settings",
         icon = icons.settings,
-        title = "settings",
+        title = "Settings",
         on_activate = function()
             ui_state.settings_open:set(true)
         end,

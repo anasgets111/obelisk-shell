@@ -30,7 +30,7 @@ obelisk.power:on_change(function(p, previous)
     -- `onIsACPoweredChanged`: plug when connected, bolt-through-battery when disconnected.
     osd.show("battery", {
         glyph = p.on_battery and icons.battery_levels[2] or icons.battery_ac,
-        text = p.on_battery and "charger disconnected" or "charger connected",
+        text = p.on_battery and "Charger disconnected" or "Charger connected",
     })
     -- `adjustBrightness`: the mirror's two levels, not dimming. Keyboard backlight is not mirrored;
     -- there is no capability for it.
@@ -51,9 +51,9 @@ obelisk.battery:on_change(function(b, previous)
     -- `Charging` drops that one. It also drops a plug-in that lands already at the limit, which is
     -- the price: an unobserved charging interval leaves nothing to cross.
     if b.state == "PendingCharge" and previous.state == "Charging" then
-        osd.show("battery", { glyph = icons.battery_ac, text = "charging paused" })
+        osd.show("battery", { glyph = icons.battery_ac, text = "Charging paused" })
     elseif previous.state == "Charging" and b.state ~= "Charging" and (b.state == "FullyCharged" or b.percent >= 100) then
-        osd.show("battery", { glyph = icons.battery_ac, text = "fully charged" })
+        osd.show("battery", { glyph = icons.battery_ac, text = "Fully charged" })
     end
     -- Three draining thresholds, each on a downward crossing. Plugging in and unplugging at 15%
     -- crosses `low` again and reports it again, matching the mirror.

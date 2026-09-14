@@ -133,7 +133,7 @@ return function(id)
                     return { { text = open and "Show Less" or "10 Day Forecast", bold = true } }
                 end), theme.FG, theme.font.sm, { align_v = "Center" }),
                 cell(computed({ weather.updated_at, obelisk.system }, function(at, system)
-                    return "updated " .. weather.time_ago(at, system and system.time)
+                    return "Updated " .. weather.time_ago(at, system and system.time)
                 end), theme.DIM, theme.font.xs, { width = "Fill", align = "End", align_v = "Center" }),
             },
         } },

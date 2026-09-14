@@ -224,22 +224,22 @@ local update_tooltip = tooltip({
             local current = state_of(u, is_dismissed)
             if current == "installing" then
                 local package = u.install_current_package
-                return (package ~= nil and package ~= "") and ("installing " .. package) or "installing"
+                return (package ~= nil and package ~= "") and ("Installing " .. package) or "Installing"
             end
             if current == "install_failed" then
-                return "update failed, click for details"
+                return "Update failed, click for details"
             end
             if current == "error" then
-                return "check failed, click for details"
+                return "Check failed, click for details"
             end
             if current == "checking" then
-                return "checking for updates"
+                return "Checking for updates"
             end
             if current == "pending" then
-                return u.count == 1 and "one package can be upgraded"
+                return u.count == 1 and "One package can be upgraded"
                     or string.format("%d packages can be upgraded", u.count)
             end
-            return "up to date, right-click for the updater"
+            return "Up to date, right-click for the updater"
         end), theme.FG, theme.font.sm),
     },
 })

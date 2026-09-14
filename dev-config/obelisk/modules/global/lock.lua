@@ -237,7 +237,7 @@ local function content(output)
                             visible = caps,
                             children = {
                                 glyph(icons.caps_lock, BADGE_FG, theme.icon.xs, { align_v = "Center" }),
-                                cell("caps lock", BADGE_FG, theme.font.xs, { align_v = "Center" }),
+                                cell("Caps lock", BADGE_FG, theme.font.xs, { align_v = "Center" }),
                             },
                         },
                     },
@@ -286,7 +286,7 @@ local function content(output)
                         status_item(
                             obelisk.network:map(util.network_glyph),
                             util.label(obelisk.network, function(n)
-                                return n.ssid or "offline"
+                                return n.ssid or "Offline"
                             end)
                         ),
                         status_item(icons.keyboard, util.label(obelisk.keyboard, function(k)

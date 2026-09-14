@@ -46,11 +46,11 @@ local idle_tooltip = tooltip({
         cell(
             computed({ idle.schedule, idle.arming, idle.manual, idle.enabled }, function(plan, arming, manual, on)
                 if not on or plan.total == 0 then
-                    return "click to hold · right-click for settings"
+                    return "Click to hold · right-click for settings"
                 end
                 -- `manual`, not `inhibited`: offering to drop a hold a camera took does nothing.
                 if manual then
-                    return "click to drop the manual hold"
+                    return "Click to drop the manual hold"
                 end
                 -- The armed stage's countdown, matching the modal masthead.
                 for _, entry in ipairs(plan.list) do
@@ -59,7 +59,7 @@ local idle_tooltip = tooltip({
                             idle.clock(math.max(0, entry.delay - arming.elapsed)))
                     end
                 end
-                return "nothing is counting down"
+                return "Nothing is counting down"
             end),
             theme.DIM,
             theme.font.xs

@@ -81,7 +81,7 @@ local function audio_control(opts)
         parent = "panel_host",
         slot = "audio-mute-" .. opts.name,
         children = { cell(is_muted:map(function(m)
-            return m and "unmute" or "mute"
+            return m and "Unmute" or "Mute"
         end), theme.FG, theme.font.sm) },
     })
 
@@ -98,7 +98,7 @@ local function audio_control(opts)
                     children = {
                         cell({ { text = opts.title, bold = true } }, theme.FG, theme.font.sm, { width = "Fill" }),
                         cell(util.label(obelisk.audio, function(a)
-                            return device_name(opts.device(a)) or "no device"
+                            return device_name(opts.device(a)) or "No device"
                         end), theme.DIM, theme.font.xs, { width = "Fill" }),
                     },
                 },
@@ -172,7 +172,7 @@ local function device_picker(opts)
                 icon = opts.open:map(function(open)
                     return open and icons.chevron_up or icons.chevron_down
                 end),
-                title = "choose device",
+                title = "Choose device",
                 on_activate = function()
                     opts.open:set(not opts.open:get())
                 end,
@@ -211,7 +211,7 @@ local function stream_row(app)
     local entry = util.app_entry(applications, app.binary)
         or util.app_entry(applications, app.process_name)
         or util.app_entry(applications, app.name)
-    local name = entry and entry.name or app.name or app.process_name or "unknown"
+    local name = entry and entry.name or app.name or app.process_name or "Unknown"
     local icon_name = entry and entry.icon or app.icon
     local leading = icon_name and icon { name = icon_name, size = theme.icon.md, align_v = "Center" }
         or glyph(app.recording and icons.mic_on or icons.music_note, theme.FG, theme.icon.md, { align_v = "Center" })
@@ -272,16 +272,16 @@ end)
 
 local body = {
     panel_header {
-        title = "audio",
+        title = "Audio",
         icon = obelisk.audio:map(util.volume_glyph),
         active = obelisk.audio:map(function(a)
             return a ~= nil and a.volume ~= nil and not a.muted
         end),
-        subtitle = "volume, devices and applications",
+        subtitle = "Volume, devices and applications",
     },
     audio_control {
         name = "output",
-        title = "output",
+        title = "Output",
         glyph_on = icons.vol_high,
         glyph_off = icons.vol_muted,
         volume = function(a)
@@ -309,7 +309,7 @@ local body = {
     },
     audio_control {
         name = "input",
-        title = "microphone",
+        title = "Microphone",
         glyph_on = icons.mic_on,
         glyph_off = icons.mic_off,
         volume = function(a)
@@ -345,7 +345,7 @@ local body = {
         panel_row {
             slot = "audio-mixer",
             icon = icons.mixer,
-            title = "application mixer",
+            title = "Application mixer",
             subtitle = util.label(streams, function(list)
                 return string.format("%d active", #list)
             end),

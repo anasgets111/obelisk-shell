@@ -26,17 +26,17 @@ local function text(read)
 end
 
 local TITLES = {
-    confirm = "pair with %s?",
+    confirm = "Pair with %s?",
     authorize = "%s wants to pair",
     service = "%s wants to connect",
-    display = "type this code on %s",
+    display = "Type this code on %s",
 }
 
 local DETAILS = {
-    confirm = "pair only if the device shows the same code",
-    authorize = "accept only a device you are pairing right now",
-    service = "the device is paired but not trusted",
-    display = "then press enter on the device",
+    confirm = "Pair only if the device shows the same code",
+    authorize = "Accept only a device you are pairing right now",
+    service = "The device is paired but not trusted",
+    display = "Then press Enter on the device",
 }
 
 -- Answers by MAC; the Supervisor ignores a yes in a request's first moments (`ACCEPT_GRACE`).
@@ -90,19 +90,19 @@ return panel {
             align_h = "End",
             spacing = theme.spacing.sm,
             children = {
-                action_button("reject", answer(false), "bluetooth-pairing-reject", {
+                action_button("Reject", answer(false), "bluetooth-pairing-reject", {
                     tone = "quiet",
                     visible = asks,
                 }),
                 action_button(
                     text(function(r)
-                        return r.kind == "service" and "allow" or "pair"
+                        return r.kind == "service" and "Allow" or "Pair"
                     end),
                     answer(true),
                     "bluetooth-pairing-accept",
                     { tone = "solid", visible = asks }
                 ),
-                action_button("done", answer(false), "bluetooth-pairing-done", {
+                action_button("Done", answer(false), "bluetooth-pairing-done", {
                     tone = "solid",
                     visible = when(function(r)
                         return r.kind == "display"

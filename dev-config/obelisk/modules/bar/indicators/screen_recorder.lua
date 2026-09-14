@@ -64,15 +64,15 @@ local screen_recorder_tooltip = tooltip({
     children = {
         cell(computed({ state_of, recorder.elapsed_text }, function(current, elapsed)
             if current == "idle" then
-                return "not recording"
+                return "Not recording"
             end
-            return string.format("%s %s", current == "paused" and "paused at" or "recording", elapsed)
+            return string.format("%s %s", current == "paused" and "Paused at" or "Recording", elapsed)
         end), theme.FG, theme.font.sm),
         cell(recorder.recording:map(function(up)
             if up then
-                return "left stop · right options"
+                return "Left stop · right options"
             end
-            return "left region · middle screen · right options"
+            return "Left region · middle screen · right options"
         end), theme.DIM, theme.font.xs),
     },
 })

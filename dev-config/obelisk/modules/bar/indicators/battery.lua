@@ -139,7 +139,7 @@ local battery_tooltip = tooltip({
         cell(util.label(obelisk.power, function(p)
             local parts = {}
             if p.on_battery ~= nil then
-                parts[#parts + 1] = p.on_battery and "on battery" or "on ac"
+                parts[#parts + 1] = p.on_battery and "On battery" or "On AC"
             end
             if p.energy_rate ~= nil then
                 parts[#parts + 1] = string.format("%.1f W", p.energy_rate)
@@ -147,7 +147,7 @@ local battery_tooltip = tooltip({
             if p.active_profile ~= nil then
                 parts[#parts + 1] = p.active_profile
             end
-            return #parts > 0 and table.concat(parts, ", ") or "no power detail"
+            return #parts > 0 and table.concat(parts, ", ") or "No power detail"
         end), theme.DIM, theme.font.xs),
     },
 })

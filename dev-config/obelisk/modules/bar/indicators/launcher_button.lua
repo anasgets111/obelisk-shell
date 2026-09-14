@@ -21,7 +21,7 @@ local launcher_tooltip = tooltip({
     id = "launcher_tooltip",
     slot = SLOT,
     children = {
-        cell("open the app launcher", theme.FG, theme.font.sm),
+        cell("Open the app launcher", theme.FG, theme.font.sm),
         cell(obelisk.applications:map(function(applications)
             local entries = applications and applications.entries
             return string.format("%d application(s)", entries and #entries or 0)

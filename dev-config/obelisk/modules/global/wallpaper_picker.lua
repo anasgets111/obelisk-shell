@@ -340,7 +340,7 @@ local empty_states = {
     panel_empty_state(
         obelisk.files:map(function(f)
             local folder = wallpaper.folder_in(f)
-            return string.format("cannot read %s: %s", wallpaper.FOLDER, folder and folder.error or "")
+            return string.format("Cannot read %s: %s", wallpaper.FOLDER, folder and folder.error or "")
         end),
         state_is("error"),
         { icon = icons.wallpaper }

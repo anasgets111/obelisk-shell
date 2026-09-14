@@ -34,21 +34,21 @@ local network_tooltip = tooltip({
     children = {
         cell(obelisk.network:map(function(n)
             if n == nil then
-                return "disconnected"
+                return "Disconnected"
             end
             if n.ssid == "Ethernet" then
-                return "ethernet"
+                return "Ethernet"
             end
             if n.ssid then
                 return string.format("%s (%d%%)", n.ssid, n.strength or 0)
             end
             if not n.networking_enabled then
-                return "networking off"
+                return "Networking off"
             end
             if not n.wifi_enabled then
-                return "wi-fi off"
+                return "Wi-Fi off"
             end
-            return n.scanning and "scanning" or "disconnected"
+            return n.scanning and "Scanning" or "Disconnected"
         end), theme.FG, theme.font.sm),
         cell(obelisk.network:map(function(n)
             return string.format("%d network(s) in range", #((n or {}).available_networks or {}))

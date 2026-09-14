@@ -28,9 +28,9 @@ local GROUPS = {
         title = "audio",
         fallback = "desktop",
         options = {
-            { value = "off",     label = "no audio",      icon = icons.vol_muted },
-            { value = "desktop", label = "desktop",       icon = icons.vol_high },
-            { value = "mic",     label = "desktop + mic", icon = icons.mic_on },
+            { value = "off",     label = "No audio",      icon = icons.vol_muted },
+            { value = "desktop", label = "Desktop",       icon = icons.vol_high },
+            { value = "mic",     label = "Desktop + mic", icon = icons.mic_on },
         },
     },
     {
@@ -40,12 +40,12 @@ local GROUPS = {
         options = {
             {
                 value = "low",
-                label = "low",
+                label = "Low",
                 icon = icons.quality_low,
-                detail = "smallest files, softest detail in motion"
+                detail = "Smallest files, softest detail in motion"
             },
-            { value = "medium", label = "medium", icon = icons.quality_medium, detail = "balanced size and detail" },
-            { value = "high",   label = "high",   icon = icons.quality_high,   detail = "sharpest detail, largest files" },
+            { value = "medium", label = "Medium", icon = icons.quality_medium, detail = "Balanced size and detail" },
+            { value = "high",   label = "High",   icon = icons.quality_high,   detail = "Sharpest detail, largest files" },
         },
     },
     {
@@ -64,12 +64,12 @@ local GROUPS = {
         title = "format",
         fallback = "mp4",
         options = {
-            { value = "mp4", label = "mp4", icon = icons.file_mp4, detail = "plays and uploads anywhere" },
+            { value = "mp4", label = "MP4", icon = icons.file_mp4, detail = "Plays and uploads anywhere" },
             {
                 value = "mkv",
-                label = "mkv",
+                label = "MKV",
                 icon = icons.file_mkv,
-                detail = "stays playable if the session crashes mid-recording"
+                detail = "Stays playable if the session crashes mid-recording"
             },
         },
     },
@@ -108,9 +108,9 @@ local status_text = computed(
             if failure ~= nil and failure ~= "" then
                 return failure
             end
-            return string.format("ready · %s", output ~= "" and output or "no output")
+            return string.format("Ready · %s", output ~= "" and output or "no output")
         end
-        local words = held and "paused" or "recording"
+        local words = held and "Paused" or "Recording"
         return label ~= "" and string.format("%s · %s", words, label) or words
     end
 )
@@ -164,7 +164,7 @@ local settings_children = {}
 for _, group in ipairs(GROUPS) do
     settings_children[#settings_children + 1] = option_group(group)
 end
-settings_children[#settings_children + 1] = cell("changes apply to the next recording", theme.DIM, theme.font.xs, {
+settings_children[#settings_children + 1] = cell("Changes apply to the next recording", theme.DIM, theme.font.xs, {
     width = "Fill",
     wrap = "Word",
     visible = recorder.recording,
@@ -172,7 +172,7 @@ settings_children[#settings_children + 1] = cell("changes apply to the next reco
 
 local body = {
     panel_header {
-        title = "screen recorder",
+        title = "Screen recorder",
         icon = icons.record,
         subtitle = status_text,
         -- `accent: recording ? Theme.critical : Theme.activeColor`: red marks an active capture,
@@ -200,7 +200,7 @@ local body = {
         width = "Fill",
         spacing = theme.spacing.sm,
         children = {
-            action_button("region", function()
+            action_button("Region", function()
                 ui_state.close_panel()
                 recorder.start("selection")
             end, "recorder-region", {
@@ -212,7 +212,7 @@ local body = {
                     return not up
                 end),
             }),
-            action_button("screen", function()
+            action_button("Screen", function()
                 ui_state.close_panel()
                 recorder.start()
             end, "recorder-screen", {
@@ -226,7 +226,7 @@ local body = {
             }),
             -- This control ends a running capture, so it uses the alert colour instead of the
             -- accent.
-            action_button("stop", recorder.stop, "recorder-stop", {
+            action_button("Stop", recorder.stop, "recorder-stop", {
                 tone = "danger",
                 width = "Fill",
                 height = theme.control.xl,
@@ -234,7 +234,7 @@ local body = {
                 visible = recorder.recording,
             }),
             action_button(recorder.paused:map(function(held)
-                return held and "resume" or "pause"
+                return held and "Resume" or "Pause"
             end), recorder.toggle_pause, "recorder-pause", {
                 tone = "accent",
                 width = "Fill",
@@ -251,7 +251,7 @@ local body = {
     rect { width = "Fill", height = theme.border_width, background = theme.BORDER_SUBTLE },
 
     panel_row {
-        title = "recording settings",
+        title = "Recording settings",
         subtitle = settings_summary,
         icon = icons.settings,
         slot = "recorder-settings",
@@ -273,7 +273,7 @@ local body = {
     },
 
     panel_row {
-        title = "open recordings folder",
+        title = "Open recordings folder",
         -- Collapse the home prefix to `~`, as with the mirror's `saveDirectory`; it tells the
         -- reader nothing when repeated on every path.
         subtitle = recorder.directory:map(function(dir)

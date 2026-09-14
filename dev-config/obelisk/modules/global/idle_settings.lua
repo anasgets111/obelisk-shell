@@ -47,17 +47,17 @@ local subtitle = computed(
     { store.idle, idle.active_profile, idle.elapsed, idle.reasons, idle.arming },
     function(stored, profile, elapsed, reasons, arming)
         if #reasons > 0 then
-            return "held awake · " .. table.concat(reasons, ", ")
+            return "Held awake · " .. table.concat(reasons, ", ")
         end
         local resolved = idle.read(stored)
         if not resolved.enabled then
-            return "automatic actions are paused"
+            return "Automatic actions are paused"
         end
         local plan = idle.plan(resolved, profile)
         if plan.total == 0 then
-            return "no actions enabled on this profile"
+            return "No actions enabled on this profile"
         end
-        local where = profile == "battery" and "on battery" or "on ac power"
+        local where = profile == "battery" and "On battery" or "On AC power"
         if elapsed == 0 then
             local first = plan.list[1]
             return string.format("%s · %s after %s", where, first.title, idle.format(first.at))
@@ -67,14 +67,14 @@ local subtitle = computed(
         for _, entry in ipairs(plan.list) do
             if entry.key == arming.key then
                 return string.format(
-                    "idle %s · %s in %s",
+                    "Idle %s · %s in %s",
                     idle.clock(elapsed),
                     entry.title,
                     idle.clock(math.max(0, entry.delay - arming.elapsed))
                 )
             end
         end
-        return string.format("idle %s · every stage has run", idle.clock(elapsed))
+        return string.format("Idle %s · every stage has run", idle.clock(elapsed))
     end
 )
 
@@ -92,7 +92,7 @@ local row_rule = rect {
 }
 
 local header = panel_header {
-    title = "idle & power",
+    title = "Idle & power",
     subtitle = subtitle,
     -- Reuse the bar circle's glyph so opener and modal read as one control.
     icon = idle.manual:map(function(manual)
@@ -234,7 +234,7 @@ local held_banner = banner(
 local paused_banner = banner(
     icons.idle,
     settings:map(function(resolved)
-        return resolved.enabled and "nothing is scheduled on this profile" or "automatic actions are off"
+        return resolved.enabled and "Nothing is scheduled on this profile" or "Automatic actions are off"
     end),
     theme.DIM,
     theme.GLASS_CONTENT,
@@ -346,12 +346,12 @@ local matrix_heading = row {
     spacing = theme.spacing.sm,
     padding = { left = theme.spacing.sm, right = theme.spacing.sm },
     children = {
-        cell({ { text = "action · in order", bold = true } }, theme.DIM, theme.font.xs, { width = "Fill" }),
-        column_heading("ac", "ac power"),
+        cell({ { text = "Action · in order", bold = true } }, theme.DIM, theme.font.xs, { width = "Fill" }),
+        column_heading("ac", "AC power"),
         row {
             width = theme.idle_profile_column,
             visible = has_battery,
-            children = { column_heading("battery", "battery") },
+            children = { column_heading("battery", "Battery") },
         },
     },
 }
@@ -447,8 +447,8 @@ local behaviour_rows = {
         icon = icons.play,
         title = bold_when(settings:map(function(resolved)
             return resolved.video_auto_inhibit
-        end), "keep awake for media"),
-        subtitle = "video, camera, microphone, screen capture",
+        end), "Keep awake for media"),
+        subtitle = "Video, camera, microphone, screen capture",
         height = theme.idle_row_height,
         icon_color = settings:map(function(resolved)
             return resolved.video_auto_inhibit and theme.ACCENT or theme.DIM
@@ -461,8 +461,8 @@ local behaviour_rows = {
     },
     panel_row {
         icon = icons.awake,
-        title = bold_when(idle.manual, "keep awake now"),
-        subtitle = "the same hold the bar circle takes",
+        title = bold_when(idle.manual, "Keep awake now"),
+        subtitle = "The same hold the bar circle takes",
         height = theme.idle_row_height,
         icon_color = idle.manual:map(function(manual)
             return manual and theme.ACCENT or theme.DIM
@@ -490,9 +490,9 @@ local flow_strip = row {
         cell(
             computed({ settings, idle.active_profile }, function(resolved, profile)
                 if not resolved.enabled then
-                    return "automation paused"
+                    return "Automation paused"
                 end
-                return "current flow · " .. (profile == "battery" and "battery" or "ac power")
+                return "Current flow · " .. (profile == "battery" and "battery" or "AC power")
             end),
             theme.FG,
             theme.font.sm,
@@ -550,11 +550,11 @@ local card_children = {
     flow_card,
     section(
         icons.sleep,
-        "automation",
-        "each stage waits for the one above it",
+        "Automation",
+        "Each stage waits for the one above it",
         { matrix_heading, stage_list }
     ),
-    section(icons.settings, "behaviour", "what may keep the session awake", behaviour_children),
+    section(icons.settings, "Behaviour", "What may keep the session awake", behaviour_children),
 }
 
 return modal({

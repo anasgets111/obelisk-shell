@@ -59,7 +59,7 @@ local function summary(n)
     end
     local dnd = n and n.dnd
     if count == 0 then
-        return dnd and "silenced · history empty" or "history empty"
+        return dnd and "Silenced · history empty" or "History empty"
     end
     local parts = { string.format("%d in history", count) }
     if apps > 1 then
@@ -119,7 +119,7 @@ local body = {
     weather_widget("notifications"),
     system_info("notifications"),
     panel_header {
-        title = "notifications",
+        title = "Notifications",
         icon = obelisk.notifications:map(function(n)
             return (n and n.dnd) and icons.bell_off or icons.bell
         end),
@@ -194,7 +194,7 @@ local body = {
         },
     },
     panel_empty_state(
-        "no notifications",
+        "No notifications",
         util.shown_when(obelisk.notifications, function(n)
             return kept(n) == 0
         end),
@@ -205,7 +205,7 @@ local body = {
             -- An empty feed under DND means something different from an empty feed without it, and
             -- the struck-through bell alone does not say which; the mirror spells it out here.
             subtext = obelisk.notifications:map(function(n)
-                return (n and n.dnd) and "do not disturb is on" or "you're all caught up"
+                return (n and n.dnd) and "Do not disturb is on" or "You're all caught up"
             end),
         }
     ),

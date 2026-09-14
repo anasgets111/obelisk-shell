@@ -118,7 +118,7 @@ return slider {
                 if volume(a) == nil then
                     return "--"
                 elseif a.muted then
-                    return "muted"
+                    return "Muted"
                 end
                 return string.format("%d%%", math.floor(v * 100 + 0.5))
             end), foreground_past(0.75), theme.font.sm, { align_v = "Center", visible = expanded }),

@@ -45,10 +45,10 @@ end
 
 local function state_line(b)
     if not b.available then
-        return "unavailable"
+        return "Unavailable"
     end
     if not b.enabled then
-        return "off"
+        return "Off"
     end
     local joined = util.sorted_devices(b.connected_devices)
     local first = joined[1]
@@ -60,7 +60,7 @@ local function state_line(b)
         end
         return table.concat(parts, " · ")
     end
-    return b.discovering and "scanning…" or "no devices connected"
+    return b.discovering and "Scanning…" or "No devices connected"
 end
 
 -- `BatteryBadge` is red under 10%, amber under 20%, and accent above; its capsule is
@@ -93,7 +93,7 @@ local function pair_button(device)
                 obelisk.bluetooth:invoke("pair", device.mac)
             end
         end,
-        children = { cell("pair", theme.ACCENT, theme.font.xs, { align = "Center", align_v = "Center" }) },
+        children = { cell("Pair", theme.ACCENT, theme.font.xs, { align = "Center", align_v = "Center" }) },
     }
 end
 
@@ -225,9 +225,9 @@ local function device_row(item)
     local subtitle = nil
     if item.status == "connected" then
         local codec = active_codec(item.card)
-        subtitle = codec and ("connected · " .. codec) or "connected"
+        subtitle = codec and ("Connected · " .. codec) or "Connected"
     elseif device.blocked then
-        subtitle = "blocked"
+        subtitle = "Blocked"
     end
     local on_activate = nil
     if item.status == "paired" and not device.blocked then
@@ -253,7 +253,7 @@ end
 
 local body = {
     panel_header {
-        title = "bluetooth",
+        title = "Bluetooth",
         icon = obelisk.bluetooth:map(function(b)
             return enabled(b) and icons.bt_on or icons.bt_off
         end),
@@ -285,7 +285,7 @@ local body = {
             panel_toggle_card {
                 slot = "bluetooth-visible-tile",
                 icon = icons.bt_visible,
-                label = "visible",
+                label = "Visible",
                 signal = obelisk.bluetooth,
                 read = function(b)
                     return b.discoverable
@@ -297,7 +297,7 @@ local body = {
             panel_toggle_card {
                 slot = "bluetooth-scan-tile",
                 icon = icons.bt_scan,
-                label = "scan",
+                label = "Scan",
                 signal = obelisk.bluetooth,
                 read = function(b)
                     return b.discovering
@@ -324,11 +324,11 @@ local body = {
     panel_empty_state(
         util.label(obelisk.bluetooth, function(b)
             if not b.available then
-                return "bluetooth unavailable"
+                return "Bluetooth unavailable"
             elseif not b.enabled then
-                return "bluetooth off"
+                return "Bluetooth off"
             end
-            return b.discovering and "scanning…" or "no devices found"
+            return b.discovering and "Scanning…" or "No devices found"
         end),
         -- `rows` is empty exactly when the radio is off or every device list is.
         computed({ obelisk.bluetooth, rows }, function(b, out)

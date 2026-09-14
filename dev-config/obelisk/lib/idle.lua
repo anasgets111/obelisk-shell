@@ -40,8 +40,8 @@ idle.TICK = 1
 idle.STAGES = {
     {
         key = "dpms",
-        title = "turn off displays",
-        detail = "until input comes back",
+        title = "Turn off displays",
+        detail = "Until input comes back",
         icon = icons.display,
         options = { 30, 60, 120, 300, 600, 900 },
         -- `_dpmsDone`. The stage after this one waits for it.
@@ -51,8 +51,8 @@ idle.STAGES = {
     },
     {
         key = "lock",
-        title = "lock screen",
-        detail = "needs your password to come back",
+        title = "Lock screen",
+        detail = "Needs your password to come back",
         icon = icons.lock,
         options = { 30, 60, 120, 300, 600, 900, 1800 },
         -- `_lockDone`; unlocking makes it false and disarms every following stage.
@@ -63,8 +63,8 @@ idle.STAGES = {
     },
     {
         key = "suspend",
-        title = "suspend",
-        detail = "sleeps the machine",
+        title = "Suspend",
+        detail = "Sleeps the machine",
         icon = icons.sleep,
         options = { 300, 600, 900, 1800, 3600, 7200 },
         -- Terminal: nothing waits behind it, and a suspended machine is not idle. A stage without
@@ -191,12 +191,12 @@ function idle.cycle(stage, sec, step)
     return options[(index - 1 + step) % #options + 1]
 end
 
---- Timeout words: `"off"`, `"45s"`, `"5m"`, `"1m 30s"`.
+--- Timeout words: `"Off"`, `"45s"`, `"5m"`, `"1m 30s"`.
 --- @param sec integer?
 --- @return string
 function idle.format(sec)
     if sec == nil or sec <= 0 then
-        return "off"
+        return "Off"
     end
     if sec < 60 then
         return string.format("%ds", sec)
@@ -320,9 +320,9 @@ idle.reasons = computed(
 --- @return string
 function idle.held_text(reasons, inhibited)
     if #reasons > 0 then
-        return "held awake by " .. table.concat(reasons, ", ")
+        return "Held awake by " .. table.concat(reasons, ", ")
     end
-    return inhibited and "held awake by something that did not name itself" or "nothing is holding this awake"
+    return inhibited and "Held awake by something that did not name itself" or "Nothing is holding this awake"
 end
 
 --- Whether anything holds the session awake, including unnamed holders. `obelisk.idle`'s `inhibited`

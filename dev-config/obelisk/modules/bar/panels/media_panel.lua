@@ -264,11 +264,11 @@ local times = row {
 
 local body = {
     panel_header {
-        title = "media",
+        title = "Media",
         icon = icons.media,
         active = has_player,
         subtitle = util.label(selected, function(player)
-            return first_nonempty(player and player.identity, "no media player running")
+            return first_nonempty(player and player.identity, "No media player running")
         end),
         trailing = {
             panel_action_icon(icons.player_switch, function()
@@ -294,14 +294,14 @@ local body = {
                     -- `trackTitle || identity || "Unknown track"`: an empty title is normal between
                     -- tracks, not a failure.
                     cell(util.label(selected, function(player)
-                        return first_nonempty(player and player.title, player and player.identity, "unknown track")
+                        return first_nonempty(player and player.title, player and player.identity, "Unknown track")
                     end):map(function(shown)
                         return { { text = shown, bold = true } }
                     end), theme.FG, theme.font.lg, { width = "Fill" }),
                     -- Fallback is artist, album, identity; `PlayerState` has no album, so use
                     -- artist then identity (ADR-0164).
                     cell(util.label(selected, function(player)
-                        return first_nonempty(player and player.artist, player and player.identity, "unknown artist")
+                        return first_nonempty(player and player.artist, player and player.identity, "Unknown artist")
                     end), theme.DIM, theme.font.sm, { width = "Fill" }),
                     transport_row,
                     seek_bar,
@@ -310,7 +310,7 @@ local body = {
             },
         },
     },
-    panel_empty_state("nothing playing", has_player:map(function(on)
+    panel_empty_state("Nothing playing", has_player:map(function(on)
         return not on
     end), { icon = icons.media }),
 }
