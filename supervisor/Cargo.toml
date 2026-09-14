@@ -32,14 +32,16 @@ schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 shared = { version = "0.1.0", path = "../shared" }
-smithay-client-toolkit = "0.21.1"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["full"] }
+# `full` minus `fs` and `parking_lot`, which nothing here uses.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "io-std"] }
 tokio-stream = "0.1.19"
 udev = { version = "0.9.3", features = ["send"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
-zbus = { version = "5.19.0", features = ["tokio"] }
+# No defaults: they add an async-io executor beside tokio. `rusty_network_manager` still turns them
+# back on until its proxies are replaced.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 # 5.1.0 is the floor, not a preference: RUSTSEC-2026-0278 is an authorization bypass through PID
 # reuse in 5.0.0 (7.3 high), and `polkit.rs` registers this session's authentication agent, so
 # the bypass would be in the path that decides whether the user authenticated.
@@ -49,4 +51,4 @@ zbus_polkit = { version = "5.1.0", default-features = false, features = ["tokio"
 # `test-util` is not in tokio's `full`, and it is what `#[tokio::test(start_paused = true)]` needs.
 # `battery::controller`'s loop is on a 30s timer, so testing it in real time is not testing it.
 tokio = { version = "1.53.1", features = ["full", "test-util"] }
-zbus = { version = "5.19.0", features = ["tokio", "p2p"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio", "p2p"] }
