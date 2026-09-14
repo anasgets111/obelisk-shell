@@ -253,7 +253,14 @@ local function stream_row(app)
 end
 
 local streams = obelisk.audio:map(function(a)
-    return (a and a.apps) or {}
+    local shown = {}
+    for _, app in ipairs((a and a.apps) or {}) do
+        -- speech-dispatcher's `sd_*` output modules hold idle streams open forever.
+        if not (app.binary or ""):match("^sd_") then
+            table.insert(shown, app)
+        end
+    end
+    return shown
 end)
 
 local body = {
@@ -326,15 +333,13 @@ local body = {
         },
     },
     -- `MixerSection`: application count, expanding to one slider per stream, capped and scrollable.
+    -- Hidden with no streams, where the mirror kept an empty card.
     panel_card({
         panel_row {
             slot = "audio-mixer",
             icon = icons.mixer,
             title = "application mixer",
             subtitle = util.label(streams, function(list)
-                if #list == 0 then
-                    return "no applications using audio"
-                end
                 return string.format("%d active", #list)
             end),
             trailing = cell(mixer_open:map(function(open)
@@ -349,9 +354,7 @@ local body = {
             max_height = theme.control.lg * 4 + theme.spacing.sm * 3,
             scroll = MIXER_SCROLL,
             spacing = theme.spacing.sm,
-            visible = computed({ mixer_open, streams }, function(open, list)
-                return open and #list > 0
-            end),
+            visible = mixer_open,
             source = streams,
             itemfn = stream_row,
             key = function(app)
@@ -360,6 +363,9 @@ local body = {
         },
     }, {
         width = "Fill",
+        visible = streams:map(function(list)
+            return #list > 0
+        end),
         spacing = theme.spacing.sm,
         background = theme.GLASS_CONTENT,
         padding = { top = theme.spacing.sm, right = theme.spacing.sm, bottom = theme.spacing.sm, left = theme.spacing.sm },
