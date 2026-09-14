@@ -347,7 +347,7 @@ mod tests {
 /// spelling.
 #[cfg(test)]
 mod meta_stub_tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     fn meta(file: &str) -> String {
@@ -509,8 +509,9 @@ mod meta_stub_tests {
     /// Feeds every `lua-meta` type through the evaluation-time surface specs, a real `Scene::apply`,
     /// and the resolved specs. Names are checked elsewhere; this catches type claims that the engine
     /// rejects, the ADR-0081 gap that once affected 21 properties, plus a closed literal set the
-    /// engine does not close and a required field it does not require. One-way by design: `just
-    /// types` catches engine-accepted fields missing from the stub. Missing `sample` rows fail.
+    /// engine does not close, an `integer` it lets take a fraction, and a required field it does
+    /// not require. One-way by design: `just types` catches engine-accepted fields missing from the
+    /// stub. Missing `sample` rows fail.
     /// ponytail: checks, does not derive. Upgrade to per-kind props structs, making `nodes.lua`
     /// generable like `obelisk.lua`; that rewrites parsing and trades property-specific errors for
     /// serde's. Not worth it while this test holds.
@@ -518,63 +519,48 @@ mod meta_stub_tests {
     fn every_type_the_stubs_declare_is_accepted_by_the_engine() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
         let classes = parse_typed_classes(&source);
-        let enums: BTreeSet<&str> = source
+        let aliases: BTreeMap<&str, &str> = source
             .lines()
             .filter_map(|line| line.strip_prefix("---@alias ")?.split_once(' '))
-            .filter(|(_, rest)| members(declared_type(rest)).iter().all(|m| m.starts_with('"')))
-            .map(|(name, _)| name)
+            .map(|(name, rest)| (name, declared_type(rest)))
             .collect();
 
-        let mut failures: Vec<String> = Vec::new();
-        let mut unsampled: Vec<String> = Vec::new();
+        let mut report = Report::default();
         for kind in super::NODE_KINDS {
             let class = format!("{}Props", capitalize(kind));
             let fields = typed_fields(&classes, &class);
             let mut required: Vec<(String, String)> = Vec::new();
             for field in fields.iter().filter(|field| field.required) {
-                match members(&field.ty).into_iter().find_map(|member| sample(&field.name, member)) {
+                match split_top(&field.ty, '|').into_iter().find_map(|member| sample(&field.name, member)) {
                     Some(literal) => required.push((field.name.clone(), literal)),
-                    None => unsampled.push(format!("  {kind}.{}: `{}`", field.name, field.ty)),
+                    None => report.unsampled.push(format!("  {kind}.{}: `{}`", field.name, field.ty)),
                 }
             }
             for (name, _) in &required {
                 if apply_one(kind, &required, name, None).is_ok() {
-                    failures.push(format!("  {kind}.{name} is declared required, engine accepts it absent"));
+                    report.failures.push(format!("  {kind}.{name} is declared required, engine accepts it absent"));
                 }
             }
-            for Field { name: field, ty, .. } in &fields {
-                let members = members(ty);
-                for member in &members {
-                    // `Bound` carries a handle the engine resolves before sibling rules apply, so
-                    // wrap a sibling sample: `image.source` needs a string signal, `list.source`
-                    // an array. The bare `hover`/`geometry`/`scroll` fall back to their own rows.
-                    let literal = if *member == "Bound" {
-                        members
-                            .iter()
-                            .filter(|m| **m != "Bound")
-                            .find_map(|m| sample(field, m))
-                            .map(|inner| format!("state(\"probe\", {inner})"))
-                            .or_else(|| sample(field, member))
-                    } else {
-                        sample(field, member)
-                    };
-                    let Some(literal) = literal else {
-                        unsampled.push(format!("  {kind}.{field}: `{member}`"));
-                        continue;
-                    };
-                    if let Err(err) = apply_one(kind, &required, field, Some(&literal)) {
-                        failures.push(format!("  {kind}.{field} declares `{member}`, engine says: {err}"));
-                    }
-                }
-                let closed =
-                    members.iter().any(|m| m.starts_with('"') || enums.contains(m)) && !members.contains(&"string");
-                if closed && apply_one(kind, &required, field, Some("\"obelisk_bogus\"")).is_ok() {
-                    failures.push(format!(
-                        "  {kind}.{field} declares a closed literal set, engine accepts `\"obelisk_bogus\"`"
-                    ));
-                }
+            for Field { name, ty, .. } in &fields {
+                probe(&aliases, kind, &required, name, ty, &|literal| literal.to_string(), &mut report);
             }
         }
+        // Alias internals no field declares directly; `@` is the probed slot.
+        let easing = typed_fields(&classes, "Transition")
+            .into_iter()
+            .find(|f| f.name == "easing")
+            .expect("Transition.easing")
+            .ty;
+        let steps = shape_field(&aliases, &easing, "steps").expect("Easing declares `{ steps }`");
+        let loops = shape_field(&aliases, "Animation", "loops").expect("Animation declares `loops`");
+        for (kind, field, ty, around) in [
+            ("image", "transition", easing.as_str(), "{ duration = 400, easing = @ }"),
+            ("image", "transition", steps, "{ duration = 400, easing = { steps = @ } }"),
+            ("rect", "animate", loops, "{ opacity = { duration = 200, keyframes = { 0, 1 }, loops = @ } }"),
+        ] {
+            probe(&aliases, kind, &[], field, ty, &|literal| around.replace('@', literal), &mut report);
+        }
+        let Report { failures, unsampled } = report;
         assert!(
             failures.is_empty(),
             "{} declared type(s) the engine refuses:\n{}",
@@ -590,24 +576,80 @@ mod meta_stub_tests {
         );
     }
 
+    #[derive(Default)]
+    struct Report {
+        failures: Vec<String>,
+        unsampled: Vec<String>,
+    }
+
+    /// Applies every member of `ty` as `field = around(literal)`. Union aliases and `(…)[]` expand,
+    /// so each declared literal is probed. Returns the first literal, for `Bound` to wrap.
+    fn probe(
+        aliases: &BTreeMap<&str, &str>,
+        kind: &str,
+        required: &[(String, String)],
+        field: &str,
+        ty: &str,
+        around: &dyn Fn(&str) -> String,
+        report: &mut Report,
+    ) -> Option<String> {
+        let mut members = expand(aliases, ty);
+        members.sort_by_key(|member| *member == "Bound");
+        let mut first: Option<String> = None;
+        for member in &members {
+            if let Some(inner) = member.strip_prefix('(').and_then(|m| m.strip_suffix(")[]")) {
+                let nested = probe(aliases, kind, required, field, inner, &|l| around(&format!("{{ {l} }}")), report);
+                first = first.or(nested);
+                continue;
+            }
+            let literal = match *member {
+                // The engine resolves a handle before sibling rules apply, so wrap a sibling's
+                // literal: `image.source` needs a string signal, `list.source` an array. The bare
+                // `hover`/`geometry`/`scroll` fall back to their own rows.
+                "Bound" => first.as_ref().map(|l| format!("state(\"probe\", {l})")).or_else(|| sample(field, member)),
+                _ => sample(field, member).map(|l| around(&l)),
+            };
+            let Some(literal) = literal else {
+                report.unsampled.push(format!("  {kind}.{field}: `{member}`"));
+                continue;
+            };
+            if let Err(err) = apply_one(kind, required, field, Some(&literal)) {
+                report.failures.push(format!("  {kind}.{field} declares `{member}`, engine says: {err}"));
+            }
+            if *member == "integer" && apply_one(kind, required, field, Some(&around("8.5"))).is_ok() {
+                report
+                    .failures
+                    .push(format!("  {kind}.{field} declares `integer`, engine accepts `{}`", around("8.5")));
+            }
+            first.get_or_insert(literal);
+        }
+        let bogus = around("\"obelisk_bogus\"");
+        if members.iter().any(|m| m.starts_with('"'))
+            && !members.contains(&"string")
+            && apply_one(kind, required, field, Some(&bogus)).is_ok()
+        {
+            report.failures.push(format!("  {kind}.{field} declares a closed literal set, engine accepts `{bogus}`"));
+        }
+        first
+    }
+
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when
     /// spelling shares a type but not a domain: `opacity` is `[0, 1]`, `size` is pixels, and
     /// `border_color`'s `Edges` holds colors while `margin`'s holds lengths.
     fn sample(field: &str, ty: &str) -> Option<String> {
         match (field, ty) {
             ("opacity", _) => return Some("0.5".to_string()),
-            ("animate", _) => return Some("{ opacity = 200 }".to_string()),
+            ("animate", "Animations") => return Some("{ opacity = 200.5 }".to_string()),
             ("scale", "Axes") | ("translate", _) => return Some("{ x = 1, y = 2 }".to_string()),
             ("scale", _) => return Some("1.5".to_string()),
-            ("rotate", _) => return Some("15".to_string()),
+            ("rotate", _) => return Some("7.5".to_string()),
             ("origin", _) => return Some("{ x = 0.5, y = 0.5 }".to_string()),
-            ("transition", _) => return Some("{ duration = 400, easing = \"InOutCubic\" }".to_string()),
+            ("transition", "Transition") => return Some("{ duration = 400.5, easing = \"InOutCubic\" }".to_string()),
             ("border_color", "BorderColors") => return Some("{ top = \"#112233\" }".to_string()),
-            ("constraint_adjustment", _) => return Some("{ \"SlideX\" }".to_string()),
             // Inline table shapes have no alias.
             ("anchor", shape) if shape.starts_with('{') => return Some("{ top = true, left = true }".to_string()),
-            ("min_size" | "max_size", _) => return Some("{ width = 8, height = 8 }".to_string()),
-            ("offset", _) => return Some("{ x = 1, y = 1 }".to_string()),
+            ("min_size" | "max_size", _) => return Some("{ width = 8.5, height = 8.5 }".to_string()),
+            ("offset", _) => return Some("{ x = 1.5, y = 1 }".to_string()),
             ("secure_submit", _) => {
                 return Some("{ capability = \"lock\", action = \"authenticate\" }".to_string());
             }
@@ -634,25 +676,24 @@ mod meta_stub_tests {
             match ty {
                 // A `lock`'s refused `NodeBase` fields.
                 "nil" => "nil",
-                "integer" | "number" => "8",
+                "integer" => "8",
+                "number" => "8.5",
                 "string" => "\"x\"",
                 "boolean" => "true",
                 "Color" => "\"#112233\"",
-                "Length" => "\"Fill\"",
-                "Edges" => "{ top = 1 }",
+                "Percent" => "\"50%\"",
+                "Edges" => "{ top = 1.5 }",
+                "[number, number, number, number]" => "{ 0.25, 0.1, 0.25, 1 }",
+                "{ steps: integer }" => "{ steps = 4 }",
                 "Node" => "rect {}",
                 "Node[]" => "{ rect {} }",
                 "TextRun[]" => {
                     "{ { text = \"x\", bold = true, underline = true, color = \"#112233\", href = \"https://x/\" } }"
                 }
-                "Align" => "\"Center\"",
-                "Cursor" => "\"pointer\"",
                 // No bare `Bound` row: callers wrap sibling samples, while the three bare fields
                 // are handled above. A row would shadow both and feed every property the wrong
                 // value.
                 "Rect" => "{ x = 0, y = 0, width = 1, height = 1 }",
-                "PopupAnchor" => "\"Top\"",
-                // First string-literal union member stands for all; the parser matches one `match`.
                 literal if literal.starts_with('"') => literal,
                 _ => return None,
             }
@@ -774,14 +815,14 @@ mod meta_stub_tests {
         rest
     }
 
-    /// Top-level `|` members; `("SlideX"|...)[]` and inline shapes stay whole.
-    fn members(ty: &str) -> Vec<&str> {
+    /// `ty` split on top-level `sep`; `("SlideX"|...)[]` and inline shapes stay whole.
+    fn split_top(ty: &str, sep: char) -> Vec<&str> {
         let (mut depth, mut start, mut out) = (0, 0, Vec::new());
         for (index, c) in ty.char_indices() {
             match c {
                 '(' | '{' | '[' | '<' => depth += 1,
                 ')' | '}' | ']' | '>' => depth -= 1,
-                '|' if depth == 0 => {
+                c if c == sep && depth == 0 => {
                     out.push(&ty[start..index]);
                     start = index + 1;
                 }
@@ -790,6 +831,29 @@ mod meta_stub_tests {
         }
         out.push(&ty[start..]);
         out
+    }
+
+    /// `ty`'s union members, with union aliases replaced by theirs.
+    fn expand<'a>(aliases: &BTreeMap<&str, &'a str>, ty: &'a str) -> Vec<&'a str> {
+        split_top(ty, '|')
+            .into_iter()
+            .flat_map(|member| match aliases.get(member) {
+                Some(def) if split_top(def, '|').len() > 1 => expand(aliases, def),
+                _ => vec![member],
+            })
+            .collect()
+    }
+
+    /// `key`'s type inside the `{ key: T, ... }` members `ty` expands to.
+    fn shape_field<'a>(aliases: &BTreeMap<&str, &'a str>, ty: &'a str, key: &str) -> Option<&'a str> {
+        expand(aliases, ty)
+            .into_iter()
+            .filter_map(|member| member.strip_prefix("{ ")?.strip_suffix(" }"))
+            .flat_map(|body| split_top(body, ','))
+            .find_map(|entry| {
+                let (name, ty) = entry.trim().split_once(": ")?;
+                (name.trim_end_matches('?') == key).then_some(ty)
+            })
     }
 
     /// One class's fields plus every parent's.
