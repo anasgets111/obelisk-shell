@@ -5,6 +5,13 @@ a tree of nodes; Rust owns the platform connections, input, layout and painting.
 
 Status: pre-release. Nothing is published, and the Lua API changes without notice.
 
+
+
+https://github.com/user-attachments/assets/770bd04b-bc43-43b9-a388-eccda8d9528f
+
+
+
+
 ## Why processes
 
 A shell reloads on every config save, and the reloaded UI has to release what the old one held.
