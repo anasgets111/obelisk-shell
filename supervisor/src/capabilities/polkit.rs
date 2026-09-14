@@ -28,8 +28,7 @@ pub struct PolkitState {
 }
 
 /// Every action `obelisk.polkit:invoke(...)` accepts (ADR-0037). `cancel` dismisses the prompt and
-/// tells polkitd's caller `Cancelled`. Variants stay undocumented: schemars would render a doc as
-/// `oneOf`, not the bare `enum` read by the stub generator.
+/// tells polkitd's caller `Cancelled`.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolkitAction {

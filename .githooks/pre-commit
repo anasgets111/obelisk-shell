@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Stops a commit that would carry stale generated stubs, or that does not pass `just check`.
 #
-# `lua-meta/obelisk.lua` is generated from the Supervisor's payload types and `lua-meta/nodes.lua` is
-# hand-written against the Renderer's node schema. Both have golden-file tests, and both only fire
-# if someone runs them -- which at the end of a long session is exactly what gets skipped. The
-# language server reads these files straight from the working tree, so a stale one is wrong with
-# authority: it offers a field the engine does not send, or hides one it does.
+# `lua-meta/obelisk.lua` is generated from the Supervisor's payload types and has a golden-file test.
+# The other stubs are hand-written and have roster tests. All of them only fire if someone runs
+# them -- which at the end of a long session is exactly what gets skipped. The language server reads
+# these files straight from the working tree, so a stale one is wrong with authority: it offers a
+# field the engine does not send, or hides one it does.
 #
 # Regenerates rather than only complaining, then refuses the commit anyway. Staging the file itself
 # would be the convenient thing and it is wrong: the stub is generated from the working tree, not

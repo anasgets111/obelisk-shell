@@ -25,7 +25,7 @@ pub struct AudioState {
     pub source_volume: f32,
     /// Default input mute, the microphone-mute click target for privacy indicators.
     pub source_muted: bool,
-    /// Every output device; `audio:set_default_sink(id)` takes [`AudioDevice::id`].
+    /// Every output device; `:invoke("set_default_sink", id)` takes [`AudioDevice::id`].
     pub sinks: Vec<AudioDevice>,
     /// Every input device, on the same terms as [`AudioState::sinks`].
     pub sources: Vec<AudioDevice>,

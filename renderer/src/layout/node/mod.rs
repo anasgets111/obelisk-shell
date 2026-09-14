@@ -294,8 +294,9 @@ fn parse_hex_color(property: &str, s: &str) -> Result<Rgba, LayoutError> {
 /// surface (ADR-0044 decision 1). `window`, `popup` and `lock` add nothing, by the same live-object
 /// test: a `window`'s `set_title`/`set_app_id`/`set_min_size`/`set_max_size` are all valid requests
 /// on a mapped toplevel; a `popup`'s whole `xdg_positioner` is rebuilt on every open (ADR-0049
-/// decision 1), so `parent`/`anchor_rect`/`anchor`/`gravity` are meant to carry a `Signal`; a
-/// `lock`'s property list is only `id` and `child`, already the universal arm's as a reconcile
+/// decision 1), so `anchor_rect`/`anchor`/`gravity` may carry a `Signal` (`parent` may not:
+/// `get_popup` pins one parent, ADR-0051 decision 1); a `lock`'s property list is only `id` and
+/// `child`, already the universal arm's as a reconcile
 /// identity rather than a protocol field. `hover` joins it there on any kind (ADR-0062 decision 3):
 /// it names the signal the pointer handler writes, and a resolved `hover` would arrive as the
 /// boolean `false`, saying nothing about *which* signal that is.

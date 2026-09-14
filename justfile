@@ -74,14 +74,10 @@ docs:
 # `---@return Signal Read-only, like `map`` declared a return of type `like`. Checking the config
 # said nothing, because the config was fine. Single-return prose is written `---@return T # ...`.
 #
-# Optional, because `lua-language-server` is not a build dependency of this workspace and there is
-# no CI to install it into. Missing means skipped and said so, never a silent pass.
+# Required, like `luac` for `lua`: a skip let `just check` go green having checked no stub.
 #
-# The PATH lookup falls back to the copy Zed's Lua extension downloads for itself. Not cleverness
-# for its own sake: that is the only copy on the machine this was written on, so the check reported
-# "skipping" on every run for as long as it existed, and the hole `dev-config/obelisk/.luarc.json`'s
-# promoted diagnostics exist to close was open the whole time. Newest version wins; the glob is
-# there so a Zed update does not silently turn the check back off.
+# The PATH lookup falls back to the copy Zed's Lua extension downloads for itself, the only copy on
+# the machine this was written on. Newest version wins; the glob survives Zed updates.
 types:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -90,8 +86,8 @@ types:
         luals=$(ls -d ~/.local/share/zed/extensions/work/lua/lua-language-server-*/bin/lua-language-server 2>/dev/null | sort -V | tail -1 || true)
     fi
     if [ -z "$luals" ]; then
-        echo "no lua-language-server on PATH, skipping the config type check (pacman -S lua-language-server)"
-        exit 0
+        echo "no lua-language-server on PATH or in Zed's extensions. Install it: pacman -S lua-language-server" >&2
+        exit 1
     fi
     log=$(mktemp -d)
     trap 'rm -rf "$log"' EXIT
@@ -152,7 +148,7 @@ stubs:
 # Both languages now. The Lua half is the larger half by file count and had no gate at all, so this
 # recipe was green over config a reviewer would have sent back. `tools/luafmt.py` explains why the
 # Lua formatter is a language server rather than a formatter binary; `.editorconfig` holds its
-# rules. It skips itself when that server is missing, on the same terms as `types` below.
+# rules. It fails when that server is missing, on the same terms as `types` above.
 fmt-check:
     cargo fmt --all -- --check
     python3 tools/luafmt.py --check dev-config lua-meta share

@@ -73,7 +73,7 @@ pub struct ConnectedDevice {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PairedDevice {
-    /// Canonical MAC address accepted by `bluetooth:connect(mac)` and `bluetooth:forget(mac)`.
+    /// Canonical MAC address accepted by `:invoke("connect", mac)` and `:invoke("forget", mac)`.
     pub mac: String,
     /// The device's advertised name.
     pub name: String,
@@ -88,7 +88,7 @@ pub struct PairedDevice {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredDevice {
-    /// Canonical MAC address accepted by `bluetooth:pair(mac)`.
+    /// Canonical MAC address accepted by `:invoke("pair", mac)`.
     pub mac: String,
     /// Advertised name, often empty when the device broadcasts only an address.
     pub name: String,
@@ -138,7 +138,7 @@ pub struct BluetoothState {
     /// after `TemporaryTimeout` (30s by default) -- one that was connected/trusted, or stored from
     /// an earlier session, stays.
     pub discovered_devices: Vec<DiscoveredDevice>,
-    /// The pairing question on screen, or `nil`. Answer with `bluetooth:answer_pairing(mac, accept)`.
+    /// The pairing question on screen, or `nil`. Answer with `:invoke("answer_pairing", mac, accept)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pairing_request: Option<PairingRequest>,
 }

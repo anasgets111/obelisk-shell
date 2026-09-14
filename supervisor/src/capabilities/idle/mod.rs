@@ -21,12 +21,8 @@ pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
 pub use state::IdleState;
 
 /// Actions accepted on an `idle` `CommandEnvelope`; exhaustive dispatch keeps variants and arms in
-/// sync. Not all of them are config-callable: see `stubs::internal_actions`.
-///
-/// Doc comments on the variants would be a mistake here. schemars emits a flat `enum` for a plain
-/// unit enum and a `oneOf` once any variant carries a description, and `stubs::action_names` reads
-/// the flat form -- so one `///` below silently empties the generated `invoke` union.
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+/// sync. `obelisk.idle` has no `invoke`; only its methods and the reload path send these.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleAction {
     Register,

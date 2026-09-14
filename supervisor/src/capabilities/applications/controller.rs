@@ -18,7 +18,7 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct ApplicationsState {
     /// Visible, launchable installed entries, sorted by name. Rebuilt by
-    /// `applications:refresh()`; directories are not watched, so mid-session installs wait for it.
+    /// `:invoke("refresh")`; directories are not watched, so mid-session installs wait for it.
     pub entries: Vec<AppSummary>,
     /// The same entries keyed by a window's `app_id`, for callers holding
     /// `workspaces.active_client.class` rather than a desktop id. Exact `StartupWMClass` and

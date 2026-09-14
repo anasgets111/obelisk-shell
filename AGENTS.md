@@ -36,6 +36,15 @@ Before writing code, trace the real flow end to end, then stop at the first rung
   real-hardware calibration.
 - Non-trivial logic gets one runnable check; trivial one-liners get none.
 
+## Lua stubs
+
+- **Capability payloads and actions** come from the Rust `*State`/`*Action` types; doc comments become the
+  descriptions. Run `just stubs` and commit `lua-meta/obelisk.lua`. Never hand-edit it.
+- **Node and surface properties** are hand-written (ADR-0081). Edit `lua-meta/nodes.lua`/`surfaces.lua` in
+  the same commit as `accepted_properties`.
+- **New Lua globals or signals** go in `lua-meta/globals.lua`/`signals.lua` in the same commit.
+- **`just check` is the gate**, `just types` included. It needs `lua-language-server`.
+
 ## Testing
 
 - **Never hardcode `/sys` or `/proc`.** Readers take `sys_root`/`proc_root`; tests point them at a tempdir.

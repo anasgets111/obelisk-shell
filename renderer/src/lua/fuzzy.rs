@@ -234,6 +234,12 @@ fn score_multi_byte_match(
 /// slightly different rules. Widening `fuzzy_match_v2` to `char` fixes it at the cost of an index
 /// map; nothing in this config has non-ASCII application names to make that pay.
 fn fuzzy_match_unicode(case_sensitive: bool, input: &str, pattern: &str) -> Option<(i32, usize)> {
+    // `start` is a byte offset into the unfolded haystack, as on the ASCII path; lowercasing can
+    // turn one char into several.
+    let offsets: Vec<usize> = input
+        .char_indices()
+        .flat_map(|(at, c)| std::iter::repeat_n(at, if case_sensitive { 1 } else { c.to_lowercase().count() }))
+        .collect();
     let fold = |text: &str| -> Vec<char> {
         if case_sensitive { text.chars().collect() } else { text.to_lowercase().chars().collect() }
     };
@@ -267,7 +273,7 @@ fn fuzzy_match_unicode(case_sensitive: bool, input: &str, pattern: &str) -> Opti
         input_index += 1;
     }
 
-    Some((score, first_index.unwrap_or(0)))
+    Some((score, offsets[first_index.unwrap_or(0)]))
 }
 
 /// Score `needle` against `haystack`: `(score, match start)`, or `None` when it does not match.
@@ -392,5 +398,12 @@ mod tests {
     #[test]
     fn start_is_where_the_match_begins() {
         assert_eq!(score("a Firefox", "fire").map(|(_, start)| start), Some(2));
+    }
+
+    /// A byte offset on the greedy path too, or `string.sub` slices mid-codepoint.
+    #[test]
+    fn a_non_ascii_start_is_a_byte_offset_into_the_original_haystack() {
+        assert_eq!(score("Дисковая Утилита", "ут").map(|(_, start)| start), Some("Дисковая ".len()));
+        assert_eq!(score("İİ ab", "ab").map(|(_, start)| start), Some("İİ ".len()));
     }
 }

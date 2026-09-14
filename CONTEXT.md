@@ -104,7 +104,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Capability roster**: The complete set of Supervisor capability names with snapshot state exposed to config, including idle. _Avoid_: pre-seed list, known capabilities, `CAPABILITIES`
 
-**IDL**: The typed contract the engine exposes to Lua: capability payload fields, action names and node properties. It is generated into the editor stubs from the Rust types rather than written a second time in Markdown, and `obelisk.version.minor` tracks it. _Avoid_: schema, API surface, wire format
+**IDL**: The typed contract the engine exposes to Lua: capability payload fields, action names and node properties. The editor stubs carry it: capability payloads and actions generated from the Rust types, node properties hand-written. _Avoid_: schema, API surface, wire format
 
 **Capability registry**: The Supervisor's collection of capability controllers and their state/event channels. _Avoid_: capability manager, service registry, plugin table
 

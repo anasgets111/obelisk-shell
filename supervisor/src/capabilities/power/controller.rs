@@ -13,7 +13,7 @@ use zbus::zvariant::OwnedValue;
 /// host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct PowerState {
-    /// Active platform profile, e.g. `"balanced"`, set by `power:set_profile`; `nil` without
+    /// Active platform profile, e.g. `"balanced"`, set by `:invoke("set_profile", p)`; `nil` without
     /// power-profiles-daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_profile: Option<String>,

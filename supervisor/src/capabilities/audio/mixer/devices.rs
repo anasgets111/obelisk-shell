@@ -13,7 +13,7 @@ use crate::capabilities::audio::master;
 /// `node.name` (`"alsa_output.pci-0000_00_1f.3.analog-stereo"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct AudioDevice {
-    /// PipeWire registry id used by `audio:set_default_sink(id)`.
+    /// PipeWire registry id, the argument of `:invoke("set_default_sink", id)`.
     pub id: u32,
     /// Device description, e.g. `"Built-in Audio Analog Stereo"`; neither is reboot-stable.
     pub name: String,
@@ -28,8 +28,8 @@ pub struct AudioDevice {
 /// One BlueZ audio device's codec choices, joined to `obelisk.bluetooth` by MAC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct BluetoothCodecs {
-    /// PipeWire device registry id, the first argument of `audio:set_bluetooth_profile(device,
-    /// index)`.
+    /// PipeWire device registry id, the first argument of
+    /// `:invoke("set_bluetooth_profile", device, index)`.
     pub device: u32,
     /// MAC address from WirePlumber's `bluez_card.` name, spelled as `obelisk.bluetooth` spells it.
     pub mac: String,
@@ -44,7 +44,7 @@ pub struct BluetoothCodecs {
 /// One entry of [`BluetoothCodecs::codecs`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct CodecProfile {
-    /// Profile index, the second argument of `audio:set_bluetooth_profile(device, index)`.
+    /// Profile index, the second argument of `:invoke("set_bluetooth_profile", device, index)`.
     pub index: i32,
     /// The codec the description names, e.g. `"AAC"`, `"LDAC"`, `"mSBC"`.
     pub codec: String,

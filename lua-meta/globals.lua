@@ -1,9 +1,8 @@
 ---@meta
 -- The remaining engine globals, and the stdlib as ADR-0048 left it.
 --
--- HAND-WRITTEN. `just stubs` does not touch it: unlike `nodes.lua`, globals register one at a time
--- in `renderer/src/lua/`, so no roster test exists. `just types` checks `dev-config` against it;
--- edit it with the Rust or drift only appears as a config diagnostic.
+-- HAND-WRITTEN. `just stubs` does not touch it. `lua::tests::the_stubs_declare_every_engine_global`
+-- checks names against the config VM; types drift only as a `just types` diagnostic.
 --
 -- The config VM loads only `COROUTINE | TABLE | STRING | UTF8 | MATH | PACKAGE | OS`, then replaces
 -- `os` with four calls. `.luarc.json` disables the other builtins; without that and this `os`
@@ -34,7 +33,7 @@ function fonts(chain) end
 ---ASCII path's. Both are on fzf's scale, so fzf's own thresholds carry over.
 ---@param haystack string The text to search, such as an application's name and comment joined.
 ---@param needle string What the user typed, already trimmed. Empty scores 0 rather than failing.
----@return integer? score, integer? start `start` is a 0-based index into `haystack`.
+---@return integer? score, integer? start `start` is a 0-based byte offset into `haystack`, so `haystack:sub(start + 1)` begins at the match.
 function fuzzy(haystack, needle) end
 
 ---@class TimerHandle
@@ -133,11 +132,11 @@ function process.detach(cmd, args) end
 ---One program declared with [`session_process`]. Every field is a signal over this program's entry
 ---in `obelisk.processes`, and the three methods are the only ways to move it: there is no handle to
 ---hold, because holding one is exactly what a config cannot do across a reload.
----@field running Signal<boolean> Whether it is up now. The other fields describe the current run while this is true and the finished one while it is false.
+---@field running Signal<boolean?> `nil` until the first push. Whether it is up now. The other fields describe the current run while this is true and the finished one while it is false.
 ---@field pid Signal<integer?> Its process id, which is also its process group. `nil` until the first `start`, and kept after an exit.
 ---@field started_at Signal<integer?> Unix seconds when the current or last run began. Subtract it from `obelisk.system`'s clock for elapsed time; nothing here needs a second timer.
 ---@field exit_code Signal<integer?> How the last finished run ended. `nil` while running, before the first run, and when a signal ended it rather than an exit.
----@field start_error Signal<string> Why the last `start` produced no process -- usually a command that is not on `PATH`. Empty when it spawned. Without reading this, a config waiting on `running` waits forever.
+---@field start_error Signal<string?> `nil` until the first push. Why the last `start` produced no process -- usually a command that is not on `PATH`. Empty when it spawned. Without reading this, a config waiting on `running` waits forever.
 local SessionProcessHandle = {}
 
 ---Runs the program, replacing whatever the last run left behind.

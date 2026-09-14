@@ -18,7 +18,7 @@ const RELIST_DEBOUNCE: Duration = Duration::from_millis(200);
 /// `obelisk.files.folders[folder]` reads back with the string the config wrote.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
 pub struct FilesState {
-    /// One entry per active `files:watch(path)`, keyed by `path` with trailing slashes stripped.
+    /// One entry per active `:invoke("watch", path)`, keyed by `path` with trailing slashes stripped.
     /// Absent until watched, so an unrequested folder is not an empty list.
     pub folders: BTreeMap<String, Folder>,
 }

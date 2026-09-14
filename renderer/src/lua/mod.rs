@@ -507,6 +507,50 @@ mod tests {
         assert!(year >= 2024, "os.date has to be the real one, not a stub: got {year}");
     }
 
+    /// Every engine global, and every member of the engine-owned `os`/`process`/`json`, has a
+    /// `lua-meta` stub, and no stub names what the VM lacks. Enumerated at runtime, so any
+    /// registration style counts. `obelisk`'s members are `obelisk.lua`'s generator's to check.
+    #[test]
+    fn the_stubs_declare_every_engine_global() {
+        const MEMBER_TABLES: [&str; 3] = ["os", "process", "json"];
+        let dir = tempfile::tempdir().unwrap();
+        let dirty = signal::DirtyFlag::new();
+        let loader = Loader::new(dirty.clone(), dir.path()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        loader.register_process(process::ProcessRegistry::new(0, tx.clone())).unwrap();
+        let commands = capability::CommandSender::new(0, tx);
+        namespace::build(&loader, &dirty, &commands, &dir.path().join("shell.lua")).unwrap();
+
+        let keys = |table: Table| -> std::collections::BTreeSet<String> {
+            table.pairs::<String, Value>().map(|pair| pair.unwrap().0).collect()
+        };
+        let stdlib = keys(Lua::new_with(config_stdlib(), mlua::LuaOptions::default()).unwrap().globals());
+        let mut engine: std::collections::BTreeSet<String> =
+            keys(loader.lua().globals()).difference(&stdlib).cloned().collect();
+        for table in MEMBER_TABLES {
+            engine.extend(
+                keys(loader.lua().globals().get(table).unwrap()).into_iter().map(|key| format!("{table}.{key}")),
+            );
+        }
+
+        let mut declared = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lua-meta")).unwrap() {
+            for line in std::fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
+                // `function name(` and `name = {}`; `local` and `Class:method` are not globals.
+                let name =
+                    line.strip_prefix("function ").and_then(|rest| rest.split_once('(')).or(line.split_once(" = {}"));
+                if let Some((name, _)) = name
+                    && !name.contains([':', ' '])
+                    && !stdlib.contains(name)
+                    && name.split_once('.').is_none_or(|(table, _)| MEMBER_TABLES.contains(&table))
+                {
+                    declared.insert(name.to_string());
+                }
+            }
+        }
+        assert_eq!(declared, engine, "lua-meta is out of step with the config VM's globals");
+    }
+
     /// `require` reads its own `package.loaded` reference, so removing only a global hands the
     /// library back through `local io = require("io")`.
     #[test]

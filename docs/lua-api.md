@@ -5,7 +5,7 @@ behavior and reload lifetimes; [roadmap](roadmap.md) owns gaps and proposed work
 [CONTEXT](../CONTEXT.md) owns terminology; [decisions](decisions.md) owns history.
 
 Exact capability fields and action names come from Rust types through
-[generated editor stubs](../supervisor/src/stubs.rs), installed by `obelisk init`.
+[generated editor stubs](../supervisor/src/stubs.rs), installed by `just install` or, without it, `obelisk init`.
 Keep schema inventories there rather than maintaining a second copy in Markdown.
 
 ## 1. Values and signals
@@ -376,7 +376,7 @@ See [wire format and dispatch limits](services.md#13-control-socket-and-wire-for
 | :--- | :--- |
 | `obelisk -d` | Starts the shell in its own session and returns; output goes to `obelisk log` |
 | `obelisk log [-f]` | Prints this run's stdout and stderr; `-f` follows until the shell exits |
-| `obelisk init -c <dir> [--force]` | Config/editor setup; generates capability field and action stubs; `--force` overwrites existing files |
+| `obelisk init -c <dir> [--force]` | Writes `.luarc.json` and a starter `shell.lua`; copies the embedded stubs when no package installed them; `--force` overwrites the two config files |
 | `obelisk check -c <dir>` | Evaluates config/surface declarations without Wayland, GPU or subprocess execution |
 | `obelisk set <name> <value>` | Writes declared named state; parses JSON, otherwise uses a string |
 | `obelisk toggle <name>` | Toggles declared boolean state |

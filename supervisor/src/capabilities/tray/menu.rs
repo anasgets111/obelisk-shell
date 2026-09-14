@@ -11,7 +11,8 @@ use crate::capabilities::truncate_utf8_bytes;
 /// One DBusMenu layout node, resolved to `tray.items[].menu`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct MenuItem {
-    /// DBusMenu item id used by `tray:activate_menu_item` and `tray:menu_will_show`.
+    /// DBusMenu item id, the second argument of `:invoke("activate_menu_item", id, menu_item_id)`
+    /// and of `"menu_will_show"`.
     pub id: i32,
     /// `"standard"` or `"separator"`. A separator carries no label and is not clickable.
     pub menu_type: String,
@@ -29,7 +30,7 @@ pub struct MenuItem {
     /// DBusMenu state: `0` off, `1` on, `-1` indeterminate. `nil` exactly when
     /// [`MenuItem::toggle_type`] is `nil`; a missing state with a toggle type becomes `-1`.
     pub toggle_state: Option<i32>,
-    /// Nested entries from the single `GetLayout(0, -1)` reply, so no `tray:menu_will_show` is
+    /// Nested entries from the single `GetLayout(0, -1)` reply, so no `"menu_will_show"` is
     /// needed to populate them. Empty for leaves and for nodes at [`MAX_MENU_DEPTH`], whose
     /// children are dropped with an stderr line.
     pub children: Vec<MenuItem>,

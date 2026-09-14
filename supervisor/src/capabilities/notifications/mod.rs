@@ -178,7 +178,7 @@ pub enum NotificationSpan {
 /// `action-icons` while neither was true; parsed buttons are retained now.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NotificationAction {
-    /// Opaque key accepted by `notifications:invoke_action(id, key)` and returned as
+    /// Opaque key accepted by `:invoke("invoke_action", id, key)` and returned as
     /// `ActionInvoked.action_key`.
     pub key: String,
     /// Button label, falling back to the key when empty unless the action is icon-only.
@@ -272,7 +272,7 @@ pub struct Notification {
     /// `obelisk.applications.by_app_id` instead of the mutable/non-unique `app_name`.
     /// `nil` when absent; slashed values are dropped (ADR-0101).
     pub desktop_entry: Option<String>,
-    /// Whether the sender offered inline reply; `notifications:reply(id, text)` requires it.
+    /// Whether the sender offered inline reply; `:invoke("reply", id, text)` requires it.
     pub has_reply: bool,
     /// `hints["x-kde-reply-placeholder-text"]`: what the sender wants an empty reply field to say,
     /// "Reply to Alice" rather than a generic "Reply"; capped at 64 bytes, `nil` if absent, and
@@ -280,7 +280,7 @@ pub struct Notification {
     pub reply_placeholder: Option<String>,
     /// Offered buttons in sender order, excluding `default` and `inline-reply`; often empty.
     pub actions: Vec<NotificationAction>,
-    /// Whether the card is activatable via `notifications:invoke_action(id, "default")`; separate
+    /// Whether the card is activatable via `:invoke("invoke_action", id, "default")`; separate
     /// from `actions` because `default` is not a button.
     pub has_default_action: bool,
     /// `hints["resident"]`: keep the notification after an action, as media prev/next needs;
@@ -300,7 +300,7 @@ pub struct NotificationsState {
     /// distinguishes them. This is a view of the 100-entry queue, so older entries remain
     /// dismissable by id after leaving the list (ADR-0033).
     pub feed: Vec<Notification>,
-    /// DND from `notifications:set_dnd`; gates only non-critical sounds. Notifications remain
+    /// DND from `:invoke("set_dnd", enabled)`; gates only non-critical sounds. Notifications remain
     /// accepted, queued, and in `feed`; popup suppression is config policy.
     pub dnd: bool,
 }

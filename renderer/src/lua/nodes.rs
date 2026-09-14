@@ -65,14 +65,11 @@ const BOX_KINDS: [&str; 8] = ["rect", "row", "column", "button", "panel", "windo
 /// Per-kind properties beyond the common and box lists. This rejects unknown keys; before it,
 /// misspelled `aling_v = "Center"` was copied, read by nothing, and silently failed to centre.
 ///
-/// ponytail: hand-written because schema is ~60 `properties.get("...")` calls across
+/// ponytail: hand-written because the schema is scattered `properties.get("...")` calls across
 /// `layout/node/`, `layout/scene.rs`, and `wayland/`, each with its own defaulting/coercion.
 /// Guards:
 /// `every_property_a_parser_reads_is_accepted`, `the_stubs_declare_the_same_properties`. Upgrade:
 /// per-kind props structs, which means rewriting the parsers.
-///
-/// Deliberate parser-less names: `textfield`'s `on_change`/`on_submit` follow ADR-0027 while
-/// `zwp_text_input_v3` is unwired; rejecting them would break documented configs.
 const NODE_PROPERTIES: &[(&str, &[&str])] = &[
     ("rect", &["children"]),
     ("row", &["children", "scroll", "spacing"]),
@@ -340,8 +337,8 @@ mod tests {
     }
 }
 
-/// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` stay hand-written: no type describes their 29
-/// scattered `properties.get("...")` calls across `layout/node/`, each validating inline.
+/// `lua-meta/nodes.lua` and `lua-meta/surfaces.lua` stay hand-written: no type describes their
+/// scattered `properties.get("...")` calls, each validating inline.
 /// `lua-meta/obelisk.lua` is generated (`supervisor/src/stubs.rs`) because capability payloads are
 /// real `Serialize` structs.
 ///
@@ -385,10 +382,8 @@ mod meta_stub_tests {
         }
     }
 
-    /// Every parser-read property must be accepted by some kind, or deserialization refuses it
-    /// first. One-way by design: parser-less names remain allowed (`textfield`'s `on_change`/
-    /// `on_submit`, typed while `zwp_text_input_v3` is unwired). Source grep is needed because
-    /// property names live in string literals, not types.
+    /// Parser reads and accepted names match both ways: a read no kind accepts is refused first, an
+    /// accepted name nothing reads is silently ignored. Source grep because names live in literals.
     #[test]
     fn every_property_a_parser_reads_is_accepted_by_some_kind() {
         let accepted: BTreeSet<String> =
@@ -396,15 +391,32 @@ mod meta_stub_tests {
         let mut read = BTreeSet::new();
         for source in rust_sources(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
             let text = std::fs::read_to_string(&source).expect("a source file this build compiled is readable");
-            // Test fixtures below `#[cfg(test)]` may name anything.
-            let production = text.split_once("\n#[cfg(test)]").map_or(text.as_str(), |(before, _)| before);
-            read.extend(property_literals(production));
+            read.extend(property_literals(&without_test_modules(&text)));
         }
         let unreachable: Vec<&String> = read.difference(&accepted).collect();
         assert!(
             unreachable.is_empty(),
             "these parsers read a property no kind accepts, so `deserialize_lua_table` refuses it first: {unreachable:?}"
         );
+        let unread: Vec<&String> = accepted.difference(&read).collect();
+        assert!(unread.is_empty(), "these properties are accepted but no parser reads them: {unread:?}");
+    }
+
+    /// Drops top-level `#[cfg(test)] mod … { … }` blocks, whose fixtures may name anything. Other
+    /// `#[cfg(test)]` items often sit above production code, so they stay.
+    fn without_test_modules(text: &str) -> String {
+        let mut out = String::new();
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line == "#[cfg(test)]" && lines.peek().is_some_and(|next| next.contains("mod ") && next.ends_with('{')) {
+                // rustfmt closes a top-level block with `}` in column 0.
+                lines.by_ref().find(|line| *line == "}");
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     /// `rect` -> `Rect`.
@@ -464,10 +476,16 @@ mod meta_stub_tests {
         out
     }
 
-    /// Property literals in `properties.get("x")` or as the named parser argument in
-    /// `parse_align(properties, "align_v")`.
+    /// Property literals in `properties.get("x")`, as the named parser argument in
+    /// `parse_align(properties, "align_v")`, or through `keyboard.rs`'s `function("on_cancel")`.
     fn property_literals(text: &str) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
+        let mut names: BTreeSet<String> = text
+            .split("function(\"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("\")"))
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
         for (index, _) in text.match_indices("properties") {
             let rest = &text[index + "properties".len()..];
             let head: String = rest.chars().take(40).collect();
@@ -488,54 +506,72 @@ mod meta_stub_tests {
         names
     }
 
-    /// Feeds every `lua-meta` type through a real `Scene::apply`. Names are checked elsewhere; this
-    /// catches type claims that the engine rejects, the ADR-0081 gap that once affected 21
-    /// properties. One-way by design: `just types` catches engine-accepted fields missing from the
-    /// stub by type-checking configs against it. All 455 types are sampled; missing `sample` rows fail.
-    /// ponytail: checks, does not derive. The node schema remains hand-written: 49 parse functions
-    /// and 45 `properties.get` calls across ten files. Upgrade to per-kind props structs, making
-    /// `nodes.lua` generable like `obelisk.lua`; that rewrites parsing and trades property-specific
-    /// errors for serde's. Not worth it while this test holds.
+    /// Feeds every `lua-meta` type through the evaluation-time surface specs, a real `Scene::apply`,
+    /// and the resolved specs. Names are checked elsewhere; this catches type claims that the engine
+    /// rejects, the ADR-0081 gap that once affected 21 properties, plus a closed literal set the
+    /// engine does not close and a required field it does not require. One-way by design: `just
+    /// types` catches engine-accepted fields missing from the stub. Missing `sample` rows fail.
+    /// ponytail: checks, does not derive. Upgrade to per-kind props structs, making `nodes.lua`
+    /// generable like `obelisk.lua`; that rewrites parsing and trades property-specific errors for
+    /// serde's. Not worth it while this test holds.
     #[test]
     fn every_type_the_stubs_declare_is_accepted_by_the_engine() {
         let source = meta("nodes.lua") + &meta("surfaces.lua");
         let classes = parse_typed_classes(&source);
+        let enums: BTreeSet<&str> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("---@alias ")?.split_once(' '))
+            .filter(|(_, rest)| members(declared_type(rest)).iter().all(|m| m.starts_with('"')))
+            .map(|(name, _)| name)
+            .collect();
 
         let mut failures: Vec<String> = Vec::new();
         let mut unsampled: Vec<String> = Vec::new();
-        let mut probed = 0usize;
         for kind in super::NODE_KINDS {
             let class = format!("{}Props", capitalize(kind));
-            for (field, ty) in typed_fields(&classes, &class) {
-                // Split only flat unions. `constraint_adjustment` is `("SlideX"|...)[]`, an array
-                // of a union, and inline table shapes contain their own `|`; keep those whole.
-                // `string|TextRun[]|Bound` is safe to split.
-                let members: Vec<&str> =
-                    if ty.contains(['(', '{']) { vec![ty.as_str()] } else { ty.split('|').collect() };
-                for member in members {
-                    // `Bound` carries a handle; the engine resolves it, then applies sibling rules.
-                    // Wrap a sibling sample, falling back to the field sample. Order is
-                    // load-bearing: `image.source` (`string|Bound`) needs a string signal, while
-                    // `list.source` (`Bound`) needs an array; field-first gives both arrays,
-                    // wrap-first both strings.
-                    let literal = if member == "Bound" {
-                        // Bracketed types never split, so cannot reach `Bound` here.
-                        ty.split('|')
-                            .filter(|m| *m != "Bound")
-                            .find_map(|m| sample(&field, m))
+            let fields = typed_fields(&classes, &class);
+            let mut required: Vec<(String, String)> = Vec::new();
+            for field in fields.iter().filter(|field| field.required) {
+                match members(&field.ty).into_iter().find_map(|member| sample(&field.name, member)) {
+                    Some(literal) => required.push((field.name.clone(), literal)),
+                    None => unsampled.push(format!("  {kind}.{}: `{}`", field.name, field.ty)),
+                }
+            }
+            for (name, _) in &required {
+                if apply_one(kind, &required, name, None).is_ok() {
+                    failures.push(format!("  {kind}.{name} is declared required, engine accepts it absent"));
+                }
+            }
+            for Field { name: field, ty, .. } in &fields {
+                let members = members(ty);
+                for member in &members {
+                    // `Bound` carries a handle the engine resolves before sibling rules apply, so
+                    // wrap a sibling sample: `image.source` needs a string signal, `list.source`
+                    // an array. The bare `hover`/`geometry`/`scroll` fall back to their own rows.
+                    let literal = if *member == "Bound" {
+                        members
+                            .iter()
+                            .filter(|m| **m != "Bound")
+                            .find_map(|m| sample(field, m))
                             .map(|inner| format!("state(\"probe\", {inner})"))
-                            .or_else(|| sample(&field, member))
+                            .or_else(|| sample(field, member))
                     } else {
-                        sample(&field, member)
+                        sample(field, member)
                     };
                     let Some(literal) = literal else {
                         unsampled.push(format!("  {kind}.{field}: `{member}`"));
                         continue;
                     };
-                    probed += 1;
-                    if let Err(err) = apply_one(kind, &field, &literal) {
+                    if let Err(err) = apply_one(kind, &required, field, Some(&literal)) {
                         failures.push(format!("  {kind}.{field} declares `{member}`, engine says: {err}"));
                     }
+                }
+                let closed =
+                    members.iter().any(|m| m.starts_with('"') || enums.contains(m)) && !members.contains(&"string");
+                if closed && apply_one(kind, &required, field, Some("\"obelisk_bogus\"")).is_ok() {
+                    failures.push(format!(
+                        "  {kind}.{field} declares a closed literal set, engine accepts `\"obelisk_bogus\"`"
+                    ));
                 }
             }
         }
@@ -552,7 +588,6 @@ mod meta_stub_tests {
             unsampled.len(),
             unsampled.join("\n")
         );
-        assert_eq!(probed, 818, "the number of declared type members moved; confirm the change is intended");
     }
 
     /// Lua literal for a declared type; `None` skips rather than guesses. Field name matters when
@@ -581,7 +616,6 @@ mod meta_stub_tests {
             ("hover", _) => return Some("hover(\"probe\")".to_string()),
             ("geometry", _) => return Some("geometry(\"probe\")".to_string()),
             ("scroll", _) => return Some("scroll(\"probe\")".to_string()),
-            ("source", "Bound") => return Some("SIGNAL_LIST".to_string()),
             // Literal-array `list.source` is fixed for the pass; real lists therefore use the
             // adjacent signal (ADR-0113 decision 3).
             ("source", "any[]") => return Some("{ 1, 2 }".to_string()),
@@ -598,6 +632,8 @@ mod meta_stub_tests {
         }
         Some(
             match ty {
+                // A `lock`'s refused `NodeBase` fields.
+                "nil" => "nil",
                 "integer" | "number" => "8",
                 "string" => "\"x\"",
                 "boolean" => "true",
@@ -624,24 +660,6 @@ mod meta_stub_tests {
         )
     }
 
-    /// Required properties per kind, so optional-field probes can build. Taken from non-optional
-    /// stub fields.
-    fn required(kind: &str) -> &'static [(&'static str, &'static str)] {
-        match kind {
-            "panel" => &[("id", "\"probe\""), ("layer", "\"Top\"")],
-            "window" | "lock" => &[("id", "\"probe\"")],
-            "popup" => &[
-                ("id", "\"probe\""),
-                ("parent", "\"host\""),
-                ("anchor_rect", "{ x = 0, y = 0, width = 1, height = 1 }"),
-                ("width", "8"),
-                ("height", "8"),
-            ],
-            "list" => &[("source", "SIGNAL_LIST"), ("itemfn", "function(item) return rect {} end")],
-            _ => &[],
-        }
-    }
-
     /// Field companions, distinct from kind requirements. `on_hover` needs a same-node `hover`
     /// slot (ADR-0095), or a probe tests pairing rather than its declared type.
     fn companions(field: &str) -> &'static [(&'static str, &'static str)] {
@@ -651,16 +669,18 @@ mod meta_stub_tests {
         }
     }
 
-    /// Applies `kind { field = literal }` through `Scene::apply`, calling all 49 parsers. Surface
+    /// Applies `kind { required..., field = literal }` (`None` omits `field`) the way a reload does:
+    /// `surface_specs`, `Scene::apply`, then the resolved spec `wayland::surface` builds. Surface
     /// roles are roots; other kinds hang under a minimal `panel`.
-    fn apply_one(kind: &str, field: &str, literal: &str) -> Result<(), String> {
-        let mut props: Vec<String> = required(kind)
+    fn apply_one(kind: &str, required: &[(String, String)], field: &str, literal: Option<&str>) -> Result<(), String> {
+        let mut props: Vec<String> = required
             .iter()
-            .chain(companions(field))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .chain(companions(field).iter().copied())
             .filter(|(name, _)| *name != field)
             .map(|(name, value)| format!("{name} = {value}"))
             .collect();
-        props.push(format!("{field} = {literal}"));
+        props.extend(literal.map(|literal| format!("{field} = {literal}")));
         let node = format!("{kind} {{ {} }}", props.join(", "));
         let surface = if SURFACE_KINDS.contains(&kind) {
             node
@@ -671,32 +691,48 @@ mod meta_stub_tests {
         let lua = mlua::Lua::new();
         super::register_node_constructors(&lua).map_err(|e| e.to_string())?;
         crate::lua::signal::register(&lua, crate::lua::signal::DirtyFlag::new()).map_err(|e| e.to_string())?;
-        // Use `state`; no bare `signal()` global exists. The five registered globals are `state`,
-        // `computed`, `hover`, `hover_rect`, and `scroll`, matching `lua-meta/signals.lua`.
-        let prelude = r#"
-            local SIGNAL_LIST = state("probe_list", { 1, 2 })
-        "#;
-        let table: mlua::Table = lua.load(format!("{prelude}\nreturn {surface}")).eval().map_err(|e| e.to_string())?;
+        let table: mlua::Table = lua.load(format!("return {surface}")).eval().map_err(|e| e.to_string())?;
         let virtual_node = super::deserialize_lua_table(&table).map_err(|e| format!("{e:?}"))?;
+        // Topology (`layer`, popup `anchor`, ...) is validated here and never read by `Scene::apply`.
+        crate::lua::surfaces::surface_specs(&crate::lua::LoadOutput { surfaces: vec![virtual_node.clone()] })
+            .map_err(|e| e.to_string())?;
         let mut scene = crate::layout::scene::Scene::new();
         let shaping = crate::text::shaping::ShapingHandle::spawn();
         // Keep `scene::tests::apply_at` `pub(super)`; widening a test helper is what the justfile's
         // `docs` baseline discourages. One instance and output suffice for this probe.
         let declared = crate::layout::node::parse_surface_id(&virtual_node.properties).map_err(|e| format!("{e:?}"))?;
+        let instance_id = format!("{declared}@PROBE");
         let instances = [crate::layout::instance::SurfaceInstance {
-            instance_id: format!("{declared}@PROBE"),
+            instance_id: instance_id.clone(),
             declared_id: declared,
             output: "PROBE".to_string(),
             available: crate::layout::LogicalSize { width: 1000.0, height: 500.0 },
             measured_axes: (false, false),
         }];
-        scene.apply(std::slice::from_ref(&virtual_node), &instances, &shaping, &lua).map_err(|e| format!("{e:?}"))
+        scene.apply(std::slice::from_ref(&virtual_node), &instances, &shaping, &lua).map_err(|e| format!("{e:?}"))?;
+        // A signal defers the evaluation-time spec, so the resolved one is where a bound value is checked.
+        let resolved = &scene.surface(&instance_id).ok_or("the probe surface was not retained")?.properties;
+        match virtual_node.kind.as_str() {
+            "panel" => crate::layout::node::panel_spec(resolved).map(drop),
+            "window" => crate::layout::node::window_spec(resolved).map(drop),
+            "popup" => crate::layout::node::popup_spec(resolved).map(drop),
+            _ => crate::layout::node::lock_spec(resolved).map(drop),
+        }
+        .map_err(|e| format!("{e:?}"))
     }
 
     const SURFACE_KINDS: [&str; 4] = ["panel", "window", "popup", "lock"];
 
-    /// One `---@class`: name, parents, and own `(field, declared type)` pairs in order.
-    type TypedClass = (String, Vec<String>, Vec<(String, String)>);
+    #[derive(Clone)]
+    struct Field {
+        name: String,
+        ty: String,
+        /// No `?` on the name.
+        required: bool,
+    }
+
+    /// One `---@class`: name, parents, and own fields in order.
+    type TypedClass = (String, Vec<String>, Vec<Field>);
 
     /// [`parse_classes`] with each field's declared type.
     fn parse_typed_classes(source: &str) -> Vec<TypedClass> {
@@ -710,18 +746,54 @@ mod meta_stub_tests {
                 classes.push((name.to_string(), parents, Vec::new()));
             } else if let Some(rest) = line.strip_prefix("---@field ")
                 && let Some(current) = classes.last_mut()
+                && let Some((name, rest)) = rest.split_once(' ')
             {
-                let mut parts = rest.split_whitespace();
-                if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
-                    current.2.push((name.trim_end_matches('?').to_string(), ty.to_string()));
-                }
+                current.2.push(Field {
+                    name: name.trim_end_matches('?').to_string(),
+                    ty: declared_type(rest).to_string(),
+                    required: !name.ends_with('?'),
+                });
             }
         }
         classes
     }
 
-    /// One class's pairs plus every parent's.
-    fn typed_fields(classes: &[TypedClass], name: &str) -> Vec<(String, String)> {
+    /// The type at the start of `rest`: up to the first space outside brackets, reading a
+    /// `fun(..): R` return past its colon.
+    fn declared_type(rest: &str) -> &str {
+        let (mut depth, mut prev) = (0, ' ');
+        for (index, c) in rest.char_indices() {
+            match c {
+                '(' | '{' | '[' | '<' => depth += 1,
+                ')' | '}' | ']' | '>' => depth -= 1,
+                ' ' if depth == 0 && prev != ':' => return &rest[..index],
+                _ => {}
+            }
+            prev = c;
+        }
+        rest
+    }
+
+    /// Top-level `|` members; `("SlideX"|...)[]` and inline shapes stay whole.
+    fn members(ty: &str) -> Vec<&str> {
+        let (mut depth, mut start, mut out) = (0, 0, Vec::new());
+        for (index, c) in ty.char_indices() {
+            match c {
+                '(' | '{' | '[' | '<' => depth += 1,
+                ')' | '}' | ']' | '>' => depth -= 1,
+                '|' if depth == 0 => {
+                    out.push(&ty[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&ty[start..]);
+        out
+    }
+
+    /// One class's fields plus every parent's.
+    fn typed_fields(classes: &[TypedClass], name: &str) -> Vec<Field> {
         let Some((_, parents, own)) = classes.iter().find(|(class, ..)| class == name) else {
             panic!("lua-meta declares no `{name}` class");
         };
@@ -729,6 +801,8 @@ mod meta_stub_tests {
         for parent in parents {
             out.extend(typed_fields(classes, parent));
         }
+        // A redeclared field replaces the parent's, as the language server reads it.
+        out.retain(|field: &Field| !own.iter().any(|mine| mine.name == field.name));
         out.extend(own.iter().cloned());
         out
     }

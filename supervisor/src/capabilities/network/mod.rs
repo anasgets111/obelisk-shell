@@ -57,7 +57,7 @@ pub struct JoinError {
 /// down radio from a powered radio with no association.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct NetworkState {
-    /// A scan is in flight. Set when `network:scan()` is accepted, before NetworkManager confirms,
+    /// A scan is in flight. Set when `:invoke("scan")` is accepted, before NetworkManager confirms,
     /// so the spinner starts on the click.
     pub scanning: bool,
     /// A connection carries the default route, from `PrimaryConnection`. `/` means none,
@@ -81,7 +81,7 @@ pub struct NetworkState {
     /// other fields describe a switched-off stack.
     pub networking_enabled: bool,
     /// A wired device is activated. This is the setter's read-back; carrier stays up when a cable
-    /// is seated, so it would not reflect `network:set_ethernet_enabled(false)`.
+    /// is seated, so it would not reflect `:invoke("set_ethernet_enabled", false)`.
     pub ethernet_enabled: bool,
     /// The Wi-Fi device's IPv4 address without its prefix, or `nil` while it holds none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,11 +91,11 @@ pub struct NetworkState {
     pub ethernet_ip: Option<String>,
     /// Link speed in Mb/s of the wired device `ethernet_ip` describes, or `0` when unknown.
     pub ethernet_speed: u32,
-    /// SSID that `network:connect` is joining, or `nil`. Names the row whose spinner runs, and
-    /// clears when the attempt reaches a verdict or `network:abort_connect` stops it.
+    /// SSID that `"connect"` is joining, or `nil`. Names the row whose spinner runs, and clears
+    /// when the attempt reaches a verdict or `:invoke("abort_connect")` stops it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_ssid: Option<String>,
-    /// The last failed `network:connect`, or `nil` after success or before any attempt.
+    /// The last failed `"connect"`, or `nil` after success or before any attempt.
     /// `AddAndActivateConnection2` returns before the radio tries; this is filled later from the
     /// Wi-Fi device's `StateChanged` reason, where a wrong password is knowable.
     ///
@@ -103,10 +103,10 @@ pub struct NetworkState {
     /// sheet opened for another one does not read a leftover failure as its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_error: Option<JoinError>,
-    /// SSID whose `network:connect` waits for a password, or `nil`. Set by
+    /// SSID whose `"connect"` waits for a password, or `nil`. Set by
     /// [`resolve_connect_intent`](NetworkController::resolve_connect_intent) when no saved profile
     /// or open AP answers, and after NetworkManager rejects a key; cleared by the consuming attempt
-    /// or `network:cancel_connect`.
+    /// or `:invoke("cancel_connect")`.
     ///
     /// Kept here because "no profile for this SSID" lives in NetworkManager, not config (ADR-0037).
     /// The shell binds `keyboard_interactivity` to it, so focus lasts exactly while it names a

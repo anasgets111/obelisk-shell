@@ -22,7 +22,7 @@ pub struct LockState {
     /// [`apply`] changes this only from the Renderer report.
     pub active: bool,
     /// A password is with PAM and unanswered. `pam_unix` takes about a second, so this drives a
-    /// spinner; `lock:authenticate` is refused while true.
+    /// spinner; a second submit is refused while true.
     pub authenticating: bool,
     /// PAM answers against the held lock, including success. Resets to `0` only on a new confirmed
     /// lock, so it is per-acquisition, not per-failure; lockout rules read it with `error`.

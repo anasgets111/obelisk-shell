@@ -1593,6 +1593,7 @@ cannot be suppressed; use LuaCATS prose markers on return annotations.
 
 Reject generating types from the current parser layer: it relocates hand-written claims rather than
 deriving them. Language-server checking is optional when absent, but the skip is explicit.
+Superseded in part by ADR-0210: a missing language server fails the gate.
 
 ## 0082. `obelisk.network` is subscribed to the association, not just to the scan
 
@@ -4684,3 +4685,11 @@ Debug order: `-c`, `dev-config/obelisk`, `$OBELISK_CONFIG_DIR`, `$XDG_CONFIG_HOM
 `$HOME/.config/obelisk`; release drops `dev-config`. `-c` sets its own `OBELISK_CONFIG_ARG`, since
 sharing `$OBELISK_CONFIG_DIR` could not tell it from the session's variable. This is ADR-0208's one
 exception, and release builds never see the path.
+
+## 0210. A missing lua-language-server fails the gate instead of skipping it
+
+`just types` and `tools/luafmt.py` exit non-zero with an install hint when no lua-language-server is
+on PATH or in Zed's extensions, as `lua` already does without `luac`. A printed skip exited 0, so
+`just check` and the pre-commit hook passed having checked no stub.
+
+Reject keeping the skip for want of CI: with no CI, `just check` is the only gate.

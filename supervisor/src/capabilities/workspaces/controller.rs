@@ -35,7 +35,7 @@ pub struct WorkspacesState {
 }
 
 /// One special workspace (ADR-0119), identified by `name`, the argument to
-/// `workspaces:toggle_special(name)`; Hyprland uses names and negative ids.
+/// `:invoke("toggle_special", name)`; Hyprland uses names and negative ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SpecialWorkspace {
     /// Full compositor name, `"special:scratch"` or unnamed `"special"`.
@@ -68,12 +68,12 @@ pub struct OutputWorkspaces {
 }
 
 /// `id` is the stable, monitor-independent identity used by `active_workspace`,
-/// `focused_workspace`, and `workspaces:focus(id)`. `idx` is the output-local 1-based position,
+/// `focused_workspace`, and `:invoke("focus", id)`. `idx` is the output-local 1-based position,
 /// useful for labels but unstable across reorders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceEntry {
     /// Stable identity independent of output; the ids on [`OutputWorkspaces`] and
-    /// `workspaces:focus(id)` use it.
+    /// `:invoke("focus", id)` use it.
     pub id: u64,
     /// 1-based position on this output. Reorders renumber it, so draw `idx` but send `id`.
     pub idx: u8,

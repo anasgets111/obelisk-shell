@@ -33,11 +33,11 @@ pub struct UpdatesState {
     /// (`Backend::check`), so this is a network/parse failure, not a half-applied change.
     pub check_error: Option<String>,
     /// A check is running. Set before sync and cleared when its result is written, with a push at
-    /// both edges for spinners/refresh controls. `updates:check` refuses a second check while true.
+    /// both edges for spinners/refresh controls. `"check"` refuses a second check while true.
     pub checking: bool,
     /// Consecutive check failures, reset to `0` by the first success. Thresholds belong in config.
     pub consecutive_check_failures: u32,
-    /// An install is running. `install_*` describe a started run; `updates:install` refuses a
+    /// An install is running. `install_*` describe a started run; `"install"` refuses a
     /// second one while true.
     pub installing: bool,
     /// Current package number, using the manager's 1-based `(2/5)` counter. `0` before progress.

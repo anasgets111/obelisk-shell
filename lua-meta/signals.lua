@@ -1,8 +1,8 @@
 ---@meta
 -- The reactive layer: `Signal` and the globals that make or read one.
 --
--- HAND-WRITTEN and unchecked, like `globals.lua`: no roster test covers it, so drift from
--- `renderer/src/lua/signal.rs` appears only when `just types` reports a false `dev-config` error.
+-- HAND-WRITTEN, like `globals.lua`: `lua::tests::the_stubs_declare_every_engine_global` checks
+-- names; types drift from `renderer/src/lua/signal.rs` only as a `just types` diagnostic.
 --
 -- These stubs serve lua-language-server only; the engine never loads this directory. They stay
 -- outside `dev-config/obelisk/` because `supervisor/src/watcher.rs` reloads on any config-tree
@@ -104,7 +104,7 @@ function hover_rect(name) end
 ---delay(open, ms) }, function(now, was) return now or was end)`, and a trailing debounce.
 ---@generic T
 ---@param source Signal<T> Any signal or capability.
----@param ms integer The hold, `[1, 60000]` ms, rounded to whole milliseconds.
+---@param ms number The hold, `[1, 60000]` ms, rounded to whole milliseconds.
 ---@return Signal<T> # Read-only; the source is the writer.
 function delay(source, ms) end
 
@@ -116,7 +116,7 @@ function delay(source, ms) end
 ---while the window is open restarts it. Gate the direction with `computed` when only one edge
 ---should fire: `computed({ pulse(plugged, ms), plugged }, function(fired, on) return fired and on end)`.
 ---@param source Signal<any> Any signal or capability.
----@param ms integer The window, `[1, 60000]` ms, rounded to whole milliseconds. Make it at least as long as what it drives.
+---@param ms number The window, `[1, 60000]` ms, rounded to whole milliseconds. Make it at least as long as what it drives.
 ---@return Signal<boolean> # Read-only; the source is the writer.
 function pulse(source, ms) end
 

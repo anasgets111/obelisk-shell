@@ -59,8 +59,7 @@ def find_server():
     """`lua-language-server` on PATH, else the copy an editor extension downloaded for itself.
 
     The same lookup `just types` does, and for the same reason: on the machine this was written on
-    that editor copy is the only one, so a PATH-only search reports "skipping" forever and the gate
-    it exists to close stays open. Newest wins.
+    that editor copy is the only one, so a PATH-only search would fail there. Newest wins.
     """
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(directory, "lua-language-server")
@@ -175,11 +174,12 @@ def main():
 
     binary = find_server()
     if binary is None:
-        # Skipped out loud, on the same terms as `just types`: lua-language-server is not a build
-        # dependency of this workspace and there is no CI to install it into. A silent pass would
-        # be worse than no gate, because it would look like one.
-        print("no lua-language-server on PATH, skipping the Lua format check (pacman -S lua-language-server)")
-        return 0
+        # Fails on the same terms as `just types`: a skip is a green gate that checked nothing.
+        print(
+            "no lua-language-server on PATH or in Zed's extensions. Install it: pacman -S lua-language-server",
+            file=sys.stderr,
+        )
+        return 1
 
     paths = []
     for root in roots:

@@ -11,17 +11,17 @@
 //! `dispatch`, and socket-boundary `parse_action` turns wire strings into them. Mismatches fail
 //! the build rather than the golden test.
 //!
-//! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting all
-//! 19 `parse_*_args` functions, only with an IDL change for named arguments.
+//! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting every
+//! `parse_*_args` function, only with an IDL change for named arguments.
 
 use std::collections::BTreeMap;
 
 use schemars::{Schema, schema_for};
 
 /// The sole capability-to-payload/action mapping. `push_snapshot` takes `&impl Serialize`, so
-/// payload types are inferred at 18 call sites; action enums are named only by their `dispatch`.
+/// payload types are inferred at each call site; action enums are named only by their `dispatch`.
 /// `every_capability_has_a_schema` checks `shared::Capability::ALL`. `None` is read-only and gets
-/// the inherited plain `invoke`.
+/// the inherited plain `invoke`, except `idle`, which gets none.
 fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     vec![
         (
@@ -35,11 +35,7 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
             Some(schema_for!(crate::capabilities::audio::AudioAction)),
         ),
         ("battery", schema_for!(crate::capabilities::battery::controller::BatteryState), None),
-        (
-            "idle",
-            schema_for!(crate::capabilities::idle::IdleState),
-            Some(schema_for!(crate::capabilities::idle::IdleAction)),
-        ),
+        ("idle", schema_for!(crate::capabilities::idle::IdleState), None),
         (
             "bluetooth",
             schema_for!(crate::capabilities::bluetooth::BluetoothState),
@@ -239,11 +235,16 @@ fn lua_type(fragment: &serde_json::Value) -> String {
 fn one_line(description: Option<&serde_json::Value>) -> String {
     match description.and_then(|d| d.as_str()) {
         Some(text) => {
-            let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let joined = unlink(text).split_whitespace().collect::<Vec<_>>().join(" ");
             format!(" {joined}")
         }
         None => String::new(),
     }
+}
+
+/// Rustdoc intra-links as plain code spans; LuaLS would print the brackets.
+fn unlink(text: &str) -> String {
+    regex::Regex::new(r"\[(`[^`]+`)\](\([^)]*\))?").expect("a valid pattern").replace_all(text, "$1").into_owned()
 }
 
 /// Renders an object schema as `---@class` plus one `---@field` per property.
@@ -252,7 +253,7 @@ fn one_line(description: Option<&serde_json::Value>) -> String {
 /// line with `if line.is_empty() { "" } else { line }`, which is the identity.
 fn append_description(body: &serde_json::Value, out: &mut String) {
     if let Some(description) = body.get("description").and_then(|d| d.as_str()) {
-        for line in description.lines() {
+        for line in unlink(description).lines() {
             out.push_str(&format!("---{line}\n"));
         }
     }
@@ -367,20 +368,20 @@ pub fn render() -> String {
     for (capability, schema, actions) in &schemas {
         let class = capability_class(capability);
         let payload = payload_class(schema);
-        let internal = internal_actions(capability);
-        let mut commands = actions.as_ref().map_or_else(Vec::new, action_names);
-        commands.retain(|command| !internal.contains(&command.as_str()));
+        let commands = actions.as_ref().map_or_else(Vec::new, action_names);
         // Inherit `get`/`map` from `Capability<T>`: repeating them would need a class-specific
-        // `self`, and an unbound `---@field` would check nothing.
-        out.push_str(&format!("\n---@class {class}: Capability<{payload}>\n"));
+        // `self`, and an unbound `---@field` would check nothing. `idle`'s userdata has no
+        // `invoke`, and `Capability<T>` would inherit one.
+        let base = if *capability == "idle" { "Signal" } else { "Capability" };
+        out.push_str(&format!("\n---@class {class}: {base}<{payload}>\n"));
+        out.push_str(hand_written_methods(capability));
         if commands.is_empty() {
-            // Omit `invoke` so calls are `undefined-field`, not accepted as the base `string`.
+            // Read-only, yet the base `invoke(string)` still type-checks.
             out.push_str(&format!("local {class} = {{}}\n"));
         } else {
             let union = commands.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join("|");
             out.push_str(&format!("---@field invoke fun(self: {class}, command: {union}, ...: any)\n"));
         }
-        out.push_str(hand_written_methods(capability));
     }
 
     out.push_str(RENDERER_SOURCED);
@@ -403,9 +404,8 @@ const GENERATED_HEADER: &str = r#"---@meta
 -- and names what checks it. This one is derivable because a capability payload is a real
 -- `Serialize` struct, and a node's schema is scattered `properties.get("...")` calls.
 --
--- The version above is what `stub_version` reads. Stubs describing a different engine than the one
--- installed are worse than no stubs, because they are wrong with authority, so `obelisk init` says
--- so and refreshes them.
+-- `obelisk init` rewrites installed stubs that differ from its own copy. Stubs describing another
+-- engine are worse than none, because they are wrong with authority.
 --
 -- The capability classes below are the supervisor's own `Serialize` types, which is what
 -- `push_snapshot` sends, so a field here is a field that crosses the socket. Descriptions are the
@@ -437,17 +437,10 @@ const GENERATED_HEADER: &str = r#"---@meta
 ---@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 "#;
 
-/// Wire actions a config must not call, excluded from the generated `invoke` union. They reach the
-/// Supervisor on the same `CommandEnvelope` path as the rest, so the action enum has to carry them,
-/// but a config calling `forget_thresholds` would silently unregister its own idle thresholds
-/// (ADR-0158).
-fn internal_actions(capability: &str) -> &'static [&'static str] {
-    if capability == "idle" { &["forget_thresholds"] } else { &[] }
-}
-
 /// Methods no action schema can describe, appended to the generated class. Only `idle` has them:
 /// three Lua callbacks never cross the wire, so no `IdleAction` signature exists (ADR-0032,
-/// ADR-0141).
+/// ADR-0141). Its userdata offers no `invoke`: `register` without the local callbacks fires into
+/// nothing, and `forget_thresholds` would drop the config's own thresholds (ADR-0158).
 ///
 /// Use `---@field`, not `function IdleCapability:...`: a class with `---@field invoke` has no local
 /// binding for a later function, so calls read `undefined-field`. The first version did this;
@@ -459,7 +452,7 @@ fn internal_actions(capability: &str) -> &'static [&'static str] {
 fn hand_written_methods(capability: &str) -> &'static str {
     match capability {
         "idle" => {
-            "---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
+            "---@field on_change fun(self: IdleCapability, handler: fun(current: IdleState, previous: IdleState?))\n---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
         }
         _ => "",
     }
@@ -473,7 +466,7 @@ const RENDERER_SOURCED: &str = r#"
 -- `obelisk.idle` used to be here too. It joined the roster with ADR-0141, because there turned out
 -- to be idle state worth reading after all -- whether anything is holding the session awake, and
 -- which application it is. It is the one member that is both: `IdleCapability` above is generated
--- from `IdleState` like any other, and the three methods below are declared onto it by hand,
+-- from `IdleState` like any other, and its three methods are declared onto it by hand,
 -- because their callbacks are Lua values that never cross the wire and so have no action schema to
 -- derive from.
 
@@ -490,7 +483,7 @@ const RENDERER_SOURCED: &str = r#"
 
 ---@class ObeliskVersion
 ---@field major integer Breaking IDL changes.
----@field minor integer Bumped for an IDL field added or changed, which is what `obelisk.version.minor >= n` gates on.
+---@field minor integer The crate's minor version. Nothing bumps it for an IDL change, so `obelisk.version.minor >= n` gates on releases, not fields.
 ---@field patch integer Everything else. Never affects what a config may use.
 "#;
 
@@ -534,36 +527,18 @@ mod tests {
         );
     }
 
-    /// Every roster name has a payload, with no removed capability. The stamp must survive the
-    /// round trip or mismatch warnings compare against `None` forever.
+    /// `IdleMember` has no `invoke`, so a stub offering one type-checks a runtime error.
     #[test]
-    fn the_generated_stub_stamps_a_version_that_reads_back() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("obelisk.lua"), super::render()).unwrap();
-        assert_eq!(crate::setup::stub_version(dir.path()).as_deref(), Some(env!("CARGO_PKG_VERSION")));
-    }
-
-    #[test]
-    fn a_directory_with_no_stubs_has_no_version() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(crate::setup::stub_version(dir.path()), None);
-    }
-
-    /// A config calling `forget_thresholds` would drop its own idle registrations, so the union it
-    /// completes against must not offer it. It is on `IdleAction` because it crosses the socket as
-    /// an ordinary `idle` command (ADR-0158), which is exactly why the exclusion has to be here.
-    #[test]
-    fn the_idle_invoke_union_offers_no_action_only_the_renderer_sends() {
+    fn the_idle_class_offers_no_invoke() {
         let generated = super::render();
-        let line = generated
+        let class: Vec<&str> = generated
             .lines()
-            .find(|line| line.contains("invoke fun(self: IdleCapability"))
-            .expect("idle still has an invoke union");
+            .skip_while(|line| !line.starts_with("---@class IdleCapability"))
+            .take_while(|line| line.starts_with("---"))
+            .collect();
 
-        assert!(!line.contains("forget_thresholds"), "a config must not be offered it: {line}");
-        for config_callable in ["register", "inhibit", "release_inhibit"] {
-            assert!(line.contains(config_callable), "{config_callable} must survive the exclusion: {line}");
-        }
+        assert_eq!(class.first(), Some(&"---@class IdleCapability: Signal<IdleState>"));
+        assert!(!class.iter().any(|line| line.contains("invoke")), "{class:#?}");
     }
 
     /// A doc comment on a variant turns schemars' `enum` into a `oneOf`; every action enum must

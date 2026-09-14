@@ -6,9 +6,10 @@
 //! (ADR-0139's gate). A config could otherwise draw "nothing is holding this awake" while every
 //! threshold event was inhibited, with no way to represent the truth.
 //!
-//! `obelisk.idle` is now a `Capability` (`get`, `map`, `on_change`, `invoke`, hydrated by
-//! `StateSnapshot`) wrapped in userdata that adds the three callbacks that cannot cross the wire as
-//! `:invoke`. The wrapper sits directly on `obelisk`, outside `__index`, so every method sends
+//! `obelisk.idle` is now a `Capability`'s read half (`get`, `map`, `on_change`, hydrated by
+//! `StateSnapshot`) wrapped in userdata that adds the three callbacks that cannot cross the wire.
+//! No `invoke`: `register` needs those callbacks, and `forget_thresholds` is the reload path's.
+//! The wrapper sits directly on `obelisk`, outside `__index`, so every method sends
 //! `start_capability` by hand; its read never passes through the index.
 //!
 //! The Supervisor creates one Wayland listener per duration and fans events out
