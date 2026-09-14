@@ -16,14 +16,16 @@ const RELIST_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// `obelisk.files`'s payload (ADR-0120): watched folders keyed by the path `watch` was given, so
 /// `obelisk.files.folders[folder]` reads back with the string the config wrote.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FilesState {
     /// One entry per active `:invoke("watch", path)`, keyed by `path` with trailing slashes stripped.
     /// Absent until watched, so an unrequested folder is not an empty list.
     pub folders: BTreeMap<String, Folder>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Folder {
     /// `false` until the first listing lands, for a picker's loading spinner. `true` thereafter,
     /// even when `entries` is empty or `error` is set.
@@ -38,7 +40,8 @@ pub struct Folder {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FileEntry {
     /// File name alone, such as `sunrise.jpg`, for drawing and search.
     pub name: String,

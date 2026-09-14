@@ -21,7 +21,8 @@ use tokio::sync::mpsc::UnboundedSender;
 ///
 /// Serialized by name, so Lua compares `b.state == "PendingCharge"`; `mpris.play_state` uses the
 /// same boundary shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub enum BatteryStatus {
     /// UPower has no answer, including hosts whose display device is not a battery.
     #[default]
@@ -66,7 +67,8 @@ impl BatteryStatus {
 
 /// `obelisk.battery`'s full payload. Field names are the `StateSnapshot` JSON keys verbatim
 /// and may not be renamed. `Default` is the correct desktop answer when no battery exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct BatteryState {
     /// Whether UPower's display device is a battery and present. `false` on a desktop is an answer,
     /// not missing data; check it before drawing the other fields.

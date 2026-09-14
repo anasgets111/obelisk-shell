@@ -37,7 +37,8 @@ pub use controller::BluetoothController;
 // ---------------------------------------------------------------------------------------------
 
 /// The call this Supervisor is running for a device, drawn as its `busy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceAction {
     Pairing,
@@ -46,7 +47,8 @@ pub enum DeviceAction {
 }
 
 /// What a [`PairingRequest`] asks; see [`PairingRequest::kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PairingKind {
     Confirm,
@@ -55,7 +57,8 @@ pub enum PairingKind {
     Display,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ConnectedDevice {
     /// Canonical MAC address, e.g. `"00:1A:7D:DA:71:11"`; every `bluetooth:` command uses it.
     pub mac: String,
@@ -71,7 +74,8 @@ pub struct ConnectedDevice {
     pub busy: Option<DeviceAction>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PairedDevice {
     /// Canonical MAC address accepted by `:invoke("connect", mac)` and `:invoke("forget", mac)`.
     pub mac: String,
@@ -86,7 +90,8 @@ pub struct PairedDevice {
     pub busy: Option<DeviceAction>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DiscoveredDevice {
     /// Canonical MAC address accepted by `:invoke("pair", mac)`.
     pub mac: String,
@@ -103,7 +108,8 @@ pub struct DiscoveredDevice {
 }
 
 /// What the pairing agent is asking the user.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PairingRequest {
     /// `"confirm"`: does the device show `code`? `"authorize"`: a device asks to pair.
     /// `"service"`: a paired but untrusted device asks to connect. `"display"`: type `code` on the
@@ -118,7 +124,8 @@ pub struct PairingRequest {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct BluetoothState {
     /// An adapter is bound; without one every other field is inert and every write a logged no-op.
     pub available: bool,
@@ -211,7 +218,8 @@ pub fn parse_mac_and_bool_args(arguments: &[serde_json::Value]) -> Option<(Strin
     Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BluetoothAction {
     /// (enabled: boolean) Powers the adapter on or off.

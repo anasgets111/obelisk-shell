@@ -14,7 +14,8 @@
 use serde::Serialize;
 
 /// One logind inhibitor blocking idle.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct IdleInhibitor {
     /// Free-text `who` passed to `Inhibit`, e.g. `"mpv"`; draw it as a label, never match it.
     pub who: String,
@@ -23,7 +24,8 @@ pub struct IdleInhibitor {
 }
 
 /// `obelisk.idle` payload (ADR-0141).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct IdleState {
     /// Anything is holding the session awake: a logind inhibitor including this shell's own, or
     /// the compositor withholding idle notifications (ADR-0160). Either way no threshold event

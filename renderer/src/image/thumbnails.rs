@@ -8,11 +8,8 @@
 //! temp-file-and-rename with `0600` files and `0700` dirs. Not implemented: `fail/` (a decode miss
 //! is `Slot::Failed` for this generation), `Thumb::Size`, or `/usr/share/thumbnails` lookup.
 
-use std::fmt::Write as _;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-
-use md5::{Digest, Md5};
 
 /// Spec sizes, smallest first, as (directory name, longest edge).
 const SIZES: [(&str, u32); 4] = [("normal", 128), ("large", 256), ("x-large", 512), ("xx-large", 1024)];
@@ -50,12 +47,7 @@ pub fn file_uri(path: &Path) -> String {
 
 /// The `dir`-size thumbnail path for `uri` under `cache_root`.
 pub fn thumbnail_path(cache_root: &Path, dir: &str, uri: &str) -> PathBuf {
-    let mut name = String::with_capacity(36);
-    for byte in Md5::digest(uri.as_bytes()) {
-        let _ = write!(name, "{byte:02x}");
-    }
-    name.push_str(".png");
-    cache_root.join("thumbnails").join(dir).join(name)
+    cache_root.join("thumbnails").join(dir).join(format!("{:x}.png", md5::compute(uri)))
 }
 
 /// A temp name no other writer can pick: unique within this process by the counter, and across

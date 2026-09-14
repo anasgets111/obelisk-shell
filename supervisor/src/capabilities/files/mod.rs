@@ -9,7 +9,8 @@ pub mod controller;
 
 pub use controller::{FilesController, FilesSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilesAction {
     /// (path: string, extensions?: string[]) Lists an absolute folder into `folders[path]`, extensions without the dot.

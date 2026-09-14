@@ -232,7 +232,7 @@ fn one_line(description: Option<&serde_json::Value>) -> String {
 
 /// Rustdoc intra-links as plain code spans; LuaLS would print the brackets.
 fn unlink(text: &str) -> String {
-    regex::Regex::new(r"\[(`[^`]+`)\](\([^)]*\))?").expect("a valid pattern").replace_all(text, "$1").into_owned()
+    regex_lite::Regex::new(r"\[(`[^`]+`)\](\([^)]*\))?").expect("a valid pattern").replace_all(text, "$1").into_owned()
 }
 
 /// Renders an object schema as `---@class` plus one `---@field` per property.

@@ -8,7 +8,8 @@ pub mod controller;
 
 pub use controller::{StorageController, StorageSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StorageAction {
     /// (path: string, defaults?: table) Declares an absolute JSON file; defaults fill missing keys.

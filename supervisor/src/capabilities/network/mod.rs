@@ -25,7 +25,8 @@ pub use controller::NetworkController;
 
 /// One scanned AP, resolved to `network.available_networks` and serialized in a `StateSnapshot`
 /// payload, same convention as `audio::mixer::AppStream`.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AccessPointInfo {
     /// Network name. Entries dedupe on it, keeping the stronger sighting.
     pub ssid: String,
@@ -42,7 +43,8 @@ pub struct AccessPointInfo {
 }
 
 /// A failed join, as `network.connect_error`.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct JoinError {
     /// The network the join was for.
     pub ssid: String,
@@ -55,7 +57,8 @@ pub struct JoinError {
 ///
 /// The AP list cannot answer "am I online": it has no wired link and cannot distinguish a powered
 /// down radio from a powered radio with no association.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NetworkState {
     /// A scan is in flight. Set when `:invoke("scan")` is accepted, before NetworkManager confirms,
     /// so the spinner starts on the click.
@@ -150,7 +153,8 @@ fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAction {
     /// (enabled: boolean) Turns NetworkManager networking on or off.

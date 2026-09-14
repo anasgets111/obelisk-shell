@@ -9,7 +9,8 @@ pub mod pacman;
 
 pub use controller::{UpdatesController, UpdatesSignal, parse_configure_args};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatesAction {
     /// () Checks for upgrades now.

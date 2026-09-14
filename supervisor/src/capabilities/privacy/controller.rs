@@ -14,14 +14,16 @@ use super::video::{find_device_openers, read_comm};
 /// An app using one watched resource. The `{app_name}` row shape from ADR-0034's
 /// `privacy.camera_users` extends to microphone and screencast under ADR-0137; one type keeps the
 /// three "who" lists identical.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PrivacyUser {
     /// Process name from its PipeWire node, then `/proc/<pid>/comm`, then `"pid 1234"`; never
     /// empty.
     pub app_name: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PrivacyState {
     /// Processes holding a camera open. Empty means no camera is in use; a config draws its
     /// indicator only when this is non-empty.

@@ -21,7 +21,8 @@ pub mod watcher;
 
 pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MprisAction {
     /// (id: string, command: "play"|"pause"|"play_pause"|"next"|"previous") Controls `players[].id`.

@@ -9,7 +9,8 @@ use tokio::sync::oneshot;
 use crate::polkit::{AgentError, BeginAuthenticationCall, first_unix_user_uid};
 
 /// `obelisk.polkit`'s payload. All fields except `active` are empty while it is false.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PolkitState {
     /// polkitd is waiting for the user; the remaining fields describe its request.
     pub active: bool,
@@ -27,7 +28,8 @@ pub struct PolkitState {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PolkitAction {
     /// () Dismisses the prompt and tells polkitd's caller `Cancelled`.

@@ -3,7 +3,7 @@
 
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex_lite::Regex;
 
 use super::NotificationSpan;
 

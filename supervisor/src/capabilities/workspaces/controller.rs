@@ -16,7 +16,8 @@ use super::{hyprland, niri};
 
 /// `obelisk.workspaces` payload. Field names are JSON keys; absent `active_client` is
 /// omitted, not `null` (`nil` when unfocused).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorkspacesState {
     /// Source compositor, `"niri"` or `"hyprland"` (ADR-0119). Hyprland creates a numbered
     /// workspace on focus, so strips pad empty slots there; niri keeps its trailing empty one.
@@ -36,7 +37,8 @@ pub struct WorkspacesState {
 
 /// One special workspace (ADR-0119), identified by `name`, the argument to
 /// `:invoke("toggle_special", name)`; Hyprland uses names and negative ids.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SpecialWorkspace {
     /// Full compositor name, `"special:scratch"` or unnamed `"special"`.
     pub name: String,
@@ -52,7 +54,8 @@ pub struct SpecialWorkspace {
 }
 
 /// One output's workspace state; ADR-0056 decision 3 added ordered `workspaces` entries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct OutputWorkspaces {
     /// Connector name, e.g. `"eDP-1"`; matches `obelisk.screens.name` and a surface's `monitor`.
     pub name: String,
@@ -70,7 +73,8 @@ pub struct OutputWorkspaces {
 /// `id` is the stable, monitor-independent identity used by `active_workspace`,
 /// `focused_workspace`, and `:invoke("focus", id)`. `idx` is the output-local 1-based position,
 /// useful for labels but unstable across reorders.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WorkspaceEntry {
     /// Stable identity independent of output; the ids on [`OutputWorkspaces`] and
     /// `:invoke("focus", id)` use it.
@@ -92,7 +96,8 @@ pub struct WorkspaceEntry {
 /// `active_client`. `is_fullscreen` is present only when reported (ADR-0056 decision 5
 /// rejects fabricated `false`; ADR-0119 lets Hyprland provide it). `class` is Wayland `app_id`;
 /// Wayland has no X11 `WM_CLASS` equivalent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ActiveClient {
     /// Window title, e.g. `"src/main.rs - Neovim"`; empty when unset.
     pub title: String,

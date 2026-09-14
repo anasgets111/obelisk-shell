@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// `obelisk.system`'s Lua-visible fields, with their `StateSnapshot` JSON keys unchanged.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SystemState {
     /// Unix epoch seconds, not milliseconds. `os.date` expects seconds; milliseconds would be wrong
     /// by 1000x.

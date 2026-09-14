@@ -11,7 +11,8 @@ use super::metadata::clamp_seek_target;
 use super::player::PlayerState;
 use super::watcher::{service_name_for_id, spawn_discovery};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct MprisState {
     /// Every MPRIS player, longest-running first. New players append and position updates do not
     /// move entries, so `players[1]` keeps its meaning.

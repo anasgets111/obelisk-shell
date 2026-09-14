@@ -61,7 +61,7 @@ wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
-md-5 = "0.11"
+md5 = "0.8"
 png = "0.18"
 
 [dev-dependencies]

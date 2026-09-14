@@ -16,7 +16,8 @@ pub mod logind;
 /// `obelisk.lock`'s payload (ADR-0052 decision 4). `attempts` counts failed authentications since
 /// acquisition. Lua cannot rebuild it from layout-time state (ADR-0044), so identical failures
 /// leave one `error` string; empty `error` means no failure, like `keyboard.active_layout`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LockState {
     /// The Renderer confirmed the session locked. A requested but unconfirmed lock remains `false`;
     /// [`apply`] changes this only from the Renderer report.
@@ -416,7 +417,8 @@ impl LockController {
 /// Every action `obelisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
 /// callback would make it a one-click path past PAM, forbidden by ADR-0042. Unknown `"unlock"` is
 /// logged and dropped.
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LockAction {
     /// () Locks the session.

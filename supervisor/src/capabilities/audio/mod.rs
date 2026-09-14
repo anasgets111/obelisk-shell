@@ -12,7 +12,8 @@ pub mod mixer;
 
 use mixer::{AudioCommand, AudioCommandSender};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AudioAction {
     /// (volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.

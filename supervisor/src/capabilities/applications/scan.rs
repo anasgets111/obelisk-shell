@@ -13,7 +13,8 @@ const MAX_DEPTH: usize = 4;
 
 /// One application as config sees it (ADR-0061). Display data only: argv stays private because
 /// `:invoke("launch", id)` runs it, and exposing it would let config rewrite the command.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AppSummary {
     /// Desktop file id (`org.telegram.desktop`), and `launch`'s argument.
     pub id: String,

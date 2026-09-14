@@ -9,7 +9,8 @@ use super::{MAX_MENU_NODES, MAX_TRAY_TEXT_BYTES};
 use crate::capabilities::truncate_utf8_bytes;
 
 /// One DBusMenu layout node, resolved to `tray.items[].menu`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct MenuItem {
     /// DBusMenu item id, the second argument of `:invoke("activate_menu_item", id, menu_item_id)`
     /// and of `"menu_will_show"`.

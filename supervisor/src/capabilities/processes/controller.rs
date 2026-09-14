@@ -42,7 +42,8 @@ use tokio::task::JoinHandle;
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// `obelisk.processes`'s payload.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ProcessesState {
     /// One entry per name a config declared with `session_process`, keyed by that name. A name
     /// nothing declared is absent rather than stopped, so a typo reads `nil` instead of quietly
@@ -51,7 +52,8 @@ pub struct ProcessesState {
 }
 
 /// One declared program: its current run, or what is left of its last one.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SessionProcess {
     /// Whether it is up now. Every field below describes the current run while this is true, and
     /// the finished one while it is false.

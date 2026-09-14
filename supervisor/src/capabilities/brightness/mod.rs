@@ -10,7 +10,8 @@ pub mod controller;
 
 pub use controller::{BrightnessController, BrightnessSignal, parse_set_args};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BrightnessAction {
     /// (percent: integer) Sets the screen backlight, `0` to `100`.

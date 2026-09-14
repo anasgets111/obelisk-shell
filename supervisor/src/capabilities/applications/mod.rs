@@ -14,7 +14,8 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationsAction {
     /// () Rescans installed desktop entries.

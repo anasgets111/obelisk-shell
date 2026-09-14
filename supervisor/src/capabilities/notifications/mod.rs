@@ -30,7 +30,8 @@ pub use controller::{
 };
 pub use sound::run_sound_player;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationsAction {
     /// (id: integer) Removes a queued notification.
@@ -147,7 +148,8 @@ const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
 
 /// One allowlisted body-markup run (CONTEXT.md, ADR-0033). Text carries styling and link target;
 /// images carry only a spooled/validated path. `alt` is parsed but not carried.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "kind")]
 pub enum NotificationSpan {
     #[serde(rename = "text")]
@@ -174,7 +176,8 @@ pub enum NotificationSpan {
 /// become [`Notification::has_default_action`] and [`Notification::has_reply`]. The flat array
 /// was once read for one bool and discarded, so `GetCapabilities` advertised `actions` and
 /// `action-icons` while neither was true; parsed buttons are retained now.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NotificationAction {
     /// Opaque key accepted by `:invoke("invoke_action", id, key)` and returned as
     /// `ActionInvoked.action_key`.
@@ -187,7 +190,8 @@ pub struct NotificationAction {
 }
 
 /// `low`/`normal`/`critical` urgency tier, also used as the sound-registry key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub enum Urgency {
     #[serde(rename = "low")]
     Low,
@@ -232,7 +236,8 @@ fn parse_urgency_str(value: &str) -> Option<Urgency> {
 
 /// Queued `notifications.feed[]` object (ADR-0033, ADR-0090). `expire_timeout` and
 /// `replaces_id` affect processing but are not feed data.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Notification {
     /// Server id, starting at `1`; used by dismiss/reply/action and reused by replacement.
     pub id: u32,
@@ -292,7 +297,8 @@ pub struct Notification {
 }
 
 /// `notifications.feed`/`notifications.dnd` `StateSnapshot` payload (ADR-0033).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct NotificationsState {
     /// Newest 20 first, including unread retired entries until dismissed (ADR-0100); `expired`
     /// distinguishes them. This is a view of the 100-entry queue, so older entries remain

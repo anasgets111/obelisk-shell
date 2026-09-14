@@ -13,7 +13,8 @@ use super::streams::{AppStream, CaptureApp, VideoSourceApp, running};
 use crate::capabilities::audio::master;
 
 /// Full `obelisk.audio` payload (ADR-0053 decision 3).
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`.
     /// `nil` until the default sink's first `Props`, or with none.

@@ -11,7 +11,8 @@ use zbus::zvariant::OwnedValue;
 
 /// `obelisk.power`'s full payload. Optional fields are omitted from JSON, so unavailable
 /// host data reads as Lua `nil`; see `power/mod.rs` for the four-field split.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PowerState {
     /// Active platform profile, e.g. `"balanced"`, set by `:invoke("set_profile", p)`; `nil` without
     /// power-profiles-daemon.

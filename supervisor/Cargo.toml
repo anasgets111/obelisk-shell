@@ -26,9 +26,8 @@ nix = { version = "0.31.3", features = ["process", "signal", "time", "user"] }
 nonstick = "0.1.2"
 pipewire = "0.10.1"
 png = "0.18.1"
-regex = "1.13.1"
+regex-lite = "0.1.9"
 rusty_network_manager = "0.7.1"
-schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 shared = { version = "0.1.0", path = "../shared" }
@@ -48,6 +47,8 @@ zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 zbus_polkit = { version = "5.1.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+# The JsonSchema derives exist only for the test-only stub generator (`stubs.rs`).
+schemars = "1.2.2"
 # `test-util` is not in tokio's `full`, and it is what `#[tokio::test(start_paused = true)]` needs.
 # `battery::controller`'s loop is on a 30s timer, so testing it in real time is not testing it.
 tokio = { version = "1.53.1", features = ["full", "test-util"] }

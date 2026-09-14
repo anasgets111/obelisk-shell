@@ -15,7 +15,8 @@ use crate::process;
 
 /// `obelisk.updates` payload. `check_error`/`install_error` are `None` when clear. While
 /// `installing`, `install_total_steps == 0` means the manager has not printed the transaction size.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdatesState {
     /// Package manager name, or `nil` when unsupported. Available before any check and used by an
     /// indicator to decide whether it belongs on the bar (ADR-0134), e.g. `"pacman"`.

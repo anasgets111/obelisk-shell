@@ -61,7 +61,8 @@ pub mod watcher;
 
 pub use controller::TrayController;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TrayState {
     /// Registered items, oldest first. New items append; property updates do not move them, so no
     /// sorting is needed. Registration order avoids lexicographic D-Bus id order, where `1.100`
@@ -124,7 +125,8 @@ pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<
     Some((id, menu_item_id))
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
     /// (id: string, x: integer, y: integer) Left-click activation at screen coordinates.

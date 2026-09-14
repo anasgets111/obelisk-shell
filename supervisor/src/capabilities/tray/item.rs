@@ -14,7 +14,8 @@ use super::proxies::StatusNotifierItemProxy;
 use super::registration::item_id;
 use crate::capabilities::truncate_utf8_bytes;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TrayItem {
     /// Sanitized D-Bus unique name with the item's object path appended, e.g.
     /// `"1.234/StatusNotifierItem"`. Used by every `tray:` command.

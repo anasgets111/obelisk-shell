@@ -18,7 +18,8 @@ use super::locks::{read_led_on, resolve_lock_leds};
 /// hardware. Lock booleans have no sentinel: they default and remain `false` if neither evdev nor
 /// sysfs resolves. `active_layout` is the non-nullable empty-string sentinel; index and count are
 /// `0` by default (ADR-0034).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct KeyboardState {
     /// Keyboard backlight, `0` to `100`, or `-1` without a backlight device. Check `-1` before
     /// drawing a slider.

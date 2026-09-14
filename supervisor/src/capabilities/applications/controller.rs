@@ -15,7 +15,8 @@ use super::scan::{AppSummary, LaunchTarget, scan};
 /// `by_app_id` repeats summaries instead of indexing `entries`: Lua arrays start at one while the
 /// serialized JSON array starts at zero. Repeating three small fields for a few hundred entries
 /// avoids an invisible off-by-one.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ApplicationsState {
     /// Visible, launchable installed entries, sorted by name. Rebuilt by
     /// `:invoke("refresh")`; directories are not watched, so mid-session installs wait for it.

@@ -15,7 +15,8 @@ use super::proxies::{MprisPlayerProxy, MprisRootProxy, bind_player, bind_root};
 use super::watcher::player_id;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct PlayerState {
     /// Bus-name suffix after `org.mpris.MediaPlayer2.`, e.g. `"spotify"`; used by `mpris:`
     /// commands.

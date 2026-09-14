@@ -12,7 +12,8 @@ pub use controller::{ProcessesController, ProcessesSignal};
 
 use nix::sys::signal::Signal;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessesAction {
     /// (name: string, stop_signal?: "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT") Default `TERM`.

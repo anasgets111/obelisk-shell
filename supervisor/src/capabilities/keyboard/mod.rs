@@ -8,7 +8,8 @@ pub mod locks;
 
 pub use controller::{KeyboardController, KeyboardSignal, parse_set_backlight_args, parse_switch_layout_args};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum KeyboardAction {
     /// (percent: integer) Sets the keyboard backlight, `0` to `100`.

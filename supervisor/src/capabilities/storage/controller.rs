@@ -14,7 +14,8 @@ use tokio::task::JoinHandle;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(1000);
 
 /// `obelisk.storage`'s payload (ADR-0136).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct StorageState {
     /// One entry per declared `persistent_table`, keyed by the absolute `path` joined from `path`
     /// and `name`. Absent until declared, so unopened files read as `nil`, not an empty table.

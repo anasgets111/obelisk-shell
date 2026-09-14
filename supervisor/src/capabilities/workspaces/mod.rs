@@ -17,7 +17,8 @@ pub mod niri;
 
 pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args, parse_toggle_special_args};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacesAction {
     /// (id: integer) Focuses a `WorkspaceEntry.id`.

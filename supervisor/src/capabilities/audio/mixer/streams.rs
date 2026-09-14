@@ -35,7 +35,8 @@ fn is_monitor_capture(props: &impl PropsLookup) -> bool {
 
 /// A `Stream/Output/Audio` or `Stream/Input/Audio` node resolved to its owning process. ADR-0053
 /// decision 3 names `id`/`name` to match the spec; ADR-0016's `pid`/`process_name` remain.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AppStream {
     /// PipeWire registry id, the `MixerState::apps` key.
     pub id: u32,
@@ -143,7 +144,8 @@ pub(super) fn apply_info_event(
 /// `Video/Source` data for `obelisk.privacy` name enrichment (ADR-0034): `pid` matches a
 /// kernel-detected `/dev/videoN` opener and `app_name` supplies its nicer PipeWire name. No
 /// `process_name`: privacy already falls back to `/proc/{pid}/comm`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct VideoSourceApp {
     pub node_id: u32,
     pub pid: i32,
@@ -177,7 +179,8 @@ pub(super) fn apply_video_info_event(
 }
 
 /// One microphone or screen-capture stream (ADR-0137); the list it is in supplies the kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CaptureApp {
     /// PipeWire registry id, its list's key.
     pub node_id: u32,
