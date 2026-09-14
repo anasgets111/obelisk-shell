@@ -1,98 +1,59 @@
 #!/usr/bin/env bash
-# Stops a commit that would carry stale generated stubs, or that does not pass `just check`.
+# Runs the half of `just check` a commit can affect, picked from the staged paths:
 #
-# `lua-meta/obelisk.lua` is generated from the Supervisor's payload types and has a golden-file test.
-# The other stubs are hand-written and have roster tests. All of them only fire if someone runs
-# them -- which at the end of a long session is exactly what gets skipped. The language server reads
-# these files straight from the working tree, so a stale one is wrong with authority: it offers a
-# field the engine does not send, or hides one it does.
+# - Rust: anything the crates compile or their tests read. `lua-meta/` and `share/starter/shell.lua`
+#   are `include_str!`'d and a test reads `packaging/pam.d`.
+# - Lua: any `.lua`, `.luarc.json`, `.editorconfig` or the formatter. Adds the renderer tests that
+#   load `dev-config` and the shipped components, since only the Rust half runs them otherwise.
+# - Anything else (Markdown, docs, justfile, this hook): nothing.
 #
-# Regenerates rather than only complaining, then refuses the commit anyway. Staging the file itself
-# would be the convenient thing and it is wrong: the stub is generated from the working tree, not
-# from the index, so a partial `git add -p` would get a stub describing code the commit does not
-# contain. One `git add` is cheaper than that class of confusion.
-#
-# The `just check` at the end is the slow half and the reason this hook is worth having twice over.
-# `check` was green on 71266cb and c83e79e while both carried unformatted files, because formatting
-# was not in it and nobody ran the recipe that was. A gate nothing runs is not a gate.
-#
-# A commit that touches nothing the compiler reads gets the short path: the Lua half of `check`
-# and the one test module that loads `dev-config`. Every recipe below compiles three crates under
-# three flag sets (test, clippy `--all-features`, doc), and a fix to a card's padding was paying for
-# all of it -- a minute of every core for a commit `cargo` could not have had an opinion on. The
-# short list is what the crates provably do not read: `share/starter/shell.lua` is `include_str!`'d
-# into the Supervisor and `packaging/` into its unit files, so both stay on the long path.
+# A stale `lua-meta/obelisk.lua` is regenerated and the commit refused rather than staged: the stub
+# comes from the working tree, so a partial `git add -p` would commit one describing code it lacks.
 #
 # Install with `just hooks`. Skip once with `git commit --no-verify`.
 set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
 
-root="$(git rev-parse --show-toplevel)"
-cd "$root"
-
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "pre-commit: no cargo on PATH, skipping the stub check" >&2
+# Deletions stay in: removing a Lua file a component `require`s is what the Lua tests are for.
+staged="$(git diff --cached --name-only)"
+rust=false
+lua=false
+# Not `grep -q` after a pipe: it exits on the first match, and pipefail reads the SIGPIPE as no match.
+if grep -vE '\.md$' <<<"$staged" |
+    grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|^rustfmt\.toml$|^\.cargo/|^(renderer|supervisor|shared|packaging|lua-meta)/|^share/starter/shell\.lua$' >/dev/null; then
+    rust=true
+fi
+if grep -qE '\.lua$|(^|/)\.luarc\.json$|^\.editorconfig$|^tools/luafmt\.py$' <<<"$staged"; then
+    lua=true
+fi
+if ! $rust && ! $lua; then
     exit 0
 fi
 
-# `--diff-filter` leaves deletions in: removing a Lua file a component `require`s is exactly the
-# kind of commit the component tests below are for.
-if ! git diff --cached --name-only | grep -qvE '^(dev-config|docs)/|\.md$'; then
-    echo "pre-commit: nothing staged the crates read, running the Lua checks only" >&2
-    if ! command -v just >/dev/null 2>&1; then
-        echo "pre-commit: no just on PATH, skipping the Lua checks" >&2
-        exit 0
-    fi
-    if ! just lua types; then
-        echo "pre-commit: the Lua checks failed. Fix it, or commit with --no-verify and own that." >&2
+if ! command -v cargo >/dev/null || ! command -v just >/dev/null; then
+    echo "pre-commit: cargo or just missing, skipping the checks" >&2
+    exit 0
+fi
+
+fail() {
+    echo "pre-commit: $1 failed. Fix it, or commit with --no-verify and own that." >&2
+    exit 1
+}
+
+if $rust; then
+    before="$(git hash-object lua-meta/obelisk.lua)"
+    # Almost always a build error rather than the generator: this is the first compile after an edit.
+    UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null 2>&1 || fail "the stub regeneration (just stubs)"
+    if [ "$before" != "$(git hash-object lua-meta/obelisk.lua)" ]; then
+        echo "pre-commit: lua-meta/obelisk.lua was stale and has been regenerated. Review it, then: git add lua-meta/obelisk.lua" >&2
         exit 1
     fi
-    # The component tests `require` the shipped `components/` and load `dev-config/obelisk/shell.lua`
-    # (`renderer/src/lua/mod.rs`). Nothing to recompile, so this is the Lua being run, not Rust
-    # being built.
-    if ! cargo test --quiet -p renderer lua::tests; then
-        echo "pre-commit: the renderer's dev-config tests failed." >&2
-        exit 1
-    fi
-    exit 0
+    cargo fmt --all -- --check || fail "cargo fmt --check"
+    just test lint docs || fail "the Rust checks"
 fi
 
-before="$(git hash-object lua-meta/obelisk.lua)"
-if ! UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null 2>&1; then
-    # Almost always a build error rather than the generator: this is the first thing to compile the
-    # crate after an edit. Do not guess which, just say where to look.
-    echo "pre-commit: the supervisor stub check did not run. Try: just stubs" >&2
-    exit 1
-fi
-after="$(git hash-object lua-meta/obelisk.lua)"
-
-if [ "$before" != "$after" ]; then
-    cat >&2 <<'MSG'
-pre-commit: lua-meta/obelisk.lua was stale and has been regenerated.
-
-  Review it, then:  git add lua-meta/obelisk.lua
-
-MSG
-    exit 1
-fi
-
-# `nodes.lua` is hand-written, so this can only report the drift, not fix it. The test names the
-# property that moved.
-if ! cargo test --quiet -p renderer meta_stub_tests >/dev/null 2>&1; then
-    echo "pre-commit: lua-meta/nodes.lua disagrees with the engine's node schema." >&2
-    echo "  cargo test -p renderer meta_stub_tests   names the property that moved." >&2
-    exit 1
-fi
-
-# Everything else: formatting, the full test run, clippy, intra-doc links, and that every Lua file
-# parses. The two targeted runs above stay even though `cargo test --workspace` re-runs both, because
-# they regenerate the stub and name the property that moved. This one only says which recipe failed.
-if ! command -v just >/dev/null 2>&1; then
-    echo "pre-commit: no just on PATH, skipping the full check" >&2
-    exit 0
-fi
-
-if ! just check; then
-    echo >&2
-    echo "pre-commit: just check failed. Fix it, or commit with --no-verify and own that." >&2
-    exit 1
+if $lua; then
+    python3 tools/luafmt.py --check dev-config lua-meta share || fail "the Lua format check"
+    just lua types || fail "the Lua checks"
+    $rust || cargo test --quiet -p renderer lua::tests || fail "the renderer's dev-config tests"
 fi
