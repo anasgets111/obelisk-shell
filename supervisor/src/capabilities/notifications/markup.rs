@@ -44,7 +44,39 @@ enum ClassifiedTag {
 fn extract_attr(attrs: &str, key: &str) -> Option<String> {
     ATTR_PATTERN
         .captures_iter(attrs)
-        .find_map(|caps| if caps[1].eq_ignore_ascii_case(key) { Some(caps[2].to_string()) } else { None })
+        .find_map(|caps| if caps[1].eq_ignore_ascii_case(key) { Some(decode_entities(&caps[2])) } else { None })
+}
+
+/// Decodes the XML entities a `body-markup` client escapes with; an unknown one stays literal.
+fn decode_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest.find(';').filter(|&end| end <= 10).and_then(|end| {
+            let ch = match &rest[1..end] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                reference => {
+                    let code = match reference.strip_prefix("#x").or_else(|| reference.strip_prefix("#X")) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => reference.strip_prefix('#').and_then(|decimal| decimal.parse().ok()),
+                    };
+                    char::from_u32(code?)?
+                }
+            };
+            Some((ch, end + 1))
+        });
+        let (ch, len) = decoded.unwrap_or(('&', 1));
+        out.push(ch);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Classifies a `TAG_PATTERN` match; malformed input falls to [`ClassifiedTag::Ignored`].
@@ -98,7 +130,7 @@ fn flush_text(
         return;
     }
     spans.push(NotificationSpan::Text {
-        text: std::mem::take(current),
+        text: decode_entities(&std::mem::take(current)),
         bold: bold > 0,
         italic: italic > 0,
         underline: underline > 0,
@@ -268,6 +300,24 @@ mod tests {
     fn parse_markup_strips_unrecognized_tags_but_keeps_their_surrounding_text() {
         let spans = parse_markup("before<div>middle</div>after");
         assert_eq!(spans, vec![text("beforemiddleafter", false, false, false, None)]);
+    }
+
+    #[test]
+    fn parse_markup_decodes_entities_in_text_and_attributes() {
+        let spans =
+            parse_markup(r#"&quot;a&amp;b&quot; &lt;i&gt; &#39;&#x263A; <a href="https://x/?a=1&amp;b=2">l</a>"#);
+        assert_eq!(
+            spans,
+            vec![
+                text("\"a&b\" <i> '☺ ", false, false, false, None),
+                text("l", false, false, false, Some("https://x/?a=1&b=2"))
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_markup_leaves_an_unknown_or_malformed_entity_literal() {
+        assert_eq!(parse_markup("&nbsp; AT&T &#xZZ; &"), vec![text("&nbsp; AT&T &#xZZ; &", false, false, false, None)]);
     }
 
     #[test]
