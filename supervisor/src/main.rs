@@ -134,8 +134,7 @@ pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::Comm
     }
 }
 
-/// Why `run_supervisor` returned and its process exit code (ADR-0059 decision 3). The service
-/// restarts every exit except the code named by `RestartPreventExitStatus`.
+/// Why `run_supervisor` returned and its process exit code (ADR-0059 decision 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shutdown {
     /// `SIGINT`, `SIGTERM`, or every channel closing; rerunning the shell is recovery.
@@ -315,8 +314,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // Renderer.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut memory_sampler = memory::sampler_from_env();
-    // Every break leaves this alone except the brake's exit, which a service manager must not
-    // restart into (ADR-0059 decision 3).
+    // Every break leaves this alone except the brake's exit, whose code marks a give-up.
     let mut shutdown = Shutdown::Requested;
 
     // Frames a swap handshake read off `inbound_frames` without being their reader (ADR-0156).
@@ -551,17 +549,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tripped_restart_brake_exits_with_a_code_a_service_manager_will_not_restart() {
-        // ADR-0059 decision 3: systemd's 5-in-10s start limit misses this brake's give-up
-        // (three deaths over 60s); the exit code carries the difference.
+    fn a_tripped_restart_brake_exits_with_a_code_distinct_from_a_clean_stop() {
         assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), Shutdown::Requested.exit_code());
         assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), 0, "a give-up is not a clean exit");
     }
 
     #[test]
-    fn a_requested_shutdown_exits_cleanly_so_a_restart_policy_treats_it_as_one() {
-        // SIGTERM at session end must not look like failure. `RestartPreventExitStatus` names one
-        // code, so every other exit means restarting is recovery.
+    fn a_requested_shutdown_exits_cleanly() {
+        // SIGTERM at session end must not look like failure.
         assert_eq!(Shutdown::Requested.exit_code(), 0);
     }
 

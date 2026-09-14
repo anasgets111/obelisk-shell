@@ -166,8 +166,8 @@ See [sysinfo](../supervisor/src/capabilities/sysinfo/mod.rs).
 `process.run(cmd, args, out_cb, exit_cb)` spawns a separate process group and streams newline-stripped
 lines. `out_cb(line, stream)` identifies the stream; `exit_cb(code)` uses nil for a signal exit.
 The handle exposes `kill()`. `process.detach(cmd, args)` starts a program in its own session with no
-handle; the shell never waits on or signals it, and init reaps it. It survives reloads, but it stays in
-the systemd unit's control group, so stopping or restarting the unit kills it.
+handle; the shell never waits on or signals it, and init reaps it. It survives reloads and outlives the
+shell.
 
 Generation retirement and Supervisor shutdown reap managed children using SIGTERM and a 100 ms grace
 before SIGKILL. In-place reload preserves the generation without restarting processes.

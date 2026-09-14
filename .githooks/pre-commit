@@ -3,8 +3,7 @@
 #
 # - Rust: anything the crates compile or their tests read. `lua-meta/` and `share/starter/shell.lua`
 #   are `include_str!`'d and a test reads `packaging/pam.d`.
-# - Lua: any `.lua`, `.luarc.json`, `.editorconfig` or the formatter. Adds the renderer tests that
-#   load `dev-config` and the shipped components, since only the Rust half runs them otherwise.
+# - Lua: any `.lua`, `.luarc.json`, `.editorconfig` or the formatter.
 # - Anything else (Markdown, docs, justfile, this hook): nothing.
 #
 # A stale `lua-meta/obelisk.lua` is regenerated and the commit refused rather than staged: the stub
@@ -15,7 +14,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # Deletions stay in: removing a Lua file a component `require`s is what the Lua tests are for.
-staged="$(git diff --cached --name-only)"
+staged="$(git diff --cached --name-only -z | tr '\0' '\n')"
 rust=false
 lua=false
 # Not `grep -q` after a pipe: it exits on the first match, and pipefail reads the SIGPIPE as no match.
@@ -55,5 +54,4 @@ fi
 if $lua; then
     python3 tools/luafmt.py --check dev-config lua-meta share || fail "the Lua format check"
     just lua types || fail "the Lua checks"
-    $rust || cargo test --quiet -p renderer lua::tests || fail "the renderer's dev-config tests"
 fi

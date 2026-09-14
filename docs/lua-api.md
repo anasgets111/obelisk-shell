@@ -145,7 +145,7 @@ Authentication for `lock` and `polkit` uses native secure submission instead of 
 | `persistent_table { path, name, defaults }` | Absolute directory and filename; defaults fill missing keys |
 | `store.key` / `store:set(key, value)` | Live key signal / write; nil deletes a key; `set` is reserved |
 | `process.run(cmd, args, out_cb, exit_cb)` | Spawns a process group; streams lines to `out_cb(line, stream)`; calls `exit_cb(code)`; returns `{ kill() }` |
-| `process.detach(cmd, args)` | Spawns a program in its own session that survives reloads; no handle, output or exit code. Stopping the systemd unit still kills it |
+| `process.detach(cmd, args)` | Spawns a program in its own session that survives reloads and outlives the shell; no handle, output or exit code |
 | `action(name, handler)` | Declares what `obelisk call <name>` runs; a string return prints bare, nil prints nothing, anything else prints as JSON. One evaluation only |
 | `session_process { name, stop_signal? }` | Declares a program whose lifetime is the session's; returns a handle with `running`/`pid`/`started_at`/`exit_code`/`start_error` signals and `start`/`signal`/`stop` methods |
 

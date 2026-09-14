@@ -1276,6 +1276,9 @@ session. Compositor startup commands alone do not supervise them.
 Rejected: reconnect to fresh Supervisor state or let the Renderer spawn its own authority. A
 persistent lock marker was not built yet.
 
+Decision 4 is superseded, and 3 keeps only its exit code. Nothing restarts the pair; the service
+unit is deleted.
+
 ## 0060. A restarted Supervisor learns the session was locked from a file in the runtime directory
 
 1. Keep the lock fact in $XDG_RUNTIME_DIR/obelisk-session-locked so it survives SIGKILL but not the
@@ -4380,9 +4383,9 @@ process of this user rather than only from a click, which is what prompted looki
 
 `spawn-at-startup "obelisk"` gives the shell `/dev/null` for stdout and stderr, so a session's
 diagnostics were gone before anyone could ask for them. Checked on the running shell: both
-`/proc/<pid>/fd/1` and `fd/2` pointed there. The repo's `packaging/obelisk-shell.service` would
-have handed them to the journal, but it is not installed and the shell is started from the
-compositor's config on purpose (`justfile`'s `install` recipe says so).
+`/proc/<pid>/fd/1` and `fd/2` pointed there. A service unit would have handed them to the journal,
+but the shell is started from the compositor's config on purpose (`justfile`'s `install` recipe
+says so).
 
 Every diagnostic in both binaries is an `eprintln!`. So `log::capture` is two `dup2` calls onto
 `$XDG_RUNTIME_DIR/obelisk-shell.log` rather than a logging crate, a level filter or a second

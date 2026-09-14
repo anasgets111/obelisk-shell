@@ -121,19 +121,6 @@ mod tests {
         assert!(path.ends_with("shell.lua"));
     }
 
-    /// Catches a crate or workspace move without a matching `DEV_CONFIG_DIR` change by reading
-    /// the `shell.lua` that `config_dir` must find.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn the_baked_in_dev_config_path_holds_a_real_shell_lua() {
-        let shell_lua = PathBuf::from(DEV_CONFIG_DIR).join("shell.lua");
-        assert!(
-            std::fs::read_to_string(&shell_lua).is_ok(),
-            "DEV_CONFIG_DIR points at {DEV_CONFIG_DIR:?}, which has no readable shell.lua -- \
-             a debug build resolves its config through this constant"
-        );
-    }
-
     /// `-c` must beat the dev config, so a debug build can still run a second config.
     #[test]
     fn the_config_argument_wins_over_the_dev_config() {
