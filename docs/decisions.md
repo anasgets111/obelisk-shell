@@ -651,6 +651,8 @@ to reuse shared JSON-frame helpers.
 Still open: exact state struct, forgetting every matching saved profile rather than only the first,
 and scan options, empty by default.
 
+Amended by ADR-0212: item 2 is reversed, and the proxies are hand-written.
+
 ## 0030. BlueZ controller: hand-written proxies, Just-Works-only pairing, deferred codec control
 
 1. **Proxy choice.** Reject `bluer` for a second D-Bus stack; reviewed zbus alternatives were
@@ -4755,3 +4757,24 @@ as it does in Quickshell under the same family.
 
 Rejected: carrying glyphs from `Scene::apply` in `PaintStyle::Text`. A `textfield`'s content is
 built at display-list time, where the shaping worker is out of reach.
+
+## 0212. NetworkManager proxies are hand-written
+
+`capabilities/network/proxies.rs` declares only the NetworkManager members `obelisk.network` calls,
+and the enum values it matches as `u32` constants from `nm-dbus-interface.h`.
+`rusty_network_manager` is removed, reversing ADR-0029 item 2.
+
+1. The crate depended on `zbus` with default features, and cargo unions features, so the Supervisor
+   carried zbus's async-io executor, `blocking` pool and `async-process` beside tokio. Without it,
+   the Supervisor's `default-features = false` holds: 137 crates to 120.
+2. Its build script ran bindgen over a vendored `nm-dbus-interface.h`, and `num_enum` derived
+   conversions for enums whose every use here matched a few values.
+3. BlueZ, UPower, logind, MPRIS and StatusNotifier proxies were already hand-written (ADR-0030).
+   The crate's `Connection.Active` proxy subscribed to `state_changed`, a member NetworkManager
+   never emits, so that one was hand-written too.
+
+`Connection.Active` stays in `connect.rs`. zbus names signal types after the D-Bus member, and its
+`StateChanged` would redefine `Device`'s in `proxies.rs`.
+
+Device tracking is unchanged: `DeviceAdded` and `DeviceRemoved` drive `refresh_devices`, which never
+lived in the crate.

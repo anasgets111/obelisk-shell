@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use rusty_network_manager::{DeviceProxy, SettingsConnectionProxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
+use super::proxies::{DeviceProxy, SettingsConnectionProxy};
 use super::{NetworkController, root_object_path};
 use crate::capabilities::bind;
 

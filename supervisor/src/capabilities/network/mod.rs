@@ -1,6 +1,6 @@
-//! NetworkManager D-Bus controller (`obelisk.network`; ADR-0029). It holds `rusty_network_manager`
-//! proxies (ADR-0013) and merges their signal streams into `main.rs`'s top-level `tokio::select!`,
-//! like `dbus::polkit`, rather than using a dedicated thread like `audio::mixer`.
+//! NetworkManager D-Bus controller (`obelisk.network`; ADR-0029). It merges its hand-written proxies'
+//! (`proxies.rs`, ADR-0212) signal streams into `main.rs`'s top-level `tokio::select!`, like
+//! `dbus::polkit`, rather than using a dedicated thread like `audio::mixer`.
 //!
 //! Forwarder tasks feed one channel: wireless APs/association, each device's state, the manager's
 //! radio switches/default route, its device list, and saved-profile changes. ADR-0082: scan-only
@@ -19,6 +19,7 @@ mod connect;
 mod controller;
 mod devices;
 mod profiles;
+mod proxies;
 mod scan;
 
 pub use controller::NetworkController;

@@ -3,9 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusty_network_manager::{AccessPointProxy, NM80211ApFlags};
 use zbus::zvariant::OwnedObjectPath;
 
+use super::proxies::{AP_FLAGS_PRIVACY, AccessPointProxy};
 use super::{AccessPointInfo, NetworkController, NetworkSignal};
 use crate::capabilities::bind;
 
@@ -27,8 +27,7 @@ pub(super) fn resolve_band(freq_mhz: u32) -> Option<&'static str> {
 /// Whether an AP requires a key: `PRIVACY` alone signals WEP; non-empty RSN (WPA2/3) or WPA1
 /// key-management flags signal the other secured cases.
 pub(super) fn access_point_is_secure(flags: u32, wpa_flags: u32, rsn_flags: u32) -> bool {
-    let flags = NM80211ApFlags::from_bits_truncate(flags);
-    flags.contains(NM80211ApFlags::PRIVACY) || wpa_flags != 0 || rsn_flags != 0
+    flags & AP_FLAGS_PRIVACY != 0 || wpa_flags != 0 || rsn_flags != 0
 }
 
 /// Merges duplicate SSIDs by highest strength, then serializes the connected one plus the strongest
@@ -100,11 +99,6 @@ async fn read_access_point(
     saved_ssids: &HashSet<Vec<u8>>,
 ) -> Option<AccessPointInfo> {
     let ssid_bytes = ap.ssid().await.ok()?;
-    if ssid_bytes.is_empty() {
-        // ponytail: an empty hidden-AP SSID cannot be shown or deduped; including it collapses all
-        // hidden APs into one `""` row. Connect still works with `hidden=true`.
-        return None;
-    }
     let strength = ap.strength().await.ok()?;
     let frequency = ap.frequency().await.ok()?;
     let flags = ap.flags().await.unwrap_or(0);
@@ -235,7 +229,7 @@ mod tests {
     #[test]
     fn access_point_is_secure_needs_privacy_or_a_wpa_or_rsn_flag() {
         assert!(!access_point_is_secure(0, 0, 0), "a fully open network");
-        assert!(access_point_is_secure(NM80211ApFlags::PRIVACY.bits(), 0, 0), "WEP privacy alone");
+        assert!(access_point_is_secure(AP_FLAGS_PRIVACY, 0, 0), "WEP privacy alone");
         assert!(access_point_is_secure(0, 0b0000_0100, 0), "only WPA flags");
         assert!(access_point_is_secure(0, 0, 0b0000_0100), "only RSN flags");
     }

@@ -2,15 +2,16 @@
 //! accepts and its verdict, and the pure helpers that shape an intent into NetworkManager's dict.
 use std::collections::HashMap;
 
-use rusty_network_manager::SettingsConnectionProxy;
-use rusty_network_manager::dbus_interface_types::NMActiveConnectionState;
-use rusty_network_manager::dbus_interface_types::NMDeviceStateReason;
 use shared::Zeroize;
 use tokio_stream::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::devices::WifiDevice;
 use super::profiles::merge_psk;
+use super::proxies::{
+    ACTIVE_STATE_ACTIVATED, ACTIVE_STATE_DEACTIVATED, REASON_NO_SECRETS, REASON_SSID_NOT_FOUND,
+    REASON_SUPPLICANT_TIMEOUT, REASON_USER_REQUESTED, SettingsConnectionProxy,
+};
 use super::{JoinError, NetworkController, NetworkSignal, PendingNetworkConnect, root_object_path};
 use crate::capabilities::bind;
 
@@ -48,11 +49,11 @@ impl From<zbus::Error> for ConnectError {
 /// Other reasons are wired, modem, or dependency failures. A Wi-Fi row cannot act on them, so they
 /// collapse to "connection failed".
 fn connect_error_text(reason: u32) -> &'static str {
-    match NMDeviceStateReason::try_from(reason) {
-        Ok(NMDeviceStateReason::NO_SECRETS) => "wrong password",
-        Ok(NMDeviceStateReason::SUPPLICANT_TIMEOUT) => "connection timed out",
-        Ok(NMDeviceStateReason::SSID_NOT_FOUND) => "network not found",
-        Ok(NMDeviceStateReason::USER_REQUESTED) => "disconnected",
+    match reason {
+        REASON_NO_SECRETS => "wrong password",
+        REASON_SUPPLICANT_TIMEOUT => "connection timed out",
+        REASON_SSID_NOT_FOUND => "network not found",
+        REASON_USER_REQUESTED => "disconnected",
         _ => "connection failed",
     }
 }
@@ -65,7 +66,7 @@ pub(super) fn activation_verdict(outcome: Option<Result<(), Option<u32>>>) -> (O
         Some(Ok(())) => (None, false),
         Some(Err(reason)) => (
             Some(reason.map_or("connection failed", connect_error_text).to_string()),
-            reason == Some(NMDeviceStateReason::NO_SECRETS as u32),
+            reason == Some(REASON_NO_SECRETS),
         ),
     }
 }
@@ -173,18 +174,12 @@ pub(super) struct Attempt {
     joined: Option<InFlight>,
 }
 
-/// Hand-written `org.freedesktop.NetworkManager.Connection.Active` proxy. In crate 0.7.1,
-/// `ActiveProxy` declares `state_changed`; zbus uses that explicit name verbatim, so it subscribes
-/// to a member NetworkManager never emits. Twenty activations reaching `ACTIVATED` in about one
-/// second produced no signal. The sibling `Device` proxy uses `StateChanged` and works, proving an
-/// upstream typo rather than a convention (ADR-0013 still requires the crate where possible).
-///
-/// Only the needed members are declared. The `state` property also avoids a generated
-/// `receive_state_changed` collision with the signal.
+/// `Connection.Active`, kept out of `proxies.rs`: zbus names signal types after the D-Bus member,
+/// so this `StateChanged` would redefine `Device`'s there. The signal is renamed off the `state`
+/// property's `receive_state_changed`.
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.Connection.Active",
-    default_service = "org.freedesktop.NetworkManager",
-    assume_defaults = false
+    default_service = "org.freedesktop.NetworkManager"
 )]
 trait ActiveConnection {
     #[zbus(signal, name = "StateChanged")]
@@ -485,9 +480,9 @@ impl NetworkController {
         //
         // ponytail: a failure in that gap loses its reason and reports the generic line; only the
         // signal carries it. Success does not, and is the likelier race.
-        match proxy.state().await.map(NMActiveConnectionState::try_from) {
-            Ok(Ok(NMActiveConnectionState::ACTIVATED)) => return Ok(()),
-            Ok(Ok(NMActiveConnectionState::DEACTIVATED)) => return Err(None),
+        match proxy.state().await {
+            Ok(ACTIVE_STATE_ACTIVATED) => return Ok(()),
+            Ok(ACTIVE_STATE_DEACTIVATED) => return Err(None),
             _ => {}
         }
 
@@ -508,9 +503,9 @@ impl NetworkController {
                     // `None`: the object disappeared without a terminal state.
                     let Some(change) = change else { return Err(reason) };
                     let Ok(args) = change.args() else { continue };
-                    match NMActiveConnectionState::try_from(args.state) {
-                        Ok(NMActiveConnectionState::ACTIVATED) => return Ok(()),
-                        Ok(NMActiveConnectionState::DEACTIVATED) => return Err(reason),
+                    match args.state {
+                        ACTIVE_STATE_ACTIVATED => return Ok(()),
+                        ACTIVE_STATE_DEACTIVATED => return Err(reason),
                         _ => {}
                     }
                 }
@@ -563,11 +558,11 @@ impl NetworkController {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rusty_network_manager::{DeviceProxy, NetworkManagerProxy, SettingsProxy, WirelessProxy};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
     use crate::capabilities::network::NetworkState;
+    use crate::capabilities::network::proxies::{DeviceProxy, NetworkManagerProxy, SettingsProxy, WirelessProxy};
     use crate::capabilities::test_support::p2p_pair_serving;
 
     #[test]
@@ -623,11 +618,11 @@ mod tests {
     fn only_the_device_reason_for_a_bad_key_reopens_the_prompt() {
         // NM fails the device with `NO_SECRETS` for a bad PSK; the active connection only says
         // `DEVICE_DISCONNECTED`.
-        let failed = |reason: NMDeviceStateReason| activation_verdict(Some(Err(Some(reason as u32))));
+        let failed = |reason| activation_verdict(Some(Err(Some(reason))));
         let verdict = |error: &str, rejected_key| (Some(error.to_string()), rejected_key);
-        assert_eq!(failed(NMDeviceStateReason::NO_SECRETS), verdict("wrong password", true));
-        assert_eq!(failed(NMDeviceStateReason::SUPPLICANT_TIMEOUT), verdict("connection timed out", false));
-        assert_eq!(failed(NMDeviceStateReason::SSID_NOT_FOUND), verdict("network not found", false));
+        assert_eq!(failed(REASON_NO_SECRETS), verdict("wrong password", true));
+        assert_eq!(failed(REASON_SUPPLICANT_TIMEOUT), verdict("connection timed out", false));
+        assert_eq!(failed(REASON_SSID_NOT_FOUND), verdict("network not found", false));
         assert_eq!(activation_verdict(Some(Err(None))), verdict("connection failed", false));
         assert_eq!(activation_verdict(None), verdict("connection timed out", false));
         assert_eq!(activation_verdict(Some(Ok(()))), (None, false));
@@ -635,8 +630,8 @@ mod tests {
 
     #[test]
     fn connect_error_text_falls_back_for_reasons_a_wifi_row_cannot_act_on() {
-        // `MODEM_FAILED` is a modem reason; 255 is not a reason at all.
-        assert_eq!(connect_error_text(NMDeviceStateReason::MODEM_FAILED as u32), "connection failed");
+        // 57 is `MODEM_FAILED`, a modem reason; 255 is not a reason at all.
+        assert_eq!(connect_error_text(57), "connection failed");
         assert_eq!(connect_error_text(255), "connection failed");
     }
 

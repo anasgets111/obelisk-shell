@@ -1,12 +1,14 @@
 //! NetworkManager devices for `obelisk.network`: resolving the Wi-Fi and wired devices, and the
 //! forwarder tasks that turn their signals, and the manager's, into [`NetworkSignal`]s.
 
-use rusty_network_manager::dbus_interface_types::NMDeviceType;
-use rusty_network_manager::{AccessPointProxy, DeviceProxy, NetworkManagerProxy, WiredProxy, WirelessProxy};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::{Stream, StreamExt};
 use zbus::zvariant::OwnedObjectPath;
 
+use super::proxies::{
+    AccessPointProxy, DEVICE_TYPE_ETHERNET, DEVICE_TYPE_WIFI, DeviceProxy, NetworkManagerProxy, WiredProxy,
+    WirelessProxy,
+};
 use super::{NetworkController, NetworkSignal};
 use crate::capabilities::bind;
 
@@ -61,12 +63,12 @@ pub(super) async fn resolve_devices(
                 continue;
             }
         };
-        match NMDeviceType::try_from(device_type) {
-            Ok(NMDeviceType::ETHERNET) => match bind::<WiredProxy>(connection, path.clone()).await {
+        match device_type {
+            DEVICE_TYPE_ETHERNET => match bind::<WiredProxy>(connection, path.clone()).await {
                 Ok(wired) => ethernet.push(EthernetDevice { path, device, wired }),
                 Err(err) => eprintln!("network: failed to bind wired device {path}: {err}"),
             },
-            Ok(NMDeviceType::WIFI) if wifi.is_none() => match bind::<WirelessProxy>(connection, path.clone()).await {
+            DEVICE_TYPE_WIFI if wifi.is_none() => match bind::<WirelessProxy>(connection, path.clone()).await {
                 Ok(wireless) => wifi = Some(WifiDevice { device_path: path, device, wireless }),
                 Err(err) => eprintln!("network: failed to bind wireless device {path}: {err}"),
             },

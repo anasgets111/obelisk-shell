@@ -4,14 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use rusty_network_manager::dbus_interface_types::NMDeviceState;
-use rusty_network_manager::{AccessPointProxy, DeviceProxy, IP4ConfigProxy, NetworkManagerProxy, SettingsProxy};
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
 
 use super::connect::Attempt;
 use super::devices::{
     Devices, EthernetDevice, WifiDevice, forward, resolve_devices, spawn_manager_forwarder, watch_devices,
+};
+use super::proxies::{
+    AccessPointProxy, DEVICE_STATE_ACTIVATED, DeviceProxy, IP4ConfigProxy, NetworkManagerProxy, SettingsProxy,
 };
 use super::scan::resolve_ssid;
 use super::{NetworkSignal, NetworkState, PendingNetworkConnect};
@@ -176,11 +177,8 @@ impl NetworkController {
     async fn activated_ethernet(&self) -> Option<EthernetDevice> {
         for ethernet in self.ethernet() {
             match ethernet.device.state().await {
-                Ok(state) => {
-                    if NMDeviceState::try_from(state) == Ok(NMDeviceState::ACTIVATED) {
-                        return Some(ethernet);
-                    }
-                }
+                Ok(DEVICE_STATE_ACTIVATED) => return Some(ethernet),
+                Ok(_) => {}
                 Err(err) => eprintln!("network: failed to read state for ethernet device {}: {err}", ethernet.path),
             }
         }
