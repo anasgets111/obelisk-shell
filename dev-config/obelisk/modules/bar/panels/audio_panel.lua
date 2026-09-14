@@ -297,6 +297,34 @@ local body = {
         toggle_mute = "toggle_mute",
         headroom = true,
         under = {
+            row {
+                width = "Fill",
+                spacing = theme.spacing.sm,
+                align_v = "Center",
+                visible = util.shown_when(obelisk.audio, function(a)
+                    return a.balance ~= nil
+                end),
+                children = {
+                    cell("L", theme.DIM, theme.font.xs),
+                    -- Accent headroom keeps the fill one color past the center.
+                    slider {
+                        name = "audio_pending_balance",
+                        signal = obelisk.audio,
+                        read = function(a)
+                            return a.balance and a.balance + 1
+                        end,
+                        on_commit = function(value)
+                            obelisk.audio:invoke("set_balance", value - 1)
+                        end,
+                        max = 2,
+                        split_at = 1,
+                        marker = true,
+                        headroom_color = theme.ACCENT,
+                        height = STREAM_SLIDER_HEIGHT,
+                    },
+                    cell("R", theme.DIM, theme.font.xs),
+                },
+            },
             device_picker {
                 name = "output",
                 open = ui_state.audio_output_picker,

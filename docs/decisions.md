@@ -2075,6 +2075,9 @@ pixels only without it (touchpads). Hyprland sends both, and its ~15px per notch
 Amendment to decision 6: output volume reads and writes up to 1.5 with channel balance kept, and the
 default sink is written back to 1.5 when another client raises it past.
 
+Amendment to decision 4: `set_balance` and `balance` pan the default output on the same write path;
+the louder side keeps its level and never passes the cap.
+
 ## 0117. A workspace knows whether it is empty and what runs on it
 
 1. Add populated and one representative app ID per workspace: focused window, else lowest window

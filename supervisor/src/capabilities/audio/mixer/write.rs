@@ -24,6 +24,15 @@ pub(super) fn apply_command(state: &Rc<RefCell<MixerState>>, command: AudioComma
         AudioCommand::SetMasterVolume(volume) => set_default_volume(state, DefaultDevice::Sink, volume),
         AudioCommand::SetMasterMuted(muted) => set_default_muted(state, DefaultDevice::Sink, Some(muted)),
         AudioCommand::ToggleMasterMute => set_default_muted(state, DefaultDevice::Sink, None),
+        AudioCommand::SetBalance(balance) => {
+            let Some((node_id, volumes)) = resolve_default(state, DefaultDevice::Sink)
+                .and_then(|(id, current)| Some((id, master::balanced_channel_volumes(&current, balance)?)))
+            else {
+                eprintln!("audio: set_balance({balance}) has no default output with left and right channels; ignored");
+                return;
+            };
+            write_device_volume(state, DefaultDevice::Sink, node_id, Some(volumes), None);
+        }
         AudioCommand::SetSourceVolume(volume) => set_default_volume(state, DefaultDevice::Source, volume),
         AudioCommand::SetSourceMuted(muted) => set_default_muted(state, DefaultDevice::Source, Some(muted)),
         AudioCommand::ToggleSourceMute => set_default_muted(state, DefaultDevice::Source, None),

@@ -324,6 +324,7 @@
 ---@class AudioState
 ---Full `obelisk.audio` payload (ADR-0053 decision 3).
 ---@field apps AppStream[] One entry per app playing or recording audio; empty is normal.
+---@field balance? number Default output balance, `[-1.0, 1.0]` from left to right; `nil` for mono or an unknown channel map.
 ---@field bluetooth BluetoothCodecs[] One entry per BlueZ audio device PipeWire knows, with its codecs; empty without one.
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device; `:invoke("set_default_sink", id)` takes `AudioDevice::id`.
@@ -510,6 +511,7 @@
 ---| "set_volume" # (volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.
 ---| "set_muted" # (muted: boolean) Sets master output mute.
 ---| "toggle_mute" # () Toggles master output mute.
+---| "set_balance" # (balance: number) Sets default output balance, clamped to `[-1.0, 1.0]`; the louder side keeps its level and never passes the cap.
 ---| "set_default_sink" # (id: integer) Makes this `sinks[].id` the default output.
 ---| "set_default_source" # (id: integer) Makes this `sources[].id` the default input.
 ---| "set_source_volume" # (volume: number) Sets default input volume, clamped to `[0.0, 1.0]`.

@@ -21,6 +21,9 @@ pub struct AudioState {
     pub volume: Option<f32>,
     /// Master output mute.
     pub muted: bool,
+    /// Default output balance, `[-1.0, 1.0]` from left to right; `nil` for mono or an unknown channel map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<f32>,
     /// Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion
     /// (`pw-cli enum-params <source> Props` has the same shape). `nil` until the default source's
     /// first `Props`, or with none.
@@ -57,6 +60,7 @@ pub enum AudioCommand {
     SetMasterVolume(f32),
     SetMasterMuted(bool),
     ToggleMasterMute,
+    SetBalance(f32),
     SetDefaultSink(u32),
     SetDefaultSource(u32),
     SetSourceVolume(f32),
@@ -197,6 +201,7 @@ impl MixerState {
         let state = AudioState {
             volume: master.map(|m| m.volume.min(master::SINK_MAX_VOLUME)),
             muted: master.is_some_and(|m| m.muted),
+            balance: master.and_then(|m| m.balance),
             source_volume: source.map(|s| s.volume),
             source_muted: source.is_some_and(|s| s.muted),
             sinks: device_list(&self.sinks, &self.device_routes, self.default_sink_name.as_deref()),
@@ -272,6 +277,7 @@ mod tests {
         let state = AudioState {
             volume: Some(0.5),
             muted: false,
+            balance: None,
             source_volume: Some(0.25),
             source_muted: true,
             sinks: vec![AudioDevice {
@@ -329,7 +335,7 @@ mod tests {
 
     /// Raw `Props` at a linear volume, so tests name the linear value rather than its cube.
     fn props_at(linear: f32, muted: bool) -> master::RawSinkProps {
-        master::RawSinkProps { mute: muted, channel_volumes: vec![linear.powi(3); 2] }
+        master::RawSinkProps { mute: muted, channel_volumes: vec![linear.powi(3); 2], channel_map: vec![] }
     }
 
     /// `publish_audio` fixture with empty proxy maps; tests fill only fields they exercise.

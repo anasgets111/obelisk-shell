@@ -17,19 +17,21 @@ use pipewire::spa::pod::{Object, Property, Value, ValueArray};
 use pipewire::spa::sys as spa_sys;
 use pipewire::spa::utils::Id;
 
-/// Master output volume/mute.
+/// Master output volume, mute and balance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MasterVolume {
     pub volume: f32,
     pub muted: bool,
+    pub balance: Option<f32>,
 }
 
-/// The `SPA_PROP_mute`/`SPA_PROP_channelVolumes` values `mixer.rs` pulls from a sink `Props` pod,
-/// stripped of pod machinery so [`master_volume_from_props`] stays testable.
+/// The `SPA_PROP_mute`/`SPA_PROP_channelVolumes`/`SPA_PROP_channelMap` values `mixer.rs` pulls from
+/// a sink `Props` pod, stripped of pod machinery so [`master_volume_from_props`] stays testable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSinkProps {
     pub mute: bool,
     pub channel_volumes: Vec<f32>,
+    pub channel_map: Vec<u32>,
 }
 
 /// Pulls [`RawSinkProps`] from `libspa`'s generic [`Value`] (always an object here, checked live).
@@ -43,18 +45,20 @@ pub fn extract_sink_props(value: &Value) -> Option<RawSinkProps> {
 
     let mut mute = false;
     let mut channel_volumes = None;
+    let mut channel_map = Vec::new();
     for property in &object.properties {
         match (property.key, &property.value) {
             (key, Value::Bool(value)) if key == spa_sys::SPA_PROP_mute => mute = *value,
-            (key, Value::ValueArray(pipewire::spa::pod::ValueArray::Float(values)))
-                if key == spa_sys::SPA_PROP_channelVolumes =>
-            {
+            (key, Value::ValueArray(ValueArray::Float(values))) if key == spa_sys::SPA_PROP_channelVolumes => {
                 channel_volumes = Some(values.clone());
+            }
+            (key, Value::ValueArray(ValueArray::Id(ids))) if key == spa_sys::SPA_PROP_channelMap => {
+                channel_map = ids.iter().map(|Id(position)| *position).collect();
             }
             _ => {}
         }
     }
-    Some(RawSinkProps { mute, channel_volumes: channel_volumes? })
+    Some(RawSinkProps { mute, channel_volumes: channel_volumes?, channel_map })
 }
 
 /// ponytail: a fixed output ceiling; upgrade path is a config-set one through an audio action.
@@ -64,7 +68,7 @@ pub const SINK_MAX_VOLUME: f32 = 1.5;
 /// report `0.0` instead of panicking.
 pub fn master_volume_from_props(props: &RawSinkProps) -> MasterVolume {
     let peak_linear = props.channel_volumes.iter().copied().fold(0.0_f32, f32::max);
-    MasterVolume { volume: peak_linear.cbrt(), muted: props.mute }
+    MasterVolume { volume: peak_linear.cbrt(), muted: props.mute, balance: balance(props) }
 }
 
 /// Parses either `default.audio.sink` or `default.audio.source`, whose live `pw-metadata` shape is
@@ -122,6 +126,64 @@ pub fn cubed_channel_volumes(target: f32, current: &[f32], max: f32) -> Option<V
     let cubed = target.clamp(0.0, max).powi(3);
     let peak = current.iter().copied().fold(0.0_f32, f32::max);
     Some(current.iter().map(|c| if peak > 0.0 { c * cubed / peak } else { cubed }).collect())
+}
+
+/// PulseAudio's balance side (`channelmap.c` `on_left`/`on_right`): `0` left, `1` right.
+fn side(position: u32) -> Option<usize> {
+    match position {
+        spa_sys::SPA_AUDIO_CHANNEL_FL
+        | spa_sys::SPA_AUDIO_CHANNEL_RL
+        | spa_sys::SPA_AUDIO_CHANNEL_SL
+        | spa_sys::SPA_AUDIO_CHANNEL_FLC
+        | spa_sys::SPA_AUDIO_CHANNEL_TFL
+        | spa_sys::SPA_AUDIO_CHANNEL_TRL => Some(0),
+        spa_sys::SPA_AUDIO_CHANNEL_FR
+        | spa_sys::SPA_AUDIO_CHANNEL_RR
+        | spa_sys::SPA_AUDIO_CHANNEL_SR
+        | spa_sys::SPA_AUDIO_CHANNEL_FRC
+        | spa_sys::SPA_AUDIO_CHANNEL_TFR
+        | spa_sys::SPA_AUDIO_CHANNEL_TRR => Some(1),
+        _ => None,
+    }
+}
+
+/// Mean cube root of the left and the right channels; `None` without both or with a mismatched map.
+fn sides(props: &RawSinkProps) -> Option<[f32; 2]> {
+    if props.channel_volumes.len() != props.channel_map.len() {
+        return None;
+    }
+    let (mut sum, mut count) = ([0.0_f32; 2], [0.0_f32; 2]);
+    for (volume, &position) in props.channel_volumes.iter().zip(&props.channel_map) {
+        if let Some(index) = side(position) {
+            sum[index] += volume.cbrt();
+            count[index] += 1.0;
+        }
+    }
+    (count[0] > 0.0 && count[1] > 0.0).then(|| [sum[0] / count[0], sum[1] / count[1]])
+}
+
+/// PulseAudio's `pa_cvolume_get_balance`: `-1.0` fully left, `1.0` fully right.
+fn balance(props: &RawSinkProps) -> Option<f32> {
+    let [left, right] = sides(props)?;
+    // Silence reads centered.
+    Some((right - left) / left.max(right).max(f32::MIN_POSITIVE))
+}
+
+/// PulseAudio's `pa_cvolume_set_balance` on cubed channels. Side averages can push one channel past
+/// the cap, so each is clamped.
+pub fn balanced_channel_volumes(props: &RawSinkProps, target: f32) -> Option<Vec<f32>> {
+    let old = sides(props)?;
+    let (loud, target) = (old[0].max(old[1]), target.clamp(-1.0, 1.0));
+    let new = [loud * (1.0 - target.max(0.0)), loud * (1.0 + target.min(0.0))];
+    let scaled = props.channel_volumes.iter().zip(&props.channel_map).map(|(&volume, &position)| {
+        let volume = match side(position) {
+            Some(index) if old[index] > 0.0 => volume * (new[index] / old[index]).powi(3),
+            Some(index) => new[index].powi(3),
+            None => volume,
+        };
+        volume.min(SINK_MAX_VOLUME.powi(3))
+    });
+    Some(scaled.collect())
 }
 
 /// Builds the partial `SPA_PARAM_Props` object accepted by `Node::set_param`. Live
@@ -301,6 +363,10 @@ mod tests {
         map.iter().map(|(&id, name)| (id, name.as_str()))
     }
 
+    fn raw(channel_volumes: &[f32], channel_map: &[u32]) -> RawSinkProps {
+        RawSinkProps { mute: false, channel_volumes: channel_volumes.to_vec(), channel_map: channel_map.to_vec() }
+    }
+
     fn sample_props_object() -> Value {
         Value::Object(pipewire::spa::pod::Object {
             type_: 262146,
@@ -381,7 +447,7 @@ mod tests {
     #[test]
     fn master_volume_from_props_cube_roots_the_loudest_channel() {
         // The exact live value: wpctl showed 30%, channelVolumes carried 0.3^3 (float rounding).
-        let props = RawSinkProps { mute: false, channel_volumes: vec![0.027004944, 0.027004944] };
+        let props = raw(&[0.027004944, 0.027004944], &[]);
         let master = master_volume_from_props(&props);
         assert!((master.volume - 0.3).abs() < 0.001, "expected ~0.3, got {}", master.volume);
         assert!(!master.muted);
@@ -389,19 +455,19 @@ mod tests {
 
     #[test]
     fn master_volume_from_props_takes_the_max_channel_not_the_first() {
-        let props = RawSinkProps { mute: false, channel_volumes: vec![0.0, 1.0] };
+        let props = raw(&[0.0, 1.0], &[]);
         assert_eq!(master_volume_from_props(&props).volume, 1.0);
     }
 
     #[test]
     fn master_volume_from_props_reports_mute_independently_of_channel_volumes() {
-        let props = RawSinkProps { mute: true, channel_volumes: vec![0.027004944, 0.027004944] };
+        let props = RawSinkProps { mute: true, ..raw(&[0.027004944, 0.027004944], &[]) };
         assert!(master_volume_from_props(&props).muted);
     }
 
     #[test]
     fn master_volume_from_props_handles_an_empty_channel_array_without_panicking() {
-        let props = RawSinkProps { mute: false, channel_volumes: vec![] };
+        let props = raw(&[], &[]);
         assert_eq!(master_volume_from_props(&props).volume, 0.0);
     }
 
@@ -453,7 +519,7 @@ mod tests {
     #[test]
     fn cubed_channel_volumes_is_the_exact_inverse_of_the_read_direction() {
         let volumes = cubed_channel_volumes(0.3, &[1.0, 1.0], 1.0).expect("two channels is not zero");
-        let read_back = master_volume_from_props(&RawSinkProps { mute: false, channel_volumes: volumes });
+        let read_back = master_volume_from_props(&raw(&volumes, &[]));
         assert!((read_back.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", read_back.volume);
     }
 
@@ -472,6 +538,32 @@ mod tests {
     #[test]
     fn cubed_channel_volumes_refuses_a_device_reporting_no_channels() {
         assert_eq!(cubed_channel_volumes(0.5, &[], 1.0), None);
+    }
+
+    const STEREO: [u32; 2] = [spa_sys::SPA_AUDIO_CHANNEL_FL, spa_sys::SPA_AUDIO_CHANNEL_FR];
+
+    #[test]
+    fn a_set_balance_reads_back_keeping_the_louder_side_under_the_cap() {
+        let volumes = balanced_channel_volumes(&raw(&[1.0, 1.0], &STEREO), -0.36).unwrap();
+        assert_eq!(volumes[0], 1.0);
+        let read_back = balance(&raw(&volumes, &STEREO)).unwrap();
+        assert!((read_back + 0.36).abs() < 1e-5, "expected ~-0.36, got {read_back}");
+        assert_eq!(balanced_channel_volumes(&raw(&[0.125, 1.0], &STEREO), 0.0), Some(vec![1.0, 1.0]));
+        let quad = [STEREO[0], STEREO[1], spa_sys::SPA_AUDIO_CHANNEL_RL, spa_sys::SPA_AUDIO_CHANNEL_RR];
+        assert_eq!(
+            balanced_channel_volumes(&raw(&[1.0, 3.375, 1.0, 0.0], &quad), 0.0),
+            Some(vec![1.0, 3.375, 1.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn balance_is_none_without_both_sides_and_centered_for_silence() {
+        let mono = [spa_sys::SPA_AUDIO_CHANNEL_MONO];
+        assert_eq!(balance(&raw(&[1.0], &mono)), None);
+        assert_eq!(balanced_channel_volumes(&raw(&[1.0], &mono), 0.5), None);
+        assert_eq!(balance(&raw(&[1.0, 1.0], &[])), None);
+        assert_eq!(balance(&raw(&[0.0, 0.0], &STEREO)), Some(0.0));
+        assert_eq!(balanced_channel_volumes(&raw(&[0.0, 0.0], &STEREO), 0.5), Some(vec![0.0, 0.0]));
     }
 
     #[test]
@@ -636,7 +728,7 @@ mod tests {
     #[test]
     fn compute_master_combines_resolution_and_lookup() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        let props = HashMap::from([(59, RawSinkProps { mute: false, channel_volumes: vec![0.027, 0.027] })]);
+        let props = HashMap::from([(59, raw(&[0.027, 0.027], &[]))]);
         let master =
             compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned())
                 .expect("a resolved sink with Props has a volume");

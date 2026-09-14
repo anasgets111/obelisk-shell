@@ -21,6 +21,8 @@ pub enum AudioAction {
     SetMuted,
     /// () Toggles master output mute.
     ToggleMute,
+    /// (balance: number) Sets default output balance, clamped to `[-1.0, 1.0]`; the louder side keeps its level and never passes the cap.
+    SetBalance,
     /// (id: integer) Makes this `sinks[].id` the default output.
     SetDefaultSink,
     /// (id: integer) Makes this `sources[].id` the default input.
@@ -53,6 +55,7 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
             crate::capabilities::parse_bool_arg(&params.arguments).map(AudioCommand::SetMasterMuted)
         }
         AudioAction::ToggleMute => Some(AudioCommand::ToggleMasterMute),
+        AudioAction::SetBalance => parse_volume_arg(&params.arguments).map(AudioCommand::SetBalance),
         AudioAction::SetDefaultSink => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSink),
         AudioAction::SetDefaultSource => parse_id_arg(&params.arguments).map(AudioCommand::SetDefaultSource),
         AudioAction::SetSourceVolume => parse_volume_arg(&params.arguments).map(AudioCommand::SetSourceVolume),
@@ -77,7 +80,7 @@ pub fn dispatch(commands: &AudioCommandSender, envelope: &shared::CommandEnvelop
     }
 }
 
-/// Parses `[vol]`; the range is clamped in `master::cubed_channel_volumes`.
+/// Parses `[number]`; the range is clamped in `master`.
 fn parse_volume_arg(arguments: &[serde_json::Value]) -> Option<f32> {
     Some(arguments.first()?.as_f64()? as f32)
 }
