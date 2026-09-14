@@ -30,7 +30,7 @@ local function muted(a)
 end
 
 local function volume(a)
-    return (a and a.volume) or 0
+    return a and a.volume
 end
 
 -- Muted uses the content ground, the mirror's way to say "this is off" without changing glyph
@@ -52,7 +52,7 @@ local headroom = obelisk.audio:map(function(a)
 end)
 
 local level = computed({ obelisk.audio, held }, function(a, h)
-    return h >= 0 and h or volume(a)
+    return h >= 0 and h or volume(a) or 0
 end)
 
 -- `Volume.qml`'s `foregroundAt`: contrast against the fill once it reaches the glyph or percentage,
@@ -115,7 +115,7 @@ return slider {
             -- A hidden percentage costs no width or spacing: `layout::scene` sums visible child
             -- footprints and multiplies spacing by their count.
             cell(computed({ obelisk.audio, level }, function(a, v)
-                if a == nil then
+                if volume(a) == nil then
                     return "--"
                 elseif a.muted then
                     return "muted"

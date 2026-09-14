@@ -17,7 +17,7 @@ local theme = require("config.theme")
 ---@class SliderOpts
 ---@field name string The `state()` name for the held drag. Unique per slider.
 ---@field signal Signal|Capability<any> The capability or state the value is read from.
----@field read fun(payload: any): number The value, `0` to `max`, off one payload.
+---@field read fun(payload: any): number? The value, `0` to `max`, off one payload; `nil` ignores drag and wheel.
 ---@field on_commit fun(value: number) Called once per drag, on release, and once per wheel step.
 ---@field max? number The full track's value. Default `1`.
 ---@field steps? number How many positions the track has across `0` to `max`, `Slider.qml`'s `steps`: a drag lands on the nearest one and a wheel notch moves one. Default `20 * max`, 5% steps; `0` is continuous.
@@ -56,11 +56,11 @@ end
 
 local function value_of(read, payload, max)
     if payload == nil then
-        return 0
+        return nil
     end
     local ok, value = pcall(read, payload)
     if not ok or type(value) ~= "number" then
-        return 0
+        return nil
     end
     return clamp(value, max)
 end
@@ -89,8 +89,12 @@ return function(opts)
                     return
                 end
                 -- Landed, or another writer moved away from `held`; ours move toward it.
-                local off = math.abs(value_of(opts.read, current, max) - held)
-                local was = math.abs(value_of(opts.read, previous, max) - held)
+                local now, before = value_of(opts.read, current, max), value_of(opts.read, previous, max)
+                if now == nil or before == nil then
+                    return
+                end
+                local off = math.abs(now - held)
+                local was = math.abs(before - held)
                 if off <= tolerance or off > was + tolerance then
                     pending:set(-1)
                 end
@@ -118,7 +122,7 @@ return function(opts)
         if held >= 0 then
             return held
         end
-        return value_of(opts.read, payload, max)
+        return value_of(opts.read, payload, max) or 0
     end)
 
     -- `%d` raises on a float in Lua 5.4; see `components/meter.lua`.
@@ -174,6 +178,11 @@ return function(opts)
         visible = opts.visible,
         on_click = opts.on_click,
         on_drag = function(rect, pointer, phase)
+            if value_of(opts.read, opts.signal:get(), max) == nil then
+                dragging:set(false)
+                pending:set(-1)
+                return
+            end
             local value = quantize(pointer.x / rect.width * max, steps, max)
             if phase ~= "end" then
                 dragging:set(true)
@@ -185,7 +194,8 @@ return function(opts)
             opts.on_commit(value)
         end,
         on_wheel = function(_, notches)
-            if steps <= 0 then
+            local current = value_of(opts.read, opts.signal:get(), max)
+            if steps <= 0 or current == nil then
                 return
             end
             -- Touchpad fractions accumulate, reset on reversal; 1e-4 rounds f32 0.9999... up.
@@ -196,7 +206,7 @@ return function(opts)
                 return
             end
             local held = pending:get()
-            local current = held >= 0 and held or value_of(opts.read, opts.signal:get(), max)
+            current = held >= 0 and held or current
             -- Snap first: a 79% value from another mixer steps to 80% then 85%, not 84%.
             local next_value = quantize(quantize(current, steps, max) + whole * max / steps, steps, max)
             hold(next_value)

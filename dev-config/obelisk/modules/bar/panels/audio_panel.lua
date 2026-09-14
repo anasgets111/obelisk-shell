@@ -27,7 +27,7 @@ local input_picker_open = state("audio_input_picker", false)
 local mixer_open = state("audio_mixer_open", false)
 
 local function percent(value)
-    return string.format("%d%%", math.floor((value or 0) * 100 + 0.5))
+    return value and string.format("%d%%", math.floor(value * 100 + 0.5)) or "--"
 end
 
 local function active_device(devices)
@@ -72,7 +72,7 @@ end
 ---@field title string
 ---@field glyph_on string
 ---@field glyph_off string
----@field volume fun(a: AudioState): number
+---@field volume fun(a: AudioState): number?
 ---@field muted fun(a: AudioState): boolean
 ---@field device fun(a: AudioState): AudioDevice? The active device, for the subtitle.
 ---@field set_volume string The `obelisk.audio` action taking one volume.
@@ -85,6 +85,9 @@ end
 local function audio_control(opts)
     local is_muted = obelisk.audio:map(function(a)
         return a ~= nil and opts.muted(a)
+    end)
+    local ready = obelisk.audio:map(function(a)
+        return a ~= nil and opts.volume(a) ~= nil
     end)
     local mute_glyph = is_muted:map(function(m)
         return m and opts.glyph_off or opts.glyph_on
@@ -112,7 +115,7 @@ local function audio_control(opts)
                     },
                 },
                 cell(computed({ obelisk.audio, held }, function(a, h)
-                    return { { text = a and percent(h >= 0 and h or opts.volume(a)) or "--", bold = true } }
+                    return { { text = percent(h >= 0 and h or a and opts.volume(a)), bold = true } }
                 end), tint, theme.font.sm, { align_v = "Center" }),
                 icon_button(mute_glyph, function()
                     obelisk.audio:invoke(opts.toggle_mute)
@@ -120,6 +123,9 @@ local function audio_control(opts)
                     slot = "audio-mute-" .. opts.name,
                     size = theme.control.md,
                     icon_size = theme.icon.sm,
+                    opacity = ready:map(function(r)
+                        return r and 1 or theme.opacity.disabled
+                    end),
                     background = is_muted:map(function(m)
                         return m and theme.GLASS_CONTROL or theme.ACCENT
                     end),
@@ -226,12 +232,12 @@ local function stream_row(app)
                 width = "Fill",
                 spacing = theme.spacing.sm,
                 align_v = "Center",
-                opacity = app.muted and theme.opacity.muted or nil,
+                opacity = (app.muted or app.volume == nil) and theme.opacity.muted or nil,
                 children = {
                     leading,
                     cell(name, theme.FG, theme.font.sm, { width = "Fill", align_v = "Center" }),
                     cell(percent(app.volume), tint, theme.font.sm, { align_v = "Center" }),
-                    panel_action_icon(app.muted and icons.vol_muted or icons.vol_high, function()
+                    panel_action_icon(app.muted and icons.vol_muted or icons.vol_high, app.volume and function()
                         obelisk.audio:invoke("set_app_muted", app.id, not app.muted)
                     end, { slot = "audio-stream-mute-" .. tostring(app.id), tint = tint }),
                 },
@@ -245,7 +251,6 @@ local function stream_row(app)
                             return stream.volume
                         end
                     end
-                    return 0
                 end,
                 on_commit = function(value)
                     obelisk.audio:invoke("set_app_volume", app.id, value)
@@ -266,7 +271,7 @@ local body = {
         title = "audio",
         icon = obelisk.audio:map(util.volume_glyph),
         active = obelisk.audio:map(function(a)
-            return a ~= nil and not a.muted
+            return a ~= nil and a.volume ~= nil and not a.muted
         end),
         subtitle = "volume, devices and applications",
     },

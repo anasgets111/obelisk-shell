@@ -104,9 +104,7 @@ fn resolve_default_node(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) ->
     )
 }
 
-/// Resolves one direction's node and last-read `Props`, or `None` while unresolved, in the same
-/// window [`master::compute_master`] falls back to its default. Clones them out before writing
-/// because the write borrows the same `RefCell` again.
+/// One direction's node and last-read `Props`, `None` whenever [`master::compute_master`] is.
 fn resolve_default(state: &Rc<RefCell<MixerState>>, kind: DefaultDevice) -> Option<(u32, master::RawSinkProps)> {
     let node_id = resolve_default_node(state, kind)?;
     let current = state.borrow().device_entries(kind).get(&node_id)?.props.clone()?;

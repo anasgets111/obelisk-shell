@@ -16,22 +16,12 @@ use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Property, Value, ValueArray};
 use pipewire::spa::sys as spa_sys;
 use pipewire::spa::utils::Id;
-use serde::Serialize;
 
-/// Master output volume/mute (`audio.volume`, `audio.muted`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
+/// Master output volume/mute.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MasterVolume {
     pub volume: f32,
     pub muted: bool,
-}
-
-impl Default for MasterVolume {
-    /// Startup value before the default sink's first `Props` event. ponytail: a live probe saw
-    /// that event on the next main-loop iteration; if it stops arriving, add an explicit
-    /// "not yet known" state.
-    fn default() -> Self {
-        Self { volume: 0.0, muted: false }
-    }
 }
 
 /// The `SPA_PROP_mute`/`SPA_PROP_channelVolumes` values `mixer.rs` pulls from a sink `Props` pod,
@@ -108,18 +98,15 @@ pub fn resolve_default_device<'a>(
     matched.or(lowest)
 }
 
-/// Combines default-name resolution with tracked [`RawSinkProps`]. Returns
-/// [`MasterVolume::default`] when resolution or `Props` is still missing; the maps update from
-/// separate PipeWire events. The raw props stay tracked because writes scale the current channels.
+/// Combines default-name resolution with tracked [`RawSinkProps`]. `None` while resolution or
+/// `Props` is still missing; the maps update from separate PipeWire events. The raw props stay
+/// tracked because writes scale the current channels.
 pub fn compute_master<'a>(
     default_name: Option<&str>,
     names: impl Iterator<Item = (u32, &'a str)>,
     props: impl Fn(u32) -> Option<RawSinkProps>,
-) -> MasterVolume {
-    resolve_default_device(default_name, names)
-        .and_then(props)
-        .map(|raw| master_volume_from_props(&raw))
-        .unwrap_or_default()
+) -> Option<MasterVolume> {
+    resolve_default_device(default_name, names).and_then(props).map(|raw| master_volume_from_props(&raw))
 }
 
 /// Inverse of [`master_volume_from_props`]'s cube root: scales `current` so its loudest channel
@@ -610,22 +597,20 @@ mod tests {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
         let props = HashMap::from([(59, RawSinkProps { mute: false, channel_volumes: vec![0.027, 0.027] })]);
         let master =
-            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned());
+            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned())
+                .expect("a resolved sink with Props has a volume");
         assert!((master.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", master.volume);
         assert!(!master.muted);
     }
 
     #[test]
-    fn compute_master_defaults_when_the_resolved_sink_has_no_props_yet() {
+    fn compute_master_is_none_when_the_resolved_sink_has_no_props_yet() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
-        assert_eq!(
-            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |_| None),
-            MasterVolume::default()
-        );
+        assert_eq!(compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |_| None), None);
     }
 
     #[test]
-    fn compute_master_defaults_with_nothing_tracked() {
-        assert_eq!(compute_master(None, names(&HashMap::new()), |_| None), MasterVolume::default());
+    fn compute_master_is_none_with_nothing_tracked() {
+        assert_eq!(compute_master(None, names(&HashMap::new()), |_| None), None);
     }
 }

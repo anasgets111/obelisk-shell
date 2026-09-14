@@ -8,7 +8,7 @@ local icon_button = require("components.icon_button")
 local CLEAR = "#00000000"
 
 ---@param glyph string|Bound A `text` glyph, or a signal of one for a control whose icon follows state.
----@param on_activate fun()
+---@param on_activate fun()?
 ---@param opts { slot: string, tint?: Color, visible?: boolean|Bound, size?: "sm"|"md" }
 return function(glyph, on_activate, opts)
     local tint = opts.tint or theme.FG

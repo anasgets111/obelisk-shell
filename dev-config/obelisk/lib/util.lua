@@ -126,15 +126,17 @@ end
 util.MAX_VOLUME = 1.5
 
 -- Shared icon mapping for `modules/bar/indicators/volume.lua` and `modules/osd/popup.lua`. It
--- takes raw `obelisk.audio`, not a signal, so callers choose their `nil` behavior. Muted, then four
--- steps by level, as Nerd Font glyphs rather than themed icon names: the OSD accent-tints them and
--- themed icons cannot be tinted.
+-- takes raw `obelisk.audio`, not a signal, so callers choose their `nil` behavior. `--` without a
+-- volume, muted, then four steps by level, as Nerd Font glyphs rather than themed icon names: the
+-- OSD accent-tints them and themed icons cannot be tinted.
 function util.volume_glyph(a)
     local icons = require("config.icons")
-    if a == nil or a.muted then
+    if a == nil or a.volume == nil then
+        return "--"
+    elseif a.muted then
         return icons.vol_muted
     end
-    local percent = (a.volume or 0) * 100
+    local percent = a.volume * 100
     if percent < 1 then
         return icons.vol_zero
     elseif percent < 33 then

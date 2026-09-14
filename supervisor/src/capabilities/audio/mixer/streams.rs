@@ -46,8 +46,9 @@ pub struct AppStream {
     /// `/proc/{pid}/comm`, if the process still existed when observed.
     pub process_name: Option<String>,
     /// Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master
-    /// sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
-    pub volume: f32,
+    /// sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `nil` until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f32>,
     /// Per-app mute, from the same `Props` as `volume`.
     pub muted: bool,
 }
@@ -103,17 +104,7 @@ fn resolve_process_name(proc_root: &Path, pid: i32) -> Option<String> {
 fn build_app_stream(proc_root: &Path, node_id: u32, props: &impl PropsLookup) -> Option<AppStream> {
     let parsed = parse_stream_props(props)?;
     let process_name = resolve_process_name(proc_root, parsed.pid);
-    Some(AppStream {
-        id: node_id,
-        pid: parsed.pid,
-        name: parsed.app_name,
-        process_name,
-        // PipeWire reports this for an untouched stream (live `pw-cli enum-params <id> Props`);
-        // replace it when the node's Props arrives. Unlike an unresolved master, 0.0 is not the
-        // correct startup value because silence is a real stream state.
-        volume: 1.0,
-        muted: false,
-    })
+    Some(AppStream { id: node_id, pid: parsed.pid, name: parsed.app_name, process_name, volume: None, muted: false })
 }
 
 /// Applies a bound node's `info`. Gate upsert/remove on `NodeChangeMask::PROPS`: state-only events
@@ -498,7 +489,7 @@ mod tests {
         assert_eq!(app.name, Some("Test App".to_string()));
         assert_eq!(app.process_name, expected_process_name);
         // Identity comes from properties; volume lives on a param and joins in publish_audio.
-        assert_eq!(app.volume, 1.0);
+        assert_eq!(app.volume, None);
         assert!(!app.muted);
     }
 
@@ -547,8 +538,14 @@ mod tests {
     #[test]
     fn app_stream_serializes_with_the_spec_field_spelling() {
         // ADR-0053 decision 3: node_id -> id, app_name -> name; keep pid/process_name (ADR-0016).
-        let stream =
-            AppStream { id: 7, pid: 999, name: Some("Zen".to_string()), process_name: None, volume: 1.0, muted: false };
+        let stream = AppStream {
+            id: 7,
+            pid: 999,
+            name: Some("Zen".to_string()),
+            process_name: None,
+            volume: Some(1.0),
+            muted: false,
+        };
         let json = serde_json::to_value(&stream).unwrap();
         assert_eq!(
             json,

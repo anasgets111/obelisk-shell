@@ -69,7 +69,7 @@
 ---@field name? string `application.name`, if the client set one.
 ---@field pid integer `application.process.id` recorded for the owning process.
 ---@field process_name? string `/proc/{pid}/comm`, if the process still existed when observed.
----@field volume number Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `1.0` before it.
+---@field volume? number Per-app volume, range `[0.0, 1.0]`, cube-rooted from `SPA_PARAM_Props` like a master sink (`pw-cli enum-params <id> Props` confirms cubed `channelVolumes`). `nil` until then.
 
 ---@class AppSummary
 ---One application as config sees it (ADR-0061). Display data only: argv stays private because
@@ -322,9 +322,9 @@
 ---@field muted boolean Master output mute.
 ---@field sinks AudioDevice[] Every output device; `:invoke("set_default_sink", id)` takes `AudioDevice::id`.
 ---@field source_muted boolean Default input mute, the microphone-mute click target for privacy indicators.
----@field source_volume number Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or with no input device.
+---@field source_volume? number Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion (`pw-cli enum-params <source> Props` has the same shape). `nil` until the default source's first `Props`, or with none.
 ---@field sources AudioDevice[] Every input device, on the same terms as `AudioState::sinks`.
----@field volume number Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`.
+---@field volume? number Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`. `nil` until the default sink's first `Props`, or with none.
 
 ---@class BatteryState
 ---`obelisk.battery`'s full payload. Field names are the `StateSnapshot` JSON keys verbatim

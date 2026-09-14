@@ -62,8 +62,9 @@ obelisk.audio:on_change(function(a, previous)
     if previous == nil then
         return
     end
-    local percent = math.floor((a.volume or 0) * 100 + 0.5)
-    if a.muted ~= previous.muted or percent ~= math.floor((previous.volume or 0) * 100 + 0.5) then
+    local percent = a.volume and math.floor(a.volume * 100 + 0.5)
+    local was = previous.volume and math.floor(previous.volume * 100 + 0.5)
+    if percent and was and (a.muted ~= previous.muted or percent ~= was) then
         osd.show("volume", {
             glyph = util.volume_glyph(a),
             text = a.muted and "muted" or string.format("%d%%", percent),

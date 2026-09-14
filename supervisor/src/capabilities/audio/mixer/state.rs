@@ -16,13 +16,16 @@ use crate::capabilities::audio::master;
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AudioState {
     /// Master output volume, range `[0.0, 1.5]`, derived from the default sink's `channelVolumes`.
-    pub volume: f32,
+    /// `nil` until the default sink's first `Props`, or with none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f32>,
     /// Master output mute.
     pub muted: bool,
     /// Default input volume, range `[0.0, 1.0]`, using the sink's cube-root conversion
-    /// (`pw-cli enum-params <source> Props` has the same shape). `0.0` before first `Props` or
-    /// with no input device.
-    pub source_volume: f32,
+    /// (`pw-cli enum-params <source> Props` has the same shape). `nil` until the default source's
+    /// first `Props`, or with none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_volume: Option<f32>,
     /// Default input mute, the microphone-mute click target for privacy indicators.
     pub source_muted: bool,
     /// Every output device; `:invoke("set_default_sink", id)` takes [`AudioDevice::id`].
@@ -165,11 +168,7 @@ impl MixerState {
 
     /// Publishes even if the receiver is absent; that is startup or shutdown, not a tracking error.
     ///
-    /// Silent until [`MixerState::hydrated`]. A sink's `props` arrive on a later `param` event than
-    /// the `global` that binds it, and `compute_master` reads a missing `Props` as `0.0`, so every
-    /// publish before that lands claims a volume of zero. A config comparing against its previous
-    /// payload reads the correction as the user having changed the volume: the OSD showed a card
-    /// for the true volume at every shell start.
+    /// Silent until [`MixerState::hydrated`], so the first snapshot is complete: volumes, device and privacy lists.
     pub(super) fn publish_audio(&self) {
         if !self.hydrated {
             return;
@@ -191,15 +190,15 @@ impl MixerState {
             .values()
             .cloned()
             .map(|app| match self.app_props.get(&app.id).map(master::master_volume_from_props) {
-                Some(measured) => AppStream { volume: measured.volume, muted: measured.muted, ..app },
+                Some(measured) => AppStream { volume: Some(measured.volume), muted: measured.muted, ..app },
                 None => app,
             })
             .collect();
         let state = AudioState {
-            volume: master.volume.min(master::SINK_MAX_VOLUME),
-            muted: master.muted,
-            source_volume: source.volume,
-            source_muted: source.muted,
+            volume: master.map(|m| m.volume.min(master::SINK_MAX_VOLUME)),
+            muted: master.is_some_and(|m| m.muted),
+            source_volume: source.map(|s| s.volume),
+            source_muted: source.is_some_and(|s| s.muted),
             sinks: device_list(
                 self.sinks.iter().map(|(&id, sink)| (id, &sink.names)),
                 self.default_sink_name.as_deref(),
@@ -252,7 +251,7 @@ mod tests {
             pid: 100 + node_id as i32,
             name: Some(format!("app-{node_id}")),
             process_name: None,
-            volume: 1.0,
+            volume: None,
             muted: false,
         }
     }
@@ -274,9 +273,9 @@ mod tests {
         // 0.5 avoids serde_json's long widened-f32 tail, keeping this about field shape.
         let stream = sample_stream(1);
         let state = AudioState {
-            volume: 0.5,
+            volume: Some(0.5),
             muted: false,
-            source_volume: 0.25,
+            source_volume: Some(0.25),
             source_muted: true,
             sinks: vec![AudioDevice {
                 id: 59,
@@ -317,7 +316,6 @@ mod tests {
                     "pid": stream.pid,
                     "name": stream.name,
                     "process_name": stream.process_name,
-                    "volume": stream.volume,
                     "muted": stream.muted,
                 }],
                 "bluetooth": [{
@@ -346,9 +344,6 @@ mod tests {
         MixerState { hydrated: true, ..MixerState::new(updates, privacy_updates) }
     }
 
-    /// The startup gate. A sink whose `Props` have not arrived reads as volume zero, and a config
-    /// comparing against its previous payload sees the correction as a volume change, so the very
-    /// snapshot this suppresses is the one that put a spurious card on screen at every shell start.
     #[test]
     fn a_state_that_has_not_hydrated_publishes_nothing() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -362,7 +357,7 @@ mod tests {
         state.publish_audio();
         state.publish_privacy();
 
-        assert!(rx.try_recv().is_err(), "an unhydrated state must not publish its zeroed master volume");
+        assert!(rx.try_recv().is_err(), "an unhydrated state must not publish its unknown master volume");
         assert!(privacy_rx.try_recv().is_err(), "an unhydrated state must not publish its empty privacy lists");
 
         state.hydrated = true;
@@ -385,13 +380,13 @@ mod tests {
         state.publish_audio();
 
         let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
-        assert!((published.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", published.volume);
+        assert!((published.volume.unwrap() - 0.3).abs() < 1e-6, "expected ~0.3, got {:?}", published.volume);
         assert!(!published.muted);
         assert_eq!(published.apps, vec![sample_stream(1)]);
     }
 
     #[test]
-    fn publish_audio_reports_the_master_volume_default_with_no_sink_tracked() {
+    fn publish_audio_reports_no_master_volume_with_no_sink_tracked() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = mixer_state(updates, privacy_updates);
@@ -399,8 +394,8 @@ mod tests {
         state.publish_audio();
 
         let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
-        assert_eq!(published.volume, master::MasterVolume::default().volume);
-        assert_eq!(published.muted, master::MasterVolume::default().muted);
+        assert_eq!(published.volume, None);
+        assert!(!published.muted);
         assert!(published.apps.is_empty());
         assert!(published.sinks.is_empty());
         assert!(published.sources.is_empty());
@@ -456,12 +451,12 @@ mod tests {
         state.publish_audio();
 
         let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
-        assert!((published.apps[0].volume - 0.42).abs() < 1e-6, "expected ~0.42, got {}", published.apps[0].volume);
+        assert!((published.apps[0].volume.unwrap() - 0.42).abs() < 1e-6, "got {:?}", published.apps[0].volume);
         assert!(published.apps[0].muted);
     }
 
     #[test]
-    fn publish_audio_leaves_a_stream_whose_props_have_not_arrived_at_pipewires_own_untouched_values() {
+    fn publish_audio_leaves_a_stream_whose_props_have_not_arrived_without_a_volume() {
         let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (privacy_updates, _privacy_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = mixer_state(updates, privacy_updates);
@@ -471,7 +466,7 @@ mod tests {
         state.publish_audio();
 
         let published = rx.try_recv().expect("publish_audio should have sent a snapshot");
-        assert_eq!(published.apps[0].volume, 1.0, "another stream's reading must not leak onto this one");
+        assert_eq!(published.apps[0].volume, None, "another stream's reading must not leak onto this one");
         assert!(!published.apps[0].muted);
     }
 
@@ -499,7 +494,7 @@ mod tests {
             vec![AudioDevice { id: 60, name: "Built-in Microphone".to_string(), active: true, icon: None }]
         );
         // The source's Props use the master's cube-root conversion.
-        assert!((published.source_volume - 0.6).abs() < 1e-6, "expected ~0.6, got {}", published.source_volume);
+        assert!((published.source_volume.unwrap() - 0.6).abs() < 1e-6, "got {:?}", published.source_volume);
         assert!(published.source_muted);
     }
 }

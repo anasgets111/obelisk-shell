@@ -320,8 +320,7 @@ fn bind_device_node(
     let node_id = obj.id;
     let Some(names) = obj.props.and_then(device_names) else { return };
 
-    // Bind before recording: a failed bind has no Props subscription, and recording its name would
-    // choose a node stuck at MasterVolume::default()'s fake 0.0 (ADR-0053 has no unknown sentinel).
+    // Bind before recording: a failed bind never gets Props, so its volume would stay `None`.
     let node: pw::node::Node = match registry.bind(obj) {
         Ok(node) => node,
         Err(err) => {
