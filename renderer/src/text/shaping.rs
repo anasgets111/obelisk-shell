@@ -5,11 +5,8 @@
 //! multi-thread runtime: this is one dedicated CPU-bound worker, and renderer's Cargo.toml only
 //! carries tokio's `rt`/`net`/`macros` features.
 //!
-//! `shape()` asks for `Family::Name(primary_family)`, the resolved chain's own first hit, so
-//! `text::atlas::TextPainter` loads the same chain in the same order into femtovg: not theoretical,
-//! since the old code measured under `Family::SansSerif` while a separate `fontdb` query for paint
-//! missed that alias, falling back to the first face in scan order and measuring a `text` node's
-//! box roughly 30% narrower than the glyphs painted into it.
+//! `shape()` asks for `Family::Name(primary_family)`, the resolved chain's own first hit, and paint
+//! draws the faces it chose (ADR-0211).
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -19,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, LineIter, Metrics, Shaping, Style, Weight};
 
 use super::fonts::{self, ResolvedFonts};
 
@@ -55,11 +52,6 @@ pub struct ShapeRequest {
 /// The measured result of shaping a request: its tight bounding box in logical pixels, plus the
 /// lines the text was broken onto getting there.
 ///
-/// `lines` is what makes a wrapped `text` drawable at all. femtovg paints one run per `fill_text`
-/// call and has no line breaker of its own, so paint has to be told where cosmic-text put the
-/// breaks; before this it was told only how tall the result came out, which is why a wrapped
-/// string measured three lines high and painted one.
-///
 /// Behind an `Arc` because [`ShapingHandle::shape`] hands a clone back on every memo hit, and a
 /// hit is the common case: `Scene::apply` re-measures every text node it resolves.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +67,33 @@ pub struct ShapeResult {
     /// styled run through a wrap: the runs are ranges over the source, and a line that knows its
     /// own range can say which runs it holds (ADR-0104).
     pub line_ranges: Arc<[Range<usize>]>,
+    /// How each of `lines` is laid out, parallel to it (ADR-0211). Paint and link hit-testing
+    /// read these glyphs rather than shaping the line a second time.
+    pub shaped: Arc<[ShapedLine]>,
+}
+
+/// One laid-out line (ADR-0211): which way it reads, how far its baseline sits below the line's
+/// top, and its glyphs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedLine {
+    pub rtl: bool,
+    pub width: f32,
+    pub baseline: f32,
+    pub glyphs: Box<[Glyph]>,
+}
+
+/// One placed glyph: the face, weight and glyph cosmic-text chose, its pen position from the line's
+/// left edge and baseline, its advance, and the byte of the request's text it came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glyph {
+    pub face: fontdb::ID,
+    /// What a variable face was shaped at ([`FontFace::coords`]).
+    pub weight: u16,
+    pub id: u16,
+    pub x: f32,
+    pub y: f32,
+    pub advance: f32,
+    pub start: usize,
 }
 
 /// The multiplier every measurement and every paint derives a line height from.
@@ -98,30 +117,26 @@ pub fn line_height(font_size: f32) -> f32 {
 #[derive(Clone)]
 pub struct FontData(std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
 
-/// What job one loaded face does, which is what tells the painter which chain to put it in
-/// (ADR-0104, ADR-0144).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum FaceRole {
-    /// The declared chain's own family: regular, and whichever of bold, italic and bold italic
-    /// `fonts::resolve_chain` found. The painter picks among them per styled run.
-    Declared,
-    /// Leads the chain for nodes that named this family by hand, under the name they wrote rather
-    /// than the one fontconfig resolved -- the painter keys on what the node asked for.
-    Named(Arc<str>),
-    /// Coverage for codepoints no leading family carries. Leads no chain and takes part in every
-    /// one of them unchanged.
-    Fallback,
-}
-
-/// One face femtovg should load: its file's shared bytes, which face of the file, and what job it
-/// does (ADR-0104, ADR-0144).
+/// One face femtovg should load: its file's shared bytes, which face of the file, and the id
+/// cosmic-text's glyphs name it by (ADR-0211).
 #[derive(Clone)]
 pub struct FontFace {
     pub data: FontData,
     pub index: u32,
-    pub role: FaceRole,
-    pub bold: bool,
-    pub italic: bool,
+    pub id: fontdb::ID,
+}
+
+impl FontFace {
+    /// The normalized axis coordinates cosmic-text shapes this face at for `weight`, in `fvar`
+    /// order, the way `cosmic_text::Font::new` derives them; empty for a face with no axes.
+    pub fn coords(&self, weight: u16) -> Vec<i16> {
+        use cosmic_text::skrifa::{FontRef, MetadataProvider, Tag};
+        let Ok(font) = FontRef::from_index(self.data.as_ref(), self.index) else {
+            return Vec::new();
+        };
+        let location = font.axes().location([(Tag::new(b"wght"), f32::from(weight))]);
+        location.coords().iter().map(|coord| coord.to_bits()).collect()
+    }
 }
 
 impl FontData {
@@ -145,7 +160,8 @@ impl AsRef<[u8]> for FontData {
 }
 
 enum Request {
-    Shape(ShapeRequest, mpsc::Sender<ShapeResult>),
+    /// The `bool` keeps each line's glyphs ([`ShapingHandle::shape_glyphs`]).
+    Shape(ShapeRequest, bool, mpsc::Sender<ShapeResult>),
     FontChainData(mpsc::Sender<Vec<FontFace>>),
     /// Replace the chain this worker measures against, once the config has said what it wants
     /// (ADR-0043 decision 2). Replies once the new `FontSystem` is live, so the next
@@ -176,6 +192,8 @@ enum Request {
 /// turns over daily rather than hourly holds fewer dead entries, not more -- but the number is
 /// worth stating correctly, because it is the one that says whether 4096 is generous or tight.
 ///
+/// Entries from [`ShapingHandle::shape_glyphs`] also hold a 32-byte `Glyph` per glyph (ADR-0211).
+///
 /// Note that `HashMap::clear` keeps the table it has grown, so after the first fill the bucket
 /// array is a floor for the rest of the session rather than something the clear gives back.
 const SHAPE_CACHE_CAPACITY: usize = 4096;
@@ -194,6 +212,7 @@ struct ShapeKey {
     max_width: Option<u32>,
     runs: Vec<FontRun>,
     font: Option<Arc<str>>,
+    glyphs: bool,
 }
 
 /// A handle to a dedicated shaping worker thread and its warm font cache. `Clone` clones only the
@@ -231,10 +250,10 @@ impl ShapingHandle {
                 let mut fonts = WorkerFonts::new(fonts::DEFAULT_CHAIN);
                 while let Ok(request) = rx.recv() {
                     match request {
-                        Request::Shape(req, reply) => {
+                        Request::Shape(req, glyphs, reply) => {
                             let family = fonts.family_for(req.font.as_ref(), &generation);
                             // A dropped receiver just means the result is discarded.
-                            let _ = reply.send(shape(&mut fonts.font_system, &family, &req));
+                            let _ = reply.send(shape(&mut fonts.font_system, &family, &req, glyphs));
                         }
                         Request::EnsureFamily(asked, reply) => {
                             fonts.family_for(Some(&asked), &generation);
@@ -278,6 +297,60 @@ impl ShapingHandle {
     /// so it keeps answering after death, correct rather than lucky, but the next new string, not
     /// the next call, is the first symptom.
     pub fn shape(&self, request: ShapeRequest) -> ShapeResult {
+        self.shape_keyed(request, false)
+    }
+
+    /// [`shape`](Self::shape), keeping each line's glyphs for paint and link hit-testing (ADR-0211).
+    pub fn shape_glyphs(&self, request: ShapeRequest) -> ShapeResult {
+        self.shape_keyed(request, true)
+    }
+
+    /// Each line of `text` shaped alone with its glyphs and `runs` re-based onto it, paired with the
+    /// byte it starts at (ADR-0211). Lines end where cosmic-text ends them, so paint draws the rows
+    /// measurement counted.
+    ///
+    /// ponytail: paint asks every frame -- a memo hit that still allocates each line's key, and blocks on
+    /// the worker after the memo clears. Upgrade path: carry the glyphs in the display list.
+    pub fn shape_lines(
+        &self,
+        text: &str,
+        runs: &[FontRun],
+        font_size: f32,
+        font: Option<&Arc<str>>,
+    ) -> Vec<(usize, ShapeResult)> {
+        let mut lines: Vec<Range<usize>> = LineIter::new(text).map(|(range, _)| range).collect();
+        // A trailing line ending opens one more, empty line, as `Buffer::set_text` does.
+        if text.is_empty() || text.ends_with(['\n', '\r']) {
+            lines.push(text.len()..text.len());
+        }
+        lines
+            .into_iter()
+            .map(|range| {
+                let runs = runs
+                    .iter()
+                    .filter_map(|run| {
+                        let (from, to) = (run.range.start.max(range.start), run.range.end.min(range.end));
+                        (from < to).then(|| FontRun {
+                            range: from - range.start..to - range.start,
+                            bold: run.bold,
+                            italic: run.italic,
+                        })
+                    })
+                    .collect();
+                let shaped = self.shape_glyphs(ShapeRequest {
+                    text: text[range.clone()].to_string(),
+                    font_size,
+                    line_height: line_height(font_size),
+                    max_width: None,
+                    runs,
+                    font: font.cloned(),
+                });
+                (range.start, shaped)
+            })
+            .collect()
+    }
+
+    fn shape_keyed(&self, request: ShapeRequest, glyphs: bool) -> ShapeResult {
         // The text moves into the key rather than being cloned into it, so a hit allocates
         // nothing and only a miss pays for the copy the worker needs.
         let key = ShapeKey {
@@ -287,6 +360,7 @@ impl ShapingHandle {
             max_width: request.max_width.map(f32::to_bits),
             runs: request.runs,
             font: request.font,
+            glyphs,
         };
         // A poisoned lock is recovered rather than propagated: this map is a pure memo, so no
         // invariant can break, and an unrelated thread's death shouldn't kill text measurement.
@@ -305,6 +379,7 @@ impl ShapingHandle {
                     runs: key.runs.clone(),
                     font: key.font.clone(),
                 },
+                key.glyphs,
                 reply_tx,
             ))
             .expect("obelisk-text-shaping worker thread died");
@@ -369,20 +444,24 @@ impl ShapingHandle {
                 let key_bytes = key.text.len() + key.runs.len() * std::mem::size_of::<FontRun>();
                 let line_bytes: usize = result.lines.iter().map(String::len).sum();
                 let range_bytes = result.line_ranges.len() * std::mem::size_of::<Range<usize>>();
+                let glyph_bytes: usize = result
+                    .shaped
+                    .iter()
+                    .map(|line| std::mem::size_of::<ShapedLine>() + std::mem::size_of_val(&*line.glyphs))
+                    .sum();
                 std::mem::size_of::<ShapeKey>()
                     + std::mem::size_of::<ShapeResult>()
                     + key_bytes
                     + line_bytes
                     + range_bytes
+                    + glyph_bytes
             })
             .sum();
         (cache.len(), bytes)
     }
 
-    /// Returns the loaded font chain's shared bytes, in chain order. Femtovg has no system font
-    /// discovery of its own; it loads these via `add_shared_font_with_index` so paint rasterizes
-    /// with the exact chain cosmic-text shaped against (`text::atlas::TextPainter::new`). Cloning
-    /// `FontData` clones an `Arc`, so repeated calls are cheap and copy no font file.
+    /// Every loaded face's shared bytes, for `text::atlas::TextPainter` to register (ADR-0211).
+    /// Cloning `FontData` clones an `Arc`, so repeated calls are cheap and copy no font file.
     pub fn font_chain_data(&self) -> Vec<FontFace> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.requests.send(Request::FontChainData(reply_tx)).expect("obelisk-text-shaping worker thread died");
@@ -457,7 +536,7 @@ impl WorkerFonts {
         // Mapped once, before the `Database` reaches cosmic-text, so the mappings stay *in* the
         // database instead of being mapped twice.
         let families = HashMap::new();
-        let chain_data = font_chain_data(&mut db, &primary_family, &families);
+        let chain_data = font_chain_data(&mut db);
         let font_system = FontSystem::new_with_locale_and_db(detect_locale(), db);
         Self { font_system, primary_family, families, loaded_paths, chain_data }
     }
@@ -477,14 +556,14 @@ impl WorkerFonts {
         if !self.families.contains_key(asked) {
             let hit = fonts::load_family(self.font_system.db_mut(), asked, &mut self.loaded_paths);
             self.families.insert(Arc::clone(asked), hit);
-            self.chain_data = font_chain_data(self.font_system.db_mut(), &self.primary_family, &self.families);
+            self.chain_data = font_chain_data(self.font_system.db_mut());
             generation.fetch_add(1, Ordering::Release);
         }
         self.families[asked].clone().unwrap_or_else(|| self.primary_family.clone())
     }
 }
 
-fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequest) -> ShapeResult {
+fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequest, glyphs: bool) -> ShapeResult {
     let metrics = Metrics::new(request.font_size, request.line_height);
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(request.max_width, None);
@@ -510,6 +589,7 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
     let mut width = 0.0f32;
     let mut lines: Vec<String> = Vec::new();
     let mut line_ranges: Vec<Range<usize>> = Vec::new();
+    let mut shaped: Vec<ShapedLine> = Vec::new();
     for run in buffer.layout_runs() {
         width = width.max(run.line_w);
         // `run.text` is cosmic-text's "original text line" -- the whole source paragraph, handed
@@ -529,6 +609,31 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
         let paragraph_start = paragraph_starts.get(run.line_i).copied().unwrap_or(0);
         line_ranges.push(paragraph_start + start..paragraph_start + start + trimmed.len());
         lines.push(trimmed.to_string());
+
+        // Positions from the line's own left edge: paint places the line by its alignment.
+        let left = run.glyphs.iter().map(|glyph| glyph.x).fold(f32::INFINITY, f32::min);
+        let placed = match glyphs {
+            true => run
+                .glyphs
+                .iter()
+                .map(|glyph| Glyph {
+                    face: glyph.font_id,
+                    weight: glyph.font_weight.0,
+                    id: glyph.glyph_id,
+                    x: glyph.x + glyph.x_offset * glyph.font_size - left,
+                    y: glyph.y - glyph.y_offset * glyph.font_size,
+                    advance: glyph.w,
+                    start: paragraph_start + glyph.start,
+                })
+                .collect(),
+            false => Box::default(),
+        };
+        shaped.push(ShapedLine {
+            rtl: run.rtl,
+            width: run.line_w,
+            baseline: run.line_y - run.line_top,
+            glyphs: placed,
+        });
     }
 
     ShapeResult {
@@ -536,6 +641,7 @@ fn shape(font_system: &mut FontSystem, primary_family: &str, request: &ShapeRequ
         height: lines.len() as f32 * metrics.line_height,
         lines: lines.into(),
         line_ranges: line_ranges.into(),
+        shaped: shaped.into(),
     }
 }
 
@@ -568,13 +674,10 @@ fn rich_spans<'t, 'a>(text: &'t str, runs: &[FontRun], base: &Attrs<'a>) -> Vec<
     spans
 }
 
-/// The faces femtovg loads, in chain order (ADR-0043 decision 2, ADR-0104): the primary family's
-/// regular face and whichever bold, italic and bold-italic faces the database holds for it, then
-/// face 0 of every other file, one entry per file. `fonts::resolve_chain` is what puts the primary
-/// family's variant files in the database in the first place; a family shipped as one `.ttc`
-/// (Inter's holds 36 faces) has them all already, and this is what reaches past index 0 to find
-/// them. Fallback files still contribute only their first face: nothing selects a weight in CJK or
-/// emoji coverage, and a `Noto Sans CJK` bold is another 16MB mapping for no visible glyph.
+/// Every face in the database, for femtovg to load (ADR-0211). Paint draws the faces cosmic-text
+/// chose, and cosmic-text may choose any face the database holds -- a collection's second face, a
+/// bold, a named family's -- so the painter is handed all of them. The database holds only the
+/// chain's files and the families nodes named, so this maps no file nothing asked for.
 ///
 /// Maps rather than reads, the entire memory story here: `Noto Color Emoji` is an 11MB CBDT bitmap
 /// font, and the `data.to_vec()` this replaces held it three times over (worker `Vec<Vec<u8>>`,
@@ -591,102 +694,16 @@ fn rich_spans<'t, 'a>(text: &'t str, runs: &[FontRun], base: &Attrs<'a>) -> Vec<
 /// A face whose mapping cannot be established is skipped rather than fatal, matching
 /// `resolve_chain`'s own treatment of an entry it can't honor: losing the emoji font is a missing
 /// glyph, not a dead shell.
-fn font_chain_data(
-    db: &mut fontdb::Database,
-    primary_family: &str,
-    families: &HashMap<Arc<str>, Option<String>>,
-) -> Vec<FontFace> {
-    struct Candidate {
-        id: fontdb::ID,
-        path: Option<PathBuf>,
-        families: Vec<String>,
-        weight: u16,
-        italic: bool,
-    }
+fn font_chain_data(db: &mut fontdb::Database) -> Vec<FontFace> {
     // Collected first: `make_shared_face_data` needs `&mut db`, so nothing may be borrowing it.
-    let faces: Vec<Candidate> = db
-        .faces()
-        .map(|face| Candidate {
-            id: face.id,
-            path: match &face.source {
-                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path.clone()),
-                fontdb::Source::Binary(_) => None,
-            },
-            families: face.families.iter().map(|(family, _)| family.clone()).collect(),
-            weight: face.weight.0,
-            italic: face.style != fontdb::Style::Normal,
-        })
-        .collect();
-    let carries = |face: &Candidate, wanted: &str| face.families.iter().any(|f| f.eq_ignore_ascii_case(wanted));
-
-    // Every chain that leads, in emission order: the declared family, then each family a node
-    // named. Resolution runs name -> faces, never face -> name: two names can resolve to one
-    // family (`"monospace"` beside the literal family it expands to), and a face cannot say which
-    // of them it belongs to. Both get their own entries, and `text::atlas`'s registration map
-    // makes the shared file cost one hash lookup rather than a second parse.
-    //
-    // Sorted, because `families` is a `HashMap`: unordered iteration would vary the face list
-    // between runs, and the painter's chains with it.
-    let mut named: Vec<(&Arc<str>, &String)> =
-        families.iter().filter_map(|(asked, resolved)| resolved.as_ref().map(|hit| (asked, hit))).collect();
-    named.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    let leaders: Vec<(FaceRole, &str)> = std::iter::once((FaceRole::Declared, primary_family))
-        .chain(named.into_iter().map(|(asked, resolved)| (FaceRole::Named(Arc::clone(asked)), resolved.as_str())))
-        .collect();
-
-    // Each leading family's face for each of the four variants: the right slant, then the weight
-    // nearest the one asked for (ADR-0104). A variant the family does not ship resolves to the same
-    // face as one it does (usually the regular) and is dropped as a duplicate -- the painter falls
-    // back to that family's regular chain for a variant it was not given.
-    let mut emit: Vec<(FaceRole, fontdb::ID, bool, bool)> = Vec::new();
-    for (role, resolved) in &leaders {
-        let mut taken: Vec<fontdb::ID> = Vec::new();
-        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
-            let target_weight: u16 = if bold { 700 } else { 400 };
-            let of_family = || faces.iter().filter(|face| carries(face, resolved));
-            let best = of_family()
-                .filter(|face| face.italic == italic)
-                .min_by_key(|face| face.weight.abs_diff(target_weight))
-                .or_else(|| of_family().min_by_key(|face| face.weight.abs_diff(target_weight)));
-            if let Some(best) = best
-                && !taken.contains(&best.id)
-            {
-                taken.push(best.id);
-                emit.push((role.clone(), best.id, bold, italic));
-            }
-        }
-    }
-
-    // Then coverage: the first face of each file no leading family already claimed. One entry per
-    // file, as it always was -- nothing selects a weight in CJK or emoji coverage, and a
-    // `Noto Sans CJK` bold is another 16MB mapping for no visible glyph.
-    let mut seen_paths: HashSet<&PathBuf> = emit
-        .iter()
-        .filter_map(|(_, id, _, _)| faces.iter().find(|face| face.id == *id).and_then(|face| face.path.as_ref()))
-        .collect();
-    for face in &faces {
-        if emit.iter().any(|(_, id, _, _)| *id == face.id) {
-            continue;
-        }
-        if let Some(path) = &face.path
-            && !seen_paths.insert(path)
-        {
-            continue;
-        }
-        emit.push((FaceRole::Fallback, face.id, false, false));
-    }
-
-    // Emission order is the painter's order -- the declared family regular first, its variants,
-    // then each named family, then coverage -- so no sort follows.
-    let mut data = Vec::with_capacity(emit.len());
-    for (role, id, bold, italic) in emit {
+    let ids: Vec<fontdb::ID> = db.faces().map(|face| face.id).collect();
+    let mut data = Vec::with_capacity(ids.len());
+    for id in ids {
         // SAFETY: mapping a font file the process does not own, as the doc comment above spells
         // out. A rewrite in place changes the bytes under the mapping. Same bargain cosmic-text
         // already makes for every font it renders.
         match unsafe { db.make_shared_face_data(id) } {
-            Some((bytes, face_index)) => {
-                data.push(FontFace { data: FontData(bytes), index: face_index, role, bold, italic })
-            }
+            Some((bytes, index)) => data.push(FontFace { data: FontData(bytes), index, id }),
             None => eprintln!("font chain: face {id:?} could not be mapped, skipped"),
         }
     }
@@ -741,89 +758,17 @@ mod tests {
         (fonts::family_installed(declared) && fonts::family_installed(named)).then_some((declared, named))
     }
 
-    /// The named family's face has to be tagged, in the one list femtovg is handed, under the name
-    /// the node wrote -- the painter keys on that, not on what fontconfig resolved.
+    /// A family a node names joins the faces femtovg is handed, so glyphs shaped in it can be
+    /// drawn (ADR-0211).
     #[test]
-    fn a_family_named_by_a_node_is_tagged_apart_from_the_declared_one() {
+    fn a_family_named_by_a_node_joins_the_faces_the_painter_is_handed() {
         let Some((declared, named)) = two_families() else {
             eprintln!("skip: need two installed families to tell apart");
             return;
         };
         let handle = ShapingHandle::spawn();
         handle.set_chain(&[declared.to_string()]);
-        // Nothing is loaded for a family until a node asks for it.
-        assert!(
-            handle.font_chain_data().iter().all(|face| !matches!(face.role, FaceRole::Named(_))),
-            "a family nobody named must not be loaded"
-        );
-
-        handle.shape(req_in("hello", 20.0, Some(named)));
-        let faces = handle.font_chain_data();
-        assert!(
-            faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
-            "the named family should now lead a chain of its own"
-        );
-        assert!(
-            matches!(faces[0].role, FaceRole::Declared) && !faces[0].bold && !faces[0].italic,
-            "the declared regular still leads the list"
-        );
-        // Declared faces first, then named, then fallbacks -- the order the painter relies on.
-        let named_at = faces.iter().position(|face| matches!(face.role, FaceRole::Named(_))).unwrap();
-        assert!(
-            faces[..named_at].iter().all(|face| matches!(face.role, FaceRole::Declared)),
-            "nothing but declared faces may precede a named one"
-        );
-    }
-
-    /// Two names for one family: `fc-match` resolves a generic alias to a real family, so a config
-    /// can reach one file under two names. Both must get a chain. Before this was resolved
-    /// name-to-faces, a face guessed which of them it belonged to by scanning a `HashMap`, so one
-    /// name won at random and the other silently drew in the declared family.
-    #[test]
-    fn two_names_that_resolve_to_one_family_each_get_their_own_chain() {
-        let Some((declared, named)) = two_families() else {
-            eprintln!("skip: need two installed families to tell apart");
-            return;
-        };
-        let handle = ShapingHandle::spawn();
-        handle.set_chain(&[declared.to_string()]);
-        // The literal family and whatever generic alias resolves to it, if this machine has one.
-        handle.ensure_family(&Arc::from(named));
-        handle.ensure_family(&Arc::from("monospace"));
-
-        let faces = handle.font_chain_data();
-        for asked in [named, "monospace"] {
-            let hit = faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(asked)));
-            // "monospace" may resolve to a family this machine does not have; only assert the
-            // literal name unconditionally.
-            if asked == named {
-                assert!(hit, "{asked:?} must lead a chain of its own");
-            }
-        }
-        // Whatever both resolved to, neither may have been dropped in favour of the other.
-        assert!(
-            faces.iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
-            "the literal family name must survive alongside any alias for it"
-        );
-    }
-
-    /// The face list feeds the painter's chains, so an unordered `HashMap` walk would reshuffle
-    /// them between runs of the same config.
-    #[test]
-    fn the_face_list_is_the_same_on_every_build_for_the_same_families() {
-        let Some((declared, named)) = two_families() else {
-            eprintln!("skip: need two installed families to tell apart");
-            return;
-        };
-        let handle = ShapingHandle::spawn();
-        handle.set_chain(&[declared.to_string()]);
-        for asked in [named, "monospace", "serif", "cursive"] {
-            handle.ensure_family(&Arc::from(asked));
-        }
-        let roles = |faces: Vec<FontFace>| faces.into_iter().map(|face| face.role).collect::<Vec<_>>();
-        let first = roles(handle.font_chain_data());
-        assert_eq!(first, roles(handle.font_chain_data()), "the order must not depend on hash iteration");
-        assert!(matches!(first[0], FaceRole::Declared), "and the declared regular still leads");
+        assert!(named_face_is_handed(&handle, named));
     }
 
     /// The hole `ensure_family` exists for: a node whose box is fully specified is never measured,
@@ -841,11 +786,15 @@ mod tests {
         handle.ensure_family(&Arc::from(named));
 
         assert!(handle.font_generation() > before, "the painter has to hear about the face");
-        assert!(
-            handle.font_chain_data().iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
-            "and the face has to be in the list femtovg is handed"
-        );
         assert_eq!(handle.cached_len(), 0, "resolving a family measures nothing");
+        assert!(named_face_is_handed(&handle, named), "and the face has to be in the list femtovg is handed");
+    }
+
+    /// Whether `named` shapes in a face of its own, and that face is one femtovg is handed.
+    fn named_face_is_handed(handle: &ShapingHandle, named: &str) -> bool {
+        let face = |family| handle.shape_glyphs(req_in("hello", 20.0, family)).shaped[0].glyphs[0].face;
+        let named_face = face(Some(named));
+        named_face != face(None) && handle.font_chain_data().iter().any(|candidate| candidate.id == named_face)
     }
 
     /// The client-side memo must not outlive the database its families resolved against, or a
@@ -866,7 +815,7 @@ mod tests {
 
         assert!(handle.font_generation() > after_reset, "the family must be loaded into the new database");
         assert!(
-            handle.font_chain_data().iter().any(|face| face.role == FaceRole::Named(Arc::from(named))),
+            named_face_is_handed(&handle, named),
             "or a node naming it would paint in the declared chain after a chain change"
         );
     }
@@ -948,13 +897,19 @@ mod tests {
         let handle = ShapingHandle::spawn();
         handle.set_chain(&[declared.to_string()]);
         handle.shape(req_in("hello", 20.0, Some(named)));
-        assert!(handle.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Named(_))));
+        assert!(named_face_is_handed(&handle, named));
 
         handle.set_chain(&[named.to_string()]);
-        assert!(
-            handle.font_chain_data().iter().all(|face| !matches!(face.role, FaceRole::Named(_))),
-            "the new database holds no family the old one had resolved"
-        );
+        // Face ids restart with a new database, so compare against a chain that never knew the old
+        // family rather than against the old ids.
+        let fresh = ShapingHandle::spawn();
+        fresh.set_chain(&[named.to_string()]);
+        let sizes = |handle: &ShapingHandle| {
+            let mut sizes: Vec<usize> = handle.font_chain_data().iter().map(|face| face.data.as_ref().len()).collect();
+            sizes.sort_unstable();
+            sizes
+        };
+        assert_eq!(sizes(&handle), sizes(&fresh), "the new database holds no family the old one had resolved");
     }
 
     /// An installed family other than `primary`, so a declared chain has something to move to.
@@ -979,8 +934,8 @@ mod tests {
     }
 
     /// `font_chain_data` is what `TextPainter::new` loads into femtovg, so a `set_chain` that moved
-    /// the measuring side and not this one would reproduce the exact defect this module's doc
-    /// records: text measured against one font and painted with another.
+    /// the measuring side and not this one would measure text against one font and paint it with
+    /// another (ADR-0043 decision 2).
     #[test]
     fn a_declared_chain_reaches_the_faces_femtovg_paints_with_too() {
         let handle = ShapingHandle::spawn();
@@ -991,51 +946,67 @@ mod tests {
         let before: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
         handle.set_chain(&[wanted]);
         let after: Vec<usize> = handle.font_chain_data().iter().map(|data| data.data.as_ref().len()).collect();
-        // One family, but up to four faces of it: the regular and whichever of bold, italic and
-        // bold italic fontconfig found for it (ADR-0104). Every one of them is the primary's.
-        assert!(
-            !after.is_empty() && after.len() <= 4,
-            "a one-family chain loads that family's faces, got {}",
-            after.len()
-        );
-        assert!(
-            handle.font_chain_data().iter().all(|face| matches!(face.role, FaceRole::Declared)),
-            "and nothing but that family"
-        );
+        assert!(!after.is_empty(), "a one-family chain loads that family's faces");
         assert_ne!(after, before, "the bytes femtovg would load must be the new font's, not the old chain's");
         assert!(after[0] > 0, "and they are real bytes, not an empty mapping");
     }
 
     // ---- styled runs (ADR-0104) ----
 
-    /// The chain's first face is the regular one, whatever else the family ships, since that is
-    /// what a plain `text` paints with and what a missing variant falls back to.
+    /// Paint draws the faces cosmic-text chose, so every face a shape names has to be one the
+    /// painter is handed: the regular, a bold run's, and coverage like emoji (ADR-0211).
     #[test]
-    fn the_chain_leads_with_the_primary_familys_regular_face() {
+    fn every_face_a_shape_names_is_one_the_painter_is_handed() {
         let handle = ShapingHandle::spawn();
-        let faces = handle.font_chain_data();
-        assert!(
-            matches!(faces[0].role, FaceRole::Declared) && !faces[0].bold && !faces[0].italic,
-            "first face must be the primary regular"
-        );
-        assert_eq!(
-            faces.iter().filter(|face| matches!(face.role, FaceRole::Declared) && !face.bold && !face.italic).count(),
-            1
-        );
+        let faces: Vec<fontdb::ID> = handle.font_chain_data().iter().map(|face| face.id).collect();
+        let text = "Obelisk 🙏 شكرا";
+        let bold = ShapeRequest { runs: vec![FontRun { range: 0..7, bold: true, italic: false }], ..req(text, 20.0) };
+        for shaped in [handle.shape_glyphs(req(text, 20.0)), handle.shape_glyphs(bold)] {
+            for glyph in shaped.shaped.iter().flat_map(|line| line.glyphs.iter()) {
+                assert!(faces.contains(&glyph.face), "{glyph:?} names a face femtovg is never given");
+            }
+        }
+    }
+
+    /// A right-to-left paragraph says so, and lays the letter it starts with out rightmost.
+    #[test]
+    fn a_right_to_left_line_reports_its_direction_and_starts_at_the_right() {
+        let handle = ShapingHandle::spawn();
+        let shaped = handle.shape_glyphs(req("اول one", 20.0));
+        let line = &shaped.shaped[0];
+        assert!(line.rtl, "an Arabic first letter makes the paragraph right to left");
+        let first = line.glyphs.iter().find(|glyph| glyph.start == 0).expect("a glyph for the first letter");
+        assert!(line.glyphs.iter().all(|glyph| glyph.x <= first.x), "and that letter is drawn rightmost");
+        assert!(!handle.shape(req("one اول", 20.0)).shaped[0].rtl);
+    }
+
+    /// ADR-0211: femtovg dropped `خامس`'s last letter and overlapped glyphs at a direction change.
+    #[test]
+    fn a_mixed_direction_line_has_a_glyph_per_letter_and_none_overlap() {
+        let handle = ShapingHandle::spawn();
+        let text = "ثالث three خامس four";
+        let mut glyphs = handle.shape_glyphs(req(text, 20.0)).shaped[0].glyphs.to_vec();
+        for (start, _) in text.char_indices() {
+            assert!(glyphs.iter().any(|glyph| glyph.start == start), "no glyph for byte {start} of {text:?}");
+        }
+        glyphs.sort_by(|a, b| a.x.total_cmp(&b.x));
+        for pair in glyphs.windows(2) {
+            assert!(pair[0].x + pair[0].advance <= pair[1].x + 0.01, "{:?} overlaps {:?}", pair[0], pair[1]);
+        }
     }
 
     #[test]
     fn a_bold_run_measures_wider_than_the_same_text_regular() {
         let handle = ShapingHandle::spawn();
-        if !handle.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Declared) && face.bold) {
-            eprintln!("skip: the default chain's family has no bold face installed");
-            return;
-        }
-        let plain = handle.shape(req("Obelisk Shell Renderer", 20.0));
-        let bold = handle.shape(ShapeRequest {
+        let plain = handle.shape_glyphs(req("Obelisk Shell Renderer", 20.0));
+        let bold = handle.shape_glyphs(ShapeRequest {
             runs: vec![FontRun { range: 0..21, bold: true, italic: false }],
             ..req("Obelisk Shell Renderer", 20.0)
         });
+        if bold.shaped[0].glyphs[0].face == plain.shaped[0].glyphs[0].face {
+            eprintln!("skip: the default chain's family has no bold face installed");
+            return;
+        }
         assert!(bold.width > plain.width, "bold {} should be wider than regular {}", bold.width, plain.width);
     }
 
@@ -1318,8 +1289,8 @@ mod tests {
             runs: Vec::new(),
             font: None,
         };
-        let proportional = shape(&mut font_system, "Noto Sans", &request);
-        let monospace = shape(&mut font_system, "Noto Sans Mono", &request);
+        let proportional = shape(&mut font_system, "Noto Sans", &request, false);
+        let monospace = shape(&mut font_system, "Noto Sans Mono", &request, false);
 
         // Near-equal widths would mean the family argument did nothing; 10% clears rounding noise.
         let diff = (proportional.width - monospace.width).abs();

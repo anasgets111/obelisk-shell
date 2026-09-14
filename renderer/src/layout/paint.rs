@@ -408,7 +408,7 @@ fn run(painter: &mut TextPainter, walk: &mut Walk<'_, '_>, commands: &[DrawCmd],
                         text: content,
                         runs,
                         font_size: *font_size,
-                        font: font.as_deref(),
+                        font: font.as_ref(),
                         color: *color,
                         align: *align,
                     },
@@ -629,13 +629,6 @@ fn draw_for(
         // `wrap` and `max_lines` are absent on purpose: `Scene::apply` already rewrote `content` to
         // the string that fits -- ellipsized, or line-broken with `\n` -- in the only place the box
         // width and the shaping worker are both in reach.
-        //
-        // ponytail: a `Content`-sized `text` box comes from cosmic-text's measurement
-        // (`layout::scene`'s measure callback), so if femtovg ever renders wider than cosmic-text
-        // measured, this draw's clip shaves the overrun off the right edge. Verified on the current
-        // chain (single-face Noto Sans): `measure_text` agreed with cosmic-text's `shape()` to
-        // within 0.0001px on a 53-character, 32px string, last lit pixel 3-4 physical pixels inside
-        // the measured edge. No shaving observed today, but the clip is the safe direction.
         PaintStyle::Text { content, runs, font_size, font, color, align, elide: _, wrap: _, max_lines: _ } => {
             Some(Draw::Text {
                 content: content.clone(),
@@ -1007,7 +1000,7 @@ mod tests {
     use crate::layout::scene::{LogicalSize, Scene};
     use crate::lua::nodes::{deserialize_lua_table, register_node_constructors};
     use crate::lua::signal;
-    use crate::text::shaping::{FaceRole, ShapeRequest, ShapingHandle};
+    use crate::text::shaping::{ShapeRequest, ShapingHandle};
 
     const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
 
@@ -1098,22 +1091,19 @@ mod tests {
         Some(instance)
     }
 
-    /// Builds a `TextPainter` against `instance`'s already-current context -- same
-    /// `font_chain_data` source `paint_surface` uses, so this harness draws with the exact
-    /// declared font chain cosmic-text shaped against (ADR-0043 decision 2).
+    /// Builds a `TextPainter` against `instance`'s already-current context, from the same
+    /// `font_chain_data` `paint_surface` registers (ADR-0211).
     fn text_painter(
         instance: &egl::Instance<egl::Static>,
         shaping: &ShapingHandle,
         width: u32,
         height: u32,
     ) -> Option<TextPainter> {
-        let font_chain = shaping.font_chain_data();
         TextPainter::new(
             |s| instance.get_proc_address(s).map_or(std::ptr::null(), |f| f as *const c_void),
             width,
             height,
-            &font_chain,
-            shaping.font_generation(),
+            shaping.clone(),
         )
         .map_err(|e| eprintln!("EGL init failed, skip: FemtoVG init: {e}"))
         .ok()
@@ -2249,117 +2239,27 @@ mod tests {
         assert_eq!(pixel_at(painter.canvas_mut(), 9, 30), (255, 0, 0, 255));
     }
 
-    /// The regression test for ADR-0043 decision 2:
-    /// measurement (`ShapingHandle::shape`, cosmic-text) and paint (`TextPainter`, femtovg) must
-    /// resolve the same font, or a `text` node's laid-out box and its painted glyphs disagree.
-    /// Measured live on the dev machine before this fix: cosmic-text measured under
-    /// `Family::SansSerif` while paint's own separate `fontdb` query missed that alias and fell
-    /// back to the first face in scan order (Adwaita Mono) -- a `text` node's box came out
-    /// roughly 30% narrower than the glyphs drawn into it.
-    ///
-    /// Both sides now measure/paint the exact same declared chain
-    /// (`ShapingHandle::font_chain_data`), so this compares cosmic-text's `shape()` against
-    /// femtovg's own `measure_text` for the identical string at the identical size and asserts
-    /// they land within 2% -- not exact equality, since the two shapers round glyph advances
-    /// slightly differently even reading the same font file.
-    ///
-    /// What this actually covers, stated plainly rather than implied: it catches paint and
-    /// measurement loading two *different font sets* -- confirmed real by temporarily having
-    /// `TextPainter` load `font_chain_data()[1..]` (dropping the chain's first entry) instead
-    /// of the full chain, which produced a 61.6% divergence and failed here as expected. It does
-    /// *not* catch `shape()` asking for the wrong family while both sides still load the *same*
-    /// set: today's default chain resolves to exactly one Latin-covering face (`Noto Sans CJK
-    /// JP` misses on every machine this has been run on), so cosmic-text's own per-run fallback
-    /// converges on that one face regardless of which family `shape()` names -- confirmed by
-    /// temporarily reverting `shape()` to bare `Attrs::new()`, which left this test green.
-    /// `text::shaping::tests::shape_measures_under_the_family_it_is_given` is what covers that
-    /// second case: it holds one `FontSystem` fixed over a database with two distinct Latin
-    /// faces and varies only the family argument `shape()` is given.
-    #[test]
-    fn femtovg_and_cosmic_text_measure_the_same_string_to_the_same_width() {
-        let Some(instance) = init_headless_egl(400, 60) else { return };
-        let shaping = ShapingHandle::spawn();
-        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
-
-        const TEXT: &str = "Obelisk Shell Renderer";
-        const FONT_SIZE: f32 = 24.0;
-
-        let shaped = shaping.shape(ShapeRequest {
-            text: TEXT.into(),
-            font_size: FONT_SIZE,
-            line_height: crate::text::shaping::line_height(FONT_SIZE),
-            max_width: None,
-            runs: Vec::new(),
-            font: None,
-        });
-
-        let mut paint = Paint::color(Color::black());
-        paint.set_font(painter.fonts());
-        paint.set_font_size(FONT_SIZE);
-        let metrics = painter
-            .canvas_mut()
-            .measure_text(0.0, 0.0, TEXT, &paint)
-            .expect("measure_text should succeed with the chain fonts loaded");
-        let femtovg_width = metrics.width();
-
-        let tolerance = shaped.width.max(femtovg_width) * 0.02;
-        let diff = (shaped.width - femtovg_width).abs();
-        assert!(
-            diff <= tolerance,
-            "cosmic-text measured {} but femtovg measured {} for the same string at the same size -- \
-             a {:.1}% divergence, over the 2% tolerance, meaning the two are not resolving the same font",
-            shaped.width,
-            femtovg_width,
-            (diff / shaped.width.max(femtovg_width)) * 100.0
-        );
+    /// The face the first glyph of "hello" is shaped in: in `family`, or the declared chain.
+    fn first_face(shaping: &ShapingHandle, family: Option<&str>) -> fontdb::ID {
+        shaping
+            .shape_glyphs(ShapeRequest {
+                text: "hello".into(),
+                font_size: 20.0,
+                line_height: crate::text::shaping::line_height(20.0),
+                max_width: None,
+                runs: Vec::new(),
+                font: family.map(std::sync::Arc::from),
+            })
+            .shaped[0]
+            .glyphs[0]
+            .face
     }
 
-    /// The same agreement for a bold run (ADR-0104): cosmic-text shaping the run in the family's
-    /// bold face and femtovg painting it from the bold variant chain have to land on one width, or
-    /// a styled line's pieces drift apart from the box they were measured into.
+    /// A family first named after the painter was built reaches femtovg through `sync`, and every
+    /// sync keeps the ids it already minted: `add_shared_font_with_index` never dedups, so
+    /// re-adding a face would strand its old `Font` and change its id.
     #[test]
-    fn femtovg_and_cosmic_text_agree_on_a_bold_runs_width() {
-        let Some(instance) = init_headless_egl(400, 60) else { return };
-        let shaping = ShapingHandle::spawn();
-        if !shaping.font_chain_data().iter().any(|face| matches!(face.role, FaceRole::Declared) && face.bold) {
-            eprintln!("skip: the chain's family has no bold face installed");
-            return;
-        }
-        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
-        assert_ne!(
-            painter.variant_fonts(true, false)[0],
-            painter.fonts()[0],
-            "the bold chain must lead with a face of its own"
-        );
-
-        const TEXT: &str = "Obelisk Shell Renderer";
-        const FONT_SIZE: f32 = 24.0;
-        let shaped = shaping.shape(ShapeRequest {
-            text: TEXT.into(),
-            font_size: FONT_SIZE,
-            line_height: crate::text::shaping::line_height(FONT_SIZE),
-            max_width: None,
-            runs: vec![crate::text::shaping::FontRun { range: 0..TEXT.len(), bold: true, italic: false }],
-            font: None,
-        });
-        let mut paint = Paint::color(Color::black());
-        paint.set_font(painter.variant_fonts(true, false));
-        paint.set_font_size(FONT_SIZE);
-        let femtovg_width = painter.canvas_mut().measure_text(0.0, 0.0, TEXT, &paint).unwrap().width();
-        let diff = (shaped.width - femtovg_width).abs();
-        assert!(
-            diff <= shaped.width.max(femtovg_width) * 0.02,
-            "cosmic-text measured the bold run at {} but femtovg at {}",
-            shaped.width,
-            femtovg_width
-        );
-    }
-
-    /// The whole runtime path in one test: a family named for the first time is resolved on the
-    /// shaping worker, and `sync` has to get those faces into femtovg -- otherwise the node
-    /// measures in one family and paints in another, the divergence ADR-0043 decision 2 closed.
-    #[test]
-    fn a_family_named_after_the_painter_was_built_reaches_femtovg_through_sync() {
+    fn a_family_named_later_reaches_femtovg_through_sync_and_held_faces_keep_their_ids() {
         let Some(instance) = init_headless_egl(400, 60) else { return };
         let (declared, named) = ("Noto Sans", "Noto Sans Mono");
         if !crate::text::fonts::fc_match_available()
@@ -2372,76 +2272,74 @@ mod tests {
         let shaping = ShapingHandle::spawn();
         shaping.set_chain(&[declared.to_string()]);
         let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
-        assert_eq!(painter.named_fonts(named), None, "nothing is registered for a family nobody named");
+        let declared_face = first_face(&shaping, None);
+        let declared_id = painter.font_id(declared_face);
+        assert!(declared_id.is_some(), "the declared face is registered from the start");
 
         // What a text node does: measure first, which is what resolves the family.
-        shaping.shape(ShapeRequest {
-            text: "hello".into(),
-            font_size: 20.0,
-            line_height: crate::text::shaping::line_height(20.0),
-            max_width: None,
-            runs: Vec::new(),
-            font: Some(std::sync::Arc::from(named)),
-        });
-        let generation = shaping.font_generation();
-        assert_ne!(generation, painter.font_generation(), "the painter should now be behind");
+        let named_face = first_face(&shaping, Some(named));
+        assert_eq!(painter.font_id(named_face), None, "the painter was built before the family loaded");
+        assert_ne!(shaping.font_generation(), painter.font_generation(), "the painter should now be behind");
+        painter.sync();
+        let named_id = painter.font_id(named_face);
+        assert!(named_id.is_some(), "the named family's face should now be drawable");
+        assert_eq!(painter.font_generation(), shaping.font_generation());
+        assert_eq!(painter.font_id(declared_face), declared_id);
 
-        painter.sync(&shaping.font_chain_data(), generation);
-        let chain = painter.named_fonts(named).expect("the named family should lead a chain of its own");
-        assert_ne!(chain[0], painter.fonts()[0], "and that chain leads with a face of its own");
-        assert_eq!(painter.font_generation(), generation);
+        shaping.ensure_family(&std::sync::Arc::from("ZZ No Such Family 9184"));
+        assert_ne!(shaping.font_generation(), painter.font_generation(), "the second sync must not be a no-op");
+        painter.sync();
+        assert_eq!(painter.font_id(declared_face), declared_id);
+        assert_eq!(painter.font_id(named_face), named_id);
     }
 
-    /// femtovg's `add_shared_font_with_index` is a `SlotMap::insert`: it mints a new `FontId` every
-    /// call and never dedups by bytes. A `sync` that re-registered the whole list would re-parse
-    /// every face, strand the previous `Font` entries for the life of the surface, and hand back
-    /// different ids each time -- so the declared chain's ids must survive a sync untouched.
+    /// A name nothing on the system answers shapes in the declared chain, whose faces the painter
+    /// holds -- a typo draws the text in the wrong face, never as nothing.
     #[test]
-    fn syncing_a_new_family_does_not_re_register_the_faces_femtovg_already_holds() {
+    fn a_family_nothing_answers_shapes_in_a_face_the_painter_holds() {
         let Some(instance) = init_headless_egl(400, 60) else { return };
-        let (declared, named) = ("Noto Sans", "Noto Sans Mono");
-        if !crate::text::fonts::fc_match_available()
-            || !crate::text::fonts::family_installed(declared)
-            || !crate::text::fonts::family_installed(named)
-        {
-            eprintln!("skip: need two installed families to tell apart");
+        let shaping = ShapingHandle::spawn();
+        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
+        let face = first_face(&shaping, Some("ZZ No Such Family 9184"));
+        painter.sync();
+        assert!(painter.font_id(face).is_some());
+    }
+
+    /// A variable family ships bold as one file's `wght` axis: cosmic-text shapes a bold run at 700,
+    /// so paint must draw that instance, not the file's default, or bold spacing holds regular ink.
+    #[test]
+    fn a_bold_run_in_a_variable_family_draws_the_bold_instance() {
+        let Some(instance) = init_headless_egl(240, 40) else { return };
+        let family = "Inter Variable";
+        if !crate::text::fonts::fc_match_available() || !crate::text::fonts::family_installed(family) {
+            eprintln!("skip: {family} is not installed");
             return;
         }
+        let lua = Lua::new();
         let shaping = ShapingHandle::spawn();
-        shaping.set_chain(&[declared.to_string()]);
-        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
-        let before: Vec<_> = painter.fonts().to_vec();
-
-        shaping.ensure_family(&std::sync::Arc::from(named));
-        painter.sync(&shaping.font_chain_data(), shaping.font_generation());
-
-        assert_eq!(painter.fonts(), &before[..], "the declared chain's ids must not be re-minted");
-
-        // And a second sync over the same faces mints nothing new either.
-        let after_first = painter.named_fonts(named).map(<[_]>::to_vec);
-        painter.sync(&shaping.font_chain_data(), painter.font_generation() + 1);
-        assert_eq!(painter.fonts(), &before[..]);
-        assert_eq!(painter.named_fonts(named).map(<[_]>::to_vec), after_first);
-    }
-
-    /// A name nothing on the system answers gets no chain, so `chain_for` hands the node the
-    /// declared one -- a typo draws the text in the wrong face, never as nothing.
-    #[test]
-    fn a_family_nothing_answers_gets_no_chain_of_its_own() {
-        let Some(instance) = init_headless_egl(400, 60) else { return };
-        let shaping = ShapingHandle::spawn();
-        let Some(mut painter) = text_painter(&instance, &shaping, 400, 60) else { return };
-        shaping.shape(ShapeRequest {
-            text: "hello".into(),
-            font_size: 20.0,
-            line_height: crate::text::shaping::line_height(20.0),
-            max_width: None,
-            runs: Vec::new(),
-            font: Some(std::sync::Arc::from("ZZ No Such Family 9184")),
-        });
-        painter.sync(&shaping.font_chain_data(), shaping.font_generation());
-        assert_eq!(painter.named_fonts("ZZ No Such Family 9184"), None);
-        assert!(!painter.fonts().is_empty(), "and the declared chain is still there to draw with");
+        shaping.ensure_family(&std::sync::Arc::from(family));
+        let Some(mut painter) = text_painter(&instance, &shaping, 240, 40) else { return };
+        let mut ink = |bold: bool| {
+            let root = resolved_surface(
+                &lua,
+                &format!(
+                    r##"return panel {{ id = "bar", width = 240, height = 40, background = "#000000FF", child = text {{
+                        font = "{family}", font_size = 24, foreground = "#FFFFFFFF",
+                        content = {{ {{ text = "Obelisk", bold = {bold} }} }} }} }}"##
+                ),
+                LogicalSize { width: 240.0, height: 40.0 },
+            );
+            paint_tree(&mut painter, &mut ImageCache::new(), &root, 1.0);
+            let mut sum = 0u32;
+            for y in 0..40 {
+                for x in 0..240 {
+                    sum += u32::from(pixel_at(painter.canvas_mut(), x, y).1);
+                }
+            }
+            sum as f32
+        };
+        let (regular, bold) = (ink(false), ink(true));
+        assert!(bold > regular * 1.2, "bold ink {bold} should clearly exceed regular ink {regular}");
     }
 
     /// A `text` node's content wider than the box layout gave it must stop at that box's edge, not

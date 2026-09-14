@@ -260,8 +260,8 @@ See [paint parsing](../renderer/src/layout/node/paint_style.rs).
 | `textfield` | `placeholder`, `font_size`, `foreground`, `text_align`, `autofocus`, `on_change`, `on_submit`, `on_cancel`, `on_navigate`, `secure_submit`, `mask_character` |
 
 `text.content` is a string or runs `{ text, bold?, italic?, underline?, color?, href? }`.
-`on_link(url)` handles activation. `text_align` is Start/Center/End; `elide` is None/End;
-`wrap` is None/Word. `max_lines = 0` is unlimited; wrapping needs a bounded width.
+`on_link(url)` handles activation. `text_align` is Start/Center/End; Start and End follow each
+line's reading direction. `elide` is None/End; `wrap` is None/Word. `max_lines = 0` is unlimited; wrapping needs a bounded width.
 Text size and icon size default to 12; `font_size` must be within [1, 8192], because the shaper
 refuses a zero line height. Text and icon content defaults can render empty before hydration.
 

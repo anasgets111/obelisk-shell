@@ -6,9 +6,9 @@
 use cursor_icon::CursorIcon;
 use mlua::Value;
 
-use crate::layout::node::{PaintStyle, StyleRun, TextAlign, apply_affine, invert_affine, segments};
+use crate::layout::node::{PaintStyle, apply_affine, font_runs, invert_affine};
 use crate::layout::scene::ResolvedNode;
-use crate::text::shaping::{self, FontRun, ShapeRequest, ShapingHandle};
+use crate::text::shaping::{self, ShapingHandle};
 use crate::text::snap::LogicalRect;
 
 /// A point in one surface's logical coordinates -- the space `wl_pointer`'s `position` already
@@ -52,11 +52,9 @@ pub fn hit_path(root: &ResolvedNode, point: LogicalPoint) -> Vec<&ResolvedNode> 
 /// plain text, past the end of a line, or below the last one (ADR-0106). `point` is in the node's
 /// own coordinates.
 ///
-/// The geometry is paint's, re-derived: `\n` splits the fitted content into lines a `line_height`
-/// apart, each line is cut into pieces at its run boundaries, and the pieces are laid left to right
-/// from the alignment's anchor. The widths come from the shaping worker rather than femtovg, which
-/// is what paint measures with; the two agree to within 2% (`layout::paint`'s divergence tests),
-/// which is well inside the slack a press on a word has.
+/// The geometry is paint's own: the rows [`ShapingHandle::shape_lines`] lays out, a `line_height`
+/// apart, under the same alignment (ADR-0211); the run under the pointer holds the byte its glyph
+/// came from.
 pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHandle) -> Option<String> {
     let Some(PaintStyle::Text { content, runs, font_size, font, align, .. }) = node.paint.as_ref() else {
         return None;
@@ -64,46 +62,17 @@ pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHan
     if runs.iter().all(|run| run.href.is_none()) || point.y < 0.0 {
         return None;
     }
-    let line_height = shaping::line_height(*font_size);
-    let line_index = (point.y / line_height) as usize;
-    let mut line_start = 0usize;
-    let line = content.split('\n').enumerate().find_map(|(index, line)| {
-        let start = line_start;
-        line_start += line.len() + 1;
-        (index == line_index).then_some(start..start + line.len())
-    })?;
-    let measured: Vec<(f32, Option<&StyleRun>)> = segments(line, runs)
-        .into_iter()
-        .map(|(range, run)| {
-            let rebased = run.filter(|run| run.bold || run.italic).map(|run| FontRun {
-                range: 0..range.len(),
-                bold: run.bold,
-                italic: run.italic,
-            });
-            let width = shaping
-                .shape(ShapeRequest {
-                    text: content[range].to_string(),
-                    font_size: *font_size,
-                    line_height,
-                    max_width: None,
-                    runs: rebased.into_iter().collect(),
-                    font: font.clone(),
-                })
-                .width;
-            (width, run)
-        })
-        .collect();
-    let total: f32 = measured.iter().map(|(width, _)| width).sum();
-    let mut x = match align {
-        TextAlign::Start => 0.0,
-        TextAlign::Center => (node.rect.width - total) / 2.0,
-        TextAlign::End => node.rect.width - total,
-    };
-    for (width, run) in measured {
-        if point.x >= x && point.x < x + width {
-            return run.and_then(|run| run.href.clone());
-        }
-        x += width;
+    let mut row = (point.y / shaping::line_height(*font_size)) as usize;
+    for (line_start, shaped) in shaping.shape_lines(content, &font_runs(runs), *font_size, font.as_ref()) {
+        let Some(laid) = shaped.shaped.get(row) else {
+            row -= shaped.shaped.len();
+            continue;
+        };
+        let left = align.line_left(laid.rtl, 0.0, node.rect.width, laid.width);
+        let glyph =
+            laid.glyphs.iter().find(|glyph| (left + glyph.x..left + glyph.x + glyph.advance).contains(&point.x))?;
+        let at = line_start + glyph.start;
+        return runs.iter().find(|run| run.range.contains(&at)).and_then(|run| run.href.clone());
     }
     None
 }
@@ -210,6 +179,8 @@ fn contains(rect: LogicalRect, point: LogicalPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::node::{StyleRun, TextAlign};
+    use crate::text::shaping::ShapeRequest;
     use std::collections::HashMap;
 
     fn node(kind: &str, (x, y, width, height): (f32, f32, f32, f32), children: Vec<ResolvedNode>) -> ResolvedNode {
@@ -415,6 +386,28 @@ mod tests {
             link_under(&node, LogicalPoint { x: 200.0 - w / 2.0, y: 5.0 }, &shaping),
             Some("https://c/".to_string())
         );
+    }
+
+    /// A link a right-to-left line opens with is found at the box's right edge under `Start`.
+    #[test]
+    fn a_right_to_left_line_starts_at_the_right_under_start() {
+        let shaping = ShapingHandle::spawn();
+        let node = styled_text("اول one", vec![link(0..6, "https://d/")], TextAlign::Start, 300.0);
+        assert_eq!(link_under(&node, LogicalPoint { x: 2.0, y: 5.0 }, &shaping), None, "the left of the box is empty");
+        assert_eq!(link_under(&node, LogicalPoint { x: 298.0, y: 5.0 }, &shaping), Some("https://d/".to_string()));
+    }
+
+    /// cosmic-text ends a line at a lone `\r` and at `\n\r`, and either opens one row, not two.
+    #[test]
+    fn a_link_after_a_carriage_return_is_found_on_the_row_below() {
+        let shaping = ShapingHandle::spawn();
+        let step = shaping::line_height(14.0);
+        for (text, range) in [("first\rsee this", 6..14), ("first\n\rsee this", 7..15)] {
+            let node = styled_text(text, vec![link(range, "https://e/")], TextAlign::Start, 300.0);
+            assert_eq!(link_under(&node, LogicalPoint { x: 4.0, y: step / 2.0 }, &shaping), None, "{text:?}");
+            let below = link_under(&node, LogicalPoint { x: 4.0, y: step * 1.5 }, &shaping);
+            assert_eq!(below, Some("https://e/".to_string()), "{text:?}");
+        }
     }
 
     #[test]

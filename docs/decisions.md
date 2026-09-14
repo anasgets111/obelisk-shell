@@ -235,6 +235,9 @@ Rejected for now: a hand-rolled 2048x2048 atlas using `create_image_empty`/`upda
 cosmic-text/swash bitmaps in an image-pattern fill. No scene-graph `Text` node exists to drive
 eviction; revisit when a `Text`/`Icon` node needs cross-surface sharing or working-set eviction.
 
+Amended by 0211: femtovg 0.27's public `fill_glyph_run` is that entry point, and paint now draws
+cosmic-text's glyphs through it.
+
 ## 0013. Polkit agent registration uses zbus_polkit for the Authority proxy, hand-writes the AuthenticationAgent side
 
 `supervisor/src/dbus/polkit.rs` uses `zbus_polkit` for the polkit `Authority` proxy and hand-writes
@@ -1867,6 +1870,9 @@ Config decides which affordance calls the action.
 Tests cover parser, wrap/elision ranges and shaping/paint width agreement; hyperlink activation was
 separate.
 
+Amended by 0211: paint draws cosmic-text's glyphs, so a styled run's face comes with its glyphs and
+no width agreement is left to test.
+
 ## 0105. The notification config pass: what the four Rust changes let the cards do
 
 Config-only use of ADR-0100 through ADR-0104.
@@ -1891,6 +1897,8 @@ X still dismisses; launcher overlap and animation remain unchanged.
 4. Release must match the armed href and paragraph rect.
 
 Keep URL buttons for links elided from the text.
+
+Amended by 0211: hit-testing reads the glyphs paint draws instead of re-measuring segments.
 
 ## 0107. The pointer takes a shape over what it is on: `cursor` on every node, a default in Rust
 
@@ -2445,6 +2453,9 @@ family falls back to the declared chain and reports once on stderr, as `fonts { 
 unanswered entry. Refuse an empty string, which reads as "no family named" with nothing to point at.
 A named family never covers the declared chain, while the declared family covers every named one, so
 text does not drift into an unrelated node's display font.
+
+Amended by 0211: paint draws the face cosmic-text chose, and its fallback searches every loaded
+family, so declared-chain text can draw a glyph from a named family's face, as measurement already did.
 
 ## 0145. `animate` is per-property tweening on the retained node, ticked by compositor frame callbacks, never by Lua
 
@@ -4703,3 +4714,41 @@ on PATH or in Zed's extensions, as `lua` already does without `luac`. A printed 
 `just check` and the pre-commit hook passed having checked no stub.
 
 Reject keeping the skip for want of CI: with no CI, `just check` is the only gate.
+
+## 0211. Paint draws cosmic-text's glyphs, and text alignment follows each line's reading direction
+
+`text::atlas::TextPainter` draws the glyphs cosmic-text placed, through femtovg 0.27's public
+`fill_glyph_run`, instead of handing femtovg the string to shape again with `fill_text`. femtovg
+still rasterizes and packs its own atlas.
+
+Two shapers disagreed on Arabic notifications. femtovg re-derived each drawn line's direction from
+its first strong letter, dropped a letter from CaskaydiaCove words whose final letter is two glyphs
+in one cluster (`خامس` drew as `امس`), and put a space on the wrong side of a direction change.
+cosmic-text's layout of the same strings was correct.
+
+1. `ShapeResult` carries a `ShapedLine` per line: its direction, baseline and glyphs, each naming
+   the `fontdb::ID` it was shaped in. femtovg registers every face in the database under that id,
+   mapping no new file; a face it refuses draws nothing. The painter's per-variant and
+   per-named-family chains (ADR-0104, ADR-0144) are deleted.
+2. Paint and `hit::link_under` shape each line alone through `ShapingHandle::shape_lines`. Lines
+   end where cosmic-text's `LineIter` ends them (`\r` and `\n\r` too), so paint draws the rows
+   measured.
+3. `Start` and `End` follow the line's reading direction, as CSS `start`/`end` and Qt's unset
+   alignment do: a right-to-left line starts at the right. `Center` is unchanged.
+4. A wrapped line shaped alone can disagree with its paragraph's direction. `wrapped_to_fit`
+   prefixes U+200F or U+200E when it does; cosmic-text gives the mark no advance.
+5. Only paint and link hit-testing keep glyphs (`ShapingHandle::shape_glyphs`), so measurements and
+   elide probes do not fill the shaping memo with them.
+6. A glyph carries the weight cosmic-text shaped it at, and paint hands `fill_glyph_run` the face's
+   normalized `wght` coordinates for it: a variable family's bold is one face at `wght` 700, and
+   with no coordinates it drew regular outlines at bold advances.
+
+The baseline is cosmic-text's, centred in the 1.2x line, where it was
+femtovg's ascender from the box top, so text moves by half the leading, and a row holding a taller
+fallback glyph moves its own baseline.
+
+Rejected: a per-script font key in `fonts {}`. CaskaydiaCove covers Arabic, so Arabic draws in it,
+as it does in Quickshell under the same family.
+
+Rejected: carrying glyphs from `Scene::apply` in `PaintStyle::Text`. A `textfield`'s content is
+built at display-list time, where the shaping worker is out of reach.

@@ -30,29 +30,6 @@ pub struct StyleRun {
     pub href: Option<String>,
 }
 
-/// Splits a line at style-run boundaries for painting and link hit-testing (ADR-0104, ADR-0106).
-/// Ranges are byte ranges into `line`; `None` marks a plain stretch.
-pub fn segments(line: Range<usize>, runs: &[StyleRun]) -> Vec<(Range<usize>, Option<&StyleRun>)> {
-    let mut pieces = Vec::new();
-    let mut cursor = line.start;
-    for run in runs {
-        let start = run.range.start.max(line.start);
-        let end = run.range.end.min(line.end);
-        if start >= end {
-            continue;
-        }
-        if start > cursor {
-            pieces.push((cursor..start, None));
-        }
-        pieces.push((start..end, Some(run)));
-        cursor = end;
-    }
-    if cursor < line.end || pieces.is_empty() {
-        pieces.push((cursor..line.end, None));
-    }
-    pieces
-}
-
 /// The bold/italic subset of `runs` in the form the shaper needs. Underline and colour do not
 /// change shaping, so contents differing only by underline or colour share a memo entry.
 pub fn font_runs(runs: &[StyleRun]) -> Vec<FontRun> {
@@ -231,6 +208,17 @@ pub enum TextAlign {
     Start,
     Center,
     End,
+}
+
+impl TextAlign {
+    /// The x a line `width` wide starts at in `x0..x1`; `Start` and `End` follow `rtl` (ADR-0211).
+    pub fn line_left(self, rtl: bool, x0: f32, x1: f32, width: f32) -> f32 {
+        match (self, rtl) {
+            (TextAlign::Center, _) => (x0 + x1 - width) / 2.0,
+            (TextAlign::Start, false) | (TextAlign::End, true) => x0,
+            (TextAlign::Start, true) | (TextAlign::End, false) => x1 - width,
+        }
+    }
 }
 
 /// `font`: the font family this node measures and paints in, as the config wrote it
@@ -474,6 +462,17 @@ mod tests {
     use super::*;
     use crate::lua::nodes::deserialize_lua_table;
 
+    /// `Start` and `End` are the line's own reading direction (ADR-0211); `Center` is either way, and
+    /// an odd-width box centres on its true half pixel.
+    #[test]
+    fn start_and_end_follow_a_lines_reading_direction() {
+        assert_eq!(TextAlign::Start.line_left(false, 10.0, 90.0, 20.0), 10.0);
+        assert_eq!(TextAlign::Start.line_left(true, 10.0, 90.0, 20.0), 70.0);
+        assert_eq!(TextAlign::End.line_left(false, 10.0, 90.0, 20.0), 70.0);
+        assert_eq!(TextAlign::End.line_left(true, 10.0, 90.0, 20.0), 10.0);
+        assert_eq!(TextAlign::Center.line_left(true, 0.0, 15.0, 6.0), 4.5);
+    }
+
     fn lua() -> mlua::Lua {
         mlua::Lua::new()
     }
@@ -590,48 +589,6 @@ mod tests {
         assert_eq!(runs[0].range, 4..8);
         let (_, none) = runs_content(&lua, r#"{ { text = "a", href = "" } }"#).unwrap();
         assert!(none.is_empty(), "an empty href is no href");
-    }
-
-    fn run(range: Range<usize>) -> StyleRun {
-        StyleRun { range, bold: true, italic: false, underline: false, color: None, href: None }
-    }
-
-    // ---- segments (ADR-0104) ----
-
-    #[test]
-    fn a_line_with_no_run_in_it_is_one_plain_piece() {
-        let pieces = segments(0..5, &[]);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].0, 0..5);
-        assert!(pieces[0].1.is_none());
-        // A run entirely on another line leaves this one plain too.
-        assert_eq!(segments(0..5, &[run(6..9)]).len(), 1);
-    }
-
-    #[test]
-    fn a_run_inside_a_line_splits_it_into_plain_styled_plain() {
-        let runs = [run(2..4)];
-        let pieces: Vec<(Range<usize>, bool)> =
-            segments(0..6, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(pieces, vec![(0..2, false), (2..4, true), (4..6, false)]);
-    }
-
-    /// A wrap can break a run across lines: the second line's slice of it starts at the line, not
-    /// at the run, and a run ending exactly at a line's end leaves no empty plain tail.
-    #[test]
-    fn a_run_crossing_a_line_boundary_is_clipped_to_the_line_on_each_side() {
-        let runs = [run(3..9)];
-        let first: Vec<_> = segments(0..5, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(first, vec![(0..3, false), (3..5, true)]);
-        let second: Vec<_> = segments(6..10, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(second, vec![(6..9, true), (9..10, false)]);
-    }
-
-    #[test]
-    fn adjacent_runs_touch_with_no_plain_piece_between_them() {
-        let runs = [run(0..2), run(2..4)];
-        let pieces: Vec<_> = segments(0..4, &runs).into_iter().map(|(r, s)| (r, s.is_some())).collect();
-        assert_eq!(pieces, vec![(0..2, true), (2..4, true)]);
     }
 
     #[test]

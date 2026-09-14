@@ -8,8 +8,9 @@
 //! dirty flag; this is a plain, non-reactive list read once.
 //!
 //! **The declared chain, not the only font.** This is the fallback chain every node uses unless it
-//! names a family itself: `femtovg` and `cosmic-text` fall back through it per glyph, so CJK and
-//! emoji coverage sits behind a sans body face and the codepoint picks the face. A `text` node that
+//! names a family itself: cosmic-text picks each glyph's face, falling back through every loaded
+//! family, and femtovg draws that face (ADR-0211), so CJK and emoji coverage sits behind a sans
+//! body face and the codepoint picks the face. A `text` node that
 //! sets `font = "<family>"` leads with that family instead and keeps this chain behind it as
 //! coverage (ADR-0144); the family is resolved on first sight, through this module's own
 //! `fc-match` path, into the same database -- so there is still one font discovery, not two.

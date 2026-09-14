@@ -1801,11 +1801,13 @@ fn wrapped_to_fit<'s>(
         font: face.family.clone(),
     });
     let mut fitted = Fitted::new(content, runs);
+    let rtl = |index: usize| shaped.shaped.get(index).is_some_and(|line| line.rtl);
     let Some(cap) = max_lines.filter(|cap| *cap < shaped.line_ranges.len()) else {
         for (index, range) in shaped.line_ranges.iter().enumerate() {
             if index > 0 {
                 fitted.push_plain("\n");
             }
+            push_direction_mark(&mut fitted, &content[range.clone()], rtl(index));
             fitted.push_source(range.clone());
         }
         return fitted;
@@ -1813,7 +1815,8 @@ fn wrapped_to_fit<'s>(
 
     // `cap` is at least 1: `parse_max_lines` maps 0 to no cap at all, so a `Some` cap standing
     // below a nonzero line count always leaves a line to rewrite.
-    for range in &shaped.line_ranges[..cap - 1] {
+    for (index, range) in shaped.line_ranges[..cap - 1].iter().enumerate() {
+        push_direction_mark(&mut fitted, &content[range.clone()], rtl(index));
         fitted.push_source(range.clone());
         fitted.push_plain("\n");
     }
@@ -1821,12 +1824,21 @@ fn wrapped_to_fit<'s>(
     if elide == node::Elide::End {
         let rest = last.start..shaped.line_ranges.last().map_or(last.end, |range| range.end);
         let cut = elide_cut(content, runs, rest.clone(), face, content_width, shaping);
+        push_direction_mark(&mut fitted, &content[rest.start..cut].replace('\n', " "), rtl(cap - 1));
         fitted.push_source_flattened(rest.start..cut, true);
         fitted.push_ellipsis(cut);
     } else {
+        push_direction_mark(&mut fitted, &content[last.clone()], rtl(cap - 1));
         fitted.push_source(last.clone());
     }
     fitted
+}
+
+/// Prefixes the mark that makes `line`, shaped alone, read the way its paragraph does (ADR-0211).
+fn push_direction_mark(fitted: &mut Fitted<'_>, line: &str, rtl: bool) {
+    if matches!(unicode_bidi::get_base_direction(line), unicode_bidi::Direction::Rtl) != rtl {
+        fitted.push_plain(if rtl { "\u{200F}" } else { "\u{200E}" });
+    }
 }
 
 /// What a string is measured in: how big, and in which family (ADR-0144). The two travel together
@@ -4157,6 +4169,26 @@ pub(super) mod tests {
         assert_eq!(height, lines.len() as f32 * 12.0 * 1.2, "the box has to be as tall as the lines it holds");
         // Whitespace is where the breaks landed, so the words survive and only the gaps moved.
         assert_eq!(drawn.split_whitespace().collect::<Vec<_>>(), LONG.split_whitespace().collect::<Vec<_>>());
+    }
+
+    /// Paint shapes each wrapped line alone, so a line of an Arabic paragraph that opens on an
+    /// English word carries a right-to-left mark, or it would draw left to right (ADR-0211). The
+    /// long word cannot share a line with the Arabic either side of it.
+    #[test]
+    fn a_wrapped_line_that_would_read_against_its_paragraph_is_marked() {
+        let (drawn, _) = text_box(
+            r#"panel { id = "bar", child = text { width = 80, content = "اول wwwwwwwww ثاني", wrap = "Word" } }"#,
+        );
+        let lines: Vec<&str> = drawn.lines().collect();
+        assert!(!lines[0].starts_with('\u{200F}'), "the line that opens the paragraph already agrees: {drawn:?}");
+        assert!(
+            lines[1..].iter().any(|line| line.starts_with('\u{200F}')),
+            "some line opens on the English word: {drawn:?}"
+        );
+        for line in &lines[1..] {
+            let arabic_first = line.chars().next().is_some_and(|c| ('\u{0600}'..='\u{06FF}').contains(&c));
+            assert!(arabic_first || line.starts_with('\u{200F}'), "every other line reads right to left: {drawn:?}");
+        }
     }
 
     #[test]

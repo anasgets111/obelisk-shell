@@ -29,6 +29,8 @@ cosmic-text = { version = "0.19.0", default-features = false, features = ["std",
 # duplicate versions out of the workspace lock.
 femtovg = { version = "0.27.0", features = ["swash"] }
 fontdb = "0.23.0"
+# A wrapped line's own direction, for `layout::scene`'s direction mark (ADR-0211).
+unicode-bidi = "0.3.18"
 freedesktop-icons = "0.4.0"
 glow = "0.18.0"
 # femtovg declares `image` with `default-features = false` and turns no format on, so its own

@@ -4,10 +4,8 @@
 //! `cosmic_text::FontSystem::new()` calls `Database::load_system_fonts()`, which parses face
 //! metadata for the whole system set (2648 faces on the dev machine ADR-0043 measured against,
 //! roughly a second of cold-cache I/O) to use a handful of them. This module is the fix: ask
-//! fontconfig which file backs each requested family, and load only those files. The chain is
-//! then handed to both cosmic-text (measurement, `text::shaping`) and femtovg (paint,
-//! `text::atlas`), which is the other half of the defect this closes -- see `shaping::shape`'s
-//! doc comment for the "measured one font, painted a different one" bug this replaces.
+//! fontconfig which file backs each requested family, and load only those files. cosmic-text shapes against them
+//! (`text::shaping`) and femtovg draws the faces it chose (`text::atlas`, ADR-0211).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
