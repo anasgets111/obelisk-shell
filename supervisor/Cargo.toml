@@ -2,6 +2,7 @@
 name = "supervisor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 # The installed name. The crate stays `supervisor`, which is what `-p supervisor` and every module
 # path in the tree already say; this is only what lands in `$PREFIX/lib/obelisk`.
@@ -20,23 +21,23 @@ futures-util = "0.3.34"
 hound = "3.5.1"
 inotify = "0.11.5"
 # One `malloc_trim` call after the update check (`memory.rs`). Already in the tree through `nix`.
-libc = "0.2"
+libc.workspace = true
 niri-ipc = "26.4.0"
-nix = { version = "0.31.3", features = ["process", "signal", "time", "user"] }
+nix = { workspace = true, features = ["process", "signal", "time", "user"] }
 nonstick = "0.1.2"
 pipewire = "0.10.1"
-png = "0.18.1"
+png.workspace = true
 regex-lite = "0.1.9"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-shared = { version = "0.1.0", path = "../shared" }
-tempfile = "3.27.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+shared.workspace = true
+tempfile.workspace = true
 # `full` minus `fs` and `parking_lot`, which nothing here uses.
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "io-std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "io-std"] }
 tokio-stream = "0.1.19"
 udev = { version = "0.9.3", features = ["send"] }
-wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-client.workspace = true
+wayland-protocols = { workspace = true, features = ["client", "staging"] }
 # No defaults: they add an async-io executor beside tokio.
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 # 5.1.0 is the floor, not a preference: RUSTSEC-2026-0278 is an authorization bypass through PID
@@ -47,7 +48,7 @@ zbus_polkit = { version = "5.1.0", default-features = false, features = ["tokio"
 [dev-dependencies]
 # The JsonSchema derives exist only for the test-only stub generator (`stubs.rs`).
 schemars = "1.2.2"
-# `test-util` is not in tokio's `full`, and it is what `#[tokio::test(start_paused = true)]` needs.
+# Only `test-util`, so tests build the tokio that ships. It is what `start_paused = true` needs:
 # `battery::controller`'s loop is on a 30s timer, so testing it in real time is not testing it.
-tokio = { version = "1.53.1", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 zbus = { version = "5.19.0", default-features = false, features = ["tokio", "p2p"] }

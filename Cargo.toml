@@ -1,6 +1,6 @@
 [workspace]
 members = ["shared", "supervisor", "renderer"]
-resolver = "2"
+resolver = "3"
 
 # One version for the three crates. They ship together, the Supervisor spawns the Renderer as a
 # sibling binary, and `shared` is only ever consumed by those two, so three numbers could differ
@@ -19,6 +19,22 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# cosmic-text 0.19's floor.
+rust-version = "1.89"
+
+# Versions shared by more than one member; features stay per member.
+[workspace.dependencies]
+libc = "0.2"
+nix = "0.31.3"
+png = "0.18.1"
+serde = "1.0.229"
+serde_json = "1.0.151"
+shared = { path = "shared" }
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = "1.53.1"
+wayland-client = "0.31.15"
+wayland-protocols = "0.32.13"
 
 # Every `unsafe` block in this workspace is a real one -- a C API (EGL, GL, fontdb's mmap) or the
 # one process-wide `set_var` in `main`. `undocumented_unsafe_blocks` makes the SAFETY comment a
