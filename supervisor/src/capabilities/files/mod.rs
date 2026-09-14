@@ -9,12 +9,12 @@ pub mod controller;
 
 pub use controller::{FilesController, FilesSignal};
 
-/// Every action `obelisk.files:invoke(...)` accepts. `dispatch` matches this rather than a string,
-/// so a variant with no arm (or an arm with no variant) fails the build.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FilesAction {
+    /// (path: string, extensions?: string[]) Lists an absolute folder into `folders[path]`, extensions without the dot.
     Watch,
+    /// (path: string) Stops a `watch` on this path.
     Unwatch,
 }
 

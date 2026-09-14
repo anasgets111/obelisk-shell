@@ -104,35 +104,10 @@ arguments are logged and dropped by dispatch.
 
 ### 3.2 Action arguments
 
-Positional arguments validated by capability dispatch. Read-only capabilities have no actions.
-
-| Capability | Actions |
-| :--- | :--- |
-| `audio` | `set_volume(volume)`, `set_muted(bool)`, `toggle_mute()`, `set_default_sink(id)`, `set_default_source(id)`, `set_source_volume(volume)`, `set_source_muted(bool)`, `toggle_source_mute()`, `set_app_volume(id, volume)`, `set_app_muted(id, bool)`, `set_bluetooth_profile(device, index)` |
-| `brightness` | `set(percent)` |
-| `keyboard` | `set_backlight(percent)`, `switch_layout(index)` |
-| `network` | `set_networking_enabled(bool)`, `set_wifi_enabled(bool)`, `set_ethernet_enabled(bool)`, `scan()`, `connect(ssid, hidden)`, `cancel_connect()`, `abort_connect()`, `forget(ssid)`, `disconnect_wifi()` |
-| `bluetooth` | `set_enabled(bool)`, `set_discoverable(bool)`, `start_discovery()`, `stop_discovery()`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `forget(mac)`, `answer_pairing(mac, bool)` |
-| `notifications` | `dismiss(id)`, `invoke_action(id, key)`, `reply(id, text)`, `set_sound(urgency, path)`, `set_dnd(bool)`, `hold_expiry(seconds)` |
-| `mpris` | `control(id, command)`, `seek(id, position_us)`, `seek_relative(id, offset_us)` |
-| `workspaces` | `focus(id)`, `toggle_special(name)` |
-| `applications` | `refresh()`, `launch(id)`, `open_url(url)` |
-| `files` | `watch(path, extensions?)`, `unwatch(path)` |
-| `sysinfo` | `configure({ cpu_interval?, ram_interval?, temp_interval? })` |
-| `processes` | `declare(name, stop_signal?)`, `start(name, cmd, args?)`, `signal(name, signal)`, `stop(name)` |
-| `updates` | `check()`, `configure({ interval, checked_at?, packages? })`, `install()` |
-| `power` | `set_profile(name)` |
-| `tray` | `activate(id, x, y)`, `secondary_activate(id, x, y)`, `scroll(id, delta, orientation)`, `menu_will_show(id, submenu_id)`, `activate_menu_item(id, menu_item_id)` |
-| `lock` | `lock()`, `set_unlock_animation(ms)` |
-| `polkit` | `cancel()` |
-
-Device, player, app, tray and notification targets use snapshot IDs.
-Volumes use 0–1; percentages use 0–100; layout indices are zero-based.
-MPRIS commands accept `play`, `pause`, `play_pause`, `next`, `previous`; seeks take microseconds.
-File watches take an absolute directory path and optional extensions.
-Session-process signals are named without their `SIG` prefix, from a closed list:
-`TERM`, `INT`, `HUP`, `QUIT`, `USR1`, `USR2`, `KILL`, `STOP`, `CONT`.
-Authentication for `lock` and `polkit` uses native secure submission instead of action arguments.
+Hover or complete a command name in `invoke` for its positional signature, generated into
+[`lua-meta/obelisk.lua`](../lua-meta/obelisk.lua). Read-only capabilities have no `invoke`.
+Targets are snapshot IDs. Volumes use 0–1, percentages 0–100, indices are zero-based, and an
+`integer` argument refuses `5.0`.
 
 ### 3.3 Dedicated APIs
 

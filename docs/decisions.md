@@ -2894,11 +2894,11 @@ the Renderer sends `RequestReload`, and the reload breaks the next cycle.
    pushes to a dead connection after every idle transition. This was the roadmap row *Idle
    registrations outlive their generation*.
 5. **Exclude `forget_thresholds` from generated `invoke`.** It is an `IdleAction` on the socket but
-   a config call would unregister its own thresholds. `stubs::internal_actions` names it, and a test
-   restricts the union to the three config-callable actions.
+   a config call would unregister its own thresholds. `idle` now pairs with no action schema in
+   `stubs::capability_schemas`, so `IdleCapability` has no `invoke` at all.
 
 A doc comment on the new variant would cause a third bug: schemars emits a flat `enum` for a plain
-unit enum and `oneOf` once any variant is described, while `stubs::action_names` reads only the flat
+unit enum and `oneOf` once any variant is described, while the stub generator then read only the flat
 form. One `///` emptied `IdleCapability`'s `invoke` union without failing anything but the golden
 test.
 

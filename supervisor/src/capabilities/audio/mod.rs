@@ -12,32 +12,30 @@ pub mod mixer;
 
 use mixer::{AudioCommand, AudioCommandSender};
 
-/// Actions accepted by `obelisk.audio:invoke(...)`; matching this enum keeps dispatch exhaustive.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioAction {
-    /// Set master output volume; `vol` is a number and is clamped to `[0.0, 1.0]`.
+    /// (volume: number) Sets master output volume, clamped to `[0.0, 1.0]`.
     SetVolume,
-    /// Set master output mute to the boolean argument.
+    /// (muted: boolean) Sets master output mute.
     SetMuted,
-    /// Toggle master output mute.
+    /// () Toggles master output mute.
     ToggleMute,
-    /// Make the tracked output device with this PipeWire registry id the default.
+    /// (id: integer) Makes this `sinks[].id` the default output.
     SetDefaultSink,
-    /// Make the tracked input device with this PipeWire registry id the default.
+    /// (id: integer) Makes this `sources[].id` the default input.
     SetDefaultSource,
-    /// Set default input volume; `vol` is a number and is clamped to `[0.0, 1.0]`.
+    /// (volume: number) Sets default input volume, clamped to `[0.0, 1.0]`.
     SetSourceVolume,
-    /// Set default input mute to the boolean argument.
+    /// (muted: boolean) Sets default input mute.
     SetSourceMuted,
-    /// Toggle default input mute.
+    /// () Toggles default input mute.
     ToggleSourceMute,
-    /// Set the per-app stream volume by PipeWire registry id; `vol` is clamped to `[0.0, 1.0]`.
+    /// (id: integer, volume: number) Sets an `apps[].id` stream's volume, clamped to `[0.0, 1.0]`.
     SetAppVolume,
-    /// Set the per-app stream mute by PipeWire registry id.
+    /// (id: integer, muted: boolean) Sets an `apps[].id` stream's mute.
     SetAppMuted,
-    /// Switch a Bluetooth audio device's codec, given a `bluetooth[].device` id and one of its
-    /// `codecs[].index`.
+    /// (device: integer, index: integer) Switches a `bluetooth[].device` to one of its `codecs[].index`.
     SetBluetoothProfile,
 }
 

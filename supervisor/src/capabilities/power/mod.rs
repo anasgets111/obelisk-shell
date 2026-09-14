@@ -15,10 +15,10 @@ pub mod controller;
 
 pub use controller::{PowerController, PowerSignal, parse_set_profile_args};
 
-/// Every action `obelisk.power:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerAction {
+    /// (name: string) Switches to one of `profiles`.
     SetProfile,
 }
 

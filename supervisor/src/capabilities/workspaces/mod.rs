@@ -17,12 +17,12 @@ pub mod niri;
 
 pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args, parse_toggle_special_args};
 
-/// Actions accepted by `obelisk.workspaces:invoke(...)`; exhaustive dispatch keeps variants and
-/// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacesAction {
+    /// (id: integer) Focuses a `WorkspaceEntry.id`.
     Focus,
+    /// (name: string) Shows or hides a special workspace.
     ToggleSpecial,
 }
 

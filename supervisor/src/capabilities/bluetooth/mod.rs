@@ -211,19 +211,26 @@ pub fn parse_mac_and_bool_args(arguments: &[serde_json::Value]) -> Option<(Strin
     Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
 }
 
-/// Actions accepted by `obelisk.bluetooth:invoke(...)`; exhaustive dispatch keeps variants and arms
-/// in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BluetoothAction {
+    /// (enabled: boolean) Powers the adapter on or off.
     SetEnabled,
+    /// (discoverable: boolean) Lets other devices find this adapter.
     SetDiscoverable,
+    /// () Starts discovery, clearing `discovered_devices`.
     StartDiscovery,
+    /// () Stops discovery; `discovered_devices` stays.
     StopDiscovery,
+    /// (mac: string) Pairs a discovered device.
     Pair,
+    /// (mac: string) Connects a paired device.
     Connect,
+    /// (mac: string) Disconnects a connected device.
     Disconnect,
+    /// (mac: string) Removes a paired device.
     Forget,
+    /// (mac: string, accept: boolean) Answers `pairing_request`.
     AnswerPairing,
 }
 

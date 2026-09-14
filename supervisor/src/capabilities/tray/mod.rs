@@ -124,14 +124,18 @@ pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<
     Some((id, menu_item_id))
 }
 
-/// Actions accepted by `obelisk.tray:invoke(...)`; `dispatch` keeps the table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
+    /// (id: string, x: integer, y: integer) Left-click activation at screen coordinates.
     Activate,
+    /// (id: string, x: integer, y: integer) Middle-click activation at screen coordinates.
     SecondaryActivate,
+    /// (id: string, delta: integer, orientation: string) Passes `"vertical"` or `"horizontal"` verbatim.
     Scroll,
+    /// (id: string, menu_item_id: integer) Clicks a `MenuItem.id`.
     ActivateMenuItem,
+    /// (id: string, submenu_id: integer) Tells the application a submenu is opening.
     MenuWillShow,
 }
 

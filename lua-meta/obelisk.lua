@@ -20,24 +20,25 @@
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
 -- than a sentinel (ADR-0057), so `if item.app_icon then` is the right guard for an optional field.
 
----@class Capability<T>: Signal<T>
----A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;
----`:invoke()` sends a command the supervisor dispatches. Read-only otherwise: `:set()` refuses it,
----or a config could overwrite the SSID the supervisor just pushed.
+---@class ReadOnlyCapability<T>: Signal<T>
+---`:get()` and `:map()` read the pushed payload. `:set()` refuses it, or a config could overwrite
+---the SSID the supervisor just pushed.
 ---
 ---Generic over the payload, and inherited as `Capability<NetworkState>` and so on below, which is
 ---what types the callback: the `n` in `obelisk.network:map(function(n) ... end)` is a `NetworkState`,
----so a misspelled field is an `undefined-field` here rather than a `nil` at runtime. `get`/`map`
----come from [`Signal`] and are not restated per capability; only `invoke` is, because each one
----knows its own command names.
+---so a misspelled field is an `undefined-field` here rather than a `nil` at runtime.
 ---
 ---`:on_change(handler)` is the one place a config reacts to a push instead of rendering it
 ---(ADR-0115): the handler runs once per pushed snapshot with the new payload and the one it
 ---replaced (`nil` on the first push), outside any layout pass, under a `map` callback's 5ms CPU
 ---budget. It may do what an input callback may do: `invoke`, `process.run`, write a `state`
 ---signal. Compare the two payloads to find the edge you want; the engine hands over every push.
+---@field on_change fun(self: ReadOnlyCapability<T>, handler: fun(current: T, previous: T?))
+
+---@class Capability<T>: ReadOnlyCapability<T>
+---`:invoke()` sends a command the supervisor dispatches. Each capability narrows `command` to its
+---`*Action` alias; hover a command for its arguments.
 ---@field invoke fun(self: Capability<T>, command: string, ...: any)
----@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 
 --- Payload types ------------------------------------------------------------------------------
 
@@ -491,75 +492,180 @@
 
 --- Capabilities -------------------------------------------------------------------------------
 
+---@alias ApplicationsAction
+---| "refresh" # () Rescans installed desktop entries.
+---| "launch" # (id: string) Launches the `entries[].id` desktop entry.
+---| "open_url" # (url: string) Opens a URL with `xdg-open`.
+
 ---@class ApplicationsCapability: Capability<ApplicationsState>
----@field invoke fun(self: ApplicationsCapability, command: "refresh"|"launch"|"open_url", ...: any)
+---@field invoke fun(self: ApplicationsCapability, command: ApplicationsAction, ...: any)
+
+---@alias AudioAction
+---| "set_volume" # (volume: number) Sets master output volume, clamped to `[0.0, 1.0]`.
+---| "set_muted" # (muted: boolean) Sets master output mute.
+---| "toggle_mute" # () Toggles master output mute.
+---| "set_default_sink" # (id: integer) Makes this `sinks[].id` the default output.
+---| "set_default_source" # (id: integer) Makes this `sources[].id` the default input.
+---| "set_source_volume" # (volume: number) Sets default input volume, clamped to `[0.0, 1.0]`.
+---| "set_source_muted" # (muted: boolean) Sets default input mute.
+---| "toggle_source_mute" # () Toggles default input mute.
+---| "set_app_volume" # (id: integer, volume: number) Sets an `apps[].id` stream's volume, clamped to `[0.0, 1.0]`.
+---| "set_app_muted" # (id: integer, muted: boolean) Sets an `apps[].id` stream's mute.
+---| "set_bluetooth_profile" # (device: integer, index: integer) Switches a `bluetooth[].device` to one of its `codecs[].index`.
 
 ---@class AudioCapability: Capability<AudioState>
----@field invoke fun(self: AudioCapability, command: "set_volume"|"set_muted"|"toggle_mute"|"set_default_sink"|"set_default_source"|"set_source_volume"|"set_source_muted"|"toggle_source_mute"|"set_app_volume"|"set_app_muted"|"set_bluetooth_profile", ...: any)
+---@field invoke fun(self: AudioCapability, command: AudioAction, ...: any)
 
----@class BatteryCapability: Capability<BatteryState>
+---@class BatteryCapability: ReadOnlyCapability<BatteryState>
 local BatteryCapability = {}
 
----@class IdleCapability: Signal<IdleState>
----@field on_change fun(self: IdleCapability, handler: fun(current: IdleState, previous: IdleState?))
+---@class IdleCapability: ReadOnlyCapability<IdleState>
 ---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.
 ---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what="idle"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.
 ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
 local IdleCapability = {}
 
+---@alias BluetoothAction
+---| "set_enabled" # (enabled: boolean) Powers the adapter on or off.
+---| "set_discoverable" # (discoverable: boolean) Lets other devices find this adapter.
+---| "start_discovery" # () Starts discovery, clearing `discovered_devices`.
+---| "stop_discovery" # () Stops discovery; `discovered_devices` stays.
+---| "pair" # (mac: string) Pairs a discovered device.
+---| "connect" # (mac: string) Connects a paired device.
+---| "disconnect" # (mac: string) Disconnects a connected device.
+---| "forget" # (mac: string) Removes a paired device.
+---| "answer_pairing" # (mac: string, accept: boolean) Answers `pairing_request`.
+
 ---@class BluetoothCapability: Capability<BluetoothState>
----@field invoke fun(self: BluetoothCapability, command: "set_enabled"|"set_discoverable"|"start_discovery"|"stop_discovery"|"pair"|"connect"|"disconnect"|"forget"|"answer_pairing", ...: any)
+---@field invoke fun(self: BluetoothCapability, command: BluetoothAction, ...: any)
+
+---@alias BrightnessAction
+---| "set" # (percent: integer) Sets the screen backlight, `0` to `100`.
 
 ---@class BrightnessCapability: Capability<BrightnessState>
----@field invoke fun(self: BrightnessCapability, command: "set", ...: any)
+---@field invoke fun(self: BrightnessCapability, command: BrightnessAction, ...: any)
+
+---@alias FilesAction
+---| "watch" # (path: string, extensions?: string[]) Lists an absolute folder into `folders[path]`, extensions without the dot.
+---| "unwatch" # (path: string) Stops a `watch` on this path.
 
 ---@class FilesCapability: Capability<FilesState>
----@field invoke fun(self: FilesCapability, command: "watch"|"unwatch", ...: any)
+---@field invoke fun(self: FilesCapability, command: FilesAction, ...: any)
+
+---@alias ProcessesAction
+---| "declare" # (name: string, stop_signal?: "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT") Default `TERM`.
+---| "start" # (name: string, cmd: string, args?: string[]) Starts a declared program without a shell.
+---| "signal" # (name: string, signal: string) Sends one of `declare`'s signal names.
+---| "stop" # (name: string) Stops a program with its stop signal.
 
 ---@class ProcessesCapability: Capability<ProcessesState>
----@field invoke fun(self: ProcessesCapability, command: "declare"|"start"|"signal"|"stop", ...: any)
+---@field invoke fun(self: ProcessesCapability, command: ProcessesAction, ...: any)
+
+---@alias KeyboardAction
+---| "set_backlight" # (percent: integer) Sets the keyboard backlight, `0` to `100`.
+---| "switch_layout" # (index: integer) Switches to the 0-based configured layout.
 
 ---@class KeyboardCapability: Capability<KeyboardState>
----@field invoke fun(self: KeyboardCapability, command: "set_backlight"|"switch_layout", ...: any)
+---@field invoke fun(self: KeyboardCapability, command: KeyboardAction, ...: any)
+
+---@alias LockAction
+---| "lock" # () Locks the session.
+---| "set_unlock_animation" # (ms?: integer) Holds the lock open after PAM says yes, for an animation out (ADR-0190).
+---Every action `obelisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
+---callback would make it a one-click path past PAM, forbidden by ADR-0042. Unknown `"unlock"` is
+---logged and dropped.
 
 ---@class LockCapability: Capability<LockState>
----@field invoke fun(self: LockCapability, command: "lock"|"set_unlock_animation", ...: any)
+---@field invoke fun(self: LockCapability, command: LockAction, ...: any)
+
+---@alias MprisAction
+---| "control" # (id: string, command: "play"|"pause"|"play_pause"|"next"|"previous") Controls `players[].id`.
+---| "seek" # (id: string, position_us: integer) Seeks to an absolute position in microseconds.
+---| "seek_relative" # (id: string, offset_us: integer) Seeks by a signed offset in microseconds.
 
 ---@class MprisCapability: Capability<MprisState>
----@field invoke fun(self: MprisCapability, command: "control"|"seek"|"seek_relative", ...: any)
+---@field invoke fun(self: MprisCapability, command: MprisAction, ...: any)
+
+---@alias NetworkAction
+---| "set_networking_enabled" # (enabled: boolean) Turns NetworkManager networking on or off.
+---| "set_wifi_enabled" # (enabled: boolean) Powers the Wi-Fi radio.
+---| "set_ethernet_enabled" # (enabled: boolean) Activates or deactivates wired devices.
+---| "scan" # () Requests a Wi-Fi scan.
+---| "connect" # (ssid: string, hidden: boolean) Joins a network, setting `password_ssid` when it needs a key.
+---| "cancel_connect" # () Drops the password request `password_ssid` names.
+---| "abort_connect" # () Stops the join `connecting_ssid` names.
+---| "forget" # (ssid: string) Deletes this SSID's saved profile.
+---| "disconnect_wifi" # () Disconnects the Wi-Fi device.
 
 ---@class NetworkCapability: Capability<NetworkState>
----@field invoke fun(self: NetworkCapability, command: "set_networking_enabled"|"set_wifi_enabled"|"set_ethernet_enabled"|"scan"|"connect"|"cancel_connect"|"abort_connect"|"forget"|"disconnect_wifi", ...: any)
+---@field invoke fun(self: NetworkCapability, command: NetworkAction, ...: any)
+
+---@alias NotificationsAction
+---| "dismiss" # (id: integer) Removes a queued notification.
+---| "invoke_action" # (id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
+---| "reply" # (id: integer, text: string) Sends reply text to a notification with `has_reply`.
+---| "set_sound" # (urgency: "low"|"normal"|"critical", path: string) Registers a sound file for an urgency tier.
+---| "set_dnd" # (enabled: boolean) Gates non-critical notification sounds.
+---| "hold_expiry" # (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
 
 ---@class NotificationsCapability: Capability<NotificationsState>
----@field invoke fun(self: NotificationsCapability, command: "dismiss"|"invoke_action"|"reply"|"set_sound"|"set_dnd"|"hold_expiry", ...: any)
+---@field invoke fun(self: NotificationsCapability, command: NotificationsAction, ...: any)
+
+---@alias PowerAction
+---| "set_profile" # (name: string) Switches to one of `profiles`.
 
 ---@class PowerCapability: Capability<PowerState>
----@field invoke fun(self: PowerCapability, command: "set_profile", ...: any)
+---@field invoke fun(self: PowerCapability, command: PowerAction, ...: any)
 
----@class PrivacyCapability: Capability<PrivacyState>
+---@class PrivacyCapability: ReadOnlyCapability<PrivacyState>
 local PrivacyCapability = {}
 
----@class SysinfoCapability: Capability<SysinfoState>
----@field invoke fun(self: SysinfoCapability, command: "configure", ...: any)
+---@alias SysinfoAction
+---| "configure" # (intervals: { cpu_interval?: integer, ram_interval?: integer, temp_interval?: integer }) Seconds.
 
----@class SystemCapability: Capability<SystemState>
+---@class SysinfoCapability: Capability<SysinfoState>
+---@field invoke fun(self: SysinfoCapability, command: SysinfoAction, ...: any)
+
+---@class SystemCapability: ReadOnlyCapability<SystemState>
 local SystemCapability = {}
 
+---@alias StorageAction
+---| "open" # (path: string, defaults?: table) Declares an absolute JSON file; defaults fill missing keys.
+---| "set" # (path: string, key: string, value?: any) Writes a key; `nil` deletes it.
+
 ---@class StorageCapability: Capability<StorageState>
----@field invoke fun(self: StorageCapability, command: "open"|"set", ...: any)
+---@field invoke fun(self: StorageCapability, command: StorageAction, ...: any)
+
+---@alias PolkitAction
+---| "cancel" # () Dismisses the prompt and tells polkitd's caller `Cancelled`.
 
 ---@class PolkitCapability: Capability<PolkitState>
----@field invoke fun(self: PolkitCapability, command: "cancel", ...: any)
+---@field invoke fun(self: PolkitCapability, command: PolkitAction, ...: any)
+
+---@alias TrayAction
+---| "activate" # (id: string, x: integer, y: integer) Left-click activation at screen coordinates.
+---| "secondary_activate" # (id: string, x: integer, y: integer) Middle-click activation at screen coordinates.
+---| "scroll" # (id: string, delta: integer, orientation: string) Passes `"vertical"` or `"horizontal"` verbatim.
+---| "activate_menu_item" # (id: string, menu_item_id: integer) Clicks a `MenuItem.id`.
+---| "menu_will_show" # (id: string, submenu_id: integer) Tells the application a submenu is opening.
 
 ---@class TrayCapability: Capability<TrayState>
----@field invoke fun(self: TrayCapability, command: "activate"|"secondary_activate"|"scroll"|"activate_menu_item"|"menu_will_show", ...: any)
+---@field invoke fun(self: TrayCapability, command: TrayAction, ...: any)
+
+---@alias UpdatesAction
+---| "check" # () Checks for upgrades now.
+---| "configure" # (config: { interval: integer, checked_at?: integer, packages?: UpdateCandidate[] }) Seconds, `0` for none.
+---| "install" # () Installs pending upgrades.
 
 ---@class UpdatesCapability: Capability<UpdatesState>
----@field invoke fun(self: UpdatesCapability, command: "check"|"configure"|"install", ...: any)
+---@field invoke fun(self: UpdatesCapability, command: UpdatesAction, ...: any)
+
+---@alias WorkspacesAction
+---| "focus" # (id: integer) Focuses a `WorkspaceEntry.id`.
+---| "toggle_special" # (name: string) Shows or hides a special workspace.
 
 ---@class WorkspacesCapability: Capability<WorkspacesState>
----@field invoke fun(self: WorkspacesCapability, command: "focus"|"toggle_special", ...: any)
+---@field invoke fun(self: WorkspacesCapability, command: WorkspacesAction, ...: any)
 
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive

@@ -10,10 +10,10 @@ pub mod controller;
 
 pub use controller::{BrightnessController, BrightnessSignal, parse_set_args};
 
-/// Every action `obelisk.brightness:invoke(...)` accepts. `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrightnessAction {
+    /// (percent: integer) Sets the screen backlight, `0` to `100`.
     Set,
 }
 

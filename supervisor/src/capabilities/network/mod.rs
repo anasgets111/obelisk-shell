@@ -150,19 +150,26 @@ fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-/// Actions accepted by `obelisk.network:invoke(...)`; matching variants in `dispatch` keeps the
-/// action table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAction {
+    /// (enabled: boolean) Turns NetworkManager networking on or off.
     SetNetworkingEnabled,
+    /// (enabled: boolean) Powers the Wi-Fi radio.
     SetWifiEnabled,
+    /// (enabled: boolean) Activates or deactivates wired devices.
     SetEthernetEnabled,
+    /// () Requests a Wi-Fi scan.
     Scan,
+    /// (ssid: string, hidden: boolean) Joins a network, setting `password_ssid` when it needs a key.
     Connect,
+    /// () Drops the password request `password_ssid` names.
     CancelConnect,
+    /// () Stops the join `connecting_ssid` names.
     AbortConnect,
+    /// (ssid: string) Deletes this SSID's saved profile.
     Forget,
+    /// () Disconnects the Wi-Fi device.
     DisconnectWifi,
 }
 

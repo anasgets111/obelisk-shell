@@ -9,12 +9,14 @@ pub mod pacman;
 
 pub use controller::{UpdatesController, UpdatesSignal, parse_configure_args};
 
-/// Actions accepted by `obelisk.updates:invoke(...)`; `dispatch` keeps the table compiler-checked.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatesAction {
+    /// () Checks for upgrades now.
     Check,
+    /// (config: { interval: integer, checked_at?: integer, packages?: UpdateCandidate[] }) Seconds, `0` for none.
     Configure,
+    /// () Installs pending upgrades.
     Install,
 }
 

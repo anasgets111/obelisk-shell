@@ -8,10 +8,10 @@ pub mod temp;
 
 pub use controller::{SysinfoController, SysinfoSignal, parse_configure_args};
 
-/// Every action `obelisk.sysinfo:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SysinfoAction {
+    /// (intervals: { cpu_interval?: integer, ram_interval?: integer, temp_interval?: integer }) Seconds.
     Configure,
 }
 

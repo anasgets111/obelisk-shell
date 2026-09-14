@@ -21,13 +21,14 @@ pub mod watcher;
 
 pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args};
 
-/// Actions accepted by `obelisk.mpris:invoke(...)`; exhaustive dispatch keeps variants and arms in
-/// sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MprisAction {
+    /// (id: string, command: "play"|"pause"|"play_pause"|"next"|"previous") Controls `players[].id`.
     Control,
+    /// (id: string, position_us: integer) Seeks to an absolute position in microseconds.
     Seek,
+    /// (id: string, offset_us: integer) Seeks by a signed offset in microseconds.
     SeekRelative,
 }
 

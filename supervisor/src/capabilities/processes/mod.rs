@@ -12,13 +12,16 @@ pub use controller::{ProcessesController, ProcessesSignal};
 
 use nix::sys::signal::Signal;
 
-/// Every action `obelisk.processes:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessesAction {
+    /// (name: string, stop_signal?: "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT") Default `TERM`.
     Declare,
+    /// (name: string, cmd: string, args?: string[]) Starts a declared program without a shell.
     Start,
+    /// (name: string, signal: string) Sends one of `declare`'s signal names.
     Signal,
+    /// (name: string) Stops a program with its stop signal.
     Stop,
 }
 

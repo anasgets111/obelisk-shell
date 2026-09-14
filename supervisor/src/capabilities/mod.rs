@@ -692,7 +692,7 @@ impl Capabilities {
 
     /// Routes a command to its module (ADR-0037). Optional controllers exist only after the config
     /// reads their member (ADR-0070), so missing ones call `log_unstarted`; boot-built `lock` is
-    /// passed in, and read-only `battery`/`privacy` have no dispatch.
+    /// passed in, and read-only `battery`/`privacy`/`system` have no dispatch.
     pub async fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
         macro_rules! to {
             ($held:expr, $dispatch:path) => {

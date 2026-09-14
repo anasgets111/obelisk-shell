@@ -30,22 +30,20 @@ pub use controller::{
 };
 pub use sound::run_sound_player;
 
-/// Actions accepted by `obelisk.notifications:invoke(...)`; exhaustive dispatch keeps variants and
-/// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationsAction {
-    /// Remove a queued notification by its server-assigned id.
+    /// (id: integer) Removes a queued notification.
     Dismiss,
-    /// Invoke a sender-declared action by notification id and action key.
+    /// (id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
     InvokeAction,
-    /// Submit reply text for a notification id that offered inline reply.
+    /// (id: integer, text: string) Sends reply text to a notification with `has_reply`.
     Reply,
-    /// Register a trusted sound-file path for a `low`, `normal`, or `critical` urgency tier.
+    /// (urgency: "low"|"normal"|"critical", path: string) Registers a sound file for an urgency tier.
     SetSound,
-    /// Enable or disable the Supervisor-global do-not-disturb sound gate.
+    /// (enabled: boolean) Gates non-critical notification sounds.
     SetDnd,
-    /// Hold expiry countdowns for whole seconds; `0` releases the hold immediately.
+    /// (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
     HoldExpiry,
 }
 

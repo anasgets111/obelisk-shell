@@ -419,9 +419,10 @@ impl LockController {
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LockAction {
+    /// () Locks the session.
     Lock,
-    /// How long the Supervisor holds a lock open after PAM says yes, so a config can animate its
-    /// lock screen out (ADR-0190). Milliseconds, clamped to [`MAX_UNLOCK_ANIMATION`].
+    /// (ms?: integer) Holds the lock open after PAM says yes, for an animation out (ADR-0190).
+    /// Clamped to [`MAX_UNLOCK_ANIMATION`].
     SetUnlockAnimation,
 }
 

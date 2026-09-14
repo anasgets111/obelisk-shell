@@ -8,11 +8,12 @@ pub mod controller;
 
 pub use controller::{StorageController, StorageSignal};
 
-/// Every action `obelisk.storage:invoke(...)` accepts; `dispatch` matches variants exhaustively.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageAction {
+    /// (path: string, defaults?: table) Declares an absolute JSON file; defaults fill missing keys.
     Open,
+    /// (path: string, key: string, value?: any) Writes a key; `nil` deletes it.
     Set,
 }
 

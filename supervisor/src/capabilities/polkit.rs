@@ -27,11 +27,10 @@ pub struct PolkitState {
     pub error: String,
 }
 
-/// Every action `obelisk.polkit:invoke(...)` accepts (ADR-0037). `cancel` dismisses the prompt and
-/// tells polkitd's caller `Cancelled`.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolkitAction {
+    /// () Dismisses the prompt and tells polkitd's caller `Cancelled`.
     Cancel,
 }
 

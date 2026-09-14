@@ -20,8 +20,7 @@ use schemars::{Schema, schema_for};
 
 /// The sole capability-to-payload/action mapping. `push_snapshot` takes `&impl Serialize`, so
 /// payload types are inferred at each call site; action enums are named only by their `dispatch`.
-/// `every_capability_has_a_schema` checks `shared::Capability::ALL`. `None` is read-only and gets
-/// the inherited plain `invoke`, except `idle`, which gets none.
+/// `every_capability_has_a_schema` checks `shared::Capability::ALL`. `None` means no `invoke`.
 fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
     vec![
         (
@@ -125,17 +124,6 @@ fn capability_schemas() -> Vec<(&'static str, Schema, Option<Schema>)> {
 /// the Rust struct renames Lua without another edit.
 fn payload_class(schema: &Schema) -> String {
     schema.get("title").and_then(|t| t.as_str()).unwrap_or("table").to_string()
-}
-
-/// Action variants as wire strings for `invoke`, in the `rename_all` spellings `parse_action`
-/// accepts: one `enum` array, or [`const_enum`]'s form once a variant has a doc comment. Order is
-/// schemars' output order, not declaration order: a mixed enum pools its undocumented variants into
-/// one `enum` branch emitted before the documented `const` branches.
-fn action_names(schema: &Schema) -> Vec<String> {
-    if let Some(variants) = const_enum(schema.as_value()) {
-        return variants.into_iter().map(|(name, _)| name.to_string()).collect();
-    }
-    enum_strings(schema.as_value()).map_or_else(Vec::new, |v| v.into_iter().map(str::to_string).collect())
 }
 
 /// `audio` -> `AudioCapability`.
@@ -280,7 +268,7 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
         out.push_str(&format!("\n---@alias {name}\n"));
         for (variant, description) in variants {
             match description.and_then(|d| d.lines().next()) {
-                Some(first) => out.push_str(&format!("---| \"{variant}\" # {first}\n")),
+                Some(first) => out.push_str(&format!("---| \"{variant}\" # {}\n", unlink(first))),
                 None => out.push_str(&format!("---| \"{variant}\"\n")),
             }
         }
@@ -368,19 +356,20 @@ pub fn render() -> String {
     for (capability, schema, actions) in &schemas {
         let class = capability_class(capability);
         let payload = payload_class(schema);
-        let commands = actions.as_ref().map_or_else(Vec::new, action_names);
-        // Inherit `get`/`map` from `Capability<T>`: repeating them would need a class-specific
-        // `self`, and an unbound `---@field` would check nothing. `idle`'s userdata has no
-        // `invoke`, and `Capability<T>` would inherit one.
-        let base = if *capability == "idle" { "Signal" } else { "Capability" };
+        // Inherit `get`/`map`/`on_change`: repeating them would need a class-specific `self`, and
+        // an unbound `---@field` would check nothing.
+        let base = if actions.is_none() { "ReadOnlyCapability" } else { "Capability" };
+        if let Some(actions) = actions {
+            render_class(&payload_class(actions), actions.as_value(), &mut out);
+        }
         out.push_str(&format!("\n---@class {class}: {base}<{payload}>\n"));
         out.push_str(hand_written_methods(capability));
-        if commands.is_empty() {
-            // Read-only, yet the base `invoke(string)` still type-checks.
-            out.push_str(&format!("local {class} = {{}}\n"));
-        } else {
-            let union = commands.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join("|");
-            out.push_str(&format!("---@field invoke fun(self: {class}, command: {union}, ...: any)\n"));
+        match actions {
+            Some(actions) => out.push_str(&format!(
+                "---@field invoke fun(self: {class}, command: {}, ...: any)\n",
+                payload_class(actions)
+            )),
+            None => out.push_str(&format!("local {class} = {{}}\n")),
         }
     }
 
@@ -417,30 +406,31 @@ const GENERATED_HEADER: &str = r#"---@meta
 -- default rather than failing the tree (ADR-0044). A JSON `null` arrives as an absent key rather
 -- than a sentinel (ADR-0057), so `if item.app_icon then` is the right guard for an optional field.
 
----@class Capability<T>: Signal<T>
----A capability is a signal you can also command. `:get()` and `:map()` read the pushed payload;
----`:invoke()` sends a command the supervisor dispatches. Read-only otherwise: `:set()` refuses it,
----or a config could overwrite the SSID the supervisor just pushed.
+---@class ReadOnlyCapability<T>: Signal<T>
+---`:get()` and `:map()` read the pushed payload. `:set()` refuses it, or a config could overwrite
+---the SSID the supervisor just pushed.
 ---
 ---Generic over the payload, and inherited as `Capability<NetworkState>` and so on below, which is
 ---what types the callback: the `n` in `obelisk.network:map(function(n) ... end)` is a `NetworkState`,
----so a misspelled field is an `undefined-field` here rather than a `nil` at runtime. `get`/`map`
----come from [`Signal`] and are not restated per capability; only `invoke` is, because each one
----knows its own command names.
+---so a misspelled field is an `undefined-field` here rather than a `nil` at runtime.
 ---
 ---`:on_change(handler)` is the one place a config reacts to a push instead of rendering it
 ---(ADR-0115): the handler runs once per pushed snapshot with the new payload and the one it
 ---replaced (`nil` on the first push), outside any layout pass, under a `map` callback's 5ms CPU
 ---budget. It may do what an input callback may do: `invoke`, `process.run`, write a `state`
 ---signal. Compare the two payloads to find the edge you want; the engine hands over every push.
+---@field on_change fun(self: ReadOnlyCapability<T>, handler: fun(current: T, previous: T?))
+
+---@class Capability<T>: ReadOnlyCapability<T>
+---`:invoke()` sends a command the supervisor dispatches. Each capability narrows `command` to its
+---`*Action` alias; hover a command for its arguments.
 ---@field invoke fun(self: Capability<T>, command: string, ...: any)
----@field on_change fun(self: Capability<T>, handler: fun(current: T, previous: T?))
 "#;
 
 /// Methods no action schema can describe, appended to the generated class. Only `idle` has them:
 /// three Lua callbacks never cross the wire, so no `IdleAction` signature exists (ADR-0032,
-/// ADR-0141). Its userdata offers no `invoke`: `register` without the local callbacks fires into
-/// nothing, and `forget_thresholds` would drop the config's own thresholds (ADR-0158).
+/// ADR-0141). Its actions stay `None`: `register` without the local callbacks fires into nothing,
+/// and `forget_thresholds` would drop the config's own thresholds (ADR-0158).
 ///
 /// Use `---@field`, not `function IdleCapability:...`: a class with `---@field invoke` has no local
 /// binding for a later function, so calls read `undefined-field`. The first version did this;
@@ -452,7 +442,7 @@ const GENERATED_HEADER: &str = r#"---@meta
 fn hand_written_methods(capability: &str) -> &'static str {
     match capability {
         "idle" => {
-            "---@field on_change fun(self: IdleCapability, handler: fun(current: IdleState, previous: IdleState?))\n---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
+            "---@field register_threshold fun(self: IdleCapability, seconds: integer, on_idle: fun(), on_resume: fun()) Runs `on_idle` after `seconds` without input on the seat, and `on_resume` when input returns. Registrations do not survive a config reload, so register at the top level rather than inside a callback that fires more than once.\n---@field inhibit fun(self: IdleCapability, reason: string) Holds off idle actions system-wide (logind `Inhibit`, `what=\"idle\"`) until a matching `release_inhibit`. Counted, so two holders need two releases. While any hold is out -- this one or another application's -- no threshold fires and `inhibited` says so.\n---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.\n"
         }
         _ => "",
     }
@@ -527,27 +517,37 @@ mod tests {
         );
     }
 
-    /// `IdleMember` has no `invoke`, so a stub offering one type-checks a runtime error.
+    /// The supervisor drops a read-only capability's commands, so `invoke` type-checks a no-op.
     #[test]
-    fn the_idle_class_offers_no_invoke() {
+    fn read_only_classes_offer_no_invoke() {
         let generated = super::render();
-        let class: Vec<&str> = generated
-            .lines()
-            .skip_while(|line| !line.starts_with("---@class IdleCapability"))
-            .take_while(|line| line.starts_with("---"))
-            .collect();
-
-        assert_eq!(class.first(), Some(&"---@class IdleCapability: Signal<IdleState>"));
-        assert!(!class.iter().any(|line| line.contains("invoke")), "{class:#?}");
+        for (capability, schema, actions) in super::capability_schemas() {
+            if actions.is_some() {
+                continue;
+            }
+            let header = format!(
+                "---@class {}: ReadOnlyCapability<{}>",
+                super::capability_class(capability),
+                super::payload_class(&schema)
+            );
+            let class: Vec<&str> = generated
+                .lines()
+                .skip_while(|line| *line != header)
+                .take_while(|line| line.starts_with("---"))
+                .collect();
+            assert!(!class.is_empty(), "{header} is missing");
+            assert!(!class.iter().any(|line| line.contains("invoke")), "{class:#?}");
+        }
     }
 
-    /// A doc comment on a variant turns schemars' `enum` into a `oneOf`; every action enum must
-    /// still yield an invoke union regardless of which form it renders as.
+    /// schemars emits `oneOf` once a variant has a doc comment; both forms must render an alias.
     #[test]
-    fn every_action_enum_yields_an_invoke_union() {
+    fn every_action_enum_renders_as_an_alias() {
         for (capability, _, actions) in super::capability_schemas() {
             if let Some(actions) = actions {
-                assert!(!super::action_names(&actions).is_empty(), "{capability} has actions but no union");
+                let mut out = String::new();
+                super::render_class("A", actions.as_value(), &mut out);
+                assert!(out.starts_with("\n---@alias A"), "{capability}: {out}");
             }
         }
     }

@@ -14,13 +14,14 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
-/// Actions accepted by `obelisk.applications:invoke(...)`; exhaustive dispatch keeps variants and
-/// arms in sync.
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationsAction {
+    /// () Rescans installed desktop entries.
     Refresh,
+    /// (id: string) Launches the `entries[].id` desktop entry.
     Launch,
+    /// (url: string) Opens a URL with `xdg-open`.
     OpenUrl,
 }
 
