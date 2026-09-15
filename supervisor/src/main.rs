@@ -61,12 +61,6 @@ async fn next_inbound(
     }
 }
 
-/// Whether an `Unchanged` report names the most recently sent `Reevaluate`; a mismatch is a
-/// superseded evaluation and cannot authorize the reload (ADR-0024).
-fn is_current_reload(report_sequence: u64, next_sequence: u64) -> bool {
-    report_sequence == next_sequence
-}
-
 /// Only the authoritative Renderer and control clients may dispatch after a swap. A failed
 /// Candidate can still have frames in flight while its process is being reaped.
 fn is_live_inbound_generation(generation_id: u32, authoritative_generation_id: u32) -> bool {
@@ -85,7 +79,7 @@ fn frame_may_dispatch(frame: &RendererFrame, generation_id: u32, authoritative_g
 
 /// Bumps and sends one `Reevaluate` sequence (ADR-0024, ADR-0041 decision 4). Debounced file
 /// changes and Renderer `RequestReload` after `wl_output` changes share this counter, so stale
-/// reports from either trigger fail `is_current_reload`.
+/// reports from either trigger fail `answer_unchanged_report`'s sequence check.
 fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_sequence: &mut u64) {
     *next_sequence += 1;
     send_frame_logged(
@@ -423,15 +417,11 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                     // ADR-0070: config read `obelisk.<capability>` or named it in `secure_submit`.
                     // Await inline (decision 4). Re-entrant because decision 3 makes each
                     // generation resend every name; each arm is a no-op after controller creation.
-                    match Capability::from_name(&capability) {
+                    match capability {
                         // Built at boot; starting it registers the agent (ADR-0070 decision 5,
                         // ADR-0114).
-                        Some(Capability::Polkit) => polkit_agent.register(&connection).await,
-                        Some(capability) => supervisor.capabilities.start(capability).await,
-                        None => eprintln!(
-                            "generation {} asked to start {capability:?}, which is not a capability this Supervisor builds",
-                            inbound.generation_id
-                        ),
+                        Capability::Polkit => polkit_agent.register(&connection).await,
+                        capability => supervisor.capabilities.start(capability).await,
                     }
                 }
                 // ADR-0112: send `obelisk set`/`toggle` to the onscreen generation. The Renderer
@@ -474,13 +464,13 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
                     eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
                 }
-                RendererFrame::SecureSubmit(mut submit) if submit.capability == "polkit" && submit.action == "authenticate" => {
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Polkit && submit.action == "authenticate" => {
                     // ADR-0028, ADR-0114. Before the catch-all arm because matches are ordered.
                     // `mem::take` gives plaintext to the worker, which zeroizes every return path.
                     let secret = std::mem::take(&mut submit.secret);
                     supervisor.begin_polkit_authentication(secret, submit.generation_id);
                 }
-                RendererFrame::SecureSubmit(mut submit) if submit.capability == "network" && submit.action == "connect" => {
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Network && submit.action == "connect" => {
                     // ADR-0029: empty secret means open network; non-empty is the WPA-PSK password.
                     // Before the catch-all for the same ordering reason as polkit.
                     match supervisor.capabilities.network().and_then(NetworkController::take_prompted_intent) {
@@ -504,21 +494,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                         }
                     }
                 }
-                RendererFrame::SecureSubmit(mut submit)
-                    if submit.capability == "lock"
-                        && submit.action == "authenticate"
-                        && inbound.generation_id != supervisor.authoritative.generation_id =>
-                {
-                    // Only the authoritative generation owns the lock screen where the password
-                    // was typed. Polkit/network accept any generation because the Supervisor owns
-                    // their challenges; a lock belongs to one generation (ADR-0042).
-                    eprintln!(
-                        "generation {}'s secure_submit(lock, authenticate) is stale -- {} is authoritative; dropping",
-                        submit.generation_id, supervisor.authoritative.generation_id
-                    );
-                    submit.secret.zeroize();
-                }
-                RendererFrame::SecureSubmit(mut submit) if submit.capability == "lock" && submit.action == "authenticate" => {
+                RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Lock && submit.action == "authenticate" => {
                     // ADR-0042, ADR-0052: this arm and `pam_outcomes` are the only unlock path,
                     // so `unlock_and_destroy` follows successful authentication at one call site.
                     // It must precede the catch-all. Unlike polkit/network, no pending intent is
@@ -599,16 +575,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         tx.send(socket::InboundFrame {
             generation_id: 9,
-            frame: shared::RendererFrame::StartCapability { capability: "after".to_string() },
+            frame: shared::RendererFrame::StartCapability { capability: Capability::Mpris },
         })
         .await
         .unwrap();
 
-        let mut replay: std::collections::VecDeque<socket::InboundFrame> = ["lock", "audio"]
+        let mut replay: std::collections::VecDeque<socket::InboundFrame> = [Capability::Lock, Capability::Audio]
             .into_iter()
             .map(|capability| socket::InboundFrame {
                 generation_id: 9,
-                frame: shared::RendererFrame::StartCapability { capability: capability.to_string() },
+                frame: shared::RendererFrame::StartCapability { capability },
             })
             .collect();
 
@@ -620,7 +596,11 @@ mod tests {
             };
             seen.push(capability);
         }
-        assert_eq!(seen, ["lock", "audio", "after"], "both held frames come first, in the order they were held");
+        assert_eq!(
+            seen,
+            [Capability::Lock, Capability::Audio, Capability::Mpris],
+            "both held frames come first, in the order they were held"
+        );
     }
 
     /// The wire stays `(action, [arguments])`; each case is a coercion the hand parsers once got
@@ -689,12 +669,6 @@ mod tests {
                 _ => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
         }
-    }
-
-    #[test]
-    fn is_current_reload_matches_only_the_most_recently_sent_sequence() {
-        assert!(is_current_reload(3, 3));
-        assert!(!is_current_reload(3, 4), "a report for an older sequence than the last-sent one must be stale");
     }
 
     #[test]

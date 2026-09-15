@@ -724,7 +724,7 @@ mod tests {
             crate::socket::InboundFrame { generation_id: 0, frame: shared::RendererFrame::RequestReload },
             crate::socket::InboundFrame {
                 generation_id: 1,
-                frame: shared::RendererFrame::StartCapability { capability: "idle".to_string() },
+                frame: shared::RendererFrame::StartCapability { capability: shared::Capability::Idle },
             },
         ];
 

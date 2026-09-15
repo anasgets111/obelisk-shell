@@ -132,11 +132,11 @@ fn edit_plain_buffer(buffer: &mut String, action: KeyAction<'_>, cancels: bool) 
 }
 
 /// A secure submit frame, or `None` without a destination (ADR-0050 decision 4). Do not send to
-/// `"unknown"/"unknown"`; the buffer is zeroized on both branches.
+/// `"unknown"/"unknown"`; the buffer is zeroized on every branch.
 ///
-/// Both refusals say so. Dropping a submit here is indistinguishable from a lock screen that has
+/// Every refusal says so. Dropping a submit here is indistinguishable from a lock screen that has
 /// stopped accepting the password: nothing reaches the Supervisor, so nothing downstream can
-/// report it, and a session that will not unlock leaves no line anywhere. Neither branch names the
+/// report it, and a session that will not unlock leaves no line anywhere. No branch names the
 /// secret or its length.
 fn submit_frame_for(
     generation_id: u32,
@@ -158,7 +158,12 @@ fn submit_frame_for(
         buffer.zeroize();
         return None;
     };
-    Some(secure_submit_frame(generation_id, &target.capability, &target.action, buffer))
+    let Some(capability) = shared::Capability::from_name(&target.capability) else {
+        eprintln!("secure submit to {}/{} dropped: no such capability", target.capability, target.action);
+        buffer.zeroize();
+        return None;
+    };
+    Some(secure_submit_frame(generation_id, capability, &target.action, buffer))
 }
 
 /// Focused `secure_submit` field and declaring surface. The surface id distinguishes live keyboard
@@ -287,13 +292,13 @@ fn key_action<'a>(event: &'a KeyEvent, repeat: bool) -> KeyAction<'a> {
 /// write in `crate::socket::pump`. Kept free for unit-testing without a live `wl_surface`.
 fn secure_submit_frame(
     generation_id: u32,
-    capability: &str,
+    capability: shared::Capability,
     action: &str,
     buffer: &mut shared::SecureBuffer,
 ) -> RendererFrame {
     let frame = RendererFrame::SecureSubmit(SecureSubmit {
         generation_id,
-        capability: capability.to_string(),
+        capability,
         action: action.to_string(),
         secret: buffer.expose_secret().to_vec(),
     });
@@ -858,13 +863,13 @@ mod tests {
         let mut buffer = shared::SecureBuffer::new();
         buffer.push_str("hunter2");
 
-        let frame = secure_submit_frame(4, "polkit", "authenticate", &mut buffer);
+        let frame = secure_submit_frame(4, shared::Capability::Polkit, "authenticate", &mut buffer);
 
         assert_eq!(
             frame,
             RendererFrame::SecureSubmit(SecureSubmit {
                 generation_id: 4,
-                capability: "polkit".to_string(),
+                capability: shared::Capability::Polkit,
                 action: "authenticate".to_string(),
                 secret: b"hunter2".to_vec(),
             })
@@ -1109,7 +1114,7 @@ mod tests {
             frame,
             Some(RendererFrame::SecureSubmit(SecureSubmit {
                 generation_id: 4,
-                capability: "polkit".to_string(),
+                capability: shared::Capability::Polkit,
                 action: "authenticate".to_string(),
                 secret: b"hunter2".to_vec(),
             }))

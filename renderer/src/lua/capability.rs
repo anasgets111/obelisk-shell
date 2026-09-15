@@ -56,7 +56,12 @@ impl CommandSender {
         if !self.started.borrow_mut().insert(capability.to_string()) {
             return;
         }
-        let frame = RendererFrame::StartCapability { capability: capability.to_string() };
+        // After the insert, so an unknown name logs once per generation.
+        let Some(capability) = shared::Capability::from_name(capability) else {
+            eprintln!("obelisk.{capability}: not a capability, so nothing starts");
+            return;
+        };
+        let frame = RendererFrame::StartCapability { capability };
         if self.outbound_tx.send(frame).is_err() {
             eprintln!("obelisk.{capability}: failed to queue the start request, the control-socket writer is gone");
         }

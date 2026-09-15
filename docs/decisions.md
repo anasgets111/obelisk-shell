@@ -517,7 +517,7 @@ Renderer owns classification because it has applied and fresh topology; Supervis
 place dispatch. `ReevaluateRequest { sequence }` goes Supervisor -> Renderer;
 `ReevaluateReport::{Unchanged, TopologyChanged, Failed} { sequence, .. }` and
 `ApplyPendingReload { sequence }` return Renderer -> Supervisor. Both guard `sequence`: Renderer
-applies only matching `ApplyPendingReload`; Supervisor's `is_current_reload` accepts `Unchanged`
+applies only matching `ApplyPendingReload`; Supervisor's `answer_unchanged_report` accepts `Unchanged`
 only for the latest `Reevaluate`, closing the race where a superseded report could otherwise fire
 `reset_registrations`/`ApplyPendingReload` after a newer edit had landed. `TopologyChanged` never
 stashes a scene; only a swap may mutate that generation.

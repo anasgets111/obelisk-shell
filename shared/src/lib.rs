@@ -317,7 +317,8 @@ pub struct ProcessExited {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SecureSubmit {
     pub generation_id: u32,
-    pub capability: String,
+    #[zeroize(skip)]
+    pub capability: Capability,
     pub action: String,
     pub secret: Vec<u8>,
 }
@@ -417,15 +418,15 @@ pub enum RendererFrame {
     CallResult(CallResult),
     /// Starts a reload cycle: the Supervisor bumps its sequence and sends the
     /// [`ReevaluateRequest`] (ADR-0041 decision 4). This carries no sequence; only the Supervisor
-    /// owns `next_sequence`, and `is_current_reload` (`supervisor/src/main.rs`) drops reports that
+    /// owns `next_sequence`, and `answer_unchanged_report` (`supervisor/src/supervisor.rs`) drops reports that
     /// do not match the last one sent.
     RequestReload,
     /// Idempotently starts `capability`'s controller when this generation first reads
     /// `obelisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it (decision
     /// 5). No generation ID is needed because the socket identifies the sender, as with
-    /// [`Self::RequestReload`]. An existing name is logged and dropped (decision 3).
+    /// [`Self::RequestReload`]. A repeat is a no-op (decision 3); an unknown name fails decode.
     StartCapability {
-        capability: String,
+        capability: Capability,
     },
 }
 
@@ -451,7 +452,7 @@ mod tests {
     fn a_secure_submit_never_formats_its_secret() {
         let submit = SecureSubmit {
             generation_id: 3,
-            capability: "polkit".into(),
+            capability: Capability::Polkit,
             action: "authenticate".into(),
             secret: b"hunter2".to_vec(),
         };
@@ -461,7 +462,7 @@ mod tests {
 
         assert!(rendered.contains("<7 bytes redacted>"), "the length is the only thing worth logging: {rendered}");
         assert!(!rendered.contains("104"), "a byte of the plaintext reached the formatter: {rendered}");
-        assert!(rendered.contains("polkit"), "everything that is not the secret still prints: {rendered}");
+        assert!(rendered.contains("Polkit"), "everything that is not the secret still prints: {rendered}");
     }
 
     #[test]
@@ -681,7 +682,7 @@ mod tests {
     fn renderer_frame_secure_submit_is_adjacently_tagged() {
         let frame = RendererFrame::SecureSubmit(SecureSubmit {
             generation_id: 4,
-            capability: "polkit".to_string(),
+            capability: Capability::Polkit,
             action: "authenticate".to_string(),
             secret: b"hunter2".to_vec(),
         });
@@ -704,7 +705,7 @@ mod tests {
     fn zeroizing_a_secure_submit_clears_its_secret() {
         let mut submit = SecureSubmit {
             generation_id: 4,
-            capability: "polkit".to_string(),
+            capability: Capability::Polkit,
             action: "authenticate".to_string(),
             secret: b"hunter2".to_vec(),
         };

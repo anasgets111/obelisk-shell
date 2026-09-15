@@ -1122,7 +1122,7 @@ mod tests {
         let mut started = Vec::new();
         while let Ok(frame) = outbound_rx.try_recv() {
             if let RendererFrame::StartCapability { capability } = frame {
-                started.push(capability);
+                started.push(capability.to_string());
             }
         }
         started
@@ -3046,7 +3046,7 @@ mod tests {
 
     #[test]
     fn request_reload_queues_the_frame_the_supervisor_starts_a_cycle_from() {
-        // ADR-0041 decision 4: `is_current_reload` would drop sequences the Supervisor did not
+        // ADR-0041 decision 4: `answer_unchanged_report` would drop sequences the Supervisor did not
         // send.
         let (client, mut outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
         client.request_reload();
@@ -3267,7 +3267,7 @@ mod tests {
         // plaintext frame copy immediately after write.
         let written = pumped_to_the_wire(RendererFrame::SecureSubmit(SecureSubmit {
             generation_id: 4,
-            capability: "polkit".to_string(),
+            capability: shared::Capability::Polkit,
             action: "authenticate".to_string(),
             secret: b"hunter2".to_vec(),
         }))
@@ -3277,7 +3277,7 @@ mod tests {
             written,
             RendererFrame::SecureSubmit(SecureSubmit {
                 generation_id: 4,
-                capability: "polkit".to_string(),
+                capability: shared::Capability::Polkit,
                 action: "authenticate".to_string(),
                 secret: b"hunter2".to_vec(),
             })

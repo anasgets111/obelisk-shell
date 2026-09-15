@@ -338,12 +338,9 @@ mod tests {
         let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
         let mut link = SocketCandidateLink::new(registry, 9, &mut inbound_rx);
 
-        for capability in ["lock", "audio"] {
+        for capability in [shared::Capability::Lock, shared::Capability::Audio] {
             inbound_tx
-                .send(InboundFrame {
-                    generation_id: 9,
-                    frame: RendererFrame::StartCapability { capability: capability.to_string() },
-                })
+                .send(InboundFrame { generation_id: 9, frame: RendererFrame::StartCapability { capability } })
                 .await
                 .unwrap();
         }
@@ -361,7 +358,7 @@ mod tests {
             .deferred
             .iter()
             .filter_map(|held| match &held.frame {
-                RendererFrame::StartCapability { capability } => Some(capability.clone()),
+                RendererFrame::StartCapability { capability } => Some(capability.to_string()),
                 _ => None,
             })
             .collect();

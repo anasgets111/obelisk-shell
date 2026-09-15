@@ -631,7 +631,9 @@ mod tests {
     #[test]
     fn frames_that_name_no_generation_are_forwarded_because_the_socket_identifies_the_sender() {
         assert!(refuse_frame(false, 3, &RendererFrame::RequestReload).is_none());
-        assert!(refuse_frame(false, 3, &RendererFrame::StartCapability { capability: "audio".to_string() }).is_none());
+        assert!(
+            refuse_frame(false, 3, &RendererFrame::StartCapability { capability: shared::Capability::Audio }).is_none()
+        );
     }
 
     #[test]
@@ -819,6 +821,28 @@ mod tests {
 
         assert_eq!(received.generation_id, 5);
         assert_eq!(received.frame, RendererFrame::ReevaluateReport(report));
+    }
+
+    /// ADR-0070 decision 3: an unknown capability name is dropped, and the connection lives on.
+    #[tokio::test]
+    async fn an_unknown_capability_start_is_dropped_without_closing_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("obelisk-shell.sock");
+        let (registry, _routes, mut inbound, _connected) = spawn_listener(&path).unwrap();
+        expect_this_process(&registry, &[5]);
+
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        framing::write_json_frame(&mut client, &ConnectionHandshake { generation_id: 5 }).await.unwrap();
+        let unknown = serde_json::json!({ "kind": "StartCapability", "data": { "capability": "nope" } });
+        framing::write_json_frame(&mut client, &unknown).await.unwrap();
+        let audio = RendererFrame::StartCapability { capability: shared::Capability::Audio };
+        framing::write_json_frame(&mut client, &audio).await.unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("the frame after the unknown one did not arrive in time")
+            .expect("inbound channel closed unexpectedly");
+        assert_eq!(received.frame, audio);
     }
 
     fn result(id: u64) -> shared::CallResult {

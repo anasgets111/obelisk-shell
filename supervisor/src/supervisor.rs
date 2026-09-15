@@ -5,7 +5,7 @@
 //! `child.wait()` and `&mut supervisor` in separate branches. Most operations address only the
 //! authoritative generation via `self.authoritative.generation_id`; `hydrate` and
 //! `answer_unchanged_report` are the exceptions. [`Capabilities`] needs a live bus, so only
-//! [`crate::is_current_reload`], [`crate::begin_reload`], and [`push_snapshot`] are isolated tests.
+//! [`crate::begin_reload`] and [`push_snapshot`] are isolated tests.
 
 use std::collections::HashMap;
 
@@ -251,7 +251,7 @@ impl Supervisor {
     /// `forget_thresholds` command, which arrives ahead of the registrations replacing them; a
     /// reset on this frame ran after both and deleted them (ADR-0158).
     pub(crate) fn answer_unchanged_report(&self, generation_id: u32, sequence: u64) {
-        if !crate::is_current_reload(sequence, self.next_sequence) {
+        if sequence != self.next_sequence {
             eprintln!(
                 "generation {generation_id}'s Unchanged report (sequence {sequence}) is stale -- a newer Reevaluate (sequence {}) is \
                  already in flight; not applying",

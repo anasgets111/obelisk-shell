@@ -234,7 +234,7 @@ mod tests {
             lua.load(call).exec().unwrap();
             let first = rx.try_recv().expect("a method must queue something");
             assert!(
-                matches!(&first, RendererFrame::StartCapability { capability } if capability == "idle"),
+                matches!(&first, RendererFrame::StartCapability { capability } if *capability == shared::Capability::Idle),
                 "{call} must send the start ahead of its command, got {first:?}"
             );
         }
