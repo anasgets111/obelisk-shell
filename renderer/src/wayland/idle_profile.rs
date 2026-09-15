@@ -1,20 +1,14 @@
-//! Reports what wakes the Renderer's poll loop, what work it does, and its CPU cost when
-//! `OBELISK_PROFILE_IDLE` is set. It replaces ad-hoc probes: each question used to mean a temporary
+//! Reports what wakes the Renderer's poll loop, what work it does, and its CPU cost under
+//! `obelisk --profile`. It replaces ad-hoc probes, where each question meant a temporary
 //! `eprintln!`, one reading, then deletion. ADR-0124 made polling timeout-free, so a wake with no
 //! work means an unnecessary re-arm and a spin. All figures here are release-build measurements.
 //! Idle costs 0.34% of a core; `dev` resolves roughly four times slower, so compare like builds.
 //!
-//! Unset means two predicted branches per turn and no clock reads: the profiler is behind an
-//! `Option`. Set a positive interval in seconds (`OBELISK_PROFILE_IDLE=10`); invalid input uses
-//! [`DEFAULT_INTERVAL_SECS`] instead of preventing startup.
+//! Off costs two predicted branches per turn and no clock reads, since the profiler is an `Option`.
 
 use std::time::{Duration, Instant};
 
 use nix::sys::resource::{UsageWho, getrusage};
-
-/// Fallback for a non-positive or invalid `OBELISK_PROFILE_IDLE`; ten seconds usually yields
-/// single-digit idle turns, making an unexpected hundred obvious.
-const DEFAULT_INTERVAL_SECS: u64 = 10;
 
 /// Work the loop already computed for one turn; the profiler measures none of these fields.
 #[derive(Clone, Copy, Default)]
@@ -172,13 +166,12 @@ pub struct IdleProfile {
 }
 
 impl IdleProfile {
-    /// `Some` only when `OBELISK_PROFILE_IDLE` is set.
+    /// `Some` only under `--profile`.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("OBELISK_PROFILE_IDLE").ok()?;
-        let secs = raw.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
-        eprintln!("[obelisk-renderer] idle profile on, reporting every {secs}s");
+        let interval = shared::profile_interval()?;
+        eprintln!("[obelisk-renderer] idle profile on, reporting every {}s", interval.as_secs());
         Some(Self {
-            interval: Duration::from_secs(secs),
+            interval,
             window_started: Instant::now(),
             cpu_at_window_start: Cpu::now(),
             counters: Counters::default(),

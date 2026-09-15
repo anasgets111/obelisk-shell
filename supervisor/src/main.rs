@@ -197,6 +197,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // SAFETY: no runtime or thread exists yet; the PAM worker branch above returns.
         unsafe { std::env::set_var(shared::CONFIG_ARG_ENV, dir) };
     }
+    if let Some(secs) = args.profile {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(shared::PROFILE_ENV, secs.to_string()) };
+    }
 
     match args.command {
         cli::Command::Help => {

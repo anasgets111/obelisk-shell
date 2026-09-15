@@ -9,11 +9,6 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
-
-/// `OBELISK_MEMORY_SAMPLE_SECS`: seconds between samples; unset/`0` disables the timer. Named here
-/// so `main.rs` and this module share the string.
-pub(crate) const SAMPLE_SECS_ENV: &str = "OBELISK_MEMORY_SAMPLE_SECS";
 
 /// Passed in at the one production call site, [`log_sample`], instead of being reached for inside
 /// the readers, so a test can point them at a tempdir of fake files. Every sysfs and procfs reader
@@ -178,13 +173,6 @@ pub(crate) fn fold_drm_clients(clients: impl IntoIterator<Item = DrmClient>) -> 
     Gpu { resident, shared, clients: kept.len() }
 }
 
-/// Parses [`SAMPLE_SECS_ENV`]. `None` (unset), an invalid string, and `"0"` all disable periodic
-/// sampling, one case for the caller.
-pub(crate) fn interval_from_env(value: Option<&str>) -> Option<Duration> {
-    let secs: u64 = value?.parse().ok()?;
-    if secs == 0 { None } else { Some(Duration::from_secs(secs)) }
-}
-
 /// One log line per sample. `total pss` sums supervisor and renderer PSS (ADR-0043 decision 1
 /// item 1, against 50 MiB per monitor); GPU stays per renderer because `smaps` omits it. Emit one
 /// `; generation N ...` clause in sample order. DRM client count shows [`fold_drm_clients`]
@@ -255,12 +243,12 @@ pub(crate) fn sample(proc_root: &Path, renderer_pids: &[(u32, u32)]) -> io::Resu
     Ok(Sample { supervisor, renderers })
 }
 
-/// Builds the opt-in steady-state sampler (ADR-0043 amendment), or `None`. `smaps_rollup` is
+/// Builds the `--profile` steady-state sampler (ADR-0043 amendment), or `None`. `smaps_rollup` is
 /// always externally readable, so an always-on timer adds only a log line; the handoff sample is
 /// unconditional because no outside observer can catch a swap-only window. First tick is one
 /// period out because a new Renderer is not steady; `Skip` keeps a late sampler current.
 pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
-    let period = interval_from_env(std::env::var(SAMPLE_SECS_ENV).ok().as_deref())?;
+    let period = shared::profile_interval()?;
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     Some(interval)
@@ -538,32 +526,6 @@ drm-engine-video-enhance:\t0 ns\n";
     #[test]
     fn fold_drm_clients_of_no_clients_is_a_zeroed_gpu() {
         assert_eq!(fold_drm_clients(std::iter::empty()), Gpu { resident: 0, shared: 0, clients: 0 });
-    }
-
-    // ---- interval_from_env ----
-
-    #[test]
-    fn interval_from_env_is_none_when_unset() {
-        assert_eq!(interval_from_env(None), None);
-    }
-
-    #[test]
-    fn interval_from_env_is_none_for_zero() {
-        assert_eq!(
-            interval_from_env(Some("0")),
-            None,
-            "0 means the periodic sampler is off, not an interval of zero seconds"
-        );
-    }
-
-    #[test]
-    fn interval_from_env_is_none_for_an_unparseable_value() {
-        assert_eq!(interval_from_env(Some("not-a-number")), None);
-    }
-
-    #[test]
-    fn interval_from_env_parses_a_positive_integer_as_seconds() {
-        assert_eq!(interval_from_env(Some("5")), Some(Duration::from_secs(5)));
     }
 
     // ---- report_line ----

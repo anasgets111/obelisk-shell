@@ -42,6 +42,8 @@ pub struct Args {
     pub config_dir: Option<PathBuf>,
     /// `-d`: re-exec detached and give the caller's shell its prompt back.
     pub detach: bool,
+    /// `--profile[=SECS]`: seconds between profile reports.
+    pub profile: Option<u64>,
 }
 
 pub const HELP: &str = "\
@@ -67,6 +69,8 @@ OPTIONS:
                          return, sending its output to `obelisk log`
         --force          init only: overwrite files that already exist
     -f, --follow         log only: keep printing until the shell exits
+        --profile[=SECS] run only: log idle, heap and PSS/GPU reports every
+                         SECS seconds, 60 by default
     -V, --version
     -h, --help
 
@@ -121,6 +125,7 @@ fn is_option(arg: &str) -> bool {
         arg,
         "-c" | "--config" | "-d" | "--detach" | "--force" | "-f" | "--follow" | "-V" | "--version" | "-h" | "--help"
     ) || arg.starts_with("--config=")
+        || arg.starts_with("--profile")
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
@@ -130,6 +135,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let mut force = false;
     let mut follow = false;
     let mut detach = false;
+    let mut profile = None;
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -163,15 +169,20 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             "-d" | "--detach" => detach = true,
             "--force" => force = true,
             "-f" | "--follow" => follow = true,
+            "--profile" => profile = Some(60),
             "-V" | "--version" => {
-                return Ok(Args { command: Command::Version, config_dir, detach });
+                return Ok(Args { command: Command::Version, config_dir, detach, profile });
             }
             "-h" | "--help" => {
-                return Ok(Args { command: Command::Help, config_dir, detach });
+                return Ok(Args { command: Command::Help, config_dir, detach, profile });
             }
             other => {
                 if let Some(value) = other.strip_prefix("--config=") {
                     config_dir = Some(config_dir_from(value)?);
+                } else if let Some(value) = other.strip_prefix("--profile=") {
+                    let secs = value.parse::<u64>().ok().filter(|secs| *secs > 0);
+                    profile =
+                        Some(secs.ok_or_else(|| format!("--profile takes a positive number of seconds, got {value}"))?);
                 } else {
                     return Err(format!("unknown argument {other}"));
                 }
@@ -225,7 +236,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     if detach && !matches!(command, Command::Run) {
         return Err("--detach is only meaningful when starting the shell".to_string());
     }
-    Ok(Args { command, config_dir, detach })
+    if profile.is_some() && !matches!(command, Command::Run) {
+        return Err("--profile is only meaningful when starting the shell".to_string());
+    }
+    Ok(Args { command, config_dir, detach, profile })
 }
 
 #[cfg(test)]
@@ -270,7 +284,19 @@ mod tests {
 
     #[test]
     fn no_arguments_runs_the_shell_against_the_default_config() {
-        assert_eq!(parse_args(&[]).unwrap(), Args { command: Command::Run, config_dir: None, detach: false });
+        assert_eq!(
+            parse_args(&[]).unwrap(),
+            Args { command: Command::Run, config_dir: None, detach: false, profile: None }
+        );
+    }
+
+    #[test]
+    fn profile_defaults_its_interval_and_refuses_one_that_would_never_report() {
+        assert_eq!(parse_args(&["--profile"]).unwrap().profile, Some(60));
+        assert_eq!(parse_args(&["--profile=5"]).unwrap().profile, Some(5));
+        assert!(parse_args(&["--profile=0"]).is_err());
+        assert!(parse_args(&["--profile=soon"]).is_err());
+        assert!(parse_args(&["check", "--profile"]).is_err(), "nothing runs long enough to report");
     }
 
     #[test]

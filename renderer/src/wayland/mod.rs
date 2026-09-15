@@ -185,7 +185,7 @@ pub struct App {
     /// [`App::focus_secure_submit`].
     focused_secure_submit: Option<FocusedField>,
     /// [`App::focus_key`] as end-of-turn arming last examined it, for the profiler's `redundant`
-    /// column. Written only while `OBELISK_PROFILE_IDLE` is set; nothing gates on it yet.
+    /// column. Written only under `--profile`; nothing gates on it yet.
     ///
     /// Starts as an empty dead scope rather than the first key observed, so the first focused turn
     /// reads as a change and is not silently classed as removable.
@@ -380,9 +380,8 @@ pub fn run(
     // Output events can now reconcile against an evaluated scene.
     app.startup_complete = true;
 
-    // `None` unless `OBELISK_PROFILE_IDLE` is set; see `idle_profile`.
+    // Both `None` unless `obelisk --profile`.
     let mut profile = idle_profile::IdleProfile::from_env();
-    // `None` unless `OBELISK_PROFILE_MEMORY` is set; see `memory_profile`.
     let mut memory = memory_profile::MemoryProfile::from_env();
 
     // Mostly-static surfaces may receive no Wayland event after `ActivateDraw`, so poll

@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Control socket under `$XDG_RUNTIME_DIR`, shared by the `supervisor` listener and `renderer`
 /// client. Not `/tmp`: it is world-writable and unsuitable for secure textfield submissions
@@ -52,6 +53,16 @@ pub const GENERATION_ID_ENV: &str = "OBELISK_GENERATION_ID";
 
 /// Set when `obelisk check` re-execs the Renderer to evaluate a config without a display.
 pub const CHECK_ENV: &str = "OBELISK_CHECK";
+
+/// `obelisk --profile[=SECS]`, set by the Supervisor so every Renderer generation inherits it. One
+/// switch for the idle, heap and PSS/GPU reports, so their lines share a clock.
+pub const PROFILE_ENV: &str = "OBELISK_PROFILE";
+
+/// The report interval [`PROFILE_ENV`] carries; the CLI already refused a bad value.
+pub fn profile_interval() -> Option<Duration> {
+    let secs = std::env::var(PROFILE_ENV).ok()?.parse::<u64>().ok().filter(|secs| *secs > 0)?;
+    Some(Duration::from_secs(secs))
+}
 
 /// Renderer exit code for a Wayland connection that is gone: a log out, a reboot, or a compositor
 /// crash. Shared because the Supervisor reads it as "the session is over" and stops rather than
