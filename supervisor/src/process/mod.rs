@@ -153,6 +153,19 @@ pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Resul
     }
 }
 
+/// Whether every pid leaves `/proc` within 10s.
+#[cfg(test)]
+pub(crate) async fn exited(pids: &[u32]) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while pids.iter().any(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt;
@@ -200,25 +213,6 @@ mod tests {
         child.kill().await.expect("cleanup kill failed");
     }
 
-    /// Polls until `condition` or `timeout`, waiting for a grandchild's `/proc` teardown after its
-    /// parent is reaped.
-    async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if condition() {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    fn proc_exists(pid: i32) -> bool {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-
     #[tokio::test]
     async fn spawn_group_leader_puts_the_child_in_its_own_process_group() {
         let mut child = spawn_group_leader("sh", &sh_args("sleep 5"), &[]).expect("failed to spawn");
@@ -243,9 +237,11 @@ mod tests {
 
     #[tokio::test]
     async fn reap_process_group_escalates_a_sigterm_ignoring_child_to_sigkill() {
-        let mut child = spawn_group_leader("sh", &sh_args("trap '' TERM; sleep 5"), &[]).expect("failed to spawn");
-        // Let the shell install `trap '' TERM`; a racing SIGTERM can otherwise flake this test.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut child =
+            spawn_group_leader_piped("sh", &sh_args("trap '' TERM; echo armed; sleep 5")).expect("failed to spawn");
+        // A SIGTERM that beats the trap kills the shell outright, so wait for the shell to say so.
+        let armed = BufReader::new(child.stdout.take().expect("stdout was piped")).lines().next_line().await;
+        assert_eq!(armed.expect("reading the trap line").as_deref(), Some("armed"));
 
         let outcome = reap_process_group(&mut child, Duration::from_millis(50)).await.expect("reap failed");
 
@@ -291,12 +287,17 @@ mod tests {
             .parse()
             .expect("grandchild pid should parse as an integer");
 
-        assert!(proc_exists(grandchild_pid), "grandchild should be running before the group is reaped");
+        assert!(
+            std::path::Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+            "grandchild should be running before the group is reaped"
+        );
 
         reap_process_group(&mut child, Duration::from_millis(200)).await.expect("reap failed");
 
-        let gone = wait_until(Duration::from_millis(500), || !proc_exists(grandchild_pid)).await;
-        assert!(gone, "grandchild (pid {grandchild_pid}) should be gone after killpg reached the whole group");
+        assert!(
+            exited(&[grandchild_pid as u32]).await,
+            "grandchild (pid {grandchild_pid}) should be gone after killpg reached the whole group"
+        );
     }
 
     #[tokio::test]
@@ -371,7 +372,8 @@ mod tests {
         // No sleep, deliberately: whether `$PPID` is read before or after `init` adopts it, the
         // answer is a pid that is not this process -- the intermediate's, or the reaper's. Waiting
         // for the handover would make the test's timing part of what it asserts, for nothing.
-        let script = format!("printf %s \"$PPID\" > {}", out.display());
+        // The rename lands the pid whole; `>` alone lets the poll below read an empty file.
+        let script = format!("printf %s \"$PPID\" > {0}.part && mv {0}.part {0}", out.display());
         spawn_detached("sh", &["-c".to_string(), script]).expect("spawn");
 
         let mut waited = 0;

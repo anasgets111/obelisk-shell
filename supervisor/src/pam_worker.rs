@@ -432,7 +432,7 @@ mod tests {
     /// unless that test asks for it by name and sets the variable, so the ordinary suite skips it
     /// rather than re-execing itself.
     ///
-    /// By the time this runs, the parent has unlinked the path this process was started from, so
+    /// Once stdin closes, the parent has unlinked the path this process was started from, so
     /// `/proc/self/exe` here reads `... (deleted)`. That is the state a `pacman -Syu` leaves a
     /// running shell in, and spawning through the link has to work anyway.
     #[test]
@@ -440,6 +440,7 @@ mod tests {
         if std::env::var_os("OBELISK_SELF_EXE_CHILD").is_none() {
             return;
         }
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new()).expect("stdin closes after the unlink");
         let own = std::fs::read_link("/proc/self/exe").expect("procfs names this process's binary");
         assert!(
             own.to_string_lossy().ends_with(" (deleted)"),
@@ -470,6 +471,7 @@ mod tests {
         let child = tokio::process::Command::new(&stand_in)
             .args(["--exact", "pam_worker::tests::self_exe_probe_child", "--nocapture"])
             .env("OBELISK_SELF_EXE_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -593,23 +595,17 @@ mod tests {
     #[tokio::test]
     async fn exchange_over_still_reaps_the_worker_when_the_frame_read_fails() {
         // Malformed frame, then a hang. Read must fail and the process must still be reaped.
-        let script = r#"printf '\000\000\000\004evil'; sleep 5"#;
+        let script = r#"printf '\000\000\000\004evil'; sleep 30"#;
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
-        let pid = child.id().expect("freshly spawned child has a pid") as i32;
+        let pid = child.id().expect("freshly spawned child has a pid");
 
         let result = exchange_over(child, b"the-password", TEST_TIMEOUT).await;
 
         assert!(result.is_err(), "an undecodable frame must surface as an error, not a silent outcome");
 
-        let gone = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await;
         assert!(
-            gone.is_ok(),
+            crate::process::exited(&[pid]).await,
             "the worker (pid {pid}) should be reaped even though exchange_over returned an error, not left sleeping"
         );
     }
@@ -654,7 +650,7 @@ mod tests {
         let script = "sleep 30";
         let child = crate::process::spawn_group_leader_stdio_piped("sh", &["-c".to_string(), script.to_string()], &[])
             .expect("failed to spawn the fake worker");
-        let pid = child.id().expect("freshly spawned child has a pid") as i32;
+        let pid = child.id().expect("freshly spawned child has a pid");
 
         let started = tokio::time::Instant::now();
         let result = exchange_over(child, b"the-password", Duration::from_millis(50)).await;
@@ -663,14 +659,8 @@ mod tests {
         assert!(result.is_err(), "a worker that never responds must surface as an error, not hang forever");
         assert!(elapsed < Duration::from_secs(5), "exchange_over took {elapsed:?} -- the timeout did not bound it");
 
-        let gone = tokio::time::timeout(Duration::from_millis(500), async {
-            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
         assert!(
-            gone.is_ok(),
+            crate::process::exited(&[pid]).await,
             "the worker (pid {pid}) should be reaped even after a timeout, not left sleeping for the full 30s"
         );
     }

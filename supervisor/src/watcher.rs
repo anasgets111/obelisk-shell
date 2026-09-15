@@ -306,16 +306,18 @@ mod tests {
     #[tokio::test]
     async fn a_burst_of_rapid_writes_coalesces_into_one_trigger() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rx = spawn_watcher(dir.path(), SHORT_DEBOUNCE).unwrap();
+        // A loaded host stretched a 10ms gap past SHORT_DEBOUNCE and split the burst.
+        let debounce = Duration::from_millis(200);
+        let mut rx = spawn_watcher(dir.path(), debounce).unwrap();
         let path = dir.path().join("shell.lua");
 
         std::fs::write(&path, "return {}").unwrap();
-        tokio::time::sleep(SHORT_DEBOUNCE / 4).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         std::fs::write(&path, "return { id = 2 }").unwrap();
 
         assert!(recv_within(&mut rx, WAIT).await.is_some(), "the burst must fire a trigger");
         assert!(
-            recv_within(&mut rx, SHORT_DEBOUNCE * 3).await.is_none(),
+            recv_within(&mut rx, debounce * 2).await.is_none(),
             "a rapid burst must coalesce into exactly one trigger, not two"
         );
     }

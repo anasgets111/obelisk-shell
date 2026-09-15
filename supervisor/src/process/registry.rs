@@ -348,9 +348,6 @@ pub(crate) async fn reap_all_processes(processes: &mut LiveProcesses) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::time::Duration;
-
     use super::*;
 
     /// Drains a `BoundedLines` over an in-memory reader, so the cap is exercised without a child.
@@ -428,17 +425,10 @@ mod tests {
     async fn a_cancelled_discard_resumes_and_does_not_eat_the_next_line() {
         // The bug this pins: resuming a cancelled discard and then discarding a *second* time,
         // which throws away the line after the over-long one.
-        let (mut client, server) = tokio::io::duplex(1024);
+        // Room for the whole line up front: a writer blocked on a cancelled reader never finishes.
+        let (mut client, server) = tokio::io::duplex(2 * MAX_LINE_BYTES as usize);
         let mut reader = BoundedLines::new(server, "test".to_string());
-
-        let writer = tokio::spawn(async move {
-            let over_long = vec![b'x'; MAX_LINE_BYTES as usize + 64];
-            tokio::io::AsyncWriteExt::write_all(&mut client, &over_long).await.unwrap();
-            // Held back so the reader is parked mid-discard when it is cancelled below.
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            tokio::io::AsyncWriteExt::write_all(&mut client, b"\nkeep me\n").await.unwrap();
-            client
-        });
+        tokio::io::AsyncWriteExt::write_all(&mut client, &[b'x'; MAX_LINE_BYTES as usize + 64]).await.unwrap();
 
         // Cancelled while discarding the tail of the over-long line.
         assert!(
@@ -446,7 +436,7 @@ mod tests {
             "the discard cannot finish yet, so this call must be cancelled mid-discard"
         );
 
-        let _client = writer.await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"\nkeep me\n").await.unwrap();
         assert_eq!(
             reader.next_line().await.unwrap().map(|line| line.len()),
             Some(MAX_LINE_BYTES as usize),
@@ -592,67 +582,30 @@ mod tests {
     #[tokio::test]
     async fn reap_generations_processes_reaps_only_the_matching_generations_entries() {
         let mut processes: LiveProcesses = HashMap::new();
-        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
-        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
+        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 30"));
+        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 30"));
+        let pid = processes[&(1, 1)].id().expect("freshly spawned child has a pid");
 
         reap_generations_processes(&mut processes, 1).await;
 
         assert!(!processes.contains_key(&(1, 1)), "generation 1's process must be reaped and removed");
+        assert!(crate::process::exited(&[pid]).await, "process {pid} must be dead, not just removed from the registry");
         assert!(processes.contains_key(&(2, 1)), "generation 2's process must be untouched");
 
         kill_registered_process(&mut processes, 2, 1).await;
     }
 
     #[tokio::test]
-    async fn reap_generations_processes_actually_kills_the_process_not_just_the_registry_entry() {
-        let mut processes: LiveProcesses = HashMap::new();
-        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
-        let pid = processes.get(&(1, 1)).unwrap().id().expect("freshly spawned child has a pid");
-
-        reap_generations_processes(&mut processes, 1).await;
-
-        let gone = tokio::time::timeout(Duration::from_millis(500), async {
-            while Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(
-            gone.is_ok(),
-            "process {pid} should be gone after the supersede-time reap, not just removed from the registry"
-        );
-    }
-
-    #[tokio::test]
     async fn reap_all_processes_reaps_every_generations_entries() {
         let mut processes: LiveProcesses = HashMap::new();
-        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
-        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
-
-        reap_all_processes(&mut processes).await;
-
-        assert!(processes.is_empty(), "shutdown must reap every tracked process, not just one generation's");
-    }
-
-    #[tokio::test]
-    async fn reap_all_processes_actually_kills_the_processes_not_just_the_registry_entries() {
-        let mut processes: LiveProcesses = HashMap::new();
-        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 5"));
-        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 5"));
+        spawn_and_register_process(&mut processes, 1, 1, "sh", &sh_args("sleep 30"));
+        spawn_and_register_process(&mut processes, 2, 1, "sh", &sh_args("sleep 30"));
         let pids: Vec<u32> =
             processes.values().map(|child| child.id().expect("freshly spawned child has a pid")).collect();
 
         reap_all_processes(&mut processes).await;
 
-        let gone = tokio::time::timeout(Duration::from_millis(500), async {
-            while pids.iter().any(|pid| Path::new(&format!("/proc/{pid}")).exists()) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(
-            gone.is_ok(),
-            "every reaped process should actually be gone from /proc, not just removed from the registry"
-        );
+        assert!(processes.is_empty(), "shutdown must reap every tracked process, not just one generation's");
+        assert!(crate::process::exited(&pids).await, "every process must be dead, not just removed from the registry");
     }
 }

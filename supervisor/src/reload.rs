@@ -342,13 +342,13 @@ mod tests {
     async fn a_swap_leaves_nothing_of_the_superseded_generation_running() {
         let registry = GenerationRegistry::default();
         let mut processes: LiveProcesses = std::collections::HashMap::new();
-        spawn_and_register_process(&mut processes, 1, 7, "sh", &sh_args("sleep 5"));
+        spawn_and_register_process(&mut processes, 1, 7, "sh", &sh_args("sleep 30"));
         let child_pid = processes.get(&(1, 7)).unwrap().id().expect("a freshly spawned child has a pid");
 
-        let superseded = process::spawn_group_leader("sh", &sh_args("sleep 5"), &[]).unwrap();
+        let superseded = process::spawn_group_leader("sh", &sh_args("sleep 30"), &[]).unwrap();
         let superseded_pid = superseded.id().expect("a freshly spawned child has a pid");
         let mut authoritative = Authoritative { generation_id: 1, child: superseded };
-        let candidate = process::spawn_group_leader("sh", &sh_args("sleep 5"), &[]).unwrap();
+        let candidate = process::spawn_group_leader("sh", &sh_args("sleep 30"), &[]).unwrap();
         let outcome = SwapOutcome { candidate, promoted_surfaces: vec!["bar@DP-1".to_string()] };
 
         swap_and_reap(&registry, &mut processes, &mut authoritative, 2, outcome).await;
@@ -362,13 +362,7 @@ mod tests {
             (child_pid, "the superseded generation's `process.run` child"),
             (superseded_pid, "the superseded Renderer"),
         ] {
-            let gone = tokio::time::timeout(Duration::from_millis(500), async {
-                while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await;
-            assert!(gone.is_ok(), "{what} (pid {pid}) is still running after the swap");
+            assert!(process::exited(&[pid]).await, "{what} (pid {pid}) is still running after the swap");
         }
 
         let _ = process::reap_process_group(&mut authoritative.child, process::DEFAULT_REAP_GRACE).await;
@@ -376,10 +370,6 @@ mod tests {
 
     fn sample_snapshot() -> shared::StateSnapshot {
         shared::StateSnapshot { capability: "audio".to_string(), revision: 1, payload: serde_json::json!({}) }
-    }
-
-    fn proc_exists(pid: i32) -> bool {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
     #[derive(Debug, PartialEq, Eq, Clone)]
@@ -612,8 +602,8 @@ mod tests {
         .expect_err("a hanging ready signal must not promote");
 
         assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::NullBufferStaging }), "{failure:?}");
-        let pid = link.candidate_pid.expect("run_swap binds the spawned candidate's pid") as i32;
-        assert!(!proc_exists(pid), "the aborted candidate (pid {pid}) must have been reaped, not leaked");
+        let pid = link.candidate_pid.expect("run_swap binds the spawned candidate's pid");
+        assert!(process::exited(&[pid]).await, "the aborted candidate (pid {pid}) must have been reaped, not leaked");
     }
 
     #[tokio::test]
