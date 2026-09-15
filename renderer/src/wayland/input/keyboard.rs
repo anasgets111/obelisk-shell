@@ -474,8 +474,7 @@ impl App {
     /// Whether `instance_id` is still a surface this process has a live `wl_surface` for.
     /// `TrackedRole::wl_surface` is the right test: it answers `None` for both shapes a gone
     /// surface takes, the entry removed outright ([`App::destroy_surface_by_id`]) or kept with its
-    /// role object dropped ([`App::hide_window`], [`App::teardown_lock_surfaces`],
-    /// [`App::drop_popup_object`]).
+    /// role object dropped ([`App::drop_role_object`]).
     fn surface_is_live(&self, instance_id: &str) -> bool {
         self.surfaces.iter().any(|tracked| tracked.surface_id == instance_id && tracked.role.wl_surface().is_some())
     }

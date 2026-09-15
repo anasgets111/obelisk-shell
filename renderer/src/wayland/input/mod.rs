@@ -10,8 +10,6 @@ pub(super) use keyboard::{FocusedField, FocusedTextField};
 pub(super) use pointer::rect_table;
 pub(super) use pointer::{ActiveDrag, ArmedClick, ArmedSerial};
 
-impl App {}
-
 impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state

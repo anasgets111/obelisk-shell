@@ -103,18 +103,10 @@ impl App {
             );
             return;
         };
-        self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Lock { output: output.clone(), surface: None },
-            bound: None,
-            surface_id: instance.instance_id.clone(),
-            map_state: MapState::Unmapped,
-            null_buffered: false,
-            configured_size: (0, 0),
-            last_painted: None,
-            stale: false,
-            blur_effect: None,
-            last_blur_region: Vec::new(),
-        });
+        self.surfaces.push(TrackedSurface::new(
+            TrackedRole::Lock { output: output.clone(), surface: None },
+            instance.instance_id.clone(),
+        ));
     }
 
     /// Creates one lock surface per declared instance lacking one, only while a lock is held. It is
@@ -148,23 +140,16 @@ impl App {
         }
     }
 
-    /// Destroys live lock surfaces and their EGL side but keeps tracking entries. Release EGL and
-    /// `wl_egl_window` before dropping `SessionLockSurface`; otherwise the latter destroys the
-    /// `wl_surface` under a live EGL window. Ordered unlock calls this after `unlock_and_destroy`:
-    /// destroying while the output is still locked causes a solid-color flash. The next lock
-    /// rebuilds its surfaces through [`App::ensure_lock_surfaces`]. `finished` has no such window
-    /// because the compositor already ended the lock.
+    /// Destroys live lock surfaces but keeps tracking entries. Ordered unlock calls this after
+    /// `unlock_and_destroy`: destroying while the output is still locked causes a solid-color
+    /// flash. The next lock rebuilds its surfaces through [`App::ensure_lock_surfaces`]. `finished`
+    /// has no such window because the compositor already ended the lock.
     fn teardown_lock_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
             if !matches!(self.surfaces[index].role, TrackedRole::Lock { surface: Some(_), .. }) {
                 continue;
             }
-            self.release_bound(index);
-            if let TrackedRole::Lock { surface, .. } = &mut self.surfaces[index].role {
-                *surface = None;
-            }
-            self.surfaces[index].map_state = MapState::Unmapped;
-            eprintln!("[obelisk-renderer] {}: lock surface destroyed", self.surfaces[index].surface_id);
+            self.drop_role_object(index);
         }
     }
 

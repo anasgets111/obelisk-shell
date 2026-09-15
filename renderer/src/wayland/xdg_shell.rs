@@ -202,18 +202,10 @@ impl App {
         instance: &SurfaceInstance,
         visible: bool,
     ) {
-        self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Window { window: None, spec: spec.clone() },
-            bound: None,
-            surface_id: instance.instance_id.clone(),
-            map_state: MapState::Unmapped,
-            null_buffered: false,
-            configured_size: (0, 0),
-            last_painted: None,
-            stale: false,
-            blur_effect: None,
-            last_blur_region: Vec::new(),
-        });
+        self.surfaces.push(TrackedSurface::new(
+            TrackedRole::Window { window: None, spec: spec.clone() },
+            instance.instance_id.clone(),
+        ));
         if visible {
             let index = self.surfaces.len() - 1;
             self.show_window(qh, index);
@@ -232,8 +224,8 @@ impl App {
         instance: &SurfaceInstance,
         visible: bool,
     ) {
-        self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Popup {
+        self.surfaces.push(TrackedSurface::new(
+            TrackedRole::Popup {
                 popup: None,
                 // The declaration's own numbers, which for a `Content` axis is zero until the first
                 // resolve measures one. Nothing opens before then; `apply_resolved_state` writes
@@ -248,16 +240,8 @@ impl App {
                 dismissed_at: None,
                 refusal_logged: None,
             },
-            bound: None,
-            surface_id: instance.instance_id.clone(),
-            map_state: MapState::Unmapped,
-            null_buffered: false,
-            configured_size: (0, 0),
-            last_painted: None,
-            stale: false,
-            blur_effect: None,
-            last_blur_region: Vec::new(),
-        });
+            instance.instance_id.clone(),
+        ));
         if visible {
             let index = self.surfaces.len() - 1;
             self.show_popup(qh, index);
@@ -367,23 +351,6 @@ impl App {
         }
         self.surfaces[index].map_state = MapState::AwaitingConfigure;
         eprintln!("[obelisk-renderer] {} creating: visible = true", self.surfaces[index].surface_id);
-    }
-
-    /// Destroys the toplevel but keeps tracking so a later `visible = true` rebuilds it
-    /// (ADR-0049 decision 1). Clear `configured_size` with the binding; the next toplevel gets its
-    /// own configure and cannot paint into a stale one. Release EGL/`wl_egl_window` first; dropping
-    /// `Window` then destroys decoration, toplevel, xdg-surface, and wl-surface in protocol order.
-    pub(super) fn hide_window(&mut self, index: usize) {
-        self.release_blur_effect(index);
-        // Child popups must die before their parent xdg-surface.
-        self.drop_child_popups(index);
-        self.release_bound(index);
-        if let TrackedRole::Window { window, .. } = &mut self.surfaces[index].role {
-            drop(window.take());
-        }
-        self.surfaces[index].map_state = MapState::Unmapped;
-        self.surfaces[index].null_buffered = false;
-        eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
     }
 
     /// Creates positioner and popup in protocol order (ADR-0040 decision 2, ADR-0049
@@ -585,7 +552,7 @@ impl App {
         for child in self.drop_child_popups(index) {
             self.latch_popup(child);
         }
-        self.drop_popup_object(index);
+        self.drop_role_object(index);
     }
 
     /// Returns shown descendants deepest-first and destroys their objects. Every surface teardown
@@ -597,23 +564,9 @@ impl App {
         let mut nested = Vec::new();
         self.shown_popups_under(index, &mut nested);
         for &child in &nested {
-            self.drop_popup_object(child);
+            self.drop_role_object(child);
         }
         nested
-    }
-
-    /// One popup object teardown, without changing its latch or nesting. Release EGL and
-    /// `wl_egl_window`, then drop [`Popup`], whose `Drop` sends `xdg_popup.destroy`.
-    fn drop_popup_object(&mut self, index: usize) {
-        self.release_bound(index);
-        if let TrackedRole::Popup { popup, positioned, .. } = &mut self.surfaces[index].role {
-            drop(popup.take());
-            // No object, no positioner to have been given anything. The next open sends afresh.
-            *positioned = None;
-        }
-        self.surfaces[index].map_state = MapState::Unmapped;
-        self.surfaces[index].null_buffered = false;
-        eprintln!("[obelisk-renderer] {} destroyed", self.surfaces[index].surface_id);
     }
 
     /// Whether this is a new refusal for the popup (ADR-0049 amendment). Different reasons each

@@ -305,23 +305,18 @@ impl App {
         });
 
         self.surfaces.push(TrackedSurface {
-            role: TrackedRole::Panel {
-                layer,
-                output: output.clone(),
-                spec: spec.clone(),
-                output_size: instance.available,
-                measured,
-                requested: if deferred { (0, 0) } else { size },
-            },
-            bound: None,
-            surface_id: instance.instance_id.clone(),
             map_state: if visible { MapState::AwaitingConfigure } else { MapState::Unmapped },
-            null_buffered: false,
-            configured_size: (0, 0),
-            last_painted: None,
-            stale: false,
-            blur_effect: None,
-            last_blur_region: Vec::new(),
+            ..TrackedSurface::new(
+                TrackedRole::Panel {
+                    layer,
+                    output: output.clone(),
+                    spec: spec.clone(),
+                    output_size: instance.available,
+                    measured,
+                    requested: if deferred { (0, 0) } else { size },
+                },
+                instance.instance_id.clone(),
+            )
         });
     }
 
@@ -330,7 +325,7 @@ impl App {
     /// **Never shown.** [`App::create_panel`] already built a bufferless surface. Painting attaches
     /// the first buffer and maps it only after its configure is acked.
     ///
-    /// **Hidden after being shown.** [`App::unmap`] destroyed the object, so rebuild from the last
+    /// **Hidden after being shown.** [`App::drop_role_object`] destroyed the object, so rebuild from the last
     /// spec and wait in [`MapState::AwaitingConfigure`]; attaching before the initial ack is the
     /// protocol error niri reports.
     ///

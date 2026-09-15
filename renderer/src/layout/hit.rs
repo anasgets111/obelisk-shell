@@ -79,10 +79,9 @@ pub fn link_under(node: &ResolvedNode, point: LogicalPoint, shaping: &ShapingHan
 
 /// The shape the pointer should take over `path`'s deepest node (ADR-0107). Innermost wins, and
 /// at each node an explicit `cursor` property beats what the node is: a `text` with `on_link` over
-/// a link's own words is a `pointer`, a `textfield` is `text`, a `button` with an `on_click` is a
-/// `pointer`, and nothing else says anything, so the arrow is what is left. The same three
-/// questions `wayland::input` asks on a press, asked on motion, so what the cursor promises is what
-/// a click does: a `button` with no handler is transparent to both.
+/// a link's own words is a `pointer`, a `textfield` is `text`, a button that
+/// [`ResolvedNode::takes_pointer`] is a `pointer`, and nothing else says anything, so the arrow is
+/// what is left.
 ///
 /// A `cursor` set on an ancestor still loses to a link inside it, since the walk meets the link
 /// first. That is the order a card with `cursor = "grab"` and a link in its body wants.
@@ -103,9 +102,7 @@ pub fn cursor_under(path: &[&ResolvedNode], point: LogicalPoint, shaping: &Shapi
                     link_under(node, local, shaping).map(|_| CursorIcon::Pointer)
                 }
                 "textfield" => Some(CursorIcon::Text),
-                "button" if matches!(node.properties.get("on_click"), Some(Value::Function(_))) => {
-                    Some(CursorIcon::Pointer)
-                }
+                _ if node.takes_pointer() => Some(CursorIcon::Pointer),
                 _ => None,
             }
         })
@@ -257,6 +254,12 @@ mod tests {
         let point = LogicalPoint { x: 60.0, y: 10.0 };
         assert_eq!(cursor_under(&hit_path(&handled, point), point, &shaping), CursorIcon::Default);
         assert_eq!(cursor_under(&[], point, &shaping), CursorIcon::Default, "off every node");
+
+        let submit = with(node("button", (0.0, 0.0, 50.0, 20.0), vec![]), &lua, "submit", Value::Boolean(true));
+        let point = LogicalPoint { x: 10.0, y: 10.0 };
+        assert_eq!(cursor_under(&hit_path(&submit, point), point, &shaping), CursorIcon::Pointer, "submit = true");
+        let wheel = with(node("button", (0.0, 0.0, 50.0, 20.0), vec![]), &lua, "on_wheel", function(&lua));
+        assert_eq!(cursor_under(&hit_path(&wheel, point), point, &shaping), CursorIcon::Pointer, "on_wheel only");
     }
 
     #[test]

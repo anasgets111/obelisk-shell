@@ -182,6 +182,15 @@ impl ResolvedNode {
         self.visible && !self.leaving
     }
 
+    /// The input region and the default cursor both ask this (ADR-0214).
+    pub fn takes_pointer(&self) -> bool {
+        self.kind == "button"
+            && (matches!(self.properties.get("submit"), Some(Value::Boolean(true)))
+                || ["on_click", "on_drag", "on_wheel"]
+                    .iter()
+                    .any(|handler| matches!(self.properties.get(*handler), Some(Value::Function(_)))))
+    }
+
     /// Whether any visible node in this tree is mid-tween, which is what asks the compositor for
     /// another frame callback (`wayland::surface::App::paint_surface`). A hidden node's subtree is
     /// frozen (ADR-0124), tweens included: nothing advances them, so counting them would arm a
@@ -2215,11 +2224,7 @@ fn takes_input_as_a_box(node: &ResolvedNode, paint_claims: bool) -> bool {
             Some(_) => true,
             None => false,
         };
-    paints
-        || (node.kind == "button"
-            && ["on_click", "on_drag", "on_wheel"]
-                .iter()
-                .any(|handler| matches!(node.properties.get(*handler), Some(Value::Function(_)))))
+    paints || node.takes_pointer()
 }
 
 #[cfg(test)]
@@ -5728,6 +5733,16 @@ pub(super) mod tests {
         let idle_button = region_node(7, "button", (0.0, 0.0, 120.0, 520.0), None, Vec::new());
         let root = region_node(8, "panel", (0.0, 0.0, 120.0, 520.0), None, vec![idle_button]);
         assert!(overlay_input_regions(&root, 1.0).is_empty(), "a button with no handler is as transparent as a rect");
+
+        let label = region_node(9, "rect", (10.0, 10.0, 50.0, 20.0), solid_paint(), Vec::new());
+        let mut submit = region_node(10, "button", (0.0, 0.0, 120.0, 40.0), None, vec![label]);
+        submit.properties.insert("submit".to_string(), Value::Boolean(true));
+        let root = region_node(11, "panel", (0.0, 0.0, 120.0, 40.0), None, vec![submit]);
+        assert_eq!(
+            overlay_input_regions(&root, 1.0),
+            [PhysicalRect { x0: 0, y0: 0, x1: 120, y1: 40 }],
+            "a submit button claims its box, not only its label"
+        );
     }
 
     /// ADR-0149: the region follows the painted box, and a node scaled to nothing paints nothing.

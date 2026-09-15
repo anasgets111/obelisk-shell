@@ -24,7 +24,7 @@ pub(super) fn log_bind_failure(surface_id: &str, stage: &str, err: impl std::fmt
 pub(super) enum MapState {
     /// `visible` is false: either no buffer was attached yet, or the role object was destroyed
     /// (ADR-0088, ADR-0049 decision 1). Nothing may be painted here; a panel may have no
-    /// `wl_surface` left to paint onto (see [`App::unmap`]).
+    /// `wl_surface` left to paint onto (see [`App::drop_role_object`]).
     Unmapped,
     /// The map commit is out; configure has not arrived.
     AwaitingConfigure,
@@ -260,23 +260,55 @@ pub(super) struct TrackedSurface {
     /// kept landing in that window, evicting a whole picker's thumbnails, which then re-decoded,
     /// landed, and unpinned everything again.
     pub(super) stale: bool,
-    /// This surface's `ext_background_effect_surface_v1` and the id of the `wl_surface` it names
-    /// (ADR-0195). `None` on a compositor without the protocol, and on every surface whose tree
-    /// never sets `blur`.
-    ///
-    /// The id is carried because the object goes inert when its `wl_surface` is destroyed, and
-    /// calling `set_blur_region` on an inert one is a protocol error that takes the whole client
-    /// down. A `TrackedSurface` outlives its `wl_surface`: a tooltip is destroyed and recreated on
-    /// every hover, keeping its index and getting a fresh surface, and `unmap` -- which does drop
-    /// this -- returns early for anything that is not a panel. Comparing ids at the push is what
-    /// makes every teardown path safe rather than the ones that were remembered.
-    pub(super) blur_effect: Option<(ExtBackgroundEffectSurfaceV1, wayland_client::backend::ObjectId)>,
+    /// This surface's `ext_background_effect_surface_v1` (ADR-0195). `None` on a compositor without
+    /// the protocol, and on every surface whose tree never sets `blur`. [`App::drop_role_object`]
+    /// destroys it with its `wl_surface`: `set_blur_region` on an inert one kills the client.
+    pub(super) blur_effect: Option<ExtBackgroundEffectSurfaceV1>,
     /// The region last sent, so an unchanged one is not resent. `apply_input_region` deliberately
     /// does not diff, and says why: one `wl_region` round trip is cheaper than the repaint that
     /// follows it. That reasoning was about a handful of rectangles. A rounded card is a couple of
     /// dozen, several cards more, and a card that only fades has the same region on every frame of
     /// the fade -- so this one compares.
     pub(super) last_blur_region: Vec<crate::text::snap::PhysicalRect>,
+}
+impl TrackedSurface {
+    pub(super) fn new(role: TrackedRole, surface_id: String) -> Self {
+        Self {
+            bound: None,
+            role,
+            surface_id,
+            map_state: MapState::Unmapped,
+            null_buffered: false,
+            configured_size: (0, 0),
+            last_painted: None,
+            stale: false,
+            blur_effect: None,
+            last_blur_region: Vec::new(),
+        }
+    }
+
+    /// [`App::drop_role_object`]'s per-entry half.
+    fn forget_role_object(&mut self) {
+        match &mut self.role {
+            TrackedRole::Panel { layer, .. } => drop(layer.take()),
+            TrackedRole::Window { window, .. } => drop(window.take()),
+            TrackedRole::Popup { popup, positioned, .. } => {
+                drop(popup.take());
+                *positioned = None;
+            }
+            TrackedRole::Lock { surface, .. } => drop(surface.take()),
+        }
+        // After the surface, not before: a live surface losing its effect falls back to a blanket
+        // compositor blur rule for its closing snapshot (see `release_blur_effect`).
+        if let Some(effect) = self.blur_effect.take() {
+            effect.destroy();
+        }
+        self.last_blur_region.clear();
+        self.map_state = MapState::Unmapped;
+        self.null_buffered = false;
+        // Those pixels are gone, and a kept list would pin its images through `trim` (ADR-0182).
+        self.last_painted = None;
+    }
 }
 /// Which surfaces a narrowed repaint must cover: the ones a tick advanced, plus every surface
 /// already marked `stale`.
@@ -545,29 +577,17 @@ impl App {
 
     /// Destroys one surface instance (ADR-0038 decision 3). An unplugged monitor produces both
     /// `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`, in either order; the
-    /// no-op handles whichever callback arrives second. The order is explicit because an implicit
-    /// drop frees no EGL surface at all: drop child popups, `eglDestroySurface`,
-    /// `wl_egl_window_destroy`, then role and `wl_surface`. Both protocols require that order;
-    /// xdg-shell rejects a parent with live popups, and SCTK preserves role-before-surface.
+    /// no-op handles whichever callback arrives second.
     pub(super) fn destroy_surface_by_id(&mut self, instance_id: &str) {
         let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
             return;
         };
-        // Drop children before `remove` invalidates indices and before the parent dies.
-        self.drop_child_popups(index);
-        self.release_bound(index);
-        // Send the effect's `destroy` while its `wl_surface` is still alive. Dropping the proxy
-        // does not send it, so an unplugged output would otherwise leave one inert object per
-        // surface on the connection for the rest of the session.
-        if let Some((effect, _)) = self.surfaces[index].blur_effect.take() {
-            effect.destroy();
-        }
-        let TrackedSurface { role, surface_id, .. } = self.surfaces.remove(index);
-        drop(role);
+        // Before `remove` invalidates indices and `forget_surface` takes the tree the scrubs read.
+        self.drop_role_object(index);
+        let TrackedSurface { surface_id, .. } = self.surfaces.remove(index);
         // `App::surfaces` and `Scene::surfaces` are different maps; dropping the tracked surface
         // leaves the retained tree behind unless it is dropped here too.
         self.client.forget_surface(&surface_id);
-        eprintln!("[obelisk-renderer] {surface_id} destroyed: its output is gone");
     }
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds
@@ -794,8 +814,8 @@ impl App {
     ///
     /// Lazily created and never created at all for the common surface, because most surfaces never
     /// set `blur` and an `ext_background_effect_surface_v1` per surface would be an object and a
-    /// destroy for nothing. The object names a `wl_surface`, so it is dropped with one: `unmap`
-    /// takes the layer object down and the next `create` makes a fresh pair.
+    /// destroy for nothing. The object names a `wl_surface`, so [`App::drop_role_object`] destroys
+    /// it with one and the next show makes a fresh pair.
     ///
     /// A compositor with no manager, or one whose `blur` capability is absent or withdrawn, gets
     /// nothing pushed and the config sees no error -- an unavailable compositor feature is not a
@@ -808,22 +828,6 @@ impl App {
             return;
         };
         let qh = self.queue_handle.clone();
-        // Identity first, and before the region compare below. An object whose `wl_surface` is
-        // gone is inert, and a tooltip reopens at the same size constantly -- so the compare would
-        // match, return, and leave the reopened surface holding a dead object and no blur. The
-        // crash this replaces was the same fact read from the other side.
-        let surface_id = surface.id();
-        if let Some((stale, named)) = self.surfaces[index].blur_effect.take() {
-            if named == surface_id {
-                self.surfaces[index].blur_effect = Some((stale, named));
-            } else {
-                // The `wl_surface` is already gone, so `destroy` is the only request still legal
-                // on it; the region it held died with the surface, so the compare below has
-                // nothing to match against.
-                stale.destroy();
-                self.surfaces[index].last_blur_region.clear();
-            }
-        }
         if regions == self.surfaces[index].last_blur_region {
             return;
         }
@@ -843,7 +847,7 @@ impl App {
                     return;
                 }
             };
-            self.surfaces[index].blur_effect = Some((effect, surface_id));
+            self.surfaces[index].blur_effect = Some(effect);
         }
         let region = match Region::new(&self.compositor_state) {
             Ok(region) => region,
@@ -855,7 +859,7 @@ impl App {
         for rect in &regions {
             region.add(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
         }
-        if let Some((effect, _)) = self.surfaces[index].blur_effect.as_ref() {
+        if let Some(effect) = self.surfaces[index].blur_effect.as_ref() {
             // A null region would remove the effect; an empty one keeps the object and blurs
             // nothing, which is what a surface whose glass is currently hidden wants.
             effect.set_blur_region(Some(region.wl_region()));
@@ -881,15 +885,9 @@ impl App {
         let Some(surface) = self.surfaces[index].role.wl_surface() else {
             return;
         };
-        let Some((effect, named)) = self.surfaces[index].blur_effect.as_ref() else {
+        let Some(effect) = self.surfaces[index].blur_effect.as_ref() else {
             return;
         };
-        // `hide_window` keeps the effect and `apply_blur_region`'s identity cleanup sits behind its
-        // `blur_supported` guard, so a withdrawn capability can leave one naming a dead surface.
-        // `set_blur_region` on that is `surface_destroyed`, which takes the whole client down.
-        if *named != surface.id() {
-            return;
-        }
         effect.set_blur_region(None);
         surface.commit();
     }
@@ -928,7 +926,7 @@ impl App {
                     let qh = self.queue_handle.clone();
                     self.show_panel(&qh, index);
                 }
-                VisibilityAction::Hide => self.unmap(index),
+                VisibilityAction::Hide => self.drop_role_object(index),
                 VisibilityAction::Nothing => {}
             },
             TrackedRole::Window { .. } => match visibility_action(self.surfaces[index].map_state, visible) {
@@ -936,7 +934,7 @@ impl App {
                     let qh = self.queue_handle.clone();
                     self.show_window(&qh, index);
                 }
-                VisibilityAction::Hide => self.hide_window(index),
+                VisibilityAction::Hide => self.drop_role_object(index),
                 VisibilityAction::Nothing => {}
             },
             // Popup visibility also reads ADR-0051's latch: dismissal leaves it `Unmapped` while
@@ -948,41 +946,22 @@ impl App {
         }
     }
 
-    /// The protocol's null-buffer unmap was one commit with no destroyed protocol objects, the
-    /// point of ADR-0038 decision 2: toggling a launcher costs this instead of a process spawn.
-    /// Hiding a panel destroys its layer object (ADR-0088): niri never revives it despite the
-    /// correct wire sequence, so show rebuilds it; this matches windows/popups and mirrored Qt
-    /// `PanelWindow`. Drop child popups, EGL/`wl_egl_window`, then the role and `wl_surface`.
-    fn unmap(&mut self, index: usize) {
-        if !matches!(self.surfaces[index].role, TrackedRole::Panel { .. }) {
-            return;
-        }
+    /// The only teardown (ADR-0213). Blur and child popups need the `wl_surface`, EGL goes before
+    /// the role object, and the input scrubs read the scene tree.
+    pub(super) fn drop_role_object(&mut self, index: usize) {
         self.release_blur_effect(index);
+        // xdg-shell rejects a parent destroyed under live popups.
         self.drop_child_popups(index);
         self.release_bound(index);
-        if let TrackedRole::Panel { layer, .. } = &mut self.surfaces[index].role {
-            drop(layer.take());
-        }
-        // The effect object names the `wl_surface` that just went away; a stale one would be inert
-        // at best. The next map creates a fresh pair, and the cleared region forces the push.
-        if let Some((effect, _)) = self.surfaces[index].blur_effect.take() {
-            effect.destroy();
-        }
-        self.surfaces[index].last_blur_region.clear();
-        self.surfaces[index].map_state = MapState::Unmapped;
-        self.surfaces[index].null_buffered = false;
-        // The old object and its pixels are gone; force the next object to paint.
-        self.surfaces[index].last_painted = None;
-        // No `leave` follows client destruction; clear stale focus or a closed polkit prompt would
-        // scrub and re-arm once per frame.
+        self.surfaces[index].forget_role_object();
+        // No `leave` follows a client-side destroy; stale focus would scrub and re-arm every frame.
         if self.keyboard_focus.as_deref() == Some(self.surfaces[index].surface_id.as_str()) {
             self.keyboard_focus = None;
             self.focus_secure_submit(None);
         }
-        // The pointer is owed the same scrub, and for more than tint: a hidden panel's `on_hover`
-        // is how a config releases what hovering took.
+        // More than tint: `on_hover(false)` is how a config releases what hovering took.
         self.pointer_left_destroyed_surface(index);
-        eprintln!("[obelisk-renderer] {} destroyed: visible = false", self.surfaces[index].surface_id);
+        eprintln!("[obelisk-renderer] {} destroyed", self.surfaces[index].surface_id);
     }
 
     /// Lazily builds the process-wide EGL state on the first drawable surface (ADR-0071). Failure
@@ -1673,6 +1652,23 @@ mod tests {
             min_size: None,
             max_size: None,
         }
+    }
+
+    #[test]
+    fn a_dropped_role_object_leaves_an_unmapped_entry_that_pins_nothing() {
+        let mut tracked =
+            TrackedSurface::new(TrackedRole::Window { window: None, spec: window("settings") }, "settings".to_string());
+        tracked.map_state = MapState::Mapped;
+        tracked.null_buffered = true;
+        tracked.last_painted = Some(((640, 480), layout::paint::DisplayList::default()));
+        tracked.last_blur_region.push(crate::text::snap::PhysicalRect { x0: 0, y0: 0, x1: 4, y1: 4 });
+
+        tracked.forget_role_object();
+
+        assert_eq!(tracked.map_state, MapState::Unmapped);
+        assert!(!tracked.null_buffered);
+        assert!(tracked.last_painted.is_none(), "a kept list pins its images in `ImageCache::trim`");
+        assert!(tracked.last_blur_region.is_empty());
     }
 
     #[test]

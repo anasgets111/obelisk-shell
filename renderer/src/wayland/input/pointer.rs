@@ -569,9 +569,10 @@ impl App {
         self.sync_hover(index, tree, Some(position), false);
     }
 
-    /// The pointer half of `surface::unmap`'s scrub, for the one leave the compositor never sends.
+    /// The pointer half of `App::drop_role_object`'s scrub, for the one leave the compositor never
+    /// sends.
     ///
-    /// Hiding a panel destroys its layer object from this side (ADR-0088), so no `wl_pointer`
+    /// Every teardown destroys its role object from this side (ADR-0088), so no `wl_pointer`
     /// leave follows and the `Leave` arm below never runs: `pointer_at` keeps naming a surface
     /// that is gone, every hover signal inside it stays true, and `on_hover(false)` is never
     /// called. Closing the notification history with the pointer over its list left

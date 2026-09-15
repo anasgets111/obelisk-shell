@@ -4789,3 +4789,30 @@ and the enum values it matches as `u32` constants from `nm-dbus-interface.h`.
 
 Device tracking is unchanged: `DeviceAdded` and `DeviceRemoved` drive `refresh_devices`, which never
 lived in the crate.
+
+## 0213. Every role object dies through one teardown
+
+Amends ADR-0088 decision 1 and ADR-0195's blur-effect lifetime.
+
+1. `App::drop_role_object` is the only path that destroys a panel, window, popup or lock object: blur
+   release, child popups, EGL, role object, per-entry resets, then keyboard and pointer scrubs.
+2. Roles keep only their own policy: the popup latch, lock-release ordering (ADR-0042), entry removal
+   on output loss.
+3. The blur effect's surface-id guard is deleted. Every `wl_surface` destroy now takes the effect with
+   it, so an effect cannot name a dead surface.
+
+Five per-role teardowns shared 1 of 10 steps. Hidden windows and popups kept `pointer_at` and hover
+signals, and pinned their last images against ADR-0182.
+
+## 0214. A button's default cursor and its input region ask one question
+
+Amends ADR-0107 decision 2 and ADR-0109 decision 3.
+
+1. `ResolvedNode::takes_pointer` is true for a `button` with `submit = true` or a callable `on_click`,
+   `on_drag` or `on_wheel`. The input region and the default cursor both read it.
+2. Drag- and wheel-only buttons show `pointer`. A config wanting `grab` sets `cursor`.
+3. Press dispatch keeps its per-gesture checks: each needs its own handler, and a drag-only button
+   inside a clickable one must not block the outer click.
+
+A transparent `submit` button claimed only its painted label, so 3800 of its 4800 px² passed clicks
+to the window behind, under an arrow cursor.
