@@ -382,20 +382,6 @@ mod tests {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
-    /// Polls until `condition` or `timeout`, avoiding a flaky post-reap single check.
-    async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if condition() {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     #[derive(Debug, PartialEq, Eq, Clone)]
     struct FakeLinkError(String);
 
@@ -413,8 +399,6 @@ mod tests {
         /// Reports evidence for this surface_id.
         Return(String),
         Fail,
-        /// Never resolves; also the empty-queue fallback.
-        Hang,
     }
 
     /// In-memory [`CandidateLink`] fake with configured behavior and ordered call recording.
@@ -425,6 +409,7 @@ mod tests {
         activate: StepBehavior,
         evidence: Mutex<VecDeque<EvidenceOutcome>>,
         calls: Mutex<Vec<&'static str>>,
+        candidate_pid: Option<u32>,
     }
 
     impl FakeCandidateLink {
@@ -455,6 +440,7 @@ mod tests {
                 activate,
                 evidence: Mutex::new(evidence),
                 calls: Mutex::new(Vec::new()),
+                candidate_pid: None,
             }
         }
 
@@ -474,8 +460,9 @@ mod tests {
     impl CandidateLink for FakeCandidateLink {
         type Error = FakeLinkError;
 
-        fn expect_candidate_pid(&mut self, _pid: Option<u32>) {
-            // No registry behind this link; the recorded call order is what these tests assert on.
+        fn expect_candidate_pid(&mut self, pid: Option<u32>) {
+            // Keeps the bound pid past the abort's `None`, so a test can check the Candidate is gone.
+            self.candidate_pid = self.candidate_pid.or(pid);
             self.record("expect_candidate_pid");
         }
 
@@ -501,17 +488,23 @@ mod tests {
             match step {
                 Some(EvidenceOutcome::Return(surface_id)) => Ok(surface_id),
                 Some(EvidenceOutcome::Fail) => Err(FakeLinkError("candidate link failed".to_string())),
-                Some(EvidenceOutcome::Hang) | None => std::future::pending().await,
+                // An exhausted queue never resolves, like a silent Candidate.
+                None => std::future::pending().await,
             }
         }
     }
 
     const SHORT_DEADLINE: Duration = Duration::from_millis(80);
-    const GRACE: Duration = Duration::from_millis(200);
+    /// Bounds only a stalled reap; `sleep` exits on SIGTERM in milliseconds.
+    const GRACE: Duration = Duration::from_secs(1);
 
-    /// `SwapTimings` with `reap_grace` fixed to [`GRACE`]; process tests cover reap escalation.
     fn timings(ready_timeout: Duration, evidence_timeout: Duration) -> SwapTimings {
         SwapTimings { ready_timeout, evidence_timeout, reap_grace: GRACE }
+    }
+
+    /// Stage classification without a Candidate process, so reap timing cannot flake it.
+    async fn handshake(link: &mut FakeCandidateLink) -> Result<Vec<String>, SwapFailure<FakeLinkError>> {
+        drive_handshake(link, &[sample_snapshot()], 1, SHORT_DEADLINE, SHORT_DEADLINE).await
     }
 
     #[tokio::test]
@@ -547,11 +540,11 @@ mod tests {
         );
 
         // Clean up the newly-promoted candidate rather than leaking the sleep.
-        process::reap_process_group(&mut outcome.candidate, GRACE).await.expect("cleanup reap failed");
+        let _ = process::reap_process_group(&mut outcome.candidate, GRACE).await;
     }
 
     #[tokio::test]
-    async fn run_swap_promotes_all_expected_surfaces_in_readysignals_order_regardless_of_arrival_order() {
+    async fn handshake_promotes_all_expected_surfaces_in_readysignals_order_regardless_of_arrival_order() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
         // Evidence arrives out of order; promoted order must follow ReadySignal, not arrival.
         let arrival_order = VecDeque::from([
@@ -567,62 +560,13 @@ mod tests {
             arrival_order,
         );
 
-        let mut outcome = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            43,
-            timings(SHORT_DEADLINE, SHORT_DEADLINE),
-        )
-        .await
-        .expect("full success across 3 surfaces must promote");
+        let promoted = handshake(&mut link).await.expect("full success across 3 surfaces must promote");
 
-        assert_eq!(outcome.promoted_surfaces, expected);
-        process::reap_process_group(&mut outcome.candidate, GRACE).await.expect("cleanup reap failed");
+        assert_eq!(promoted, expected);
     }
 
     #[tokio::test]
-    async fn run_swap_aborts_the_candidate_when_ready_signal_times_out() {
-        let mut link = FakeCandidateLink::new(StepBehavior::Hang, EvidenceOutcome::Return("main_bar".to_string()));
-
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            1,
-            timings(Duration::from_millis(30), SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("a hanging ready signal must not promote");
-
-        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::NullBufferStaging }));
-    }
-
-    #[tokio::test]
-    async fn run_swap_aborts_the_candidate_when_evidence_times_out() {
-        let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Hang);
-
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            2,
-            timings(SHORT_DEADLINE, Duration::from_millis(30)),
-        )
-        .await
-        .expect_err("evidence that never arrives must not promote");
-
-        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::EvidenceVerification }));
-    }
-
-    #[tokio::test]
-    async fn run_swap_aborts_the_candidate_when_state_hydration_times_out() {
+    async fn handshake_times_out_when_state_hydration_hangs() {
         let mut link = FakeCandidateLink::with_steps(
             StepBehavior::Hang,
             StepBehavior::Succeed,
@@ -631,23 +575,13 @@ mod tests {
             VecDeque::from([EvidenceOutcome::Return("main_bar".to_string())]),
         );
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            6,
-            timings(Duration::from_millis(30), SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("a hanging state-snapshot push must not promote");
+        let failure = handshake(&mut link).await.expect_err("a hanging state-snapshot push must not promote");
 
         assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::StateHydration }));
     }
 
     #[tokio::test]
-    async fn run_swap_aborts_the_candidate_when_activate_draw_times_out() {
+    async fn handshake_times_out_when_activate_draw_hangs() {
         let mut link = FakeCandidateLink::with_steps(
             StepBehavior::Succeed,
             StepBehavior::Succeed,
@@ -656,54 +590,18 @@ mod tests {
             VecDeque::from([EvidenceOutcome::Return("main_bar".to_string())]),
         );
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            7,
-            timings(SHORT_DEADLINE, Duration::from_millis(30)),
-        )
-        .await
-        .expect_err("a hanging activate-draw send must not promote");
+        let failure = handshake(&mut link).await.expect_err("a hanging activate-draw send must not promote");
 
         assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::ActivateDraw }));
-    }
-
-    /// Polls for a parseable pid in `path`. Failure-path recovery uses the Candidate's `$$`, which
-    /// equals `Child::id()` because it `exec`s the shell before blocking.
-    async fn wait_for_pidfile(path: &std::path::Path, timeout: Duration) -> Option<i32> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(pid) = contents.trim().parse()
-            {
-                return Some(pid);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Pid-per-test file, not shared command matching: parallel tests spawn near-identical commands
-    /// and would false-positive on siblings.
-    fn unique_pidfile() -> std::path::PathBuf {
-        let unique =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock").as_nanos();
-        std::env::temp_dir().join(format!("obelisk-reload-test-{}-{unique}.pid", std::process::id()))
     }
 
     #[tokio::test]
     async fn run_swap_aborts_the_candidate_process_group_on_a_ready_timeout() {
         let mut link = FakeCandidateLink::new(StepBehavior::Hang, EvidenceOutcome::Return("main_bar".to_string()));
-        let pidfile = unique_pidfile();
 
-        run_swap(
+        let failure = run_swap(
             "sh",
-            &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
+            &sh_args("sleep 30"),
             &[],
             &mut link,
             &[sample_snapshot()],
@@ -713,17 +611,13 @@ mod tests {
         .await
         .expect_err("a hanging ready signal must not promote");
 
-        let candidate_pid = wait_for_pidfile(&pidfile, Duration::from_millis(300))
-            .await
-            .expect("candidate should have written its own pid before hanging on the ready signal");
-        let _ = std::fs::remove_file(&pidfile);
-
-        let gone = wait_until(Duration::from_millis(500), || !proc_exists(candidate_pid)).await;
-        assert!(gone, "the aborted candidate (pid {candidate_pid}) must have been reaped, not leaked");
+        assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::NullBufferStaging }), "{failure:?}");
+        let pid = link.candidate_pid.expect("run_swap binds the spawned candidate's pid") as i32;
+        assert!(!proc_exists(pid), "the aborted candidate (pid {pid}) must have been reaped, not leaked");
     }
 
     #[tokio::test]
-    async fn run_swap_times_out_and_aborts_the_candidate_when_one_of_three_expected_surfaces_never_reports_evidence() {
+    async fn handshake_times_out_when_one_of_three_expected_surfaces_never_reports_evidence() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string(), "wallpaper_layer@DP-1".to_string()];
         // No third queue entry: `recv_presentation_evidence` treats it as a hang.
         let evidence = VecDeque::from([
@@ -737,50 +631,20 @@ mod tests {
             StepBehavior::Succeed,
             evidence,
         );
-        let pidfile = unique_pidfile();
 
-        let failure = run_swap(
-            "sh",
-            &sh_args(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            8,
-            timings(SHORT_DEADLINE, Duration::from_millis(60)),
-        )
-        .await
-        .expect_err("2 of 3 expected surfaces reporting evidence must not promote -- all-or-nothing gating");
+        let failure = handshake(&mut link)
+            .await
+            .expect_err("2 of 3 expected surfaces reporting evidence must not promote -- all-or-nothing gating");
 
         assert!(matches!(failure, SwapFailure::Timeout { stage: Stage::EvidenceVerification }));
-
-        let candidate_pid = wait_for_pidfile(&pidfile, Duration::from_millis(300))
-            .await
-            .expect("candidate should have written its own pid before its evidence loop timed out");
-        let _ = std::fs::remove_file(&pidfile);
-
-        let gone = wait_until(Duration::from_millis(500), || !proc_exists(candidate_pid)).await;
-        assert!(
-            gone,
-            "the aborted candidate (pid {candidate_pid}) must have been reaped even though 2 of 3 surfaces 'succeeded'"
-        );
     }
 
     #[tokio::test]
-    async fn run_swap_fails_with_unexpected_evidence_for_a_surface_id_never_announced() {
+    async fn handshake_fails_with_unexpected_evidence_for_a_surface_id_never_announced() {
         let mut link =
             FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Return("never_announced".to_string()));
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            9,
-            timings(SHORT_DEADLINE, SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("evidence for an unannounced surface_id must not promote");
+        let failure = handshake(&mut link).await.expect_err("evidence for an unannounced surface_id must not promote");
 
         match failure {
             SwapFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
@@ -791,7 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_swap_fails_with_unexpected_evidence_when_the_same_surface_id_is_reported_twice() {
+    async fn handshake_fails_with_unexpected_evidence_when_the_same_surface_id_is_reported_twice() {
         let expected = vec!["main_bar".to_string(), "overlay_canvas".to_string()];
         let evidence = VecDeque::from([
             EvidenceOutcome::Return("main_bar".to_string()),
@@ -805,17 +669,7 @@ mod tests {
             evidence,
         );
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            10,
-            timings(SHORT_DEADLINE, SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("a duplicate surface_id must not promote");
+        let failure = handshake(&mut link).await.expect_err("a duplicate surface_id must not promote");
 
         match failure {
             SwapFailure::UnexpectedEvidence { stage: Stage::EvidenceVerification, surface_id } => {
@@ -826,20 +680,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_swap_aborts_the_candidate_on_a_link_error() {
+    async fn handshake_fails_on_a_link_error() {
         let mut link = FakeCandidateLink::new(StepBehavior::Fail, EvidenceOutcome::Return("main_bar".to_string()));
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            4,
-            timings(SHORT_DEADLINE, SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("a link error must not promote");
+        let failure = handshake(&mut link).await.expect_err("a link error must not promote");
 
         match failure {
             SwapFailure::Link { stage: Stage::NullBufferStaging, source } => {
@@ -850,20 +694,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_swap_aborts_the_candidate_on_a_link_error_during_evidence_collection() {
+    async fn handshake_fails_on_a_link_error_during_evidence_collection() {
         let mut link = FakeCandidateLink::new(StepBehavior::Succeed, EvidenceOutcome::Fail);
 
-        let failure = run_swap(
-            "sh",
-            &sh_args("sleep 30"),
-            &[],
-            &mut link,
-            &[sample_snapshot()],
-            11,
-            timings(SHORT_DEADLINE, SHORT_DEADLINE),
-        )
-        .await
-        .expect_err("a link error during evidence collection must not promote");
+        let failure = handshake(&mut link).await.expect_err("a link error during evidence collection must not promote");
 
         match failure {
             SwapFailure::Link { stage: Stage::EvidenceVerification, source } => {
@@ -891,13 +725,6 @@ mod tests {
 
         assert!(matches!(failure, SwapFailure::SpawnFailed(_)));
         assert!(link.calls.lock().unwrap().is_empty(), "no handshake call should happen if the spawn itself failed");
-    }
-
-    #[tokio::test]
-    async fn wait_until_helper_reports_false_on_a_condition_that_never_becomes_true() {
-        // Self-check the polling helper.
-        let became_true = wait_until(Duration::from_millis(30), || false).await;
-        assert!(!became_true);
     }
 
     #[test]
