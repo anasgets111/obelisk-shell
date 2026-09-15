@@ -40,7 +40,7 @@ pub enum NotificationsAction {
     InvokeAction,
     /// (id: integer, text: string) Sends reply text to a notification with `has_reply`.
     Reply,
-    /// (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis sound file for an urgency tier.
+    /// (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
     SetSound,
     /// (enabled: boolean) Gates non-critical notification sounds.
     SetDnd,

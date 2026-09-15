@@ -612,7 +612,7 @@ local IdleCapability = {}
 ---| "dismiss" # (id: integer) Removes a queued notification.
 ---| "invoke_action" # (id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
 ---| "reply" # (id: integer, text: string) Sends reply text to a notification with `has_reply`.
----| "set_sound" # (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis sound file for an urgency tier.
+---| "set_sound" # (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
 ---| "set_dnd" # (enabled: boolean) Gates non-critical notification sounds.
 ---| "set_quiet" # (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
 ---| "hold_expiry" # (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.

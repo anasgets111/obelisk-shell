@@ -21,15 +21,14 @@ pub(super) fn resolve_expiry(urgency: Urgency, expire_timeout: i32) -> Option<Du
     }
 }
 
-/// Whether sound plays (ADR-0033): it needs a registered tier sound and bypasses DND only for
-/// critical urgency.
-pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: bool) -> bool {
-    sound_registered && (!dnd || urgency == Urgency::Critical)
+/// Whether a selected sound plays (ADR-0033): DND gates it except for critical urgency.
+pub(super) fn should_play_sound(dnd: bool, urgency: Urgency) -> bool {
+    !dnd || urgency == Urgency::Critical
 }
 
 /// Selects one `Notify` sound (ADR-0033): `suppress` wins; otherwise `client_sound_file`, already
 /// validated against the sound roots, beats the tier default. `sound_name` only replaces a tier
-/// default the config registered, so no config stays silent. DND/urgency is separate.
+/// default the config registered. DND/urgency is separate.
 pub(super) fn resolve_sound_path(
     suppress: bool,
     client_sound_file: Option<PathBuf>,
@@ -194,26 +193,20 @@ mod tests {
     }
 
     #[test]
-    fn should_play_sound_is_false_when_nothing_is_registered() {
-        assert!(!should_play_sound(false, Urgency::Normal, false));
-        assert!(!should_play_sound(false, Urgency::Critical, false));
-    }
-
-    #[test]
     fn should_play_sound_is_false_under_dnd_for_non_critical() {
-        assert!(!should_play_sound(true, Urgency::Low, true));
-        assert!(!should_play_sound(true, Urgency::Normal, true));
+        assert!(!should_play_sound(true, Urgency::Low));
+        assert!(!should_play_sound(true, Urgency::Normal));
     }
 
     #[test]
     fn should_play_sound_critical_bypasses_dnd() {
-        assert!(should_play_sound(true, Urgency::Critical, true));
+        assert!(should_play_sound(true, Urgency::Critical));
     }
 
     #[test]
-    fn should_play_sound_is_true_outside_dnd_with_a_registered_sound() {
-        assert!(should_play_sound(false, Urgency::Normal, true));
-        assert!(should_play_sound(false, Urgency::Low, true));
+    fn should_play_sound_is_true_outside_dnd() {
+        assert!(should_play_sound(false, Urgency::Normal));
+        assert!(should_play_sound(false, Urgency::Low));
     }
 
     #[test]

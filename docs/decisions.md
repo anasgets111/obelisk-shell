@@ -760,11 +760,12 @@ global, gates only sound and resets on restart. Critical notifications bypass DN
 expiry; Lua owns popup policy.
 
 Amended: sound-name resolves to the freedesktop theme's `sounds/freedesktop/stereo/<name>.oga`, only
-in place of a configured urgency sound, so a config that registers none stays silent. set_sound,
-sound-file and sound-name share sound roots (`/usr/share`, `/usr/local/share`, `/opt`,
-`$XDG_DATA_HOME`), kept apart from the icon roots. Playback decodes Ogg Vorbis only, what the theme
-ships, capped at 4 MiB, 30 seconds, two channels and 8-192 kHz; one sound waits behind the one
-playing and later ones drop, and playback gives up after the sound's length plus two seconds.
+in place of a configured urgency sound, so a config that registers none plays only a client's
+sound-file. set_sound, sound-file and sound-name share sound roots (`/usr/share`, `/usr/local/share`,
+`/opt`, `$XDG_DATA_HOME`), kept apart from the icon roots. Playback decodes Ogg Vorbis, what the
+theme ships, and 16-bit PCM WAV, what Telegram's sound-file is, picked by header and capped at 4
+MiB, 30 seconds, two channels and 8-192 kHz; one sound waits behind the one playing and later ones
+drop, and playback gives up after the sound's length plus two seconds.
 `set_quiet` gates non-critical sounds like DND without changing it, so a config can stay silent while
 locked or blanked. Accepted gap: a client that plays its own sound is heard twice.
 

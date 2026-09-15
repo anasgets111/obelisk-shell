@@ -1,4 +1,4 @@
-//! Testable Ogg Vorbis decode plus a dedicated one-shot PipeWire playback thread. Split from
+//! Testable Ogg Vorbis and WAV decode plus a dedicated one-shot PipeWire playback thread. Split from
 //! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
@@ -40,19 +40,23 @@ pub(super) fn resolve_sound_name(name: &str, roots: &[PathBuf]) -> Option<PathBu
     })
 }
 
-/// ponytail: Ogg Vorbis only, what the freedesktop theme ships; WAV, FLAC or Opus need another
-/// decoder. Any client can name the file, so size, length, channels, rate and chaining are capped.
+/// ponytail: Ogg Vorbis, what the theme ships, and 16-bit PCM WAV, what Telegram's sound-file is;
+/// FLAC or Opus need another decoder. Any client can name the file, so size, length, channels, rate
+/// and chaining are capped.
 fn decode_sound(path: &Path) -> Result<DecodedSound, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     if file.metadata()?.len() > MAX_SOUND_FILE_BYTES {
         return Err("larger than 4 MiB".into());
     }
-    let mut reader = lewton::inside_ogg::OggStreamReader::new(std::io::BufReader::new(file))?;
+    let mut file = std::io::BufReader::new(file);
+    // The header, not the client's extension, picks the decoder.
+    if std::io::BufRead::fill_buf(&mut file)?.starts_with(b"RIFF") {
+        return decode_wav(file);
+    }
+    let mut reader = lewton::inside_ogg::OggStreamReader::new(file)?;
     let channels = u32::from(reader.ident_hdr.audio_channels);
     let sample_rate = reader.ident_hdr.audio_sample_rate;
-    if channels > 2 || !(8_000..=192_000).contains(&sample_rate) {
-        return Err(format!("unsupported {channels} channels at {sample_rate} Hz").into());
-    }
+    let max_samples = max_samples(channels, sample_rate)?;
     // lewton silently rereads headers for a chained stream, which can change channels mid-file.
     let serial = reader.stream_serial();
     let mut samples = Vec::new();
@@ -61,11 +65,33 @@ fn decode_sound(path: &Path) -> Result<DecodedSound, Box<dyn std::error::Error>>
             return Err("chained Ogg stream".into());
         }
         samples.extend(packet);
-        if samples.len() > MAX_SOUND_SECONDS * sample_rate as usize * channels as usize {
+        if samples.len() > max_samples {
             return Err("longer than 30 seconds".into());
         }
     }
     Ok(DecodedSound { channels, sample_rate, samples })
+}
+
+/// 16-bit only: hound hands other widths back unscaled as `i16`, so 8-bit plays at 1/256 volume.
+fn decode_wav(file: impl std::io::Read) -> Result<DecodedSound, Box<dyn std::error::Error>> {
+    let wav = hound::WavReader::new(file)?;
+    let spec = wav.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err("WAV is not 16-bit PCM".into());
+    }
+    let (channels, sample_rate) = (u32::from(spec.channels), spec.sample_rate);
+    if wav.len() as usize > max_samples(channels, sample_rate)? {
+        return Err("longer than 30 seconds".into());
+    }
+    Ok(DecodedSound { channels, sample_rate, samples: wav.into_samples().collect::<Result<_, _>>()? })
+}
+
+/// Interleaved samples in 30 seconds, once channels and rate are known to be playable.
+fn max_samples(channels: u32, sample_rate: u32) -> Result<usize, Box<dyn std::error::Error>> {
+    if !(1..=2).contains(&channels) || !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!("unsupported {channels} channels at {sample_rate} Hz").into());
+    }
+    Ok(MAX_SOUND_SECONDS * sample_rate as usize * channels as usize)
 }
 
 /// Decodes and plays each request through a fresh one-shot PipeWire stream (ADR-0033: no
@@ -230,6 +256,22 @@ mod tests {
         let decoded = decode_sound(Path::new("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"))
             .expect("must decode the freedesktop theme");
         assert!(decoded.channels <= 2 && !decoded.samples.is_empty());
+    }
+
+    #[test]
+    fn decode_sound_reads_16_bit_wav_whatever_the_extension() {
+        let file = tempfile::NamedTempFile::with_suffix(".oga").unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(file.path(), spec).unwrap();
+        [1i16, -1, 2, -2].into_iter().for_each(|sample| writer.write_sample(sample).unwrap());
+        writer.finalize().unwrap();
+        let decoded = decode_sound(file.path()).expect("must decode a 16-bit WAV");
+        assert_eq!((decoded.channels, decoded.sample_rate, decoded.samples), (2, 44_100, vec![1, -1, 2, -2]));
     }
 
     #[test]

@@ -27,7 +27,7 @@ The Supervisor claims `org.freedesktop.Notifications` on the session bus.
 | Identity | ID, arrival timestamp, desktop entry, urgency and action/reply metadata accompany each entry |
 | Expiry | Marks a retained entry expired; expired transient entries are removed |
 | DND | Gates sound only; critical urgency bypasses DND and automatic expiry. `set_quiet` gates sound the same way for a config's own rules |
-| Sounds | Ogg Vorbis, configured per urgency; a trusted client sound-file overrides it, sound-name picks a freedesktop theme sound in its place, suppress-sound silences it |
+| Sounds | Ogg Vorbis or 16-bit WAV, configured per urgency; a trusted client sound-file overrides it, sound-name picks a freedesktop theme sound in its place, suppress-sound silences it |
 
 Spooled files live under `$XDG_RUNTIME_DIR/obelisk/notifications/`.
 The [notification types and limits](../supervisor/src/capabilities/notifications/mod.rs)

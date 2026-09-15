@@ -591,7 +591,7 @@ impl NotificationsController {
             sound_file.and_then(|path| validate_trusted_path(strip_file_uri(&path), &self.sound_roots));
         let named_sound = sound_name.and_then(|name| resolve_sound_name(&name, &self.sound_roots));
         let sound_path = resolve_sound_path(suppress_sound, client_sound_file, named_sound, tier_default_sound);
-        if should_play_sound(silenced, urgency, sound_path.is_some())
+        if should_play_sound(silenced, urgency)
             && let Some(sound_path) = sound_path
         {
             let _ = self.sound_tx.try_send(sound_path);
