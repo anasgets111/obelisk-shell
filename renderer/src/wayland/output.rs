@@ -131,9 +131,9 @@ impl App {
 
     /// Handles an output appearing, changing, or leaving: update `screens` only when its payload
     /// changed. `update_output` also fires for things `screens` does not carry; re-running the
-    /// rest for one would ask the Supervisor for an unjustified reload. Reconcile `monitor = "All"`
-    /// instances in place (ADR-0038 decision 3), then ask the Supervisor for a reload, which
-    /// catches a config's `screens` loop changing surface ids (ADR-0041 decisions 2-3).
+    /// rest for one would re-evaluate for nothing. Reconcile `monitor = "All"`
+    /// instances in place (ADR-0038 decision 3), then re-evaluate, which catches a config's `screens`
+    /// loop changing surface ids (ADR-0041 decisions 2-3).
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
         // Before the early return: an output arriving during the startup burst changes what the
@@ -167,17 +167,16 @@ impl App {
         // Before `create_surfaces`, which reads the scene for a new surface's `visible`.
         self.client.set_instances(reconcile.instances);
         self.create_surfaces(qh, &specs, &reconcile.added);
-        self.client.request_reload();
+        if self.client.reevaluate() {
+            self.apply_pending(qh);
+        }
     }
 
-    /// Every `ApplyPendingReload` (ADR-0216). The fresh instances reach the scene before the apply,
-    /// which refuses an instance of a removed declaration; protocol objects change only once it
-    /// succeeds, and an unchanged surface set reconciles to no change.
-    pub(super) fn apply_pending(&mut self, qh: &QueueHandle<App>, sequence: u64) {
-        let apply = shared::ApplyPendingReload { sequence };
-        let Some((specs, rebuilt)) = self.client.pending_surfaces(sequence) else {
-            // Stale: this logs and ignores it.
-            self.client.handle_apply_pending(apply);
+    /// Applies a successful re-evaluation (ADR-0216). The fresh instances reach the scene before
+    /// the apply, which refuses an instance of a removed declaration; protocol objects change only
+    /// once it succeeds, and an unchanged surface set reconciles to no change.
+    pub(super) fn apply_pending(&mut self, qh: &QueueHandle<App>) {
+        let Some((specs, rebuilt)) = self.client.pending_surfaces() else {
             return;
         };
         // A renamed lock's new surface lands on an output niri still counts as locked:
@@ -197,7 +196,7 @@ impl App {
         let reconcile = reconcile_instances(self.client.instances(), &fresh, &rebuilt);
         let previous = self.client.instances().to_vec();
         self.client.set_instances(reconcile.instances);
-        if !self.client.handle_apply_pending(apply) {
+        if !self.client.handle_apply_pending() {
             self.client.set_instances(previous);
             return;
         }
@@ -210,54 +209,6 @@ impl App {
             }
         }
         self.create_surfaces(qh, &specs, &reconcile.added);
-    }
-}
-
-impl PresentationTimeHandler for App {
-    fn presentation_time_state(&mut self) -> &mut PresentationTimeState {
-        &mut self.presentation_time
-    }
-
-    /// Presentation evidence: the compositor confirmed `surface`'s committed frame reached the
-    /// screen; queue `shared::PresentationEvidence` for the socket thread.
-    fn presented(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _feedback: &wp_presentation_feedback::WpPresentationFeedback,
-        surface: &wl_surface::WlSurface,
-        _outputs: Vec<wl_output::WlOutput>,
-        _time: PresentTime,
-        _refresh: u32,
-        _seq: u64,
-        _flags: WEnum<wp_presentation_feedback::Kind>,
-    ) {
-        let Some(nonce) = self.active_nonce else {
-            eprintln!("[obelisk-renderer] presented event arrived with no active ActivateDraw nonce; dropping");
-            return;
-        };
-        let Some(surface_id) = self.surface_id_for(surface).map(str::to_string) else {
-            eprintln!("[obelisk-renderer] presented event for an untracked surface; dropping");
-            return;
-        };
-        if let Err(e) =
-            self.outbound_tx.send(RendererFrame::PresentationEvidence(PresentationEvidence { nonce, surface_id }))
-        {
-            eprintln!("[obelisk-renderer] failed to queue PresentationEvidence for the socket thread: {e}");
-        }
-    }
-
-    /// The update was never displayed. Log only; `evidence_timeout` catches it (ADR-0025), so do
-    /// not queue `PresentationEvidence`.
-    fn discarded(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _feedback: &wp_presentation_feedback::WpPresentationFeedback,
-        surface: &wl_surface::WlSurface,
-    ) {
-        let label = self.surface_id_for(surface).unwrap_or("<untracked surface>");
-        eprintln!("[obelisk-renderer] presentation feedback discarded for {label}");
     }
 }
 

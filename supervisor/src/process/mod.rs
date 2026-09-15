@@ -1,6 +1,5 @@
 //! Process-group lifecycle: spawn a new group leader, then reap the group with `SIGTERM`, grace,
-//! and `SIGKILL`. See ADR-0018, ADR-0026 (`process.run`, [`registry`]), and ADR-0025
-//! (`reload::run_swap` calls the reap primitive).
+//! and `SIGKILL`. See ADR-0018 and ADR-0026 (`process.run`, [`registry`]).
 //!
 //! Uses `tokio::process::Command::process_group(0)` rather than hand-rolling `setpgid`.
 

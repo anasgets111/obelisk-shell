@@ -119,8 +119,7 @@ impl IdleRegistry {
     /// fan-out entries feeding them (ADR-0158).
     ///
     /// The command matters as much as the local clear. Both travel this generation's one ordered
-    /// socket, so the new tree's registrations land behind it and survive. The Supervisor used to
-    /// clear on its own timing, when the `Unchanged` report came back, which is after them. Silent
+    /// socket, so the new tree's registrations land behind it and survive. Silent
     /// when nothing was registered, so a config that never asked for a threshold is not the reason
     /// `idle` starts.
     pub fn forget_thresholds(&self) {

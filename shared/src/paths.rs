@@ -48,7 +48,7 @@ pub const CONFIG_DIR_ENV: &str = "OBELISK_CONFIG_DIR";
 /// Generation id stamped on every spawned Renderer.
 ///
 /// Shared because both binaries read it. If absent, the Renderer treats that as "nobody spawned
-/// me" and refuses to start; the Supervisor sets it on boot and every generation swap.
+/// me" and refuses to start; the Supervisor sets it on boot and every respawn.
 pub const GENERATION_ID_ENV: &str = "OBELISK_GENERATION_ID";
 
 /// Set when `obelisk check` re-execs the Renderer to evaluate a config without a display.
@@ -76,9 +76,9 @@ pub const EXIT_COMPOSITOR_GONE: i32 = 71;
 /// `$OBELISK_CONFIG_DIR`, `$XDG_CONFIG_HOME/obelisk`, then `$HOME/.config/obelisk`.
 ///
 /// Both binaries call this and agree through the environment. `-c` therefore sets
-/// [`CONFIG_ARG_ENV`] in the Supervisor: every spawned Renderer, including after a generation
-/// swap, inherits it. Passing a path through the handshake would require re-passing it on every
-/// swap; a missed pass would silently load a different config than the watched one.
+/// [`CONFIG_ARG_ENV`] in the Supervisor: every spawned Renderer, including a replacement,
+/// inherits it. Passing a path through the handshake would require re-passing it on every
+/// respawn; a missed pass would silently load a different config than the watched one.
 pub fn config_dir() -> io::Result<PathBuf> {
     // A debug binary run away from its build tree may have a nonexistent DEV_CONFIG_DIR.
     #[cfg(debug_assertions)]

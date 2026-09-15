@@ -60,7 +60,7 @@ local cancelled = state("recorder_cancelled", false)
 -- `paused_total` accumulates finished pauses and `paused_at` timestamps an open one, zero meaning
 -- none. Elapsed time is the difference.
 --
--- Both are `state`, so they survive an in-place reload and reset on a generation swap -- after
+-- Both are `state`, so they survive a reload and reset when a crashed Renderer is replaced -- after
 -- which paused seconds count as recorded ones. The mirror has the same hole across a Quickshell
 -- restart and documents it the same way; a debounced disk write per pause is not worth closing it.
 local paused_total = state("recorder_paused_total", 0)

@@ -23,8 +23,6 @@ pub struct Turn {
     pub typed: bool,
     /// A background image decode landed.
     pub decoded: bool,
-    /// `ActivateDraw` nonces serviced this turn.
-    pub draws: usize,
     /// The turn reached `repaint_mapped_surfaces`.
     pub painted: bool,
     /// Surfaces that repaint actually drew and swapped. `painted` can exceed this because
@@ -37,7 +35,7 @@ pub struct Turn {
 impl Turn {
     /// A woken turn with `false` is the spin signature.
     fn did_work(self) -> bool {
-        self.dispatched || self.re_resolved || self.typed || self.decoded || self.draws > 0
+        self.dispatched || self.re_resolved || self.typed || self.decoded
     }
 }
 
@@ -104,7 +102,6 @@ pub struct Counters {
     ticked: u64,
     typed: u64,
     decoded: u64,
-    draws: u64,
     painted: u64,
     drawn: u64,
     resolve: Duration,
@@ -221,7 +218,6 @@ impl IdleProfile {
         c.ticked += u64::from(turn.ticked);
         c.typed += u64::from(turn.typed);
         c.decoded += u64::from(turn.decoded);
-        c.draws += turn.draws as u64;
         c.painted += u64::from(turn.painted);
         c.drawn += turn.drawn as u64;
         c.resolve += phases.resolve;
@@ -248,7 +244,7 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
     let spinning = c.turns >= 100 && c.idle_turns * 2 > c.turns;
     format!(
         "idle {:.1}s: turns={} idle={} cpu proc={:.2}% main={:.2}% | wake wl={} wake={} both={} none={} \
-         | work dispatch={} resolve={} tick={} type={} decode={} draw={} paint={} drawn={} \
+         | work dispatch={} resolve={} tick={} type={} decode={} paint={} drawn={} \
          | ms resolve={:.1} surfstate={:.1} repaint={:.1} dispatch={:.1} \
          | focus turns={} searched={} redundant={} ms={:.1} redundant={:.1} ({:.2}% of a core){}",
         secs,
@@ -265,7 +261,6 @@ fn render(window: Duration, c: &Counters, cpu: Cpu) -> String {
         c.ticked,
         c.typed,
         c.decoded,
-        c.draws,
         c.painted,
         c.drawn,
         c.resolve.as_secs_f64() * 1000.0,
@@ -294,7 +289,6 @@ mod tests {
     fn a_turn_that_only_painted_still_counts_as_idle() {
         assert!(!Turn { painted: true, ..Turn::default() }.did_work());
         assert!(Turn { re_resolved: true, ..Turn::default() }.did_work());
-        assert!(Turn { draws: 1, ..Turn::default() }.did_work());
     }
 
     #[test]

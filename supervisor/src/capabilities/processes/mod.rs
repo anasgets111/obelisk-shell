@@ -4,7 +4,7 @@
 //! Sibling of `storage` in shape -- a config declares a name, the Supervisor owns what sits behind
 //! it, and the state comes back keyed by that name -- and its opposite in what it holds. `storage`
 //! keeps a file the config could have read itself; this keeps a handle the config *cannot* hold,
-//! because the VM holding it is replaced on every generation swap.
+//! because the VM holding it goes with any Renderer replacement.
 
 pub mod controller;
 

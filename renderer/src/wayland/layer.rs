@@ -160,8 +160,8 @@ fn exclusive_zone_for(anchor: node::Anchor, configured_size: (u32, u32)) -> i32 
 }
 /// Double-buffered layer-shell changes: `margin`, `keyboard_interactivity`, size, and `exclusive`
 /// (ADR-0038 decision 2). `None` means unchanged. Topology (`id`, `layer`, `anchor`,
-/// `monitor`, `namespace`) is absent because `get_layer_surface` consumes namespace/output and
-/// edits route to a generation swap instead; `crate::socket::handle_reevaluate` owns that handoff.
+/// `monitor`, `namespace`) is absent because `get_layer_surface` consumes namespace/output, so an
+/// edit rebuilds the surface instead (ADR-0216).
 /// `is_structural_property` rejects signals there. `output` is the logical output size, not the
 /// configured surface size.
 #[derive(Debug, Default, PartialEq)]
@@ -273,9 +273,7 @@ impl App {
         //
         // Every hidden panel defers, not only a measured one. A fully anchored panel could be sized
         // here, but keeping its object made `visible = false` mean two things: no object for one
-        // panel, a permanent unmapped object for another. Staging during a swap loses nothing
-        // either way, an `Unmapped` surface presents no frame (`MapState::presents`) and
-        // `candidate_has_staged` counts a no-object surface complete. `show_panel` and
+        // panel, a permanent unmapped object for another. `show_panel` and
         // `apply_spec_change` both repeat [`ambiguous_zero_axis`], so a bad anchor is still
         // refused, on the pass that shows it.
         let deferred = !visible;
@@ -411,8 +409,7 @@ impl App {
     /// edit changed the display list and `swap_buffers` delivered focus immediately. A surface that
     /// redraws a clock every second hides the bug.
     ///
-    /// Only a `Mapped`, non-Candidate surface: a bufferless commit would be the protocol's re-map
-    /// procedure, and the generation swap keeps Candidates invisible until `ActivateDraw`.
+    /// Only a `Mapped` surface: a bufferless commit would be the protocol's re-map procedure.
     pub(super) fn apply_spec_change(&mut self, index: usize, mut fresh: PanelSpec, visible: bool) {
         // [`App::apply_visibility`]'s own unmap test, run before it: a mapped panel going invisible
         // loses its layer object later this pass, so requests sent now die with it. Not just waste --
@@ -478,7 +475,6 @@ impl App {
         // After the zone request, keeping the pass to one commit.
         if update.moved_anything()
             && self.surfaces[index].map_state == MapState::Mapped
-            && !self.is_swap_candidate
             && let TrackedRole::Panel { layer: Some(layer), .. } = &self.surfaces[index].role
         {
             layer.commit();

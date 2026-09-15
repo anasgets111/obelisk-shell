@@ -639,8 +639,8 @@ pub fn any_hover_registered(lua: &Lua) -> bool {
 
 /// ADR-0044 decision 5 state registry: name preserves last-click values across in-place reloads;
 /// the stored literal detects an edited initial, which wins over live state (the wallpaper case).
-/// In `Lua::set_app_data`, so ADR-0044 decision 4's persistent VM preserves it and a generation
-/// swap's new process discards it.
+/// In `Lua::set_app_data`, so ADR-0044 decision 4's persistent VM preserves it and a replaced
+/// Renderer starts without it.
 #[derive(Default)]
 struct StateRegistry(HashMap<String, (Signal, Value)>);
 
@@ -862,8 +862,8 @@ impl<'lua> CpuBudget<'lua> {
 
     /// Second 5ms gate at Rust boundary. A `pcall` can catch the hook and return a partial `Ok`,
     /// measured at 7.5x the cap; this check turns it into `Err`. ponytail: a body that swallows the
-    /// hook and never returns still spins. VM lacks preemption; upgrade to generation-swap process
-    /// boundary (ADR-0039).
+    /// hook and never returns still spins. VM lacks preemption; upgrade path: evaluate in a separate
+    /// process (ADR-0039).
     pub(crate) fn check_not_exceeded(&self) -> mlua::Result<()> {
         match expired_budget(self.lua) {
             Some(message) => Err(mlua::Error::runtime(message)),

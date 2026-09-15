@@ -2,14 +2,14 @@
 //!
 //! The difference from `process.run` is lifetime, and it is the whole feature. A `process.run`
 //! child belongs to the generation that spawned it, and `reap_generations_processes` kills its
-//! group on every swap; a config wanting a program to survive an edit has to orphan it with
+//! group when that Renderer is replaced; a config wanting a program to survive has to orphan it with
 //! `setsid` and then re-find it through a lock file and `/proc`, because by then nothing in the
 //! shell still holds it. That is what the mirror's `ScreenRecordingService.qml` spends 223 lines
 //! on: a pid, the pid's kernel start time, and a two-second poll, all to answer a question the
 //! kernel would answer for free to whoever held the handle.
 //!
-//! Here the Supervisor holds it. The Supervisor does not restart on a config edit, so a swap is
-//! not an event a session process can observe, and the identity question never arises.
+//! Here the Supervisor holds it. The Supervisor outlives every Renderer, so a replacement is not
+//! an event a session process can observe, and the identity question never arises.
 //!
 //! ## One task per running program, and why signalling goes through it
 //!

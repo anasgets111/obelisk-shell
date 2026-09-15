@@ -37,9 +37,9 @@ fn pam_service() -> &'static str {
     pam_service_in(std::path::Path::new(PAM_CONFIG_DIR))
 }
 
-/// Ceiling on the whole worker exchange (`exchange_over`), not one PAM call. It exceeds
-/// `reload::SwapTimings`'s 2-3 seconds because PAM may be human-paced (network module, fingerprint
-/// retry), but bounds a wedged `read_json_frame` and prevents a spawned task holding plaintext
+/// Ceiling on the whole worker exchange (`exchange_over`), not one PAM call. Long because PAM may be
+/// human-paced (network module, fingerprint retry), but bounds a wedged `read_json_frame` and
+/// prevents a spawned task holding plaintext
 /// forever while the prompt remains `authenticating`.
 const PAM_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -153,8 +153,8 @@ pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
 /// [`run_authentication`] owns scrubbing on every path.
 ///
 /// ponytail: `User::from_uid` blocks in libc (`getpwuid_r`), but stays inline because local passwd
-/// lookup is fast, has no NSS/LDAP, and is rare (one challenge/lock submission; ADR-0025's
-/// generation swap precedent). Upgrade: `spawn_blocking` if a networked NSS backend appears.
+/// lookup is fast, has no NSS/LDAP, and is rare (one challenge/lock submission). Upgrade:
+/// `spawn_blocking` if a networked NSS backend appears.
 async fn authenticate_uid(uid: u32, secret: &[u8]) -> Result<shared::PamOutcome, String> {
     let username = username_for(uid)?;
     spawn_worker_and_exchange(&username, secret).await.map_err(|err| format!("pam worker failed: {err}"))

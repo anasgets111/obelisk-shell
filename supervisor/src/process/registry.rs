@@ -68,7 +68,7 @@ pub(crate) async fn dispatch(
             }
         },
         // No registry entry, no handle, no callbacks: a detached program is not this shell's to
-        // reap, and a generation swap must leave it alone (ADR-0188). That is the whole difference
+        // reap, and a Renderer replacement must leave it alone (ADR-0188). That is the whole difference
         // from `run`, and it is why this sends no `ProcessExited` -- there is no `exit_cb` waiting.
         "detach" => match process_run_args(&envelope.params.arguments) {
             Some((cmd, args)) => {
@@ -317,9 +317,8 @@ pub(crate) async fn wait_and_report_exit(
     }
 }
 
-/// Applies the SIGTERM/SIGKILL group reap to every process spawned by the superseded
-/// generation's Lua, not only its Renderer (`CONTEXT.md` Generation swap). Send no `ProcessExited`;
-/// that generation's connection is torn down in the same swap.
+/// Applies the SIGTERM/SIGKILL group reap to every process spawned by a departed generation's Lua,
+/// not only its Renderer. Send no `ProcessExited`; that generation's connection is already gone.
 pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, generation_id: u32) {
     let stale_ids: Vec<(u32, u64)> =
         processes.keys().filter(|(entry_generation_id, _)| *entry_generation_id == generation_id).copied().collect();
@@ -327,7 +326,7 @@ pub(crate) async fn reap_generations_processes(processes: &mut LiveProcesses, ge
         if let Some(mut child) = processes.remove(&key)
             && let Err(err) = super::reap_process_group(&mut child, super::DEFAULT_REAP_GRACE).await
         {
-            eprintln!("failed to reap process {key:?} belonging to superseded generation {generation_id}: {err}");
+            eprintln!("failed to reap process {key:?} belonging to departed generation {generation_id}: {err}");
         }
     }
 }

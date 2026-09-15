@@ -40,10 +40,8 @@ pub struct LockState {
     /// Supervisor the moment PAM answers, and this is a readout of that, not a handle on it.
     pub unlocking: bool,
     /// `SetSessionLock { locked: true }` is in flight before Renderer confirmation.
-    /// `#[serde(skip)]`:
-    /// swap-gate state, not payload. `active` must mean only Renderer confirmation, but the gate
-    /// shuts earlier because `ext_session_lock_v1` withholds `locked` until every output presents;
-    /// swapping then reaps the holder and locks the user out (ADR-0042).
+    /// `#[serde(skip)]`: bookkeeping, not payload. `active` must mean only Renderer confirmation,
+    /// but a respawn must still retake a lock that was asked for and not yet confirmed (ADR-0058).
     #[serde(skip)]
     pub requested: bool,
     /// Acquisition number, bumped only on Renderer `Locked`. `#[serde(skip)]` like `requested`.
@@ -145,13 +143,6 @@ pub fn apply(state: &mut LockState, event: LockEvent) {
 /// case can be checked without sleeping: the task re-reads exactly this before it sends.
 pub fn releases(state: &LockState, acquisition: u64) -> bool {
     state.acquisition == acquisition && state.unlocking
-}
-
-/// ADR-0042 swap gate. One client may hold a session lock, so candidate N+1 cannot acquire N while
-/// it is held or mid-acquisition. `requested` is the unresolved half; ignoring it can reap the
-/// holder mid-handshake with nobody able to unlock the compositor.
-pub fn defers_swap(state: &LockState) -> bool {
-    state.active || state.requested
 }
 
 /// What [`shared::LockOutcome`] says about the compositor's lock, distinct from [`apply`]
@@ -378,11 +369,6 @@ impl LockController {
         self.state.lock().unwrap().clone()
     }
 
-    /// Reads [`defers_swap`] for `main.rs`'s `TopologyChanged` gate.
-    pub fn defers_swap(&self) -> bool {
-        defers_swap(&self.state.lock().unwrap())
-    }
-
     /// Atomically admits and marks one PAM conversation, or refuses. `main.rs` spawns it, so a
     /// getter plus record would race. `Some` carries the acquisition for
     /// [`Self::record_authentication`], the only moment the worker's lock number is known.
@@ -547,7 +533,7 @@ mod tests {
         apply(&mut state, LockEvent::RendererLost);
 
         assert!(!state.active, "the lock object died with the process that held it");
-        assert!(!state.requested, "a request nothing will answer must not keep the swap gate shut forever");
+        assert!(!state.requested, "a request nothing will answer must not stay pending forever");
         // LockController::lock refuses while active. Without clearing it here, the replacement's
         // re-acquisition is dropped before it reaches the wire (ADR-0058 decision 4).
     }
@@ -613,46 +599,6 @@ mod tests {
             LockState { requested: true, ..LockState::default() },
             "a fresh lock() must not show the last attempt's reason, and must not claim active before the Renderer reports it"
         );
-    }
-
-    #[test]
-    fn a_lock_request_defers_a_swap_before_the_renderer_has_confirmed_it() {
-        // ADR-0042: the gate shuts when the order goes out, not when the compositor confirms
-        // it -- that window can be long, and a swap inside it reaps the process owning the lock.
-        let mut state = LockState::default();
-        assert!(!defers_swap(&state), "an untouched session defers nothing");
-
-        apply(&mut state, LockEvent::LockRequested);
-        assert!(defers_swap(&state), "the order is out; the holder-to-be must not be reaped now");
-        assert!(!state.active, "and `active` still moves only on the Renderer's own report");
-    }
-
-    #[test]
-    fn every_way_a_lock_request_resolves_reopens_the_swap_gate() {
-        // A resolution that forgot to clear `requested` would defer reloads for the rest of the
-        // session.
-        for outcome in [
-            shared::LockOutcome::Refused("no lock node is declared".to_string()),
-            shared::LockOutcome::Finished,
-            shared::LockOutcome::Unlocked,
-        ] {
-            let mut state = LockState::default();
-            apply(&mut state, LockEvent::LockRequested);
-            apply(&mut state, LockEvent::Reported(outcome.clone()));
-            assert!(!defers_swap(&state), "{outcome:?} resolved the request, so a swap may run again");
-        }
-
-        // `Locked` resolves the request too. The gate stays shut, but on `active` now.
-        let mut state = LockState::default();
-        apply(&mut state, LockEvent::LockRequested);
-        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Locked));
-        assert!(
-            defers_swap(&state) && state.active && !state.requested,
-            "a confirmed lock hands the gate over to `active`"
-        );
-
-        apply(&mut state, LockEvent::Reported(shared::LockOutcome::Unlocked));
-        assert!(!defers_swap(&state));
     }
 
     #[test]
@@ -867,7 +813,6 @@ mod tests {
         controller.lock();
         assert_eq!(rx.try_recv().ok(), Some(shared::SetSessionLock { locked: true }));
         assert!(!controller.snapshot().active, "the lock is not active until the Renderer reports Locked");
-        assert!(controller.defers_swap(), "but the swap gate is already shut -- the order is in flight");
 
         controller.record(LockEvent::Reported(shared::LockOutcome::Locked));
         assert!(controller.snapshot().active);

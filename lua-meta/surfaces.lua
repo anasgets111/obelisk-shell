@@ -7,8 +7,8 @@
 -- `---@param props`/`---@return Node` lines are bare there too.
 --
 -- `id`, `layer`, `anchor`, `monitor`, and a popup's `parent` reject `Signal`, unlike the rest. Read
--- them once per evaluation to choose in-place reload or full generation swap (ADR-0001); a later
--- change would strand that decision.
+-- them once per evaluation to decide which surfaces are rebuilt (ADR-0216); a later change would
+-- strand that decision.
 
 ---@alias Rect { x: number, y: number, width: number, height: number }
 ---@alias PopupAnchor "Top"|"Bottom"|"Left"|"Right"|"TopLeft"|"TopRight"|"BottomLeft"|"BottomRight"|"Center"
@@ -30,7 +30,7 @@
 ---@field child? Node|fun(output: string): Node? The one root node. A surface holds exactly one; use a `row` or `column` for more. A function is called once per output instance with that output's connector name and its return takes the child's place, so one `monitor = "All"` panel can show a different file per screen (ADR-0121); `nil` maps that instance empty. The eval-time probe calls it with `"PROBE"`.
 
 ---@class WindowProps: NodeBase, BoxBase
----@field id string Unique across the surface set. Structural: read once per evaluation to decide in-place update against generation swap, so it rejects a `Signal`.
+---@field id string Unique across the surface set. Structural: read once per evaluation to decide what is rebuilt, so it rejects a `Signal`.
 ---@field title? string|Bound What the compositor shows in a task switcher. `xdg_toplevel.set_title`, valid on a mapped window, so a `Signal` here retitles in place.
 ---@field app_id? string|Bound What the compositor matches rules against.
 ---@field min_size? { width: number, height: number }|Bound Advisory; the spec says a client should not rely on the compositor obeying it.

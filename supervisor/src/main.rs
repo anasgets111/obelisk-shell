@@ -11,8 +11,6 @@ mod memory;
 mod pam_worker;
 mod polkit;
 mod process;
-mod reload;
-mod reload_link;
 mod setup;
 mod snapshot;
 mod socket;
@@ -30,7 +28,7 @@ use capabilities::Capabilities;
 use capabilities::lock::{self, LockController};
 use generation::renderer_binary_path;
 use polkit::PolkitAgent;
-use shared::{Capability, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize};
+use shared::{Capability, RendererFrame, SupervisorFrame, Zeroize};
 use socket::send_frame_logged;
 use supervisor::Supervisor;
 
@@ -38,57 +36,20 @@ use supervisor::Supervisor;
 /// (ADR-0024).
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Ready-signal and evidence-verification deadlines (`reload::SwapTimings`), scaled
-/// above `reload.rs`'s test constants for a Candidate binding Wayland/EGL. Healthy Candidates fit;
-/// wedged ones cannot hang a config edit.
-const SWAP_TIMINGS: reload::SwapTimings = reload::SwapTimings {
-    ready_timeout: Duration::from_secs(2),
-    evidence_timeout: Duration::from_secs(3),
-    reap_grace: process::DEFAULT_REAP_GRACE,
-};
-
-/// The next frame for the main loop: a deferred one first, then the socket. A swap handshake
-/// borrows the shared receiver and takes frames it is not the reader of off it (ADR-0025), so
-/// `replay` is where they wait; draining it first is what keeps their order.
-///
-/// Cancel-safe, which the `select!` arm requires: the pop is synchronous, so the only await point
-/// is `Receiver::recv`, and a cancelled call cannot have taken a frame from either source.
-async fn next_inbound(
-    replay: &mut std::collections::VecDeque<socket::InboundFrame>,
-    inbound: &mut tokio::sync::mpsc::Receiver<socket::InboundFrame>,
-) -> Option<socket::InboundFrame> {
-    match replay.pop_front() {
-        Some(frame) => Some(frame),
-        None => inbound.recv().await,
-    }
-}
-
-/// Only the authoritative Renderer and control clients may dispatch after a swap. A failed
-/// Candidate can still have frames in flight while its process is being reaped.
+/// Only the authoritative Renderer and control clients may dispatch; a replaced Renderer can still
+/// have frames in flight.
 fn is_live_inbound_generation(generation_id: u32, authoritative_generation_id: u32) -> bool {
     generation_id == authoritative_generation_id || generation_id == shared::CONTROL_CLIENT_GENERATION
 }
 
 /// [`is_live_inbound_generation`] with `CallResult`'s exemption. An `obelisk call` dispatched before
-/// a swap is answered by the generation it was asked, which by then may be the superseded one, and
+/// a respawn is answered by the generation it was asked, which by then may be the replaced one, and
 /// that answer is correct. `CallRoutes::answer` applies the stricter test this cannot: it refuses
 /// any generation other than the one the call went to. Dropping the frame here instead would strand
 /// the caller until its deadline.
 fn frame_may_dispatch(frame: &RendererFrame, generation_id: u32, authoritative_generation_id: u32) -> bool {
     matches!(frame, RendererFrame::CallResult(_))
         || is_live_inbound_generation(generation_id, authoritative_generation_id)
-}
-
-/// Bumps and sends one `Reevaluate` sequence (ADR-0024, ADR-0041 decision 4). Debounced file
-/// changes and Renderer `RequestReload` after `wl_output` changes share this counter, so stale
-/// reports from either trigger fail `answer_unchanged_report`'s sequence check.
-fn begin_reload(registry: &socket::GenerationRegistry, generation_id: u32, next_sequence: &mut u64) {
-    *next_sequence += 1;
-    send_frame_logged(
-        registry,
-        generation_id,
-        &SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: *next_sequence }),
-    );
 }
 
 /// Logs a command for a controller never built (ADR-0070). A config cannot reach this: reading
@@ -194,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Set before path resolution and in this process, not just in children. `shared::config_dir`
-    // and every Renderer, including later swap generations, read it.
+    // and every Renderer, including replacements, read it.
     if let Some(dir) = &args.config_dir {
         // SAFETY: no runtime or thread exists yet; the PAM worker branch above returns.
         unsafe { std::env::set_var(shared::CONFIG_ARG_ENV, dir) };
@@ -275,7 +236,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
 
     // Lock (ADR-0042, ADR-0052): the Renderer holds and paints `ext_session_lock_v1`; this side
     // decides whether to take it. The controller must not cache the authoritative generation id,
-    // because a swap reassigns it.
+    // because a respawn reassigns it.
     let (lock_command_tx, mut lock_commands) = tokio::sync::mpsc::unbounded_channel::<shared::SetSessionLock>();
     let lock = LockController::new(lock_command_tx);
     // `loginctl lock-session` in, `LockedHint` out (ADR-0138). Subscribe here, before a key press,
@@ -321,11 +282,6 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut memory_sampler = memory::sampler_from_env();
 
-    // Frames a swap handshake read off `inbound_frames` without being their reader (ADR-0156).
-    // Drained ahead of the socket so they keep their arrival order relative to each other and to
-    // everything that arrived after the swap.
-    let mut replay: std::collections::VecDeque<socket::InboundFrame> = std::collections::VecDeque::new();
-
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -350,7 +306,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
             }
             Some(_) = memory::tick_sampler(&mut memory_sampler) => {
-                memory::log_sample("steady state", &[(supervisor.authoritative.generation_id, &supervisor.authoritative.child)]);
+                memory::log_sample("steady state", supervisor.authoritative.generation_id, &supervisor.authoritative.child);
             }
             Some(request) = agent_requests.recv() => supervisor.handle_polkit_request(request),
             Some((cookie, outcome)) = polkit_outcomes.recv() => supervisor.record_polkit_outcome(cookie, outcome),
@@ -370,7 +326,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
             Some((acquisition, outcome)) = pam_outcomes.recv() => supervisor.record_pam_outcome(acquisition, outcome),
             Some(()) = reload_events.recv() => supervisor.begin_reload(),
             Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
-            Some(inbound) = next_inbound(&mut replay, &mut inbound_frames) => {
+            Some(inbound) = inbound_frames.recv() => {
                 // No Renderer is live during a cooldown, so only control clients and call answers dispatch.
                 let live = supervisor.respawn_at.map_or(supervisor.authoritative.generation_id, |_| shared::CONTROL_CLIENT_GENERATION);
                 if !frame_may_dispatch(&inbound.frame, inbound.generation_id, live) {
@@ -391,11 +347,6 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                         None => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                     },
                 },
-                RendererFrame::ReadySignal(_) | RendererFrame::PresentationEvidence(_) => {
-                    // SocketCandidateLink reads these only mid-handshake from `inbound_frames` (see
-                    // TopologyChanged, ADR-0025). Here they are stale or a wire-protocol desync.
-                    eprintln!("generation {}'s handshake frame arrived outside any in-flight generation swap; dropping: {:?}", inbound.generation_id, inbound.frame);
-                }
                 RendererFrame::StartCapability { capability } => {
                     // ADR-0070: config read `obelisk.<capability>` or named it in `secure_submit`.
                     // Re-entrant because decision 3 makes each generation resend every name; each
@@ -423,29 +374,11 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
                 // The answer, back to whichever peer is waiting on that id. A refusal here is the
                 // caller's deadline expiring rather than a wrong answer, which is the safe way
-                // round when a generation swapped mid-call.
+                // round when a Renderer was replaced mid-call.
                 RendererFrame::CallResult(result) => {
                     if let Err(why) = call_routes.answer(inbound.generation_id, &result) {
                         eprintln!("control-socket: dropped an `obelisk call` answer: {why}");
                     }
-                }
-                // ADR-0041 decision 4: a `wl_output` appeared or disappeared.
-                RendererFrame::RequestReload => supervisor.begin_reload(),
-                RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence }) => {
-                    supervisor.answer_unchanged_report(inbound.generation_id, sequence);
-                }
-                RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) if supervisor.lock.defers_swap() => {
-                    // ADR-0042: candidate N+1 cannot acquire generation N's lock, so the generation
-                    // swap waits for release. `Unchanged` reloads are not gated. Use `defers_swap`,
-                    // not `is_active`: an unreported lock order is also unswappable, and a swap
-                    // then would reap the process owning the lock object.
-                    supervisor.defer_swap(sequence);
-                }
-                RendererFrame::ReevaluateReport(ReevaluateReport::TopologyChanged { sequence }) => {
-                    supervisor.swap_generation(sequence, &mut inbound_frames, &mut replay).await;
-                }
-                RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
-                    eprintln!("generation {}'s shell.lua re-evaluation (sequence {sequence}) failed: {error}", inbound.generation_id);
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Polkit && submit.action == "authenticate" => {
                     // ADR-0028, ADR-0114. Before the catch-all arm because matches are ordered.
@@ -520,42 +453,6 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Order is the whole point of holding the frames in a queue rather than pushing them back
-    /// onto the socket channel: a deferred `StartCapability` must be handled before whatever
-    /// arrived while the swap was finishing, not after it.
-    #[tokio::test]
-    async fn next_inbound_drains_every_deferred_frame_before_it_reads_the_socket_again() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        tx.send(socket::InboundFrame {
-            generation_id: 9,
-            frame: shared::RendererFrame::StartCapability { capability: Capability::Mpris },
-        })
-        .await
-        .unwrap();
-
-        let mut replay: std::collections::VecDeque<socket::InboundFrame> = [Capability::Lock, Capability::Audio]
-            .into_iter()
-            .map(|capability| socket::InboundFrame {
-                generation_id: 9,
-                frame: shared::RendererFrame::StartCapability { capability },
-            })
-            .collect();
-
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            let inbound = next_inbound(&mut replay, &mut rx).await.expect("three frames are available");
-            let shared::RendererFrame::StartCapability { capability } = inbound.frame else {
-                panic!("only starts were queued");
-            };
-            seen.push(capability);
-        }
-        assert_eq!(
-            seen,
-            [Capability::Lock, Capability::Audio, Capability::Mpris],
-            "both held frames come first, in the order they were held"
-        );
-    }
 
     /// The wire stays `(action, [arguments])`; each case is a coercion the hand parsers once got
     /// wrong or a Lua marshalling quirk a config really sends.
@@ -643,42 +540,8 @@ mod tests {
         assert!(frame_may_dispatch(&answer, 0, 1));
 
         // Everything else from a superseded generation is still refused.
-        assert!(!frame_may_dispatch(&RendererFrame::RequestReload, 0, 1));
-        assert!(frame_may_dispatch(&RendererFrame::RequestReload, 1, 1));
-    }
-
-    #[test]
-    fn begin_reload_bumps_the_supervisor_owned_sequence_and_sends_the_reevaluate_carrying_it() {
-        let registry = socket::GenerationRegistry::default();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        registry.register(7, tx, std::sync::Arc::new(tokio::sync::Notify::new()));
-        let mut next_sequence = 0;
-
-        // Watcher file changes and `RequestReload` (ADR-0041 decision 4) share this call, so both
-        // must produce distinct increasing sequences.
-        begin_reload(&registry, 7, &mut next_sequence);
-        begin_reload(&registry, 7, &mut next_sequence);
-
-        assert_eq!(next_sequence, 2);
-        let sent: Vec<SupervisorFrame> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|payload| serde_json::from_slice(&payload).unwrap())
-            .collect();
-        assert_eq!(
-            sent,
-            vec![
-                SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 }),
-                SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 2 }),
-            ]
-        );
-    }
-
-    #[test]
-    fn begin_reload_still_advances_the_sequence_when_the_generation_has_no_connection() {
-        // `send_frame_logged` drops `NoConnection` after logging. Advance anyway, or a reconnecting
-        // generation's report could collide with an accepted sequence.
-        let registry = socket::GenerationRegistry::default();
-        let mut next_sequence = 41;
-        begin_reload(&registry, 7, &mut next_sequence);
-        assert_eq!(next_sequence, 42);
+        let start = RendererFrame::StartCapability { capability: Capability::Lock };
+        assert!(!frame_may_dispatch(&start, 0, 1));
+        assert!(frame_may_dispatch(&start, 1, 1));
     }
 }

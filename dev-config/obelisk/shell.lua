@@ -1,15 +1,15 @@
 -- Development bar, real-session fixture, and worked example. If they conflict, the fixture wins.
--- `cargo build --workspace && XDG_CONFIG_HOME=dev-config target/debug/supervisor`.
--- Supervisor finds Renderer beside its binary via `supervisor/src/generation.rs`'s
--- `renderer_binary_path`, not through Cargo; `cargo run -p supervisor` can rebuild one half and
--- launch stale `target/debug/renderer`. A Renderer older than `fonts` then reports `attempt to call
--- a nil value (global 'fonts')` at this file.
+-- `just run` builds both binaries and starts `target/debug/obelisk` on this directory.
+-- The Supervisor finds `obelisk-renderer` beside its own binary (`renderer_binary_path` in
+-- `supervisor/src/generation.rs`), not through Cargo; `cargo run -p supervisor` can rebuild one half
+-- and launch a stale Renderer. A Renderer older than `fonts` then reports `attempt to call a nil
+-- value (global 'fonts')` at this file.
 --
 -- Zones and module order copy `~/.config/quickshell`, including the rightmost clock. ADR-0053
 -- exposed the need for clock, battery and volume data sources; none had a source until that ADR.
 --
--- Editing reloads the stack. Changing surface `id`/`layer`/`anchor`/`monitor`/`namespace` changes
--- topology and triggers a full generation swap; other edits reload in place on the same Lua VM.
+-- Editing reloads in place on the same Lua VM. Changing a surface's `id`/`layer`/`anchor`/
+-- `monitor`/`namespace` rebuilds that surface; other edits update it live.
 
 -- Imports mirror the Quickshell tree. `config/` holds tokens, `components/` dumb reusable widgets,
 -- `lib/` node-free functions, and `modules/` assembles `bar/indicators/`, `bar/panels/`,

@@ -289,7 +289,7 @@ impl Scene {
     /// `admit` vetoes the finished apply after all instances, asking whether the whole resolved
     /// lock tree remains authenticatable; it rolls back on error. The snapshot restores exactly the
     /// pre-call state because a failing getter may already have changed `next_id` or
-    /// the trees (`CONTEXT.md`, Rollback; `socket.rs::handle_reevaluate`).
+    /// the trees (`CONTEXT.md`, Rollback; `socket.rs::reevaluate`).
     ///
     /// ponytail: every apply deep-clones the tree, even on success; the dirty flag limits this to
     /// capability-push cadence. The structural clone is O(nodes), not O(Lua heap).

@@ -4878,4 +4878,9 @@ then every role is created and destroyed at runtime (ADR-0049, ADR-0088) through
 (ADR-0213), so a topology edit is the monitor-hotplug path with a different instance set. The swap
 had cost two process handshakes per edit and the bugs of ADR-0156 and ADR-0158.
 
-Not yet: deleting the Supervisor's swap orchestration and the handshake frames, now unreachable.
+Amendment (2026-09-15): the Supervisor's swap orchestration (`reload.rs`, `reload_link.rs`, the
+unlock deferral), the five handshake frames, `ReevaluateReport::TopologyChanged` and the Renderer's
+Candidate path are deleted, superseding ADR-0019, ADR-0025 and ADR-0156. The reload round trip goes
+too (ADR-0024): it let the Supervisor choose a swap, so `ReevaluateReport`, `ApplyPendingReload`,
+`RequestReload` and the reload sequence are deleted, and the Renderer evaluates and applies a
+`Reevaluate` in one turn. An edit superseded mid-flight now applies once before the next replaces it.

@@ -3,8 +3,8 @@
 //! sends `shared::ConnectionHandshake` first. Two threads/channels (ADR-0039): [`pump`] does framed
 //! I/O, while the Wayland thread owns Lua and the GL-context paint pass because `mlua::Lua` is
 //! `!Send`. `StateSnapshot` hydrates a capability signal and dirties the scene (ADR-0044 decision
-//! 2), then runs its `on_change` handlers (ADR-0115); only `Reevaluate` runs Lua, reporting
-//! `Unchanged` or `Failed`, and the Wayland loop applies it (ADR-0216). No reconnect after
+//! 2), then runs its `on_change` handlers (ADR-0115); only `Reevaluate` runs Lua, and the Wayland
+//! loop applies it (ADR-0216). No reconnect after
 //! disconnect (ADR-0059 decision 1): the Supervisor owns capabilities, `process.run` children, and
 //! PAM.
 
@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 
 use shared::framing::{self, write_json_frame};
 use shared::{
-    ApplyPendingReload, ConnectionHandshake, DeselectInput, IdleEvent, ProcessExited, ProcessOutputLine,
-    PromoteGeneration, ReevaluateReport, ReevaluateRequest, RendererFrame, SetSessionLock, StateSnapshot,
+    ConnectionHandshake, IdleEvent, ProcessExited, ProcessOutputLine, RendererFrame, SetSessionLock, StateSnapshot,
     SupervisorFrame, Zeroize,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,13 +22,13 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::layout::instance::SurfaceInstance;
-use crate::layout::node::{SurfaceFingerprint, SurfaceSpec};
+use crate::layout::node::SurfaceSpec;
 use crate::layout::secure_submit::lock_stays_authenticatable;
 use crate::layout::{self, Scene};
 use crate::lua::capability::{Capability, CapabilityHandle, CommandSender};
 use crate::lua::process::ProcessRegistry;
 use crate::lua::signal::{DirtyFlag, LiveSignalHandle};
-use crate::lua::surfaces::{evaluate_and_specs, surface_specs};
+use crate::lua::surfaces::evaluate_and_specs;
 use crate::lua::{self, Loader};
 use crate::text::shaping::ShapingHandle;
 
@@ -83,34 +82,28 @@ pub fn spawn_client(
     });
 }
 
-/// Reload state. `applied_topology` is this generation's topology and is `None` only before any
-/// evaluation. `pending` holds evaluated-but-unapplied output/specs between `Unchanged`
-/// `Reevaluate` and `ApplyPendingReload`. `applied_output` is ADR-0044 decision 2's re-resolve
+/// Reload state. `applied_specs` is the applied declaration set, empty before any evaluation.
+/// `pending` holds an evaluation until the Wayland loop applies it. `applied_output` is ADR-0044 decision 2's re-resolve
 /// target, retained so pushes skip `shell.lua`. mlua 0.12's `ValueRef` holds `WeakLua`: a retained
 /// `mlua::Value` does not keep Lua alive and `ValueRef::to_pointer` panics after death, so Rust
 /// field-drop order must keep `Lua` last (see [`RendererClient`]).
 struct ReloadState {
-    applied_topology: Option<Vec<SurfaceFingerprint>>,
+    applied_specs: Vec<SurfaceSpec>,
     applied_output: Option<lua::LoadOutput>,
-    pending: Option<(u64, lua::LoadOutput, Vec<SurfaceSpec>)>,
+    pending: Option<(lua::LoadOutput, Vec<SurfaceSpec>)>,
 }
 
-/// What an inbound frame still owes Wayland after [`RendererClient::handle_frame`]. One enum avoids
-/// an `Option<u64>` plus out-parameter: `ActivateDraw` needs `crate::wayland::App`'s EGL/surface
-/// state; `SetSessionLock` needs SCTK `SessionLockState` and lock surfaces (ADR-0042). Two options
-/// could make a caller service both.
+/// What an inbound frame still owes Wayland after [`RendererClient::handle_frame`]: `ApplyPending`
+/// needs `crate::wayland::App`'s surfaces, `SetSessionLock` its SCTK lock state (ADR-0042).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
     /// Fully serviced by [`RendererClient::handle_frame`].
     Handled,
-    /// The generation swap's `ActivateDraw`: draw surfaces and request per-surface presentation
-    /// feedback tagged with this nonce (`crate::wayland::App::activate_draw`).
-    ActivateDraw(u64),
     /// ADR-0042/ADR-0052's `SetSessionLock`: match the session lock to this flag
     /// (`crate::wayland::App::set_session_lock`).
     SetSessionLock(bool),
-    /// An `ApplyPendingReload`, which may change the surface set (`crate::wayland::App::apply_pending`).
-    ApplyPending(u64),
+    /// A successful `Reevaluate`, which may change the surface set (`crate::wayland::App::apply_pending`).
+    ApplyPending,
 }
 
 /// One generation's Lua side: VM, retained scene, live signals, and reload state. Deliberately
@@ -126,7 +119,7 @@ pub struct RendererClient {
     /// [`Self::re_resolve_if_dirty`].
     instances: Vec<SurfaceInstance>,
     /// Whether this process holds or requested a lock. Arms [`lock_stays_authenticatable`]:
-    /// `SurfaceFingerprint::Lock` carries only `id`, so editing `child` reads `Unchanged` and
+    /// `SurfaceFingerprint::Lock` carries only `id`, so editing `child` rebuilds nothing and
     /// reloads in place; deleting the password while locked would leave only a VT switch. Written
     /// by `crate::wayland::App::set_session_lock` and teardown. **A `bool`, not instance ids**:
     /// hotplug replaces instances, so the veto reads [`Self::instances`].
@@ -231,7 +224,7 @@ impl RendererClient {
             process_registry,
             idle_registry: namespace.idle,
             dirty,
-            state: ReloadState { applied_topology: None, applied_output: None, pending: None },
+            state: ReloadState { applied_specs: Vec::new(), applied_output: None, pending: None },
             obelisk: namespace.table,
             loader,
         })
@@ -305,15 +298,14 @@ impl RendererClient {
         Ok(handle)
     }
 
-    /// Evaluates `shell.lua` once at startup without a Supervisor round trip (ADR-0024, "safe to
-    /// apply"). `applied_topology` stays `None` only on *evaluation* failure; a failed *apply*
-    /// leaves it because surfaces are already bound. Split so the caller expands returned specs via
+    /// Evaluates `shell.lua` once at startup. `applied_specs` stays empty only on *evaluation*
+    /// failure; a failed *apply* keeps it because surfaces are already bound. Split so the caller expands returned specs via
     /// [`Self::apply_instances`].
     pub fn run_startup_evaluation(&mut self) -> Option<Vec<SurfaceSpec>> {
         self.clear_change_handlers();
         match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
-                self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
+                self.state.applied_specs = specs.clone();
                 // ADR-0044 decision 2 target: later pushes skip `shell.lua`.
                 self.state.applied_output = Some(output);
                 lua::timer::promote(self.loader.lua());
@@ -350,36 +342,14 @@ impl RendererClient {
         &self.instances
     }
 
-    /// Declared surfaces from the applied evaluation, reparsed from `applied_output`, never
-    /// `shell.lua`. Hotplug expands against this (ADR-0038 decision 3); reevaluation would race
-    /// the Supervisor's `Reevaluate` (ADR-0041 decision 4). Empty before any apply.
+    /// Declared surfaces from the applied evaluation, never `shell.lua`. Hotplug expands against
+    /// this (ADR-0038 decision 3). Empty before any apply.
     pub fn applied_surface_specs(&self) -> Vec<SurfaceSpec> {
-        let Some(output) = self.state.applied_output.as_ref() else {
-            return Vec::new();
-        };
-        match surface_specs(output) {
-            Ok(specs) => specs,
-            Err(err) => {
-                // `surface_specs` already succeeded on `applied_output`; log, not panic, to keep a
-                // painting shell alive.
-                eprintln!("control-socket client: the applied evaluation's surface specs no longer parse: {err}");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Asks the Supervisor to start a reload cycle (ADR-0041 decision 4); it alone decides
-    /// topology changes (ADR-0041 decision 3). No sequence: `supervisor/src/main.rs` drops reports
-    /// without its `next_sequence`, so this only begins a cycle. Used when a `screens` loop changes
-    /// the surface set.
-    pub fn request_reload(&self) {
-        if let Err(err) = self.commands.frames().send(RendererFrame::RequestReload) {
-            eprintln!("control-socket client: failed to request a reload after an output change: {err}");
-        }
+        self.state.applied_specs.clone()
     }
 
     /// Pushes `screens` (ADR-0041 decision 2) and reports change. As with `set_rescue_state`, the
-    /// caller gates [`Self::request_reload`], so a duplicate must not request a reload.
+    /// caller gates a reload on it, so a duplicate must not trigger one.
     pub fn set_screens(&mut self, payload: serde_json::Value) -> bool {
         if self.screens_payload == payload {
             return false;
@@ -453,7 +423,7 @@ impl RendererClient {
     }
 
     /// Applies the last evaluation to current instances, setting rescue on failure. Returns success
-    /// so `crate::wayland::run` can distinguish an exiting Candidate. Instances come only from
+    /// so `crate::wayland::run` can log a startup that applied nothing. Instances come only from
     /// [`Self::set_instances`].
     pub fn apply_instances(&mut self) -> bool {
         let Some(output) = self.state.applied_output.as_ref() else {
@@ -501,8 +471,7 @@ impl RendererClient {
         self.scene.note_drawn_images(instance_id, drawn, now);
     }
 
-    /// Drops a departed instance's retained tree. Called by topology handling when an output goes
-    /// away, which is the one path that removes a surface without a reload replacing the process.
+    /// Drops a departed instance's retained tree, whenever its surface is destroyed.
     pub fn forget_surface(&mut self, instance_id: &str) {
         self.scene.forget(instance_id);
     }
@@ -515,7 +484,7 @@ impl RendererClient {
     }
 
     /// Handles one [`pump`]-decoded frame. Returns [`FrameOutcome`]: `Handled`, or work handed to
-    /// `crate::wayland::App` for EGL/surface draw (the generation swap) or SCTK
+    /// `crate::wayland::App` for its surfaces or SCTK
     /// `SessionLockState`/lock surfaces (ADR-0042).
     #[must_use]
     pub fn handle_frame(&mut self, frame: SupervisorFrame) -> FrameOutcome {
@@ -525,17 +494,10 @@ impl RendererClient {
                     eprintln!("control-socket client: failed to convert a pushed StateSnapshot to a Lua value: {err}");
                 }
             }
-            SupervisorFrame::Reevaluate(request) => self.handle_reevaluate(request),
-            SupervisorFrame::ApplyPendingReload(apply) => return FrameOutcome::ApplyPending(apply.sequence),
-            SupervisorFrame::ActivateDraw(activate) => return FrameOutcome::ActivateDraw(activate.nonce),
-            SupervisorFrame::DeselectInput(DeselectInput { surface_id }) => {
-                // No per-surface input-region/focus machinery yet (ADR-0025).
-                eprintln!(
-                    "control-socket client: DeselectInput({surface_id}) received (no real input-region wiring yet)"
-                );
-            }
-            SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id }) => {
-                eprintln!("control-socket client: PromoteGeneration({surface_id}) received (no real focus wiring yet)");
+            SupervisorFrame::Reevaluate => {
+                if self.reevaluate() {
+                    return FrameOutcome::ApplyPending;
+                }
             }
             SupervisorFrame::ProcessOutput(ProcessOutputLine { id, stream, line }) => {
                 self.process_registry.dispatch_output(id, stream, line);
@@ -577,42 +539,33 @@ impl RendererClient {
         FrameOutcome::Handled
     }
 
-    /// Evaluates one `Reevaluate`, updates pending or rescue, and queues the verdict. A changed
-    /// surface set is still `Unchanged`: [`Self::pending_surfaces`] names what it rebuilds (ADR-0216).
-    fn handle_reevaluate(&mut self, request: ReevaluateRequest) {
+    /// Evaluates `shell.lua` into `pending`, or sets rescue. `true` means there is something to
+    /// apply; [`Self::pending_surfaces`] names what it rebuilds (ADR-0216).
+    pub fn reevaluate(&mut self) -> bool {
         self.clear_change_handlers();
-        let report = match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
+        match evaluate_and_specs(&self.loader, &self.shell_lua_path) {
             Ok((output, specs)) => {
                 self.set_rescue_state(false, "");
-                self.state.pending = Some((request.sequence, output, specs));
-                ReevaluateReport::Unchanged { sequence: request.sequence }
+                self.state.pending = Some((output, specs));
+                true
             }
             Err(err) => {
                 // Whatever it registered before raising goes with it. `discard` after the clear
                 // because that arms the next evaluation; nothing is running one now.
                 self.clear_change_handlers();
                 lua::timer::discard(self.loader.lua());
+                eprintln!("control-socket client: shell.lua re-evaluation failed: {err}");
                 self.set_rescue_state(true, &err.to_string());
-                ReevaluateReport::Failed { sequence: request.sequence, error: err.to_string() }
+                false
             }
-        };
-
-        if let Err(err) = self.commands.frames().send(RendererFrame::ReevaluateReport(report)) {
-            eprintln!("control-socket client: failed to send a ReevaluateReport: {err}");
         }
     }
 
-    /// Applies `state.pending` only when its sequence matches `apply.sequence`; otherwise a newer
-    /// `Reevaluate` superseded it, so log and ignore. Returns whether the scene took it.
-    pub fn handle_apply_pending(&mut self, apply: ApplyPendingReload) -> bool {
-        if !matches!(&self.state.pending, Some((sequence, _, _)) if *sequence == apply.sequence) {
-            eprintln!(
-                "control-socket client: ApplyPendingReload({}) doesn't match the currently pending reload; ignoring",
-                apply.sequence
-            );
+    /// Applies `state.pending`. Returns whether the scene took it.
+    pub fn handle_apply_pending(&mut self) -> bool {
+        let Some((output, specs)) = self.state.pending.take() else {
             return false;
-        }
-        let (_, output, specs) = self.state.pending.take().expect("just confirmed Some above");
+        };
         let (instances, locked) = (&self.instances, self.holds_session_lock);
         match self.scene.apply_admitting(&output.surfaces, instances, &self.shaping, self.loader.lua(), |scene| {
             lock_stays_authenticatable(scene, instances, locked)
@@ -620,7 +573,7 @@ impl RendererClient {
             Ok(()) => {
                 log_applied_surfaces(&self.scene, &self.instances);
                 start_secure_submit_capabilities(&self.scene, &self.instances, &self.commands);
-                self.state.applied_topology = Some(specs.iter().map(SurfaceSpec::fingerprint).collect());
+                self.state.applied_specs = specs;
                 // ADR-0044 decision 2 re-resolve target.
                 self.state.applied_output = Some(output);
                 // The poll loop repaints on `re_resolve_if_dirty`.
@@ -631,20 +584,20 @@ impl RendererClient {
             }
             Err(err) => {
                 lua::timer::discard(self.loader.lua());
-                eprintln!("control-socket client: ApplyPendingReload's stored evaluation failed to apply: {err}");
+                eprintln!("control-socket client: the re-evaluated config failed to apply: {err}");
                 false
             }
         }
     }
 
     /// The pending evaluation's specs, and the declared ids whose fingerprint the applied set lacks:
-    /// their protocol objects cannot be reused. `None` when `sequence` is not the pending one.
-    pub fn pending_surfaces(&self, sequence: u64) -> Option<(Vec<SurfaceSpec>, Vec<String>)> {
-        let (_, _, specs) = self.state.pending.as_ref().filter(|(pending, _, _)| *pending == sequence)?;
-        let applied = self.state.applied_topology.as_deref().unwrap_or_default();
+    /// their protocol objects cannot be reused.
+    pub fn pending_surfaces(&self) -> Option<(Vec<SurfaceSpec>, Vec<String>)> {
+        let (_, specs) = self.state.pending.as_ref()?;
+        let applied = &self.state.applied_specs;
         let rebuilt = specs
             .iter()
-            .filter(|spec| !applied.contains(&spec.fingerprint()))
+            .filter(|spec| !applied.iter().any(|old| old.fingerprint() == spec.fingerprint()))
             .map(|spec| spec.declared_id().to_string())
             .collect();
         Some((specs.clone(), rebuilt))
@@ -710,8 +663,7 @@ impl RendererClient {
 
     /// Runs the config callbacks whose deadline has passed, before this turn's dirty-tree
     /// re-resolve. A `state:set` inside one therefore reaches this turn's pass, which resolves the
-    /// *applied* tree: a reload still waiting on `ApplyPendingReload` paints its new bindings when
-    /// that lands, not here.
+    /// *applied* tree.
     pub fn fire_due_timers(&mut self) {
         crate::lua::timer::dispatch_due(self.loader.lua(), std::time::Instant::now());
     }
@@ -784,7 +736,7 @@ async fn run(
 
 /// After handshake, forward decoded `SupervisorFrame`s to Wayland and queued `RendererFrame`s to
 /// the wire (ADR-0039). Decode failure is transport failure: one sender and fixed shapes mean
-/// desync, unlike a recoverable `ApplyPendingReload` sequence mismatch. Read and write are separate
+/// desync. Read and write are separate
 /// long-lived futures. `read_json_frame` has two sequential `read_exact`s; racing one frame read
 /// against `outbound_rx.recv()` would drop partial bytes when outbound wins and desync the stream.
 async fn pump<R, W>(
@@ -843,13 +795,9 @@ async fn pump<R, W>(
 /// would print `SecureSubmit.secret` (ADR-0005).
 fn frame_label(frame: &RendererFrame) -> &'static str {
     match frame {
-        RendererFrame::ReadySignal(_) => "ReadySignal",
-        RendererFrame::PresentationEvidence(_) => "PresentationEvidence",
-        RendererFrame::ReevaluateReport(_) => "ReevaluateReport",
         RendererFrame::Command(_) => "Command",
         RendererFrame::SecureSubmit(_) => "SecureSubmit",
         RendererFrame::LockReport(_) => "LockReport",
-        RendererFrame::RequestReload => "RequestReload",
         RendererFrame::StartCapability { .. } => "StartCapability",
         RendererFrame::CallResult(_) => "CallResult",
         // Never sent here (ADR-0112, ADR-0197), but a wildcard could hide a new unnamed variant.
@@ -904,9 +852,9 @@ fn log_applied_surfaces(scene: &Scene, instances: &[SurfaceInstance]) {
 mod tests {
     use super::*;
     use crate::layout::instance::{OutputGeometry, expand_instances};
-    use crate::layout::node::LayerKind;
+    use crate::lua::surfaces::surface_specs;
     use shared::framing::read_json_frame;
-    use shared::{ActivateDraw, CommandEnvelope, PresentationEvidence, ReadySignal, SecureSubmit};
+    use shared::{CommandEnvelope, SecureSubmit};
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
 
@@ -1084,7 +1032,7 @@ mod tests {
         vec![OutputGeometry { name: "TEST".to_string(), size: layout::LogicalSize { width: 1920.0, height: 1080.0 } }]
     }
 
-    /// `crate::wayland::run` startup in swap order: evaluate, expand, store instances, apply.
+    /// `crate::wayland::run` startup order: evaluate, expand, store instances, apply.
     fn run_startup(client: &mut RendererClient) -> bool {
         let Some(specs) = client.run_startup_evaluation() else {
             return false;
@@ -1932,7 +1880,7 @@ mod tests {
         run_startup(&mut client);
 
         assert!(client.scene.surface("bar@TEST").is_some());
-        assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
+        assert_eq!(client.state.applied_specs.len(), 1);
         assert_eq!(rescue_state(&client.loader), (false, String::new()));
     }
 
@@ -1962,28 +1910,17 @@ mod tests {
     }
 
     #[test]
-    fn the_swap_fingerprint_carries_every_role_so_adding_a_window_is_a_topology_change() {
+    fn the_fingerprint_carries_every_role_so_adding_a_window_is_a_topology_change() {
         // ADR-0049 decision 3: a window object may come and go within a generation, but its
         // *declaration* is fixed, so adding one changes topology.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.state.applied_specs = surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap();
 
         write_shell_lua(dir.path(), three_roles_config());
-        client.handle_reevaluate(ReevaluateRequest { sequence: 9 });
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 })
-        );
-        let (specs, rebuilt) = client.pending_surfaces(9).expect("staged");
+        assert!(client.reevaluate());
+        let (specs, rebuilt) = client.pending_surfaces().expect("staged");
         assert_eq!(specs.len(), 3);
         assert_eq!(rebuilt.len(), 2, "only the added window and popup are new; the panel keeps its layer surface");
     }
@@ -2002,23 +1939,18 @@ mod tests {
 
     #[test]
     fn an_in_place_reload_may_restyle_a_live_lock_screen_but_not_remove_its_way_out() {
-        // `SurfaceFingerprint::Lock` carries only `id`, so edits inside the lock are `Unchanged`
-        // and bypass the generation-swap gate. Restyles must land (ADR-0052 decision 2), but
+        // `SurfaceFingerprint::Lock` carries only `id`, so edits inside the lock rebuild nothing. Restyles must land (ADR-0052 decision 2), but
         // removing the way out must be refused; `Scene::apply` rollback preserves the live tree.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
         client.set_session_locked(true);
 
         // Restyle: same surfaces and field, different colour.
         write_shell_lua(dir.path(), &lock_config("#204080FF"));
-        client.handle_reevaluate(ReevaluateRequest { sequence: 20 });
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 20 })
-        );
-        client.handle_apply_pending(ApplyPendingReload { sequence: 20 });
+        assert!(client.reevaluate());
+        client.handle_apply_pending();
         let restyled = client.scene.surface("screen@TEST").expect("the lock instance is still resolved");
         assert_eq!(
             restyled.children[0].properties.get("background").unwrap().as_string().unwrap().to_string_lossy(),
@@ -2034,12 +1966,8 @@ mod tests {
             lock { id = "screen", child = column { background = "#204080FF", children = {} } },
         }"##,
         );
-        client.handle_reevaluate(ReevaluateRequest { sequence: 21 });
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 21 })
-        );
-        client.handle_apply_pending(ApplyPendingReload { sequence: 21 });
+        assert!(client.reevaluate());
+        client.handle_apply_pending();
 
         let still_up = client.scene.surface("screen@TEST").expect("a refused apply leaves the prior scene standing");
         assert_eq!(
@@ -2055,7 +1983,7 @@ mod tests {
         // With no lock held, the lock screen may become empty like any surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
 
         write_shell_lua(
@@ -2065,12 +1993,8 @@ mod tests {
             lock { id = "screen", child = column { background = "#101010FF", children = {} } },
         }"##,
         );
-        client.handle_reevaluate(ReevaluateRequest { sequence: 22 });
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 22 })
-        );
-        client.handle_apply_pending(ApplyPendingReload { sequence: 22 });
+        assert!(client.reevaluate());
+        client.handle_apply_pending();
 
         assert!(
             client.scene.surface("screen@TEST").unwrap().children[0].children.is_empty(),
@@ -2087,7 +2011,7 @@ mod tests {
         // outputs, store, resolve.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), &lock_config("#101010FF"));
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
         assert!(run_startup(&mut client));
         client.set_session_locked(true);
 
@@ -2106,12 +2030,8 @@ mod tests {
             lock { id = "screen", child = column { background = "#101010FF", children = {} } },
         }"##,
         );
-        client.handle_reevaluate(ReevaluateRequest { sequence: 30 });
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 30 })
-        );
-        client.handle_apply_pending(ApplyPendingReload { sequence: 30 });
+        assert!(client.reevaluate());
+        client.handle_apply_pending();
 
         let live =
             client.scene.surface("screen@DP-1").expect("the lock instance on the output that is actually plugged in");
@@ -2128,11 +2048,11 @@ mod tests {
         // `ensure_lock_surfaces` send two `get_lock_surface`s for one `wl_output`;
         // `ext-session-lock-v1` calls that `duplicate_output`, and the compositor kills the
         // connection after lock, leaving only a VT switch. Both entry points reject it: startup
-        // returns no specs and `Reevaluate` reports `Failed`, never staging it.
+        // returns no specs and `Reevaluate` fails, never staging it.
         let dir = tempfile::tempdir().unwrap();
         let two_locks = r#"return { lock { id = "first" }, lock { id = "second" } }"#;
         let path = write_shell_lua(dir.path(), two_locks);
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
 
         assert!(!run_startup(&mut client), "a config with two `lock` surfaces must not produce a generation");
         let (is_rescue, error_log) = rescue_state(&client.loader);
@@ -2140,21 +2060,10 @@ mod tests {
         assert!(error_log.contains("`lock` surfaces"), "the message must name what was refused: {error_log}");
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
+        client.state.applied_specs = surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap();
         write_shell_lua(dir.path(), two_locks);
-        client.handle_reevaluate(ReevaluateRequest { sequence: 11 });
-
         assert!(
-            matches!(
-                queued_frame(&mut outbound_rx),
-                RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence: 11, .. })
-            ),
+            !client.reevaluate(),
             "an edit that adds a second lock must fail the reevaluation rather than be staged"
         );
         assert!(client.state.pending.is_none());
@@ -2166,26 +2075,19 @@ mod tests {
         // not respawn the process.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return window { id = "settings", title = "Settings" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.state.applied_specs = surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap();
 
         write_shell_lua(
             dir.path(),
             r#"return window { id = "settings", title = "Obelisk settings", app_id = "obelisk.settings" }"#,
         );
-        client.handle_reevaluate(ReevaluateRequest { sequence: 10 });
-
+        assert!(client.reevaluate());
         assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 10 })
+            client.pending_surfaces().map(|(_, rebuilt)| rebuilt),
+            Some(Vec::new()),
+            "a title edit rebuilds nothing"
         );
-        assert!(client.state.pending.is_some());
     }
 
     #[test]
@@ -2239,7 +2141,7 @@ mod tests {
 
         run_startup(&mut client);
 
-        assert!(client.state.applied_topology.is_none());
+        assert!(client.state.applied_specs.is_empty());
         assert!(client.scene.surface("bar@TEST").is_none());
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue);
@@ -2247,73 +2149,33 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_reevaluate_after_a_startup_failure_recovers_instead_of_reporting_topology_changed_forever() {
-        // Treating "nothing applied yet" as empty topology instead of "no prior state" made every
-        // later evaluation `TopologyChanged`, which nothing applies, leaving the shell blank.
+    fn a_successful_reevaluate_after_a_startup_failure_creates_every_surface() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("shell.lua");
-        let (mut client, mut outbound_rx) = test_client(&missing);
+        let (mut client, _outbound_rx) = test_client(&missing);
         run_startup(&mut client);
-        assert!(client.state.applied_topology.is_none(), "startup must have failed (no file yet)");
+        assert!(client.state.applied_specs.is_empty(), "startup must have failed (no file yet)");
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
-
+        assert!(client.reevaluate(), "the first successful evaluation after a startup failure must be applied");
         assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 1 }),
-            "the first successful evaluation after a startup failure must be treated as safe to apply, not a topology change"
-        );
-        assert_eq!(
-            client.pending_surfaces(1).map(|(_, rebuilt)| rebuilt),
+            client.pending_surfaces().map(|(_, rebuilt)| rebuilt),
             Some(vec!["bar".to_string()]),
             "nothing was applied, so every declaration gets its surfaces"
         );
     }
 
     #[test]
-    fn handle_reevaluate_reports_unchanged_and_stores_pending_when_topology_matches() {
+    fn a_topology_edit_names_the_declarations_to_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
-
-        client.handle_reevaluate(ReevaluateRequest { sequence: 5 });
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 5 })
-        );
-        assert!(matches!(&client.state.pending, Some((sequence, _, _)) if *sequence == 5));
-    }
-
-    #[test]
-    fn a_topology_edit_reports_unchanged_and_names_the_declarations_to_rebuild() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
         // Seed a *different* topology so fresh evaluation reads as changed.
-        client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
-            id: "other".to_string(),
-            layer: LayerKind::Top,
-            anchor: Default::default(),
-            monitor: "All".to_string(),
-            namespace: "obelisk-other".to_string(),
-        })]);
+        let other = client.loader.evaluate(r#"return panel { id = "other", layer = "Top" }"#).unwrap();
+        client.state.applied_specs = surface_specs(&other).unwrap();
 
-        client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 1 })
-        );
-        let (specs, rebuilt) = client.pending_surfaces(1).expect("staged");
+        assert!(client.reevaluate());
+        let (specs, rebuilt) = client.pending_surfaces().expect("staged");
         assert_eq!(specs.len(), 1);
         assert_eq!(rebuilt, ["bar"], "`bar` is new; `other` goes because no fresh instance names it");
     }
@@ -2329,50 +2191,39 @@ mod tests {
         assert!(run_startup(&mut client));
 
         write_shell_lua(dir.path(), r#"return { panel { id = "bar", layer = "Top" } }"#);
-        client.handle_reevaluate(ReevaluateRequest { sequence: 2 });
-        let (_, rebuilt) = client.pending_surfaces(2).expect("staged");
+        assert!(client.reevaluate());
+        let (_, rebuilt) = client.pending_surfaces().expect("staged");
         assert!(rebuilt.is_empty(), "removing `dock` rebuilds nothing; reconcile drops its instance");
 
-        // What `App::apply_topology` does: the scene resolves against the fresh instance set.
+        // What `App::apply_pending` does: the scene resolves against the fresh instance set.
         client.set_instances(instances_for(&["bar"]));
-        assert!(client.handle_apply_pending(ApplyPendingReload { sequence: 2 }));
+        assert!(client.handle_apply_pending());
         assert!(client.scene.surface("bar@TEST").is_some());
     }
 
     #[test]
     fn editing_only_the_in_place_panel_fields_reports_unchanged_and_reloads_in_place() {
         // ADR-0038 decision 2: layer-shell accepts `margin`, exclusive zone,
-        // `keyboard_interactivity`, and size on a live surface. Comparing whole specs would swap
-        // generations for each, respawning just to move a bar 4px.
+        // `keyboard_interactivity`, and size on a live surface. Comparing whole specs would rebuild
+        // the surface for each, remapping it just to move a bar 4px.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(
             dir.path(),
             r#"return panel { id = "bar", layer = "Top", margin = { left = 4 }, keyboard_interactivity = "None", exclusive = false, height = 32 }"#,
         );
-        let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.state.applied_specs = surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap();
 
         // Change every in-place field; leave topology unchanged.
         write_shell_lua(
             dir.path(),
             r#"return panel { id = "bar", layer = "Top", margin = { left = 40 }, keyboard_interactivity = "Exclusive", exclusive = true, height = 48 }"#,
         );
-        client.handle_reevaluate(ReevaluateRequest { sequence: 7 });
-
+        assert!(client.reevaluate());
         assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 7 }),
-            "margin/keyboard_interactivity/exclusive/size are in-place fields and must not trigger a generation swap"
-        );
-        assert!(
-            client.state.pending.is_some(),
-            "an Unchanged verdict must stage the fresh evaluation for ApplyPendingReload"
+            client.pending_surfaces().map(|(_, rebuilt)| rebuilt),
+            Some(Vec::new()),
+            "margin/keyboard_interactivity/exclusive/size are in-place fields and must not rebuild the surface"
         );
     }
 
@@ -2381,23 +2232,12 @@ mod tests {
         // `get_layer_surface` fixes namespace at creation, so the edit needs a new layer surface.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-        client.state.applied_topology = Some(
-            surface_specs(&client.loader.evaluate_file(&path).unwrap())
-                .unwrap()
-                .iter()
-                .map(SurfaceSpec::fingerprint)
-                .collect(),
-        );
+        let (mut client, _outbound_rx) = test_client(&path);
+        client.state.applied_specs = surface_specs(&client.loader.evaluate_file(&path).unwrap()).unwrap();
 
         write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", namespace = "my-bar" }"#);
-        client.handle_reevaluate(ReevaluateRequest { sequence: 8 });
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 8 })
-        );
-        assert_eq!(client.pending_surfaces(8).map(|(_, rebuilt)| rebuilt), Some(vec!["bar".to_string()]));
+        assert!(client.reevaluate());
+        assert_eq!(client.pending_surfaces().map(|(_, rebuilt)| rebuilt), Some(vec!["bar".to_string()]));
     }
 
     #[test]
@@ -2561,20 +2401,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_reevaluate_reports_failed_and_sets_rescue_on_a_broken_file() {
+    fn a_failed_reevaluation_stages_nothing_and_sets_rescue() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), "this is not lua");
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
 
-        client.handle_reevaluate(ReevaluateRequest { sequence: 2 });
-
-        match queued_frame(&mut outbound_rx) {
-            RendererFrame::ReevaluateReport(ReevaluateReport::Failed { sequence, error }) => {
-                assert_eq!(sequence, 2);
-                assert!(!error.is_empty());
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
+        assert!(!client.reevaluate());
         assert!(client.state.pending.is_none());
         let (is_rescue, error_log) = rescue_state(&client.loader);
         assert!(is_rescue);
@@ -2582,26 +2414,21 @@ mod tests {
     }
 
     #[test]
-    fn handle_reevaluate_reports_a_topology_field_error_distinctly_from_a_top_level_return_error() {
+    fn a_topology_field_error_reads_distinctly_from_a_top_level_return_error() {
         // A topology-field type error such as `anchor.top` not boolean used to become
         // `InvalidTopLevelReturn`'s fixed "must be a `panel` node or an array of them" message.
         let dir = tempfile::tempdir().unwrap();
         let path =
             write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top", anchor = { top = "yes" } }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
+        let (mut client, _outbound_rx) = test_client(&path);
 
-        client.handle_reevaluate(ReevaluateRequest { sequence: 1 });
-
-        match queued_frame(&mut outbound_rx) {
-            RendererFrame::ReevaluateReport(ReevaluateReport::Failed { error, .. }) => {
-                assert!(error.contains("topology"), "expected a topology-specific message, got: {error}");
-                assert!(
-                    !error.contains("top-level return"),
-                    "must not reuse the unrelated top-level-return message, got: {error}"
-                );
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
+        assert!(!client.reevaluate());
+        let (_, error) = rescue_state(&client.loader);
+        assert!(error.contains("topology"), "expected a topology-specific message, got: {error}");
+        assert!(
+            !error.contains("top-level return"),
+            "must not reuse the unrelated top-level-return message, got: {error}"
+        );
     }
 
     #[test]
@@ -2611,30 +2438,15 @@ mod tests {
         let (mut client, _outbound_rx) = test_client(&path);
         let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
         client.set_instances(instances_for(&["bar"]));
-        client.state.pending = Some((3, output, specs));
+        client.state.pending = Some((output, specs));
 
-        client.handle_apply_pending(ApplyPendingReload { sequence: 3 });
+        client.handle_apply_pending();
 
         assert!(client.scene.surface("bar@TEST").is_some());
         assert!(client.state.pending.is_none());
-        assert_eq!(client.state.applied_topology.as_ref().map(Vec::len), Some(1));
+        assert_eq!(client.state.applied_specs.len(), 1);
         // The poll loop repaints only when `re_resolve_if_dirty` reports change.
         assert!(client.dirty.take(), "an applied in-place reload must mark the scene dirty");
-    }
-
-    #[test]
-    fn handle_apply_pending_ignores_a_mismatched_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, _outbound_rx) = test_client(&path);
-        let (output, specs) = evaluate_and_specs(&client.loader, &path).unwrap();
-        client.set_instances(instances_for(&["bar"]));
-        client.state.pending = Some((3, output, specs));
-
-        client.handle_apply_pending(ApplyPendingReload { sequence: 99 });
-
-        assert!(client.scene.surface("bar@TEST").is_none(), "a stale ApplyPendingReload must not apply");
-        assert!(client.state.pending.is_some(), "the still-current pending evaluation must survive a mismatched Apply");
     }
 
     // ADR-0044 decision 2: a `StateSnapshot` dirties the scene; dirty re-resolve uses the last
@@ -2997,7 +2809,7 @@ mod tests {
     #[test]
     fn set_screens_repeating_the_same_list_reports_no_change_and_leaves_the_scene_clean() {
         // `update_output` handles changes absent from `screens`; an unchanged push buys neither
-        // `Scene::apply` nor a Supervisor round trip.
+        // `Scene::apply` nor a re-evaluation.
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
@@ -3075,56 +2887,18 @@ mod tests {
     }
 
     #[test]
-    fn request_reload_queues_the_frame_the_supervisor_starts_a_cycle_from() {
-        // ADR-0041 decision 4: `answer_unchanged_report` would drop sequences the Supervisor did not
-        // send.
-        let (client, mut outbound_rx) = test_client(std::path::Path::new("/no/such/shell.lua"));
-        client.request_reload();
-        assert_eq!(queued_frame(&mut outbound_rx), RendererFrame::RequestReload);
-    }
-
-    #[test]
-    fn handle_frame_answers_a_reevaluate_frame_with_a_report() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-        // Different applied topology proves dispatch/queue, not `handle_reevaluate` classification.
-        client.state.applied_topology = Some(vec![SurfaceFingerprint::Panel(layout::node::SurfaceTopology {
-            id: "other".to_string(),
-            layer: LayerKind::Top,
-            anchor: Default::default(),
-            monitor: "All".to_string(),
-            namespace: "obelisk-other".to_string(),
-        })]);
-
-        assert_eq!(
-            client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 1 })),
-            FrameOutcome::Handled
-        );
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 1 })
-        );
-        assert_eq!(
-            client.handle_frame(SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence: 1 })),
-            FrameOutcome::ApplyPending(1),
-            "every apply goes to the Wayland loop, which owns the protocol objects"
-        );
-    }
-
-    #[test]
-    fn handle_frame_hands_an_activate_draw_nonce_back_to_the_wayland_loop() {
-        // Drawing needs `wayland::App`'s EGL/surface state, so return the nonce to
-        // `App::activate_draw`.
+    fn handle_frame_hands_a_successful_reevaluate_to_the_wayland_loop() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
         let (mut client, _outbound_rx) = test_client(&path);
 
         assert_eq!(
-            client.handle_frame(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })),
-            FrameOutcome::ActivateDraw(42)
+            client.handle_frame(SupervisorFrame::Reevaluate),
+            FrameOutcome::ApplyPending,
+            "every apply goes to the Wayland loop, which owns the protocol objects"
         );
+        write_shell_lua(dir.path(), "this is not lua");
+        assert_eq!(client.handle_frame(SupervisorFrame::Reevaluate), FrameOutcome::Handled);
     }
 
     #[test]
@@ -3142,34 +2916,6 @@ mod tests {
         assert_eq!(
             client.handle_frame(SupervisorFrame::SetSessionLock(SetSessionLock { locked: false })),
             FrameOutcome::SetSessionLock(false)
-        );
-    }
-
-    #[test]
-    fn handle_frame_logs_and_continues_on_deselect_input_and_promote_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_shell_lua(dir.path(), r#"return panel { id = "bar", layer = "Top" }"#);
-        let (mut client, mut outbound_rx) = test_client(&path);
-
-        assert_eq!(
-            client.handle_frame(SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() })),
-            FrameOutcome::Handled
-        );
-        assert_eq!(
-            client.handle_frame(SupervisorFrame::PromoteGeneration(PromoteGeneration {
-                surface_id: "main_bar".to_string()
-            })),
-            FrameOutcome::Handled
-        );
-        // A third recognized frame proves dispatch still works; the exact verdict is irrelevant.
-        assert_eq!(
-            client.handle_frame(SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 9 })),
-            FrameOutcome::Handled
-        );
-
-        assert_eq!(
-            queued_frame(&mut outbound_rx),
-            RendererFrame::ReevaluateReport(ReevaluateReport::Unchanged { sequence: 9 })
         );
     }
 
@@ -3230,20 +2976,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_writes_a_ready_signal_frame_to_the_wire() {
-        let surfaces = vec!["main_bar".to_string(), "overlay_canvas".to_string()];
-        let written = pumped_to_the_wire(RendererFrame::ReadySignal(ReadySignal { surfaces: surfaces.clone() })).await;
-        assert_eq!(written, RendererFrame::ReadySignal(ReadySignal { surfaces }));
-    }
-
-    #[tokio::test]
-    async fn pump_writes_a_presentation_evidence_frame_to_the_wire() {
-        let evidence = PresentationEvidence { nonce: 7, surface_id: "wallpaper_layer@DP-1".to_string() };
-        let written = pumped_to_the_wire(RendererFrame::PresentationEvidence(evidence.clone())).await;
-        assert_eq!(written, RendererFrame::PresentationEvidence(evidence));
-    }
-
-    #[tokio::test]
     async fn pump_writes_a_queued_process_command_frame_to_the_wire() {
         let envelope = CommandEnvelope {
             jsonrpc: "2.0".to_string(),
@@ -3297,7 +3029,7 @@ mod tests {
         let (mut server_read, mut server_write) = tokio::io::split(server);
 
         // Close the write half so `pump`'s *second* read hits EOF after forwarding one frame.
-        write_json_frame(&mut wire, &SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })).await.unwrap();
+        write_json_frame(&mut wire, &SupervisorFrame::Reevaluate).await.unwrap();
         wire.shutdown().await.unwrap();
 
         let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(INBOUND_CAPACITY);
@@ -3305,7 +3037,7 @@ mod tests {
 
         pump(&mut server_read, &mut server_write, &inbound_tx, &mut outbound_rx, None).await;
 
-        assert_eq!(inbound_rx.try_recv(), Ok(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })));
+        assert_eq!(inbound_rx.try_recv(), Ok(SupervisorFrame::Reevaluate));
     }
 
     /// Advances `pumping` for up to `millis`. If `pump` completes first, a loop broke, which is a
@@ -3331,7 +3063,7 @@ mod tests {
         let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel(INBOUND_CAPACITY);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
 
-        let inbound_frame = SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 });
+        let inbound_frame = SupervisorFrame::Reevaluate;
         let payload = serde_json::to_vec(&inbound_frame).unwrap();
         let mut wire_bytes = (payload.len() as u32).to_be_bytes().to_vec();
         wire_bytes.extend_from_slice(&payload);
@@ -3348,14 +3080,12 @@ mod tests {
             let_pump_advance(pumping.as_mut(), 20).await;
 
             // Queue outbound while inbound is stalled mid-frame, the old `select!` race.
-            outbound_tx
-                .send(RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }))
-                .unwrap();
+            outbound_tx.send(RendererFrame::StartCapability { capability: shared::Capability::Lock }).unwrap();
             let_pump_advance(pumping.as_mut(), 20).await;
 
             // A stuck read must not starve writes.
             let written = read_json_frame::<_, RendererFrame>(&mut wire).await.unwrap();
-            assert_eq!(written, RendererFrame::ReadySignal(ReadySignal { surfaces: vec!["main_bar".to_string()] }));
+            assert_eq!(written, RendererFrame::StartCapability { capability: shared::Capability::Lock });
 
             // Complete inbound. If outbound cancelled the read, this prefix would land mid-payload.
             wire.write_all(&wire_bytes[split_at..]).await.unwrap();
@@ -3366,7 +3096,7 @@ mod tests {
 
         assert_eq!(
             inbound_rx.try_recv(),
-            Ok(SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 })),
+            Ok(SupervisorFrame::Reevaluate),
             "the inbound frame split across two writes around an outbound frame must still decode correctly"
         );
     }

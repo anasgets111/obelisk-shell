@@ -1,4 +1,4 @@
-//! Surface specs, swap fingerprints, child-list parsers, and masked `SecureSubmitTarget`.
+//! Surface specs, rebuild fingerprints, child-list parsers, and masked `SecureSubmitTarget`.
 //! List generation also owns duplicate-key rejection.
 
 use std::collections::{HashMap, HashSet};
@@ -42,7 +42,7 @@ pub fn lock_spec(properties: &HashMap<String, Value>) -> Result<LockSpec, Layout
 }
 
 /// One declared top-level surface, parsed by its role (ADR-0040 decision 1). Declaration order
-/// remains in the roster and swap fingerprint, so one enum preserves it across roles.
+/// remains in the roster and fingerprint, so one enum preserves it across roles.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceSpec {
     Panel(PanelSpec),

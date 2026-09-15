@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 /// How long `obelisk call` waits for an answer.
 ///
 /// Generous against the work a handler can actually do: config Lua runs under a 5ms CPU cap, so a
-/// reply that has not arrived by now means the shell is wedged or a generation swapped mid-call,
+/// reply that has not arrived by now means the shell is wedged or the Renderer was replaced mid-call,
 /// not that the handler is still thinking. Expiring says "outcome unknown", never "nothing
 /// happened" -- the call may well have run.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);

@@ -30,10 +30,7 @@ pub use content::{
     Elide, StyleRun, TextAlign, Wrap, font_runs, parse_content, parse_icon_size, parse_node_id, parse_surface_id,
 };
 pub use paint_style::{PaintStyle, paint_style};
-pub use spec::{
-    SecureSubmitTarget, SurfaceFingerprint, SurfaceSpec, lock_spec, parse_children, parse_list_children,
-    parse_single_child,
-};
+pub use spec::{SecureSubmitTarget, SurfaceSpec, lock_spec, parse_children, parse_list_children, parse_single_child};
 // `wayland::tests`' and `instance::tests`' fixtures name it `node::LockSpec`; nothing else does.
 #[cfg(test)]
 pub use spec::LockSpec;
@@ -417,8 +414,8 @@ pub fn resolve_properties(
 /// resting on a value that no longer holds. Every other property is read for the geometry or
 /// appearance of the pass it was read in, so a later change simply produces different output next
 /// pass. Concretely: `surface_topology` runs on every `Scene::apply` so `socket.rs`'s
-/// `handle_reevaluate` can diff it against `applied_topology` and choose swap-versus-in-place
-/// (ADR-0001); a surface could otherwise move layer or monitor with no swap. `id` is
+/// `pending_surfaces` can diff it against `applied_topology` and choose what to rebuild
+/// (ADR-0216); a surface could otherwise move layer or monitor with no rebuild. `id` is
 /// `pair_children_by_id_then_position`'s reconcile identity, matched once per `Scene::apply` to
 /// pair a fresh child against its retained counterpart; a later-changing value would make "the
 /// same node as last time" ambiguous. ADR-0044 decision 1 leaves both out: a gap, not a rejected

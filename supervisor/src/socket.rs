@@ -1,8 +1,7 @@
 //! Supervisor-side Unix control-socket listener.
 //!
 //! Binds at `$XDG_RUNTIME_DIR/obelisk-shell.sock`, not world-writable `/tmp`, because it carries
-//! secure textfield submissions (ADR-0005). Accepts simultaneous connections during a swap, with
-//! Generation `N` and Candidate `N+1` registered by `generation_id`.
+//! secure textfield submissions (ADR-0005). Connections register by `generation_id`.
 //!
 //! Command-dispatch routing remains deferred (ADR-0020), including the ~30 write commands.
 //! Decode inbound frames as `shared::RendererFrame` (ADR-0024) and forward them unchanged.
@@ -43,7 +42,7 @@ const CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Connections handled at once, across Renderers and control clients.
 ///
-/// A swap has two Renderers live and `obelisk set` is one short-lived client at a time, so
+/// One Renderer is live and `obelisk set` is one short-lived client at a time, so
 /// the working set is single digits. This is sized to leave that room untouched while refusing the
 /// unbounded accept loop that preceded it: past this, `accept` still runs -- the listener must not
 /// wedge -- but the new connection is closed immediately.
@@ -52,8 +51,8 @@ const MAX_CONNECTIONS: usize = 64;
 /// Decoded frames queued from all peers toward `main`'s loop.
 ///
 /// Bounded with backpressure rather than a drop policy: `main` reads these in protocol order, and
-/// the generation swap's evidence, reload reports and lock reports are each load-bearing
-/// (ADR-0025), so a dropped frame is a stalled handshake rather than a lost log line. A full queue
+/// lock reports and commands are load-bearing, so a dropped frame is a stalled lock or a lost
+/// action rather than a lost log line. A full queue
 /// instead parks the one connection task that is producing faster than `main` consumes, which is
 /// the peer that should be waiting.
 const MAX_INBOUND_FRAMES: usize = 1024;
@@ -466,7 +465,7 @@ struct Pending {
 struct Waiting {
     reply: mpsc::Sender<Vec<u8>>,
     /// `None` until `main` forwards it. A result naming a different generation is stale, which a
-    /// swap mid-call can produce, and answering from it would report another config's outcome.
+    /// respawn mid-call can produce, and answering from it would report another config's outcome.
     dispatched_to: Option<u32>,
 }
 
@@ -610,7 +609,8 @@ mod tests {
         let refusal = refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &command_frame(0))
             .expect("a control client must not be able to send Command");
         assert!(refusal.contains("only send SetState"), "{refusal}");
-        assert!(refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &RendererFrame::RequestReload).is_some());
+        let start = RendererFrame::StartCapability { capability: shared::Capability::Audio };
+        assert!(refuse_frame(true, shared::CONTROL_CLIENT_GENERATION, &start).is_some());
     }
 
     #[test]
@@ -625,7 +625,6 @@ mod tests {
 
     #[test]
     fn frames_that_name_no_generation_are_forwarded_because_the_socket_identifies_the_sender() {
-        assert!(refuse_frame(false, 3, &RendererFrame::RequestReload).is_none());
         assert!(
             refuse_frame(false, 3, &RendererFrame::StartCapability { capability: shared::Capability::Audio }).is_none()
         );
@@ -797,7 +796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_listener_forwards_a_decoded_reevaluate_report_tagged_with_its_generation() {
+    async fn spawn_listener_forwards_a_decoded_frame_tagged_with_its_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obelisk-shell.sock");
         let (registry, _routes, mut inbound, _connected) = spawn_listener(&path).unwrap();
@@ -806,16 +805,16 @@ mod tests {
         let mut client = UnixStream::connect(&path).await.unwrap();
         framing::write_json_frame(&mut client, &ConnectionHandshake { generation_id: 5 }).await.unwrap();
 
-        let report = shared::ReevaluateReport::Unchanged { sequence: 3 };
-        framing::write_json_frame(&mut client, &RendererFrame::ReevaluateReport(report.clone())).await.unwrap();
+        let frame = RendererFrame::StartCapability { capability: shared::Capability::Audio };
+        framing::write_json_frame(&mut client, &frame).await.unwrap();
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
             .await
-            .expect("inbound report did not arrive in time")
+            .expect("inbound frame did not arrive in time")
             .expect("inbound channel closed unexpectedly");
 
         assert_eq!(received.generation_id, 5);
-        assert_eq!(received.frame, RendererFrame::ReevaluateReport(report));
+        assert_eq!(received.frame, frame);
     }
 
     /// ADR-0070 decision 3: an unknown capability name is dropped, and the connection lives on.
@@ -864,7 +863,7 @@ mod tests {
         let id = routes.open(tx).unwrap();
         routes.dispatched(id, 7);
 
-        // A swap mid-call leaves the old generation able to reply.
+        // A respawn mid-call can leave the old generation's reply in flight.
         let refusal = routes.answer(8, &result(id)).expect_err("a stale generation must be refused");
         assert!(refusal.contains('7') && refusal.contains('8'), "the refusal names both: {refusal}");
         assert!(rx.try_recv().is_err(), "nothing may reach the caller");

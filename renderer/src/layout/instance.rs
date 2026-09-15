@@ -11,14 +11,11 @@ use crate::layout::node::{SizeMode, SurfaceSpec};
 use crate::layout::scene::LogicalSize;
 
 /// One `(panel, output)` pair (`CONTEXT.md`, Surface instance). `instance_id` is the shared id
-/// space for Lua, the retained scene, Wayland, and the generation swap (ADR-0038), using the
-/// `"{id}@{output}"` convention from `supervisor/src/reload.rs`, generalising wallpaper's existing
-/// id namespace.
+/// space for Lua, the retained scene and Wayland (ADR-0038).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceInstance {
     /// `"bar@DP-1"` for a `panel`; the bare declared id (`"settings"`) for a `window`, with no
-    /// output to qualify it. Keys `Scene`'s surface map and names this surface in every
-    /// `ReadySignal`/`PresentationEvidence` frame.
+    /// output to qualify it. Keys `Scene`'s surface map.
     pub instance_id: String,
     /// `"bar"`: what `node::parse_surface_id` reads off the node, pairing it to its `VirtualNode`.
     pub declared_id: String,

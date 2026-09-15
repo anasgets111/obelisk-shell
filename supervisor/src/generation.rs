@@ -1,6 +1,6 @@
 //! A generation's authoritative identity and process handle, sibling Renderer resolution, exit
 //! classification/reporting, and `RestartBrake`. `Supervisor::respawn_renderer` consults the brake.
-//! Promotion and retirement stay in its `select!` loop (ADR-0037), where the arm shares loop state.
+//! Respawn stays in its `select!` loop (ADR-0037), where the arm shares loop state.
 
 use std::io;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ pub(crate) fn renderer_binary_path() -> io::Result<PathBuf> {
     Ok(exe.with_file_name(RENDERER_BINARY))
 }
 
-/// One generation's identity and process handle while authoritative; replaced wholesale on swap.
+/// One generation's identity and process handle while authoritative; replaced wholesale on respawn.
 pub(super) struct Authoritative {
     pub(super) generation_id: u32,
     pub(super) child: tokio::process::Child,

@@ -272,7 +272,7 @@ local function activate()
         else
             -- `Utils.copyText`. A Wayland selection belongs to a process that stays alive to serve
             -- it, which is what `process.detach` gives `wl-copy` and what a generation cannot
-            -- promise: a `process.run` child's group is reaped by the next generation swap, and the
+            -- promise: a `process.run` child's group is reaped when its Renderer is replaced, and the
             -- selection goes with it.
             process.detach("wl-copy", { row.payload })
         end

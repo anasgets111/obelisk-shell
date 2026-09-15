@@ -3,13 +3,12 @@
 //! `run_supervisor`'s `select!` owns event order; this owns each operation's state. Receivers stay
 //! in `main.rs`, one per arm. `select!` drops losing futures before running the winner, allowing
 //! `child.wait()` and `&mut supervisor` in separate branches. Most operations address only the
-//! authoritative generation via `self.authoritative.generation_id`; `hydrate` and
-//! `answer_unchanged_report` are the exceptions. [`Capabilities`] needs a live bus, so only
-//! [`crate::begin_reload`] and [`push_snapshot`] are isolated tests.
+//! authoritative generation via `self.authoritative.generation_id`; `hydrate` is the exception.
+//! [`Capabilities`] needs a live bus, so only [`push_snapshot`] is tested in isolation.
 
 use std::collections::HashMap;
 
-use shared::{ApplyPendingReload, Capability, SupervisorFrame};
+use shared::{Capability, SupervisorFrame};
 
 use crate::capabilities::lock::{self, LockController};
 use crate::capabilities::polkit::{self, Answer, PolkitController};
@@ -21,10 +20,9 @@ use crate::generation::{
 use crate::pam_worker;
 use crate::polkit::AgentRequest;
 use crate::process::registry::{LiveProcesses, reap_all_processes, wait_and_report_exit};
-use crate::reload_link::SocketCandidateLink;
 use crate::snapshot::push_snapshot;
-use crate::socket::{self, InboundFrame};
-use crate::{SWAP_TIMINGS, begin_reload, memory, process, reload, send_frame_logged};
+use crate::socket;
+use crate::{process, send_frame_logged};
 
 /// Why a generation must take an unrequested lock. Causes differ in logs but both mean the
 /// compositor holds a lock with nothing of ours on it; a named enum beats an ambiguous `bool`.
@@ -79,11 +77,9 @@ pub(crate) struct Supervisor {
     session_bridge: lock::logind::SessionBridge,
     /// Capability state-version counters by name (ADR-0004).
     revisions: HashMap<String, u32>,
-    /// Last snapshot per capability, seeding a Candidate's first evaluation (ADR-0029).
+    /// Last snapshot per capability, replayed to each new generation by [`Supervisor::hydrate`].
     last_snapshots: HashMap<String, shared::StateSnapshot>,
-    /// Most recently sent `Reevaluate` sequence (ADR-0024).
-    next_sequence: u64,
-    /// Id for the next Candidate or crash replacement.
+    /// Id for the next crash replacement.
     next_generation_id: u32,
     /// Renderer binary for every spawn.
     renderer_path: String,
@@ -96,9 +92,6 @@ pub(crate) struct Supervisor {
     /// `relock_in_flight` distinguishes its report.
     relock_when_connected: Option<RelockReason>,
     relock_in_flight: Option<RelockReason>,
-    /// Topology reload owed after unlock (ADR-0042). Bool, not queue: multiple locked changes need
-    /// one reload.
-    swap_owed_on_unlock: bool,
     /// Tracked `process.run` children (ADR-0026).
     processes: LiveProcesses,
     process_done_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64)>,
@@ -139,7 +132,6 @@ impl Supervisor {
             session_bridge,
             revisions: HashMap::new(),
             last_snapshots: HashMap::new(),
-            next_sequence: 0,
             next_generation_id: 1,
             renderer_path,
             restart_brake: RestartBrake::default(),
@@ -147,7 +139,6 @@ impl Supervisor {
             renderer_departed: false,
             relock_when_connected,
             relock_in_flight: None,
-            swap_owed_on_unlock: false,
             processes: HashMap::new(),
             process_done_tx,
         }
@@ -239,42 +230,13 @@ impl Supervisor {
         );
     }
 
-    /// Starts a reload for the authoritative generation (ADR-0024, ADR-0041 decision 4); a
-    /// superseded generation cannot start one.
-    pub(crate) fn begin_reload(&mut self) {
-        begin_reload(&self.registry, self.authoritative.generation_id, &mut self.next_sequence);
-    }
-
-    /// Answers `Unchanged`: send the go-ahead only for the current `Reevaluate` (ADR-0024).
-    /// Address the reporter, which evaluated it, not authority.
-    ///
-    /// Nothing is reset here. Idle thresholds are cleared by the reporter's own
-    /// `forget_thresholds` command, which arrives ahead of the registrations replacing them; a
-    /// reset on this frame ran after both and deleted them (ADR-0158).
-    pub(crate) fn answer_unchanged_report(&self, generation_id: u32, sequence: u64) {
-        if sequence != self.next_sequence {
-            eprintln!(
-                "generation {generation_id}'s Unchanged report (sequence {sequence}) is stale -- a newer Reevaluate (sequence {}) is \
-                 already in flight; not applying",
-                self.next_sequence
-            );
-            return;
-        }
-        send_frame_logged(
-            &self.registry,
-            generation_id,
-            &SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence }),
-        );
-    }
-
-    /// Records a locked swap for [`Supervisor::record_lock_report`] to redeem (ADR-0042).
-    pub(crate) fn defer_swap(&mut self, sequence: u64) {
-        eprintln!("generation swap for sequence {sequence} deferred: the session is locked (ADR-0042)");
-        self.swap_owed_on_unlock = true;
+    /// Asks the authoritative generation to re-evaluate its config (ADR-0216).
+    pub(crate) fn begin_reload(&self) {
+        send_frame_logged(&self.registry, self.authoritative.generation_id, &SupervisorFrame::Reevaluate);
     }
 
     /// Replays snapshots to a newly registered authoritative generation, then gives it an owed
-    /// lock. Candidates hydrate from `run_swap`'s snapshots (ADR-0029), fixing the boot race.
+    /// lock.
     pub(crate) fn hydrate(&mut self, generation_id: u32) {
         if generation_id != self.authoritative.generation_id {
             return;
@@ -350,7 +312,7 @@ impl Supervisor {
                 self.renderer_departed = false;
                 eprintln!("spawned generation {replacement_generation_id} to replace it");
                 self.capabilities.forget_departed_requests();
-                // What the swap arms release too: without it the dead id kept its idle fan-out entry
+                // Without this the dead id kept its idle fan-out entry
                 // (a failed push per idle transition, and any inhibit it held) and its `process.run`
                 // children.
                 if let Some(idle) = self.capabilities.idle() {
@@ -408,8 +370,7 @@ impl Supervisor {
         }
     }
 
-    /// Records the authoritative lock answer (ADR-0052 decision 4), then runs a deferred swap
-    /// once `defers_swap` clears. Refused also clears it; only an in-flight request keeps the gate.
+    /// Records the authoritative lock answer (ADR-0052 decision 4).
     pub(crate) fn record_lock_report(&mut self, report: shared::LockReport) {
         if let Some(who) = self.relock_in_flight.take() {
             let who = who.subject();
@@ -438,98 +399,6 @@ impl Supervisor {
         }
         self.lock.record(lock::LockEvent::Reported(report.outcome));
         self.push_lock_state();
-        if !self.lock.defers_swap() && std::mem::take(&mut self.swap_owed_on_unlock) {
-            // Start fresh: the deferred sequence is stale and config may have changed.
-            self.begin_reload();
-        }
-    }
-
-    /// Runs one `TopologyChanged` swap (ADR-0025) inline. Swaps are rare and bounded by seconds
-    /// (`SWAP_TIMINGS`), so capability traffic cannot starve. Borrow `inbound` so the link reads
-    /// Candidate ReadySignal/evidence from the loop's receiver.
-    /// `replay` receives every frame the handshake took off the shared channel without being its
-    /// reader, in arrival order, for the caller's loop to handle once the swap is over (ADR-0156).
-    pub(crate) async fn swap_generation(
-        &mut self,
-        sequence: u64,
-        inbound: &mut tokio::sync::mpsc::Receiver<InboundFrame>,
-        replay: &mut std::collections::VecDeque<InboundFrame>,
-    ) {
-        let candidate_generation_id = self.take_generation_id();
-        let candidate_envs = vec![
-            (shared::GENERATION_ID_ENV.to_string(), candidate_generation_id.to_string()),
-            ("OBELISK_SWAP_CANDIDATE".to_string(), "1".to_string()),
-        ];
-        // All latest snapshots hydrate Candidate's first evaluation (ADR-0029), not just
-        // audio's.
-        let snapshots: Vec<shared::StateSnapshot> = self.last_snapshots.values().cloned().collect();
-        let mut link = SocketCandidateLink::new(self.registry.clone(), candidate_generation_id, inbound);
-
-        let outcome =
-            reload::run_swap(&self.renderer_path, &[], &candidate_envs, &mut link, &snapshots, sequence, SWAP_TIMINGS)
-                .await;
-
-        match outcome {
-            Ok(outcome) => {
-                // The candidate is now authoritative, so its deferred capability commands are
-                // owed to the main loop. Frames from the other generation remain ordered behind
-                // them and are filtered as stale when the loop resumes.
-                reload::replay_deferred_frames(
-                    replay,
-                    std::mem::take(&mut link.deferred),
-                    candidate_generation_id,
-                    true,
-                );
-                // ADR-0043 decision 1: widest handoff point, Candidate presented while superseded
-                // still owns every buffer and both are resident. Sample before swap reaps one.
-                memory::log_sample(
-                    "swap handoff",
-                    &[
-                        (self.authoritative.generation_id, &self.authoritative.child),
-                        (candidate_generation_id, &outcome.candidate),
-                    ],
-                );
-                let superseded_generation_id = self.authoritative.generation_id;
-                reload::swap_and_reap(
-                    &self.registry,
-                    &mut self.processes,
-                    &mut self.authoritative,
-                    candidate_generation_id,
-                    outcome,
-                )
-                .await;
-                // The superseded generation is a reaped process; everything the Supervisor held on
-                // its behalf goes with it. Only the swap path needs this -- an in-place reload
-                // keeps the same VM and the same generation id, so its thresholds are replaced by
-                // the reporter's own `forget_thresholds` and its inhibit counts are still owed
-                // (ADR-0158). Without it the dead generation kept its entry in the notify fan-out
-                // and every idle transition logged a push to a generation with no connection.
-                if let Some(idle) = self.capabilities.idle() {
-                    idle.reset_registrations(superseded_generation_id).await;
-                }
-                self.capabilities.forget_departed_requests();
-            }
-            Err(failure) => {
-                // The candidate was reaped before this branch. Its deferred StartCapability and
-                // Command frames are no longer owed to the main loop because dispatching them
-                // would recreate resources owned by a dead generation. Frames consumed from the
-                // authoritative connection still need replay.
-                reload::replay_deferred_frames(
-                    replay,
-                    std::mem::take(&mut link.deferred),
-                    candidate_generation_id,
-                    false,
-                );
-                // A candidate can evaluate far enough to inhibit idle before it fails, and the
-                // `Ok` arm cleans only the *superseded* generation. Without this, logind stayed
-                // blocked until the shell restarted, with no VM left to claim the hold.
-                if let Some(idle) = self.capabilities.idle() {
-                    idle.reset_registrations(candidate_generation_id).await;
-                }
-                eprintln!("generation swap for sequence {sequence} failed: {failure}");
-                eprintln!("{} stays authoritative", self.authoritative.generation_id);
-            }
-        }
     }
 
     /// Routes a roster command to its controller (ADR-0037); `lock` is separate (ADR-0052).
@@ -576,7 +445,7 @@ impl Supervisor {
         self.capabilities.reap_sessions().await;
     }
 
-    /// Hands out unique generation ids for interleaved replacements and swaps.
+    /// Hands out unique generation ids for replacements.
     fn take_generation_id(&mut self) -> u32 {
         let id = self.next_generation_id;
         self.next_generation_id += 1;

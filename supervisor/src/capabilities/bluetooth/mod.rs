@@ -13,7 +13,7 @@
 //! Supervisor is not, because the `ObjectManager` binding and agent registration happen once.
 //! Upgrade path: watch `org.bluez`'s `NameOwnerChanged` and rebuild.
 //!
-//! ponytail: After `start_discovery` clears the list and pushes a fresh Candidate, matching the
+//! ponytail: After `start_discovery` clears the list and pushes a fresh snapshot, matching the
 //! `last_snapshots` bookkeeping used by every capability, any
 //! `DeviceRegistryChanged` rebuilds both lists from the entire registry, not only devices newly
 //! seen this session, matching `NetworkController::build_available_networks`'s no-debounce

@@ -1,6 +1,6 @@
 //! Memory measurement harness (ADR-0043 decision 1): `/proc/[pid]/smaps_rollup` supplies PSS/USS;
 //! `/proc/[pid]/fdinfo/*` supplies DRM residency. It reports, never evicts shell state: total PSS
-//! for supervisor plus live renderers (item 1, against the 50 MiB-per-monitor budget), per-renderer
+//! for supervisor plus the live renderer (item 1, against the 50 MiB-per-monitor budget), renderer
 //! USS (item 2), and GPU residency, never folded into PSS because real drivers omit it from
 //! `smaps`.
 //!
@@ -47,12 +47,12 @@ pub(crate) struct ProcessMemory {
     pub(crate) gpu: Gpu,
 }
 
-/// Supervisor plus every renderer that answered, keyed by generation. A renderer already exited
-/// at read time is absent, not an error (see [`sample`]).
+/// Supervisor plus the renderer, keyed by generation. A renderer already exited at read time is
+/// absent, not an error (see [`sample`]).
 #[derive(Debug)]
 pub(crate) struct Sample {
     pub(crate) supervisor: ProcessMemory,
-    pub(crate) renderers: Vec<(u32, ProcessMemory)>,
+    pub(crate) renderer: Option<(u32, ProcessMemory)>,
 }
 
 /// Parses `smaps_rollup` into PSS and USS. Missing `Pss:` yields `None`: a truncated rollup is not
@@ -174,18 +174,18 @@ pub(crate) fn fold_drm_clients(clients: impl IntoIterator<Item = DrmClient>) -> 
 }
 
 /// One log line per sample. `total pss` sums supervisor and renderer PSS (ADR-0043 decision 1
-/// item 1, against 50 MiB per monitor); GPU stays per renderer because `smaps` omits it. Emit one
-/// `; generation N ...` clause in sample order. DRM client count shows [`fold_drm_clients`]
+/// item 1, against 50 MiB per monitor); GPU stays on the renderer clause because `smaps` omits it.
+/// DRM client count shows [`fold_drm_clients`]
 /// deduped rather than summed: `1` beside a plausible number is measured, not luck.
 pub(crate) fn report_line(label: &str, sample: &Sample) -> String {
     let total_pss: u64 =
-        sample.supervisor.rollup.pss + sample.renderers.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
+        sample.supervisor.rollup.pss + sample.renderer.iter().map(|(_, memory)| memory.rollup.pss).sum::<u64>();
     let mut line = format!(
         "[obelisk-memory] {label}: total pss {:.1} MiB; supervisor pss {:.1} MiB",
         mib(total_pss),
         mib(sample.supervisor.rollup.pss)
     );
-    for (generation_id, memory) in &sample.renderers {
+    if let Some((generation_id, memory)) = &sample.renderer {
         line.push_str(&format!(
             "; generation {generation_id} pss {:.1} MiB uss {:.1} MiB gpu {:.1} MiB ({:.1} MiB shared, {} drm client(s))",
             mib(memory.rollup.pss),
@@ -226,26 +226,22 @@ fn read_gpu(process_dir: &Path) -> Gpu {
     fold_drm_clients(clients)
 }
 
-/// Reads `<proc_root>/self`, then renderers in `renderer_pids` (`(generation_id, pid)` order). A
-/// pid already exited during an ordinary generation swap handoff or crash is logged and skipped;
-/// only the supervisor read is fatal.
-pub(crate) fn sample(proc_root: &Path, renderer_pids: &[(u32, u32)]) -> io::Result<Sample> {
+/// Reads `<proc_root>/self`, then the renderer's `(generation_id, pid)`. A pid that already exited
+/// is logged and skipped; only the supervisor read is fatal.
+pub(crate) fn sample(proc_root: &Path, renderer: Option<(u32, u32)>) -> io::Result<Sample> {
     let supervisor = read_process_memory(proc_root, "self")?;
-    let mut renderers = Vec::with_capacity(renderer_pids.len());
-    for &(generation_id, pid) in renderer_pids {
-        match read_process_memory(proc_root, &pid.to_string()) {
-            Ok(memory) => renderers.push((generation_id, memory)),
-            Err(err) => eprintln!(
-                "[obelisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}"
-            ),
+    let renderer = renderer.and_then(|(generation_id, pid)| match read_process_memory(proc_root, &pid.to_string()) {
+        Ok(memory) => Some((generation_id, memory)),
+        Err(err) => {
+            eprintln!("[obelisk-memory] generation {generation_id} (pid {pid}) could not be sampled, skipping: {err}");
+            None
         }
-    }
-    Ok(Sample { supervisor, renderers })
+    });
+    Ok(Sample { supervisor, renderer })
 }
 
 /// Builds the `--profile` steady-state sampler (ADR-0043 amendment), or `None`. `smaps_rollup` is
-/// always externally readable, so an always-on timer adds only a log line; the handoff sample is
-/// unconditional because no outside observer can catch a swap-only window. First tick is one
+/// always externally readable, so an always-on timer adds only a log line. First tick is one
 /// period out because a new Renderer is not steady; `Skip` keeps a late sampler current.
 pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
     let period = shared::profile_interval()?;
@@ -254,14 +250,11 @@ pub(crate) fn sampler_from_env() -> Option<tokio::time::Interval> {
     Some(interval)
 }
 
-/// Reads and logs one sample across Supervisor and `renderers` (ADR-0043 decision 1). `main.rs`
-/// calls it from the steady-state timer (one authoritative generation) and the generation swap
-/// (both during the two-generation window). A reaped `Child` with `id() == None` is dropped, not
-/// reported as zero.
-pub(crate) fn log_sample(label: &str, renderers: &[(u32, &tokio::process::Child)]) {
-    let pids: Vec<(u32, u32)> =
-        renderers.iter().filter_map(|(generation_id, child)| child.id().map(|pid| (*generation_id, pid))).collect();
-    match sample(Path::new(PROC_ROOT), &pids) {
+/// Reads and logs one sample across the Supervisor and the authoritative Renderer (ADR-0043
+/// decision 1), from `main.rs`'s steady-state timer. A reaped `Child` with `id() == None` is left
+/// out, not reported as zero.
+pub(crate) fn log_sample(label: &str, generation_id: u32, child: &tokio::process::Child) {
+    match sample(Path::new(PROC_ROOT), child.id().map(|pid| (generation_id, pid))) {
         Ok(sample) => eprintln!("{}", report_line(label, &sample)),
         Err(err) => eprintln!("[obelisk-memory] {label} sample failed: {err}"),
     }
@@ -531,35 +524,25 @@ drm-engine-video-enhance:\t0 ns\n";
     // ---- report_line ----
 
     #[test]
-    fn report_line_formats_total_supervisor_and_one_clause_per_renderer_in_order() {
+    fn report_line_formats_total_supervisor_and_the_renderer_clause() {
         let sample = Sample {
             supervisor: ProcessMemory {
                 rollup: Rollup { pss: 8192, uss: 0 },
                 gpu: Gpu { resident: 0, shared: 0, clients: 0 },
             },
-            renderers: vec![
-                (
-                    0,
-                    ProcessMemory {
-                        rollup: Rollup { pss: 51200, uss: 40960 },
-                        gpu: Gpu { resident: 20480, shared: 3072, clients: 1 },
-                    },
-                ),
-                (
-                    1,
-                    ProcessMemory {
-                        rollup: Rollup { pss: 10240, uss: 5120 },
-                        gpu: Gpu { resident: 1024, shared: 512, clients: 1 },
-                    },
-                ),
-            ],
+            renderer: Some((
+                0,
+                ProcessMemory {
+                    rollup: Rollup { pss: 51200, uss: 40960 },
+                    gpu: Gpu { resident: 20480, shared: 3072, clients: 1 },
+                },
+            )),
         };
 
         assert_eq!(
             report_line("periodic", &sample),
-            "[obelisk-memory] periodic: total pss 68.0 MiB; supervisor pss 8.0 MiB; \
-             generation 0 pss 50.0 MiB uss 40.0 MiB gpu 20.0 MiB (3.0 MiB shared, 1 drm client(s)); \
-             generation 1 pss 10.0 MiB uss 5.0 MiB gpu 1.0 MiB (0.5 MiB shared, 1 drm client(s))"
+            "[obelisk-memory] periodic: total pss 58.0 MiB; supervisor pss 8.0 MiB; \
+             generation 0 pss 50.0 MiB uss 40.0 MiB gpu 20.0 MiB (3.0 MiB shared, 1 drm client(s))"
         );
     }
 
@@ -571,13 +554,13 @@ drm-engine-video-enhance:\t0 ns\n";
                 rollup: Rollup { pss: 1024, uss: 999_999 },
                 gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 },
             },
-            renderers: vec![(
+            renderer: Some((
                 0,
                 ProcessMemory {
                     rollup: Rollup { pss: 1024, uss: 999_999 },
                     gpu: Gpu { resident: 999_999, shared: 999_999, clients: 1 },
                 },
-            )],
+            )),
         };
         assert!(report_line("check", &sample).starts_with("[obelisk-memory] check: total pss 2.0 MiB;"));
     }

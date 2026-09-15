@@ -195,7 +195,7 @@ See [session processes](../supervisor/src/capabilities/processes/controller.rs).
 | `applications` | Desktop entry indexing, app launching and URL opening |
 | `updates` | Package-manager checking and install progress via backend trait |
 | `files` | Config-requested directory listings followed through inotify |
-| `processes` | Programs declared with `session_process`, owned across generation swaps |
+| `processes` | Programs declared with `session_process`, owned across Renderer replacements |
 
 See [capability registry](../supervisor/src/capabilities/mod.rs).
 
@@ -233,28 +233,16 @@ Commands carry generation and revision metadata:
 
 Inbound frames are tagged with the connection's generation ID.
 Frames from a non-authoritative generation, or naming another generation, are dropped, except a
-`CallResult`: the generation a call went to may answer it after a swap. Nothing checks
+`CallResult`: the generation a call went to may answer it after a respawn. Nothing checks
 `expected_revision`, so it is not an authorization guarantee.
 See [wire types](../shared/src/lib.rs), [socket](../supervisor/src/socket.rs) and
 [dispatch](../supervisor/src/supervisor.rs).
 
 ## 14. Reload lifecycle
 
-### 14.1 Evaluation
-
-Config edits trigger evaluation in the current generation. Value changes reconcile in place;
-topology changes require a candidate generation. Evaluation failure preserves the active scene and
-reports via `obelisk.rescue`.
-
-### 14.2 Candidate preparation and presentation
-
-The candidate evaluates with dependency snapshots and prepares declared surfaces with null buffers.
-A nonce-bound `ActivateDraw` from the Supervisor permits drawing. The candidate commits buffers with
-`wp_presentation_feedback` and reports evidence back to the Supervisor upon display presentation.
-
-### 14.3 Promotion
-
-Promotion waits for evidence from every expected surface within one shared timeout.
-Only then does authority transfer per surface, updating input focus and exclusive zones.
-The superseded generation's surfaces are unmapped, and its process group and managed children are reaped.
-See [reload](../supervisor/src/reload.rs) and [presentation handling](../renderer/src/wayland/output.rs).
+Config edits trigger evaluation in the current generation, and a successful one applies in place:
+the scene reconciles, then surfaces whose declaration was removed, added or changed a creation-time
+field are destroyed or created (ADR-0216). Evaluation or apply failure preserves the active scene
+and surfaces and reports via `obelisk.rescue`. While locked, an edit that would recreate a lock
+surface is refused; save again after unlock.
+See [apply](../renderer/src/wayland/output.rs).

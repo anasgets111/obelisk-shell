@@ -31,15 +31,8 @@ pub(super) enum MapState {
     /// Configured; [`App::paint_surface`] may attach a buffer, and `swap_buffers` commits state.
     Mapped,
 }
-impl MapState {
-    /// Whether this surface will put a frame on screen: the one predicate the generation swap's
-    /// expected set and its drawn set must agree on. See [`presenting_surface_ids`].
-    fn presents(self) -> bool {
-        self != MapState::Unmapped
-    }
-}
 /// A tracked `wl_surface`'s role and last-applied spec (ADR-0040 decision 1). One enum keeps
-/// EGL, paint, input, and swap paths on the shared `App::surfaces` index. Role objects exist only
+/// EGL, paint and input paths on the shared `App::surfaces` index. Role objects exist only
 /// while shown (ADR-0049 decision 1, ADR-0088), hence the `Option`s.
 pub(super) enum TrackedRole {
     Panel {
@@ -237,14 +230,10 @@ pub(super) struct TrackedSurface {
     pub(super) bound: Option<BoundSurface>,
     pub(super) role: TrackedRole,
     /// `surface_id`: `"{id}@{output}"` for panels, bare `id` for windows; shared
-    /// by Lua, the retained scene, Wayland, and the generation swap.
+    /// by Lua, the retained scene and Wayland.
     pub(super) surface_id: String,
     pub(super) map_state: MapState,
-    /// Null buffer committed during a swap; hidden windows never set it because they receive no
-    /// configure. Always false outside candidates.
-    pub(super) null_buffered: bool,
-    /// Latest configure size for [`App::activate_draw`]'s EGL bind; candidate mode records it
-    /// before binding (see [`App::bind_and_clear`]).
+    /// Latest configure size, for the EGL bind (see [`App::bind_and_clear`]).
     pub(super) configured_size: (u32, u32),
     /// Last display list and size. The size matters because a resized EGL surface has empty
     /// buffers; clear on rebind or any branch that cannot prove the pixels still match, or a stale
@@ -278,7 +267,6 @@ impl TrackedSurface {
             role,
             surface_id,
             map_state: MapState::Unmapped,
-            null_buffered: false,
             configured_size: (0, 0),
             last_painted: None,
             stale: false,
@@ -305,7 +293,6 @@ impl TrackedSurface {
         }
         self.last_blur_region.clear();
         self.map_state = MapState::Unmapped;
-        self.null_buffered = false;
         // Those pixels are gone, and a kept list would pin its images through `trim` (ADR-0182).
         self.last_painted = None;
     }
@@ -438,25 +425,6 @@ fn resolved_surface_spec(
         SurfaceSpec::Popup(_) => ("popup", node::popup_spec(properties).map(SurfaceSpec::Popup)),
         SurfaceSpec::Lock(_) => ("lock", node::lock_spec(properties).map(SurfaceSpec::Lock)),
     }
-}
-/// Surface ids a Candidate announces in `ReadySignal` and draws on `ActivateDraw`, using the
-/// same [`MapState::presents`] predicate. They must match: `drive_handshake` otherwise waits past
-/// `evidence_timeout` for an announced-but-undrawn surface or aborts with
-/// `SwapFailure::UnexpectedEvidence` for an unannounced frame. Hidden panels stage but do not
-/// present; hidden windows/popups have no role object, and Candidates freeze popup visibility.
-/// Empty is legal; the evidence loop exits immediately.
-fn presenting_surface_ids<'a>(surfaces: impl Iterator<Item = (&'a str, MapState)>) -> Vec<String> {
-    surfaces.filter(|(_, state)| state.presents()).map(|(id, _)| id.to_string()).collect()
-}
-/// The swap's staging gate. It takes `(null_buffered, exists)`: a hidden window has no
-/// `xdg_toplevel`, so `null_buffered` stays false forever and a plain `all(null_buffered)` would
-/// hang `ready_timeout`. A no-object surface is complete by construction; a shown window also
-/// attaches a null buffer on its first configure. A `panel` gets a configure once it has a layer
-/// object, which it is created with unless it measures an axis and starts hidden -- and that one
-/// has no object, so it is complete by construction too. Popup visibility is frozen during the
-/// handshake. [`presenting_surface_ids`] uses the matching `Unmapped` filter.
-fn candidate_has_staged(surfaces: impl Iterator<Item = (bool, bool)>) -> bool {
-    surfaces.into_iter().all(|(null_buffered, exists)| null_buffered || !exists)
 }
 
 /// What `visible` owes a panel or window that is in `map_state`. Panels and windows share one
@@ -597,8 +565,7 @@ impl App {
     }
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds
-    /// EGL, and paints. A swap stops after a null-buffer commit, deferring the real bind to
-    /// [`App::activate_draw`]. Layer-shell and xdg-shell share this path
+    /// EGL, and paints. Layer-shell and xdg-shell share this path
     /// because both require an initial unbuffered commit (ADR-0040 decision 4). The callers differ
     /// only in size source: layer-shell supplies it, while a toplevel's `None` axes may be chosen
     /// by the client (see `xdg_shell::toplevel_size_for`).
@@ -620,27 +587,6 @@ impl App {
         // Apply resolved state on first configure too: a full transparent panel can otherwise mark
         // the scene clean before its input region is ever set and swallow clicks behind it.
         self.apply_resolved_state(index);
-
-        if self.is_swap_candidate {
-            // Cloned rather than borrowed: a `wl_surface` proxy is a refcounted handle, and holding
-            // a borrow of `self.surfaces` across the `null_buffered` write below would not compile.
-            let surface = self.surfaces[index].role.wl_surface().cloned();
-            if let Some(surface) = surface.filter(|_| self.surfaces[index].map_state.presents()) {
-                if !self.surfaces[index].null_buffered {
-                    surface.attach(None, 0, 0);
-                    self.surfaces[index].null_buffered = true;
-                }
-                // Every candidate configure needs a commit; no `swap_buffers` exists until
-                // `ActivateDraw` to carry staged state.
-                surface.commit();
-            } else {
-                // A hidden surface already has the invisible swap state; mark staged without wire
-                // traffic and let `presenting_surface_ids` omit it.
-                self.surfaces[index].null_buffered = true;
-            }
-            self.maybe_send_ready_signal();
-            return;
-        }
 
         // A remap commit may be awaiting configure, so reject every state except `Mapped`.
         if self.surfaces[index].map_state != MapState::Mapped {
@@ -897,33 +843,8 @@ impl App {
         surface.commit();
     }
 
-    /// Apply `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088). Freeze it
-    /// for Candidates: `ReadySignal` and `ActivateDraw` must announce and draw the same set, or the
-    /// generation swap yields `evidence_timeout` or `SwapFailure::UnexpectedEvidence`.
-    ///
-    /// A change skipped by that freeze waits for the next full pass. Promotion does not cause one:
-    /// `activate_draw` clears the flag as its last statement (`mod.rs` runs it after the turn's
-    /// `StateScope` dispatch), and `re_resolve_if_dirty` has already taken the dirty flag, so the
-    /// scene holds the new `visible` while the protocol does not. Any ticking signal or capability
-    /// push supplies that pass, under a second for a config with a clock. A config with neither
-    /// keeps the stale value until something else dirties the scene.
-    ///
-    /// `ponytail:` the freeze also ends too early. It lifts when `activate_draw` returns, but the
-    /// presentation feedback it requested is still outstanding, so an ordinary pass on the next
-    /// turn can unmap a surface the `ReadySignal` announced. Its `presented` event then fails
-    /// `surface_id_for` and is dropped (`output.rs`), and the Supervisor's evidence loop
-    /// (`reload.rs`) times out the reload. One frame wide, and a failed reload rolls back.
-    ///
-    /// Both want the freeze to end on evidence completion rather than on promotion. The cheap
-    /// shape is the `PromoteGeneration` frame the Supervisor already sends after that loop
-    /// succeeds, which `socket.rs` currently only logs, plus an explicit branch for an empty
-    /// announced set, which receives no such message. Not taken here: the renderer has no
-    /// evidence-complete state to hang it on (`active_nonce` is set and never cleared), and this
-    /// is the least-tested path in the crate.
+    /// Apply `visible` as create/destroy for every role (ADR-0049 decision 1, ADR-0088).
     fn apply_visibility(&mut self, index: usize, visible: bool) {
-        if self.is_swap_candidate {
-            return;
-        }
         match &self.surfaces[index].role {
             TrackedRole::Panel { .. } => match visibility_action(self.surfaces[index].map_state, visible) {
                 // `QueueHandle` is a cheap refcounted handle; clone it across `&mut self`.
@@ -969,8 +890,7 @@ impl App {
     }
 
     /// Lazily builds the process-wide EGL state on the first drawable surface (ADR-0071). Failure
-    /// is fatal: a Candidate signals ready before proving it can build a context, so a broken
-    /// EGL between generations takes the shell down rather than rolling back (ADR-0071 decision 3).
+    /// is fatal: the Renderer exits and the Supervisor respawns it (ADR-0058, ADR-0071 decision 3).
     fn ensure_egl(&mut self, surface_id: &str) -> bool {
         if self.egl.is_some() {
             return true;
@@ -1292,8 +1212,8 @@ impl App {
             }
             if self.surfaces[index].bound.is_none() {
                 // A panel shown after starting hidden was configured without EGL; bind here because
-                // no further configure is coming. Candidates wait for `ActivateDraw`.
-                if self.is_swap_candidate || !self.ensure_bound(index) {
+                // no further configure is coming.
+                if !self.ensure_bound(index) {
                     continue;
                 }
             }
@@ -1304,83 +1224,14 @@ impl App {
         }
     }
 
-    /// Once every candidate surface stages, queue one `ReadySignal`. The gate covers every
-    /// tracked surface; the payload covers only presenting surfaces. Called after each candidate
-    /// configure because any one may complete the set.
-    pub(super) fn maybe_send_ready_signal(&mut self) {
-        let staged =
-            candidate_has_staged(self.surfaces.iter().map(|s| (s.null_buffered, s.role.wl_surface().is_some())));
-        if self.ready_signal_sent || !staged {
-            return;
-        }
-        self.ready_signal_sent = true;
-        let surfaces = presenting_surface_ids(self.surfaces.iter().map(|s| (s.surface_id.as_str(), s.map_state)));
-        if let Err(e) = self.outbound_tx.send(RendererFrame::ReadySignal(ReadySignal { surfaces })) {
-            eprintln!("[obelisk-renderer] failed to queue ReadySignal for the socket thread: {e}");
-        }
-    }
-
-    /// Draw the swap's first frame for `ActivateDraw`, requesting presentation feedback and tagging
-    /// it with `nonce`. Draw exactly the `ReadySignal` presenting set; Candidates freeze map state,
-    /// so any mismatch would hang or abort the handshake.
-    pub(super) fn activate_draw(&mut self, nonce: u64) {
-        // A retained tag, never cleared: one activation per renderer, and `activate_draw` is the
-        // only place feedback is requested. `ponytail:` a second activation would have the
-        // `presented` callbacks read the newer nonce and misattribute the older generation's
-        // frames. Clearing it needs an evidence-complete lifecycle, not a `None` on the way out.
-        self.active_nonce = Some(nonce);
-        for index in 0..self.surfaces.len() {
-            if !self.surfaces[index].map_state.presents() {
-                continue;
-            }
-            self.activate_draw_one(index, nonce);
-            if self.exit {
-                return;
-            }
-        }
-        // Promotion must return later configure events to the ordinary resize path; the candidate
-        // branch stops after `null_buffered` and would otherwise disable resize permanently.
-        self.is_swap_candidate = false;
-    }
-
-    /// One `ActivateDraw`: bind like the ordinary path, request presentation feedback before
-    /// `swap_buffers`, then paint. Indexing avoids holding a surface borrow across EGL and painter
-    /// calls.
-    fn activate_draw_one(&mut self, index: usize, nonce: u64) {
-        if !self.ensure_bound(index) {
-            return;
-        }
-
-        // Request feedback before `swap_buffers` so it associates with that commit; verify ordering
-        // with `WAYLAND_DEBUG=1` if needed.
-        if let Some(surface) = self.surfaces[index].role.wl_surface().cloned()
-            && let Err(e) = self.presentation_time.feedback(&surface, &self.queue_handle)
-        {
-            // `evidence_timeout` catches a surface that never presents (ADR-0025); keep the
-            // candidate alive rather than adding a second failure path.
-            log_bind_failure(&self.surfaces[index].surface_id.clone(), "wp_presentation::feedback", e);
-        }
-
-        self.paint_surface(index);
-        if self.exit {
-            return;
-        }
-
-        let (width, height) = self.surfaces[index].configured_size;
-        eprintln!(
-            "[obelisk-renderer] {} activated: {width}x{height}, presentation feedback requested (nonce={nonce})",
-            self.surfaces[index].surface_id
-        );
-    }
-
-    /// Resolve a raw `wl_surface` from feedback, pointer, or keyboard events. `None` is routine:
+    /// Resolve a raw `wl_surface` from pointer or keyboard events. `None` is routine:
     /// per-seat/per-commit objects can name a surface destroyed by output change or `visible`
     /// flip (ADR-0049 decision 1).
     pub(super) fn index_of_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.surfaces.iter().position(|s| s.role.wl_surface() == Some(surface))
     }
 
-    /// [`App::index_of_surface`] as a surface id for `presented`/`discarded`.
+    /// [`App::index_of_surface`] as a surface id.
     pub(super) fn surface_id_for(&self, surface: &wl_surface::WlSurface) -> Option<&str> {
         self.index_of_surface(surface).map(|index| self.surfaces[index].surface_id.as_str())
     }
@@ -1468,16 +1319,6 @@ mod tests {
         assert_eq!(turn(false, false, false), SurfaceStateWork { scope: StateScope::Nothing, popup_latch: false });
     }
 
-    #[test]
-    fn a_declared_but_unlocked_lock_instance_neither_hangs_nor_joins_the_swap_ready_set() {
-        // A `lock` instance owns zero Wayland objects until `locked` arrives, so it reaches both
-        // swap gates as `(null_buffered: false, exists: false)` and `MapState::Unmapped` --
-        // complete by construction for the staging gate, absent from the announced set. Getting
-        // either wrong is a `ready_timeout` hang or an `UnexpectedEvidence` abort.
-        assert!(candidate_has_staged([(false, false)].into_iter()));
-        assert!(presenting_surface_ids([("screen-lock@eDP-1", MapState::Unmapped)].into_iter()).is_empty());
-    }
-
     /// ADR-0088's transition, which had no coverage: hiding a shown panel destroys its object, and
     /// showing it again rebuilds one. The `Unmapped`/`false` cell is the case that reaches
     /// `apply_visibility` for every hidden panel on every capability push.
@@ -1494,53 +1335,6 @@ mod tests {
         ] {
             assert_eq!(visibility_action(state, visible), want, "{state:?} with visible = {visible}");
         }
-    }
-
-    #[test]
-    fn the_ready_signal_announces_every_surface_that_will_present_and_no_others() {
-        // The one place a mistake hangs the shell instead of failing a test: `activate_draw` draws
-        // exactly this set, `run_swap` expects evidence from exactly this set, and both directions
-        // of a mismatch abort or time out the Candidate.
-        let surfaces = [
-            ("bar@eDP-1", MapState::Mapped),
-            ("launcher@eDP-1", MapState::Unmapped),
-            ("dock@DP-1", MapState::AwaitingConfigure),
-        ];
-        assert_eq!(
-            presenting_surface_ids(surfaces.into_iter()),
-            ["bar@eDP-1", "dock@DP-1"],
-            "a panel declared `visible = false` is created and staged, but never presents a frame, so it must not be expected to"
-        );
-    }
-
-    #[test]
-    fn a_candidate_stages_when_every_surface_that_has_a_wayland_object_has_null_buffered() {
-        // A plain `all(null_buffered)` gate is correct only while every tracked surface is a panel:
-        // a panel always gets a configure, since it is committed at startup even when hidden.
-        assert!(candidate_has_staged([(true, true), (true, true)].into_iter()));
-        assert!(!candidate_has_staged([(true, true), (false, true)].into_iter()));
-    }
-
-    #[test]
-    fn a_window_declared_invisible_has_nothing_to_stage_and_must_not_hold_the_ready_signal() {
-        // ADR-0049 decision 1 creates no `xdg_toplevel` for it, so no configure is coming and
-        // `null_buffered` would stay false forever -- a `ready_timeout` hang under a plain gate, on
-        // any config declaring a hidden window.
-        assert!(candidate_has_staged(
-            [("bar", true, true), ("settings", false, false)].into_iter().map(|(_, n, e)| (n, e))
-        ));
-        assert!(
-            candidate_has_staged([(false, false)].into_iter()),
-            "a surface with no object at all is complete by construction"
-        );
-    }
-
-    #[test]
-    fn a_generation_whose_every_panel_starts_hidden_announces_nothing_at_all() {
-        // Legal, not degenerate: `drive_handshake`'s `while collected.len() < expected.len()` loop
-        // exits immediately on an empty expected set, so this Candidate completes its handshake.
-        let surfaces = [("launcher@eDP-1", MapState::Unmapped)];
-        assert!(presenting_surface_ids(surfaces.into_iter()).is_empty());
     }
 
     fn panel(id: &str) -> PanelSpec {
@@ -1670,14 +1464,12 @@ mod tests {
         let mut tracked =
             TrackedSurface::new(TrackedRole::Window { window: None, spec: window("settings") }, "settings".to_string());
         tracked.map_state = MapState::Mapped;
-        tracked.null_buffered = true;
         tracked.last_painted = Some(((640, 480), layout::paint::DisplayList::default()));
         tracked.last_blur_region.push(crate::text::snap::PhysicalRect { x0: 0, y0: 0, x1: 4, y1: 4 });
 
         tracked.forget_role_object();
 
         assert_eq!(tracked.map_state, MapState::Unmapped);
-        assert!(!tracked.null_buffered);
         assert!(tracked.last_painted.is_none(), "a kept list pins its images in `ImageCache::trim`");
         assert!(tracked.last_blur_region.is_empty());
     }

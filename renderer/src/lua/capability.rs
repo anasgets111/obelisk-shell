@@ -67,8 +67,8 @@ impl CommandSender {
         }
     }
 
-    /// The channel where `RendererClient` queues non-command frames (`ReevaluateReport`,
-    /// `RequestReload`) alongside commands.
+    /// The channel where `RendererClient` queues non-command frames (`CallResult`, `LockReport`)
+    /// alongside commands.
     pub fn frames(&self) -> UnboundedSender<RendererFrame> {
         self.outbound_tx.clone()
     }

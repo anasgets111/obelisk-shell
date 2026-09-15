@@ -6,7 +6,7 @@
 //! over the owning capability, cached with `rawset` so later reads are ordinary.
 //!
 //! The reason it exists is lifetime. `process.run`'s child belongs to the generation that spawned
-//! it and its group is reaped on every swap, which is right for a helper that answers a question
+//! it and its group is reaped when that Renderer is replaced, which is right for a helper that answers a question
 //! and exits. A program the config wants to keep -- a recorder, a stream a widget reads -- has to
 //! outlive the VM that started it, and the only thing here that does is the Supervisor. So the
 //! config names the program and the Supervisor holds it; what comes back is state, like every

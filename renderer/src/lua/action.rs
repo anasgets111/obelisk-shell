@@ -26,7 +26,7 @@ use super::signal::CpuBudget;
 const MAX_ANSWER_BYTES: usize = 1024 * 1024;
 
 /// Every `action(name, fn)` this evaluation declared. In `app_data` beside the other registries, so
-/// ADR-0044 decision 4's persistent VM holds it and a generation swap's new process starts empty.
+/// ADR-0044 decision 4's persistent VM holds it and a replaced Renderer starts empty.
 #[derive(Default)]
 struct ActionRegistry(HashMap<String, Function>);
 

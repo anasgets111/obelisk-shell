@@ -191,8 +191,7 @@ pub fn promote(lua: &Lua) {
 }
 
 /// The evaluation's output was refused, superseded, or never produced, so what it armed goes with
-/// it. Without this a generation swap leaves the outgoing process running the incoming config's
-/// timers beside it. Also the "no evaluation is in flight" reset: after a failed one, nothing will
+/// it. Also the "no evaluation is in flight" reset: after a failed one, nothing will
 /// arrive to promote, and leaving `evaluating` set would stage a callback's timer forever.
 pub fn discard(lua: &Lua) {
     if let Some(mut registry) = lua.app_data_mut::<TimerRegistry>() {
@@ -397,8 +396,7 @@ mod tests {
         assert!(lua.globals().get::<bool>("fired").unwrap(), "one bad callback must not take the batch with it");
     }
 
-    /// The generation-swap case: an evaluation whose output nothing applies must not leave its
-    /// timers running in the process that kept the old scene.
+    /// An evaluation whose output nothing applies must not leave its timers running.
     #[test]
     fn a_discarded_evaluations_timers_never_fire() {
         let lua = lua();

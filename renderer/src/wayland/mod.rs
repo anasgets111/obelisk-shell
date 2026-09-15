@@ -6,13 +6,10 @@ use std::ffi::c_void;
 
 use khronos_egl::Surface as EglSurface;
 use mlua::{Function, Lua, Table, Value};
-use shared::{
-    LockOutcome, LockReport, PresentationEvidence, ReadySignal, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize,
-};
+use shared::{LockOutcome, LockReport, RendererFrame, SecureSubmit, SupervisorFrame, Zeroize};
 use smithay_client_toolkit::background_effect::{BackgroundEffectHandler, BackgroundEffectState};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::presentation_time::{PresentTime, PresentationTimeHandler, PresentationTimeState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers};
 use smithay_client_toolkit::seat::pointer::{
@@ -35,10 +32,9 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface};
-use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Proxy, QueueHandle};
 use wayland_egl::WlEglSurface;
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1;
-use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 use wayland_protocols::xdg::shell::client::{xdg_positioner, xdg_surface};
 
 use crate::image::ImageCache;
@@ -97,12 +93,11 @@ pub struct App {
     session_lock: Option<SessionLock>,
     /// Shared EGL display/config/GLES3 context, lazy because `eglInitialize` loads Mesa,
     /// `libgallium`, and LLVM: 125 MB mapped and 13-35 ms. No-surface configs avoid it
-    /// (ADR-0070 decision 7); Candidates pay after `ActivateDraw`, their only bind
-    /// (ADR-0071).
+    /// (ADR-0070 decision 7, ADR-0071).
     egl: Option<egl::EglState>,
     gl: Option<glow::Context>,
     /// Config shaders compiled against `gl`, kept for the context's lifetime rather than a
-    /// generation's: a swap replaces the scene, not the GL objects (ADR-0184).
+    /// generation's: a reload replaces the scene, not the GL objects (ADR-0184).
     shader_stage: crate::layout::image_shader::ShaderStage,
     /// Owns the `wl_display` pointer [`App::ensure_egl`] passes to EGL. Keeping the whole
     /// `Connection` refcounted guarantees `egl::init`'s SAFETY precondition: the display outlives
@@ -120,10 +115,6 @@ pub struct App {
     client: RendererClient,
     surfaces: Vec<TrackedSurface>,
     exit: bool,
-    /// Whether `OBELISK_SWAP_CANDIDATE` was set (the generation swap), read once in [`run`].
-    is_swap_candidate: bool,
-    /// Set after [`App::maybe_send_ready_signal`] sends its one-time `ReadySignal`.
-    ready_signal_sent: bool,
     /// Set after startup evaluation and surface creation. The initial `wl_output` burst occurs in
     /// [`run`]'s two roundtrips before `screens` seeds evaluation (ADR-0041 decision 2), so output
     /// changes must not reconcile before a spec exists.
@@ -134,12 +125,8 @@ pub struct App {
     /// This Renderer's generation id, stamped into every `SecureSubmit`; read in `main` from
     /// `OBELISK_GENERATION_ID`.
     generation_id: u32,
-    presentation_time: PresentationTimeState,
-    /// Clone used by poll-loop [`App::activate_draw`] to request `wp_presentation_feedback`.
+    /// Clone for paths that create surfaces or request frame callbacks through `&mut self`.
     queue_handle: QueueHandle<App>,
-    /// In-flight `ActivateDraw` nonce for every `presented` event. The generation swap has one
-    /// handshake at a time, so one field replaces a per-surface map.
-    active_nonce: Option<u64>,
     /// Advertised seat pointer, kept alive because dropping it destroys pointer events. One slot;
     /// [`SeatHandler::new_capability`] stores whichever seat announces the capability.
     pointer: Option<ThemedPointer>,
@@ -216,7 +203,7 @@ pub struct App {
 
 /// Renderer main thread: Wayland, EGL, Lua, the retained `Scene`, and live signals (ADR-0039).
 /// `inbound_rx` carries socket-decoded `SupervisorFrame`s; `outbound_tx` carries every frame this
-/// thread sends back, including replies, readiness, presentation evidence, and lock reports. Ends
+/// thread sends back, including replies and lock reports. Ends
 /// the process on a dead Wayland connection, like the `EXIT_SUPERVISOR_GONE` arm below and for the
 /// same reason: `std::process::exit` skips destructors. Returning an error instead unwinds `App`,
 /// whose EGL surfaces and `wl_surface`s talk to the compositor that just left, which is how a log
@@ -261,12 +248,6 @@ pub fn run(
     // (ADR-0052 decision 4).
     let session_lock_state = SessionLockState::new(&globals, &qh);
     let registry_state = RegistryState::new(&globals);
-    // `bind` tolerates a missing presentation-time global; later `feedback()` reports
-    // `GlobalError::MissingGlobal`.
-    let presentation_time = PresentationTimeState::bind(&globals, &qh);
-
-    let is_swap_candidate = std::env::var("OBELISK_SWAP_CANDIDATE").is_ok();
-
     // One process-wide shaping handle; `RendererClient` gets a clone (ADR-0039 decision 3).
     // `Loader::new()` stays here because `mlua::Lua` is `!Send`.
     let shaping = ShapingHandle::spawn();
@@ -293,14 +274,10 @@ pub fn run(
         client,
         surfaces: Vec::new(),
         exit: false,
-        is_swap_candidate,
-        ready_signal_sent: false,
         startup_complete: false,
         outbound_tx,
         generation_id,
-        presentation_time,
         queue_handle: qh.clone(),
-        active_nonce: None,
         pointer: None,
         cursor_shown: None,
         pointer_at: None,
@@ -326,14 +303,6 @@ pub fn run(
     event_queue.roundtrip(&mut app)?;
     event_queue.roundtrip(&mut app)?;
 
-    // Candidate order from the generation swap: evaluate shell.lua, bind declared layer surfaces
-    // (ADR-0038 decision 1), commit null buffers (`bind_and_clear`'s candidate branch), and signal
-    // ready (`maybe_send_ready_signal`).
-    //
-    // ponytail: this runs inside the swap's ready window (`ready_timeout` 2s,
-    // `supervisor/src/main.rs`'s `SWAP_TIMINGS`); first `text` shaping blocks on
-    // `FontSystem::new()`. Accepted because the generation swap requires evaluate-before-bind.
-    //
     // Seed `screens` before evaluation (ADR-0041 decision 2): configs loop over it during the
     // first pass, so seeding after evaluation would declare no per-monitor panels.
     let screens = app.screens(None);
@@ -362,8 +331,8 @@ pub fn run(
         }
     }
     app.client.set_instances(instances.clone());
-    // The first resolve validates only: the generation swap requires evaluate-before-bind, so
-    // instances use output logical sizes and are never painted. Evaluation/apply already log and
+    // The first resolve validates only: it runs before any surface binds, so instances use output
+    // logical sizes and are never painted. Evaluation/apply already log and
     // set rescue; this adds the consequence.
     if !app.client.apply_instances() {
         eprintln!(
@@ -372,11 +341,6 @@ pub fn run(
     }
 
     app.create_surfaces(&qh, &specs, &instances);
-    if app.is_swap_candidate {
-        // Hidden-only windows have no `xdg_toplevel` configure (ADR-0049 decision 1), so without
-        // this gate such a Candidate never sends `ReadySignal` and hits `ready_timeout`.
-        app.maybe_send_ready_signal();
-    }
     // Output events can now reconcile against an evaluated scene.
     app.startup_complete = true;
 
@@ -384,9 +348,6 @@ pub fn run(
     let mut profile = idle_profile::IdleProfile::from_env();
     let mut memory = memory_profile::MemoryProfile::from_env();
 
-    // Mostly-static surfaces may receive no Wayland event after `ActivateDraw`, so poll
-    // `inbound_rx` with bounded latency instead of blocking on the Wayland fd. Non-Candidates still
-    // draw synchronously in the first configure handler.
     loop {
         // `then` leaves the clock unread while the profile is off, as `idle_profile` promises.
         let dispatch_started = profile.is_some().then(thread_cpu_time).flatten();
@@ -411,9 +372,7 @@ pub fn run(
         }
         // Drain every `SupervisorFrame` (ADR-0039), coalescing snapshot bursts into one wake. A
         // dead socket is distinct from an empty one (ADR-0059 decision 1), or the Renderer could
-        // block in `poll` with no capability source. Collect draw nonces until after the drain so
-        // a paired snapshot paints first; keep a `Vec` because each nonce owes evidence.
-        let mut draw_nonces: Vec<u64> = Vec::new();
+        // block in `poll` with no capability source.
         loop {
             let frame = match inbound_rx.try_recv() {
                 Ok(frame) => frame,
@@ -438,8 +397,7 @@ pub fn run(
             };
             match app.client.handle_frame(frame) {
                 FrameOutcome::Handled => {}
-                FrameOutcome::ActivateDraw(nonce) => draw_nonces.push(nonce),
-                FrameOutcome::ApplyPending(sequence) => app.apply_pending(&qh, sequence),
+                FrameOutcome::ApplyPending => app.apply_pending(&qh),
                 // Service immediately: lock declaration is tracked-surface state, not a
                 // capability-push result (ADR-0052 decision 3), and deferring weakens "secure now".
                 FrameOutcome::SetSessionLock(locked) => {
@@ -530,7 +488,7 @@ pub fn run(
         phases.mark_repaint();
         // Skip focus maintenance on a truly idle turn (ADR-0124). It clones the focused tree to
         // find fields; at 66 turns/s on an open picker, that was most of the process's work.
-        let active = dispatched || re_resolved || typed || !landed.is_empty() || !draw_nonces.is_empty();
+        let active = dispatched || re_resolved || typed || !landed.is_empty();
         // Disarm after the turn, not only when active: `dispatch_pending` armed this serial and
         // `apply_resolved_surface_state` is its only reader. This enforces ADR-0049's one-turn
         // real-input window.
@@ -565,7 +523,7 @@ pub fn run(
         }
         if let Some(profile) = profile.as_mut() {
             // After focus maintenance so a turn's focus cost reports in its own window, and
-            // still before consuming nonces or breaking, so an exiting turn is reported.
+            // still before breaking, so an exiting turn is reported.
             profile.turn(
                 idle_profile::Turn {
                     dispatched,
@@ -573,7 +531,6 @@ pub fn run(
                     ticked: !ticked.is_empty(),
                     typed,
                     decoded: !landed.is_empty(),
-                    draws: draw_nonces.len(),
                     painted: re_resolved || typed || !landed.is_empty(),
                     drawn: std::mem::take(&mut app.surfaces_drawn),
                 },
@@ -584,12 +541,6 @@ pub fn run(
             // The closure keeps the scene walk and the cache locks off every turn but the one
             // that reports; see `memory_profile`.
             memory.maybe_report(|| census(&app));
-        }
-        for nonce in draw_nonces {
-            app.activate_draw(nonce);
-            if app.exit {
-                break;
-            }
         }
         if app.exit {
             break;

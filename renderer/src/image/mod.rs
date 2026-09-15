@@ -376,7 +376,7 @@ impl Pool {
 }
 
 /// Path/size to uploaded texture for one generation (`CONTEXT.md`, **Image cache**). Not shared or
-/// persisted: reload swaps the Renderer, so this is cold after every config edit (ADR-0054).
+/// persisted: a replaced Renderer starts cold (ADR-0054).
 pub struct ImageCache {
     entries: HashMap<CacheKey, Entry>,
     /// Evicted since [`ImageCache::release_evicted`], not yet freed.

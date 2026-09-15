@@ -4,7 +4,7 @@
 -- The bar pill, `power_button` below, offers log out, restart, and power off behind ten-second
 -- countdowns. A second click skips; right-click or cancel stops. `process.detach` shells out to
 -- `systemctl` and the compositor, as `PowerManagementService` does: a shutdown must not be reaped
--- by a generation swap landing mid-flight (ADR-0188).
+-- by a Renderer crash landing mid-flight (ADR-0188).
 --
 -- The panel adds lock, sleep, settings, and a brightness slider. Settings has no other door; lock
 -- and sleep lose nothing, so need no countdown. Sleep calls `systemctl suspend`; the mirror's

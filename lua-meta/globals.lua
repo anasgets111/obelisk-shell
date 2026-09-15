@@ -160,8 +160,8 @@ function SessionProcessHandle:stop() end
 
 ---Declares a program whose lifetime is the session's rather than this generation's.
 ---
----[`process.run`]'s child belongs to the generation that spawned it: a config edit that changes
----topology swaps generations, and the swap reaps that child's process group. Right for a helper
+---[`process.run`]'s child belongs to the generation that spawned it, and replacing that Renderer
+---reaps the child's process group. Right for a helper
 ---that answers a question and exits, wrong for anything the user would notice stopping -- a
 ---recorder mid-file, a stream a widget is reading. This declares the second kind. The Supervisor
 ---holds it, does not restart on a config edit, and answers for it in `obelisk.processes`.

@@ -155,7 +155,7 @@ impl ApplicationsController {
     ///
     /// This is separate from config `process.run`: that action pipes stdout/stderr and holds the
     /// `Child` for its exit code (ADR-0026). For a GUI app that keeps two pipes and a child alive
-    /// for its whole run; a generation swap would reap it and close an editor when config reloads.
+    /// for its whole run; a Renderer replacement would reap it and close the editor.
     ///
     /// [`crate::process::spawn_detached`] rather than a new process group: a group leader is still
     /// a direct child of the Supervisor, so every launched app sat under the shell in the process

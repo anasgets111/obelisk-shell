@@ -68,7 +68,7 @@ pub fn parse_monitor(properties: &HashMap<String, Value>) -> Result<String, Layo
 }
 
 /// The layer-shell namespace, also used by Hyprland `layerrule` for blur and animations. It
-/// defaults to `"obelisk-{id}"`; `get_layer_surface` fixes it at creation, so edits swap generation.
+/// defaults to `"obelisk-{id}"`; `get_layer_surface` fixes it at creation, so an edit rebuilds the surface.
 pub fn parse_namespace(properties: &HashMap<String, Value>, id: &str) -> Result<String, LayoutError> {
     let default = format!("obelisk-{id}");
     parse_string_property(properties, "namespace", Some(&default))
@@ -144,9 +144,9 @@ pub fn parse_exclusive(properties: &HashMap<String, Value>) -> Result<Exclusive,
     }
 }
 
-/// Creation-time topology (`layer`, `anchor`, `monitor`, `namespace`, and `id`). The
-/// order-sensitive `Vec<SurfaceTopology>` diff in `renderer/src/socket.rs` triggers a swap; other
-/// `PanelSpec` fields reload in place (ADR-0038 decision 2).
+/// Creation-time topology (`layer`, `anchor`, `monitor`, `namespace`, and `id`). A changed one
+/// rebuilds that panel's surfaces (ADR-0216); other `PanelSpec` fields update live (ADR-0038
+/// decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceTopology {
     pub id: String,
@@ -169,11 +169,11 @@ pub fn surface_topology(properties: &HashMap<String, Value>) -> Result<SurfaceTo
 }
 
 /// One `panel`'s layer-shell spec: `surface_specs` builds it, `expand_instances` makes
-/// per-output instances, and `App::create_panel` binds them. `handle_reevaluate` diffs only
-/// `topology`, so `margin` reloads in place while `layer` swaps generation.
+/// per-output instances, and `App::create_panel` binds them. Only `topology` rebuilds
+/// the surface; `margin` and the rest update it live.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelSpec {
-    /// Swap fingerprint: id, layer, anchor, monitor, namespace.
+    /// Rebuild fingerprint: id, layer, anchor, monitor, namespace.
     pub topology: SurfaceTopology,
     pub keyboard_interactivity: KeyboardInteractivity,
     pub exclusive: Exclusive,

@@ -214,74 +214,6 @@ pub enum CallOutcome {
     Failed(String),
 }
 
-/// Supervisor -> Renderer: re-evaluate `shell.lua`. Echo `sequence` in every response so a second
-/// file-change event before the first completes cannot be mistaken for the current round trip.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReevaluateRequest {
-    pub sequence: u64,
-}
-
-/// Renderer -> Supervisor: the [`ReevaluateRequest`] outcome. The Renderer classifies
-/// Unchanged vs TopologyChanged; the Supervisor dispatches on that verdict.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ReevaluateReport {
-    Unchanged {
-        sequence: u64,
-    },
-    TopologyChanged {
-        sequence: u64,
-    },
-    /// `shell.lua` failed. The Renderer keeps its prior scene and enters rescue state; `error` is
-    /// only for Supervisor logging.
-    Failed {
-        sequence: u64,
-        error: String,
-    },
-}
-
-/// Supervisor -> Renderer: apply the pending evaluation with the same `sequence`, only after
-/// [`ReevaluateReport::Unchanged`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ApplyPendingReload {
-    pub sequence: u64,
-}
-
-/// Tells the Candidate to compile and draw its first GPU frame. Not a `CommandEnvelope` because its
-/// direction and shape differ (ADR-0019).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ActivateDraw {
-    pub nonce: u64,
-}
-
-/// The Candidate's one-time report that every tracked Wayland surface staged its null buffer and
-/// awaits `ActivateDraw`. `surfaces` lists surface IDs, not monitor IDs (ADR-0025).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReadySignal {
-    pub surfaces: Vec<String>,
-}
-
-/// One message per surface ID after its `wp_presentation_feedback` `presented` event (ADR-0019).
-/// This is the Candidate's report; the all-surfaces barrier is in `reload::run_swap`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PresentationEvidence {
-    pub nonce: u64,
-    pub surface_id: String,
-}
-
-/// Makes the superseded generation stop treating `surface_id` as authoritative. Per-surface
-/// input-region/focus wiring does not exist yet (ADR-0025).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeselectInput {
-    pub surface_id: String,
-}
-
-/// Gives the new generation ownership of `surface_id`. Currently inert for the same reason as
-/// `DeselectInput`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PromoteGeneration {
-    pub surface_id: String,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProcessStream {
     Stdout,
@@ -343,10 +275,9 @@ pub struct SecureSubmit {
     pub secret: Vec<u8>,
 }
 
-/// Hand-written `Debug` prints only `secret`'s length. `RendererFrame` derives `Debug`, and two
-/// log lines call `SocketCandidateLink::recv_matching` (`supervisor/src/reload_link.rs`) on
-/// rejected frames; deriving here would put a mid-swap password in the journal. `ZeroizeOnDrop`
-/// keeps plaintext from outliving its read, but a formatter or future `{:?}` path can defeat it.
+/// Hand-written `Debug` prints only `secret`'s length. `RendererFrame` derives `Debug`, so deriving
+/// here would put a password in the log from any `{:?}` of a frame. `ZeroizeOnDrop` keeps plaintext
+/// from outliving its read, but a formatter can defeat it.
 impl std::fmt::Debug for SecureSubmit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecureSubmit")
@@ -367,12 +298,11 @@ pub struct SetSessionLock {
     pub locked: bool,
 }
 
-/// Renderer report of the lock state (ADR-0052 decision 4). The Supervisor gates generation swaps
-/// on it (ADR-0042): "never acquired" differs from "acquired then torn down" even though both end
-/// unlocked.
+/// Renderer report of the lock state (ADR-0052 decision 4): "never acquired" differs from "acquired
+/// then torn down" even though both end unlocked.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LockOutcome {
-    /// `ext_session_lock_v1::locked` arrived; lock surfaces are up and swaps are blocked.
+    /// `ext_session_lock_v1::locked` arrived; lock surfaces are up.
     Locked,
     /// Never acquired: no `lock` node (ADR-0052 decision 3), immediate compositor `finished`, or
     /// no advertised `ext_session_lock_manager_v1`.
@@ -392,17 +322,12 @@ pub struct LockReport {
 }
 
 /// Supervisor -> Renderer frames, adjacently tagged so one read loop dispatches on `kind`.
-/// `content = "data"` is required because [`ReevaluateReport`] is itself an enum and cannot merge
-/// into an internally-tagged flat object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
 pub enum SupervisorFrame {
     StateSnapshot(StateSnapshot),
-    Reevaluate(ReevaluateRequest),
-    ApplyPendingReload(ApplyPendingReload),
-    ActivateDraw(ActivateDraw),
-    DeselectInput(DeselectInput),
-    PromoteGeneration(PromoteGeneration),
+    /// A config file changed: evaluate `shell.lua` and apply it in place (ADR-0216).
+    Reevaluate,
     ProcessOutput(ProcessOutputLine),
     ProcessExited(ProcessExited),
     IdleEvent(IdleEvent),
@@ -416,15 +341,11 @@ pub enum SupervisorFrame {
 }
 
 /// Renderer -> Supervisor frames, tagged like [`SupervisorFrame`]. `Command` is the Lua-write
-/// envelope; `ReevaluateReport` is the reload verdict; `ReadySignal`/`PresentationEvidence` are
-/// generation swap reports.
+/// envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "data")]
 pub enum RendererFrame {
     Command(CommandEnvelope),
-    ReevaluateReport(ReevaluateReport),
-    ReadySignal(ReadySignal),
-    PresentationEvidence(PresentationEvidence),
     SecureSubmit(SecureSubmit),
     LockReport(LockReport),
     /// Control-client frame, not a Renderer frame: `obelisk set`/`obelisk toggle` uses
@@ -436,15 +357,10 @@ pub enum RendererFrame {
     Call(Call),
     /// A generation answering a forwarded [`Call`] (ADR-0197).
     CallResult(CallResult),
-    /// Starts a reload cycle: the Supervisor bumps its sequence and sends the
-    /// [`ReevaluateRequest`] (ADR-0041 decision 4). This carries no sequence; only the Supervisor
-    /// owns `next_sequence`, and `answer_unchanged_report` (`supervisor/src/supervisor.rs`) drops reports that
-    /// do not match the last one sent.
-    RequestReload,
     /// Idempotently starts `capability`'s controller when this generation first reads
     /// `obelisk.<capability>` (ADR-0070 decision 1) or a scene's `secure_submit` names it (decision
-    /// 5). No generation ID is needed because the socket identifies the sender, as with
-    /// [`Self::RequestReload`]. A repeat is a no-op (decision 3); an unknown name fails decode.
+    /// 5). No generation ID is needed because the socket identifies the sender. A repeat is a no-op
+    /// (decision 3); an unknown name fails decode.
     StartCapability {
         capability: Capability,
     },
@@ -562,23 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_frame_reevaluate_is_adjacently_tagged() {
-        let frame = SupervisorFrame::Reevaluate(ReevaluateRequest { sequence: 7 });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "Reevaluate", "data": { "sequence": 7 } }));
+    fn supervisor_frame_reevaluate_is_a_bare_kind_with_no_data() {
+        // The one payload-free frame: serde omits `data` for a unit variant, so the decoder must
+        // accept this shape.
+        let wire = serde_json::to_value(SupervisorFrame::Reevaluate).unwrap();
+        assert_eq!(wire, serde_json::json!({ "kind": "Reevaluate" }));
 
         let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn supervisor_frame_apply_pending_reload_is_adjacently_tagged() {
-        let frame = SupervisorFrame::ApplyPendingReload(ApplyPendingReload { sequence: 9 });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "ApplyPendingReload", "data": { "sequence": 9 } }));
-
-        let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
+        assert_eq!(parsed, SupervisorFrame::Reevaluate);
     }
 
     #[test]
@@ -605,97 +512,6 @@ mod tests {
             RendererFrame::Command(parsed_envelope) => assert_eq!(parsed_envelope.id, envelope.id),
             other => panic!("expected Command, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn renderer_frame_reevaluate_report_variants_round_trip() {
-        for report in [
-            ReevaluateReport::Unchanged { sequence: 1 },
-            ReevaluateReport::TopologyChanged { sequence: 2 },
-            ReevaluateReport::Failed { sequence: 3, error: "syntax error".to_string() },
-        ] {
-            let frame = RendererFrame::ReevaluateReport(report.clone());
-            let wire = serde_json::to_value(&frame).unwrap();
-            assert_eq!(wire["kind"], "ReevaluateReport");
-
-            let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
-            assert_eq!(parsed, RendererFrame::ReevaluateReport(report));
-        }
-    }
-
-    #[test]
-    fn supervisor_frame_activate_draw_is_adjacently_tagged() {
-        let frame = SupervisorFrame::ActivateDraw(ActivateDraw { nonce: 42 });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "ActivateDraw", "data": { "nonce": 42 } }));
-
-        let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn supervisor_frame_deselect_input_is_adjacently_tagged() {
-        let frame = SupervisorFrame::DeselectInput(DeselectInput { surface_id: "main_bar".to_string() });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "DeselectInput", "data": { "surface_id": "main_bar" } }));
-
-        let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn supervisor_frame_promote_generation_is_adjacently_tagged() {
-        let frame = SupervisorFrame::PromoteGeneration(PromoteGeneration { surface_id: "overlay_canvas".to_string() });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(
-            wire,
-            serde_json::json!({ "kind": "PromoteGeneration", "data": { "surface_id": "overlay_canvas" } })
-        );
-
-        let parsed: SupervisorFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn renderer_frame_ready_signal_is_adjacently_tagged() {
-        let frame = RendererFrame::ReadySignal(ReadySignal {
-            surfaces: vec!["main_bar".to_string(), "overlay_canvas".to_string()],
-        });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(
-            wire,
-            serde_json::json!({ "kind": "ReadySignal", "data": { "surfaces": ["main_bar", "overlay_canvas"] } })
-        );
-
-        let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn renderer_frame_presentation_evidence_is_adjacently_tagged() {
-        let frame = RendererFrame::PresentationEvidence(PresentationEvidence {
-            nonce: 7,
-            surface_id: "wallpaper_layer@DP-1".to_string(),
-        });
-        let wire = serde_json::to_value(&frame).unwrap();
-        assert_eq!(
-            wire,
-            serde_json::json!({ "kind": "PresentationEvidence", "data": { "nonce": 7, "surface_id": "wallpaper_layer@DP-1" } })
-        );
-
-        let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, frame);
-    }
-
-    #[test]
-    fn renderer_frame_request_reload_is_a_bare_kind_with_no_data() {
-        // The one payload-free frame either direction has: serde omits `data` entirely for a
-        // unit variant, so the decoder must accept this shape.
-        let wire = serde_json::to_value(RendererFrame::RequestReload).unwrap();
-        assert_eq!(wire, serde_json::json!({ "kind": "RequestReload" }));
-
-        let parsed: RendererFrame = serde_json::from_value(wire).unwrap();
-        assert_eq!(parsed, RendererFrame::RequestReload);
     }
 
     #[test]

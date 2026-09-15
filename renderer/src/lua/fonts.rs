@@ -72,7 +72,7 @@ pub fn register(lua: &Lua) -> mlua::Result<()> {
 /// at startup. A live edit re-evaluates and records a new chain, but nothing uses it until restart.
 ///
 /// Deliberate: applying a change requires reaching the Wayland thread that owns the `TextPainter`,
-/// dropping and rebuilding it, and threading a new `FrameOutcome` through the swap's reload path.
+/// dropping and rebuilding it, and threading a new `FrameOutcome` through the reload path.
 /// A chain change invalidates every measurement, unlike reload's in-place restyle. Upgrade with
 /// that outcome variant when live font changes are needed.
 pub fn declared_chain(lua: &Lua) -> Vec<String> {

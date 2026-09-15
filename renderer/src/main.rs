@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reaper; this would map a bar that never updates or exits. Refuse with one visible line.
     //
     // Check the env var before connecting. `process::spawn_group_leader` sets
-    // `OBELISK_GENERATION_ID` on every Renderer, at boot and generation swap.
+    // `OBELISK_GENERATION_ID` on every Renderer, at boot and on respawn.
     if std::env::var_os(shared::GENERATION_ID_ENV).is_none() {
         eprintln!(
             "obelisk-renderer is not a command. The Supervisor starts it, one process per renderer \

@@ -6,19 +6,11 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Generation**: A Renderer process and its Lua state with one generation ID. _Avoid_: instance, worker
 
-**Candidate**: A generation being prepared but not yet authoritative. _Avoid_: active generation, staged shell
+**Authoritative generation**: The live Renderer generation, receiving input and capability pushes; a crash replacement takes authority when it connects. _Avoid_: active generation, current process
 
-**Authoritative generation**: The generation receiving input, reserving exclusive space and owning capability routing for an output. Authority transfers per output during a generation swap. _Avoid_: active generation, current process
+**Topology change**: A config edit that changes the declared surface set or its topology fingerprint. It applies in place, rebuilding only the changed surfaces (ADR-0216). _Avoid_: structural change, breaking change
 
-**Presentation evidence**: Evidence accepted for a targeted surface instance before authority transfers. _Avoid_: readiness, activation ACK
-
-**Topology change**: A config edit that changes the declared surface set or its topology fingerprint. It requires a generation swap. _Avoid_: structural change, breaking change
-
-**Value change**: A config edit that leaves the surface topology unchanged and applies through an in-place reload. _Avoid_: minor change, hot patch
-
-**Generation swap**: Replacement of a generation through candidate preparation, presentation evidence, authority transfer and retirement. _Avoid_: hot-reload
-
-**Handoff window**: The interval in a generation swap when the candidate and the generation it replaces both exist. _Avoid_: overlap, transition period
+**Value change**: A config edit that rebuilds no surface: every change applies to the live surfaces. _Avoid_: minor change, hot patch
 
 **In-place reload**: Re-evaluation of the config in the same generation, preserving its Lua state and reconciling its retained scene. _Avoid_: hot-reload, live patch, VM reset
 
@@ -28,7 +20,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Watcher**: The Supervisor's config-edit observer that initiates reload evaluation. _Avoid_: file monitor, reload trigger
 
-**Rollback**: Preservation of the working scene or generation when a reload fails. _Avoid_: revert, recovery
+**Rollback**: Preservation of the working scene and surfaces when a reload fails. _Avoid_: revert, recovery
 
 ## Surfaces
 
@@ -62,7 +54,7 @@ Current project vocabulary. Implementation contracts live in [docs](docs/lua-api
 
 **Node identity**: The match between nodes across evaluations, scoped to their parent. Explicit sibling IDs or list keys take precedence over positional matching. _Avoid_: node id, key, handle
 
-**Named state**: Lua-writable reactive state identified by a name within a generation. It survives in-place reloads with an unchanged seed, but not generation swaps. _Avoid_: persistent state, local state, property
+**Named state**: Lua-writable reactive state identified by a name within a generation. It survives in-place reloads with an unchanged seed, but not a Renderer replacement. _Avoid_: persistent state, local state, property
 
 **Signal resolution**: Reading a signal's current value when resolving a node property. A value obtained with `:get()` is a snapshot rather than a live property. _Avoid_: binding, unwrapping, dereferencing
 
