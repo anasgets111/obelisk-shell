@@ -142,10 +142,11 @@ impl PolkitAgent {
         PolkitAgent { agent: Some(AuthenticationAgent::new(requests)) }
     }
 
-    /// Registers once. Failures log and disable this process's agent, costing only its challenges.
-    pub async fn register(&mut self, connection: &zbus::Connection) {
+    /// Registers once, in a spawned task so a slow polkitd cannot hold the Supervisor loop.
+    /// Failures log and disable this process's agent, costing only its challenges.
+    pub fn register(&mut self, connection: &zbus::Connection) {
         match current_session_subject() {
-            Ok(subject) => self.register_for(connection, &subject).await,
+            Ok(subject) => self.register_for(connection, subject),
             Err(err) => {
                 eprintln!(
                     "polkit: $XDG_SESSION_ID names no session to register an agent for; agent disabled for this run: {err}"
@@ -159,16 +160,19 @@ impl PolkitAgent {
     /// [`Self::register`] once the subject is known, preserving the take-once rule. Separate so
     /// tests can call it twice without `set_var`, whose process-wide `environ` rewrite races any
     /// concurrent `getenv`.
-    async fn register_for(&mut self, connection: &zbus::Connection, subject: &Subject) {
+    fn register_for(&mut self, connection: &zbus::Connection, subject: Subject) {
         let Some(agent) = self.agent.take() else {
             return;
         };
-        match register_agent(connection, agent, subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await {
-            Ok(()) => eprintln!("polkit: registered as this session's authentication agent"),
-            Err(err) => eprintln!(
-                "polkit: RegisterAuthenticationAgent failed, so another agent answers this session; disabled for this run: {err}"
-            ),
-        }
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            match register_agent(&connection, agent, &subject, "en_US.UTF-8", AGENT_OBJECT_PATH).await {
+                Ok(()) => eprintln!("polkit: registered as this session's authentication agent"),
+                Err(err) => eprintln!(
+                    "polkit: RegisterAuthenticationAgent failed, so another agent answers this session; disabled for this run: {err}"
+                ),
+            }
+        });
     }
 }
 
@@ -249,9 +253,8 @@ mod tests {
         let (challenges_tx, _challenges_rx) = mpsc::unbounded_channel();
         let mut agent = PolkitAgent::new(challenges_tx);
 
-        let subject = test_subject();
-        agent.register_for(&agent_side, &subject).await;
-        agent.register_for(&agent_side, &subject).await;
+        agent.register_for(&agent_side, test_subject());
+        agent.register_for(&agent_side, test_subject());
 
         calls_rx.recv().await.expect("the first register must reach the Authority");
         assert!(calls_rx.try_recv().is_err(), "the second register must be a no-op");

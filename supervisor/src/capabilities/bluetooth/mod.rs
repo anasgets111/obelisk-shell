@@ -150,7 +150,7 @@ pub struct BluetoothState {
     pub pairing_request: Option<PairingRequest>,
 }
 
-/// What signal forwarders report to `main.rs`'s top-level `select!`.
+/// What signal forwarders report to the bluetooth worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothSignal {
     /// The adapter's own `Powered`, `Discovering` or `Discoverable` property changed.

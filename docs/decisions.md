@@ -1469,6 +1469,14 @@ construction is an upgrade if measured startup cost warrants it.
 Amendment to decision 4: every Supervisor D-Bus connection sets the 25s call timeout Qt, GDBus and
 libdbus default to, so an inline start waits at most that per call and then takes its error path.
 
+Amendment (2026-09-15): decision 4 no longer holds for `network`, `bluetooth` and `keyboard`, or for
+polkit's registration. zbus fetches a proxy's properties with no call timeout, so a service that owns
+its name but stops answering held the loop, and every lock frame behind it, for good; `network`'s
+signal rebuilds did the same after start. Each now builds and handles its signals in its own task
+and sends finished state, and its commands queue in that task's channel until the build lands, so
+none is dropped and order holds. A failed build closes the task, so the next start retries.
+Starts that wait only on the bus daemon or local files stay inline.
+
 ## 0071. The GL context is built by the first surface that needs it
 
 1. Make EGL optional and initialize on the first surface bind. Hold the Wayland connection so its

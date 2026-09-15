@@ -229,16 +229,14 @@ impl Supervisor {
     }
 
     /// Pushes one roster capability signal as a snapshot (ADR-0076).
-    pub(crate) async fn push_capability_signal(&mut self, signal: Signal) {
-        self.capabilities
-            .push(
-                signal,
-                &self.registry,
-                self.authoritative.generation_id,
-                &mut self.revisions,
-                &mut self.last_snapshots,
-            )
-            .await;
+    pub(crate) fn push_capability_signal(&mut self, signal: Signal) {
+        self.capabilities.push(
+            signal,
+            &self.registry,
+            self.authoritative.generation_id,
+            &mut self.revisions,
+            &mut self.last_snapshots,
+        );
     }
 
     /// Starts a reload for the authoritative generation (ADR-0024, ADR-0041 decision 4); a
@@ -535,11 +533,7 @@ impl Supervisor {
     }
 
     /// Routes a roster command to its controller (ADR-0037); `lock` is separate (ADR-0052).
-    pub(crate) async fn dispatch_capability_command(
-        &mut self,
-        capability: Capability,
-        envelope: &shared::CommandEnvelope,
-    ) {
+    pub(crate) fn dispatch_capability_command(&mut self, capability: Capability, envelope: &shared::CommandEnvelope) {
         // Keep polkit here beside the cancel path (ADR-0114).
         if capability == Capability::Polkit {
             if polkit::dispatch(&mut self.polkit, envelope) {
@@ -547,7 +541,7 @@ impl Supervisor {
             }
             return;
         }
-        self.capabilities.dispatch(capability, envelope, &self.lock).await;
+        self.capabilities.dispatch(capability, envelope, &self.lock);
     }
 
     /// Routes a `process` command (ADR-0026).

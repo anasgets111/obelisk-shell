@@ -24,14 +24,14 @@ use crate::{log_unstarted, socket};
 use applications::{ApplicationsController, ApplicationsSignal};
 use audio::mixer::{AudioState, PrivacySources};
 use battery::{BatteryController, BatterySignal};
-use bluetooth::{BluetoothController, BluetoothSignal};
+use bluetooth::{BluetoothController, BluetoothState};
 use brightness::{BrightnessController, BrightnessSignal};
 use files::{FilesController, FilesSignal};
 use idle::{IdleController, IdleState};
-use keyboard::{KeyboardController, KeyboardSignal};
+use keyboard::{KeyboardController, KeyboardState};
 use lock::LockController;
 use mpris::{MprisController, MprisSignal};
-use network::{NetworkController, NetworkSignal};
+use network::{NetworkController, NetworkState};
 use notifications::{NotificationsController, NotificationsSignal};
 use power::{PowerController, PowerSignal};
 use privacy::{PrivacyController, PrivacySignal};
@@ -126,20 +126,69 @@ where
     zbus::proxy::Builder::new(connection).path(path)?.build().await
 }
 
+/// A controller whose construction and signal handling wait on another service, so both run in its
+/// own task: a NetworkManager that owned its name but stopped answering held the loop, and every lock
+/// frame behind it, with no timeout. Requests queue in the channel until the build lands, in order.
+type Worker<C> = UnboundedSender<Box<dyn FnOnce(&C) + Send>>;
+
+/// Builds a [`Worker`]; `handle` turns each signal into the state sent to the loop. A failed build
+/// closes the worker, so the next start retries it.
+fn spawn_worker<C, S, T, Fut>(
+    build: impl Future<Output = Option<C>> + Send + 'static,
+    mut signals: UnboundedReceiver<S>,
+    handle: impl Fn(C, S) -> Fut + Send + 'static,
+    states: UnboundedSender<T>,
+) -> Worker<C>
+where
+    C: Clone + Send + Sync + 'static,
+    S: Send + 'static,
+    T: Send + 'static,
+    Fut: Future<Output = T> + Send,
+{
+    let (worker, mut requests) = unbounded_channel::<Box<dyn FnOnce(&C) + Send>>();
+    tokio::spawn(async move {
+        let Some(controller) = build.await else { return };
+        loop {
+            tokio::select! {
+                Some(request) = requests.recv() => request(&controller),
+                Some(signal) = signals.recv() => {
+                    if states.send(handle(controller.clone(), signal).await).is_err() {
+                        break;
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+    worker
+}
+
+/// Queues a command for a worker capability, or logs it like any unstarted one.
+fn queue<C: 'static>(worker: &Option<Worker<C>>, envelope: &CommandEnvelope, dispatch: fn(&C, &CommandEnvelope)) {
+    let Some(worker) = worker else { return log_unstarted(envelope) };
+    let command = envelope.clone();
+    if worker.send(Box::new(move |controller| dispatch(controller, &command))).is_err() {
+        eprintln!(
+            "{}: its backend failed to start; {} was dropped",
+            envelope.params.capability, envelope.params.action
+        );
+    }
+}
+
 /// A received signal waiting for [`Capabilities::push`]. [`Signals::next`] only awaits `recv()`,
-/// so losing the `tokio::select!` race drops no signal; the winning arm's body is not canceled.
-/// This matters because `network`/`bluetooth` await while building state.
+/// so losing the `tokio::select!` race drops no signal.
 #[derive(Debug)]
 pub enum Signal {
     /// Carries mixer state directly, not a controller name.
     Audio(AudioState),
-    Network(NetworkSignal),
-    Bluetooth(BluetoothSignal),
+    /// Worker capabilities send finished state, like `Audio`.
+    Network(NetworkState),
+    Bluetooth(BluetoothState),
     Tray,
     Mpris,
     Notifications,
     Sysinfo,
-    Keyboard,
+    Keyboard(KeyboardState),
     Battery,
     Brightness,
     Workspaces,
@@ -222,16 +271,16 @@ capability_channels! {
     channels {
         // Mixer sends state directly (see `Signal::Audio`).
         Audio => audio: AudioState, Some(state) => Signal::Audio(state);
-        // Controllers own signal semantics (ADR-0037).
-        Network => network: NetworkSignal, Some(signal) => Signal::Network(signal);
-        Bluetooth => bluetooth: BluetoothSignal, Some(signal) => Signal::Bluetooth(signal);
+        // Workers send finished state (see `spawn_worker`).
+        Network => network: NetworkState, Some(state) => Signal::Network(state);
+        Bluetooth => bluetooth: BluetoothState, Some(state) => Signal::Bluetooth(state);
         // Other `Changed` signals collapse to unit `Signal` variants.
         Tray => tray: TraySignal, Some(TraySignal::RegistryChanged) => Signal::Tray;
         Mpris => mpris: MprisSignal, Some(MprisSignal::Changed) => Signal::Mpris;
         Notifications => notifications: NotificationsSignal,
             Some(NotificationsSignal::Changed) => Signal::Notifications;
         Sysinfo => sysinfo: SysinfoSignal, Some(SysinfoSignal::Changed) => Signal::Sysinfo;
-        Keyboard => keyboard: KeyboardSignal, Some(KeyboardSignal::Changed) => Signal::Keyboard;
+        Keyboard => keyboard: KeyboardState, Some(state) => Signal::Keyboard(state);
         Privacy => privacy: PrivacySignal, Some(PrivacySignal::Changed) => Signal::Privacy;
         Updates => updates: UpdatesSignal, Some(UpdatesSignal::Changed) => Signal::Updates;
         Battery => battery: BatterySignal, Some(BatterySignal::Changed) => Signal::Battery;
@@ -255,13 +304,13 @@ capability_channels! {
 /// On-demand controllers and their inputs. `audio` starts the PipeWire mixer and stores its command
 /// channel; `lock` is boot-built in `main.rs` for relock (ADR-0060) and passed to dispatch.
 pub struct Capabilities {
-    network: Option<NetworkController>,
-    bluetooth: Option<BluetoothController>,
+    network: Option<Worker<NetworkController>>,
+    bluetooth: Option<Worker<BluetoothController>>,
     tray: Option<TrayController>,
     notifications: Option<NotificationsController>,
     mpris: Option<MprisController>,
     sysinfo: Option<SysinfoController>,
-    keyboard: Option<KeyboardController>,
+    keyboard: Option<Worker<KeyboardController>>,
     privacy: Option<PrivacyController>,
     updates: Option<UpdatesController>,
     battery: Option<BatteryController>,
@@ -350,42 +399,77 @@ impl Capabilities {
         self.idle.as_ref()
     }
 
-    /// Live `network` controller for `secure_submit(network, connect)`; it owns pending intent, and
-    /// plaintext secrets never enter this module (ADR-0029).
-    pub fn network(&self) -> Option<&NetworkController> {
-        self.network.as_ref()
+    /// `secure_submit(network, connect)`: the worker pairs the secret with the intent it holds
+    /// (ADR-0029). A request that is never run drops the secret, which zeroizes it.
+    pub fn connect_prompted(&self, generation_id: u32, secret: shared::Zeroizing<Vec<u8>>) {
+        let connect = move |network: &NetworkController| match network.take_prompted_intent() {
+            Some(pending) => {
+                let network = network.clone();
+                tokio::spawn(async move { network.connect(pending, secret).await });
+            }
+            None => eprintln!(
+                "generation {generation_id}'s secure_submit(network, connect) arrived with no intent for the network the prompt names; dropping"
+            ),
+        };
+        let sent = match &self.network {
+            Some(network) => network.send(Box::new(connect)).is_ok(),
+            None => false,
+        };
+        if !sent {
+            eprintln!(
+                "generation {generation_id}'s secure_submit(network, connect) arrived with no network backend; dropping"
+            );
+        }
     }
 
     /// Drops what a departed generation asked for. Its replacement starts with fresh state (named
     /// state survives only an in-place reload), so nothing would send the Bluetooth discovery stop
     /// or the Wi-Fi prompt cancel the old one owed, and discovery ran for the rest of the session.
+    /// Queued behind that generation's own requests, so none runs after it.
     pub fn forget_departed_requests(&self) {
         if let Some(bluetooth) = &self.bluetooth {
-            bluetooth.set_discovery(false);
+            let _ = bluetooth.send(Box::new(|bluetooth| bluetooth.set_discovery(false)));
         }
         if let Some(network) = &self.network {
-            network.cancel_connect();
+            let _ = network.send(Box::new(|network| network.cancel_connect()));
         }
     }
 
-    /// ADR-0070 lazy start: inline await (decision 4), re-entrant across generation swaps (decision
-    /// 3), with each arm a no-op after construction.
+    /// ADR-0070 lazy start, re-entrant across generation swaps (decision 3), with each arm a no-op
+    /// after construction. Backends that wait on another service build in a [`Worker`].
     pub async fn start(&mut self, capability: Capability) {
         match capability {
             Capability::Network => {
-                if self.network.is_none() {
-                    match NetworkController::new(self.connection.clone(), self.senders.network.clone()).await {
-                        Ok(controller) => self.network = Some(controller),
-                        Err(err) => {
-                            eprintln!("network: NetworkManager is unreachable; capability disabled for this run: {err}")
-                        }
-                    }
+                if self.network.as_ref().is_none_or(UnboundedSender::is_closed) {
+                    let (events, signals) = unbounded_channel();
+                    let connection = self.connection.clone();
+                    let build = async move {
+                        NetworkController::new(connection, events)
+                            .await
+                            .map_err(|err| {
+                                eprintln!(
+                                    "network: NetworkManager is unreachable; disabled until the next start: {err}"
+                                )
+                            })
+                            .ok()
+                    };
+                    let handle =
+                        |network: NetworkController, signal| async move { network.handle_signal(signal).await };
+                    self.network = Some(spawn_worker(build, signals, handle, self.senders.network.clone()));
                 }
             }
             Capability::Bluetooth => {
                 if self.bluetooth.is_none() {
-                    self.bluetooth =
-                        Some(BluetoothController::new(self.connection.clone(), self.senders.bluetooth.clone()).await);
+                    let (events, signals) = unbounded_channel();
+                    let build = BluetoothController::new(self.connection.clone(), events);
+                    let handle =
+                        |bluetooth: BluetoothController, signal| async move { bluetooth.handle_signal(signal).await };
+                    self.bluetooth = Some(spawn_worker(
+                        async move { Some(build.await) },
+                        signals,
+                        handle,
+                        self.senders.bluetooth.clone(),
+                    ));
                 }
             }
             // Own session bus; missing it yields `inert`. Tray, Notifications and Mpris push once when
@@ -451,14 +535,13 @@ impl Capabilities {
             // Missing KbdBacklight -> -1; missing lock source -> `false` (ADR-0034).
             Capability::Keyboard => {
                 if self.keyboard.is_none() {
-                    self.keyboard = Some(
-                        KeyboardController::new(
-                            self.connection.clone(),
-                            &PathBuf::from("/sys/class/leds"),
-                            self.senders.keyboard.clone(),
-                        )
-                        .await,
-                    );
+                    let (events, signals) = unbounded_channel();
+                    let connection = self.connection.clone();
+                    let build = async move {
+                        Some(KeyboardController::new(connection, Path::new("/sys/class/leds"), events).await)
+                    };
+                    let handle = |keyboard: KeyboardController, _| async move { keyboard.snapshot() };
+                    self.keyboard = Some(spawn_worker(build, signals, handle, self.senders.keyboard.clone()));
                 }
             }
             // Camera `/dev/videoN` inotify plus `/proc` scan, enriched by `privacy_sources`
@@ -582,9 +665,8 @@ impl Capabilities {
         self.audio = Some(command_tx);
     }
 
-    /// Pushes one received [`Signal`] from the winning `select!` arm; `network`/`bluetooth` may
-    /// await without a dropped signal.
-    pub async fn push(
+    /// Pushes one received [`Signal`] from the winning `select!` arm.
+    pub fn push(
         &self,
         signal: Signal,
         registry: &socket::GenerationRegistry,
@@ -599,17 +681,8 @@ impl Capabilities {
         }
         match signal {
             Signal::Audio(state) => push!(Capability::Audio, &state),
-            // Controller owns signal semantics and answers async (ADR-0037).
-            Signal::Network(signal) => {
-                if let Some(network) = &self.network {
-                    push!(Capability::Network, &network.handle_signal(signal).await);
-                }
-            }
-            Signal::Bluetooth(signal) => {
-                if let Some(bluetooth) = &self.bluetooth {
-                    push!(Capability::Bluetooth, &bluetooth.handle_signal(signal).await);
-                }
-            }
+            Signal::Network(state) => push!(Capability::Network, &state),
+            Signal::Bluetooth(state) => push!(Capability::Bluetooth, &state),
             // No debounce: `build_state` already snapshots recomputed data (ADR-0031).
             Signal::Tray => {
                 if let Some(tray) = &self.tray {
@@ -634,11 +707,7 @@ impl Capabilities {
                     push!(Capability::Sysinfo, &sysinfo.snapshot());
                 }
             }
-            Signal::Keyboard => {
-                if let Some(keyboard) = &self.keyboard {
-                    push!(Capability::Keyboard, &keyboard.snapshot());
-                }
-            }
+            Signal::Keyboard(state) => push!(Capability::Keyboard, &state),
             Signal::Battery => {
                 if let Some(battery) = &self.battery {
                     push!(Capability::Battery, &battery.snapshot());
@@ -711,7 +780,7 @@ impl Capabilities {
     /// Routes a command to its module (ADR-0037). Optional controllers exist only after the config
     /// reads their member (ADR-0070), so missing ones call `log_unstarted`; boot-built `lock` is
     /// passed in, and read-only `battery`/`privacy`/`system` have no dispatch.
-    pub async fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
+    pub fn dispatch(&mut self, capability: Capability, envelope: &CommandEnvelope, lock: &LockController) {
         macro_rules! to {
             ($held:expr, $dispatch:path) => {
                 match &$held {
@@ -721,13 +790,13 @@ impl Capabilities {
             };
         }
         match capability {
-            Capability::Network => to!(self.network, network::dispatch),
-            Capability::Bluetooth => to!(self.bluetooth, bluetooth::dispatch),
+            Capability::Network => queue(&self.network, envelope, network::dispatch),
+            Capability::Bluetooth => queue(&self.bluetooth, envelope, bluetooth::dispatch),
             Capability::Tray => to!(self.tray, tray::dispatch),
             Capability::Notifications => to!(self.notifications, notifications::dispatch),
             Capability::Mpris => to!(self.mpris, mpris::dispatch),
             Capability::Sysinfo => to!(self.sysinfo, sysinfo::dispatch),
-            Capability::Keyboard => to!(self.keyboard, keyboard::dispatch),
+            Capability::Keyboard => queue(&self.keyboard, envelope, keyboard::dispatch),
             Capability::Brightness => to!(self.brightness, brightness::dispatch),
             Capability::Workspaces => to!(self.workspaces, workspaces::dispatch),
             Capability::Power => to!(self.power, power::dispatch),
@@ -797,5 +866,39 @@ mod tests {
     #[test]
     fn truncate_utf8_bytes_handles_a_cap_of_zero() {
         assert_eq!(truncate_utf8_bytes("hello", 0), "");
+    }
+
+    #[tokio::test]
+    async fn a_worker_runs_requests_sent_before_its_build_landed_in_order_and_a_failed_build_closes_it() {
+        let (release, built) = tokio::sync::oneshot::channel::<()>();
+        let (signal_tx, signals) = unbounded_channel();
+        let (states_tx, mut states) = unbounded_channel();
+        let worker = spawn_worker(
+            async move { built.await.ok().map(|()| 7u32) },
+            signals,
+            |c, s: u32| async move { c + s },
+            states_tx,
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for n in [1, 2] {
+            let seen = seen.clone();
+            worker.send(Box::new(move |c: &u32| seen.lock().unwrap().push(c * 10 + n))).unwrap();
+        }
+        signal_tx.send(1).unwrap();
+        release.send(()).unwrap();
+
+        assert_eq!(states.recv().await, Some(8), "a signal becomes state from the built controller");
+        let (done, finished) = tokio::sync::oneshot::channel();
+        worker.send(Box::new(move |_| done.send(()).unwrap())).unwrap();
+        finished.await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [71, 72]);
+
+        let failed = spawn_worker(
+            async { None::<u32> },
+            unbounded_channel::<u32>().1,
+            |c, s| async move { c + s },
+            unbounded_channel().0,
+        );
+        failed.closed().await;
     }
 }

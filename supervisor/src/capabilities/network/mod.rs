@@ -1,6 +1,6 @@
-//! NetworkManager D-Bus controller (`obelisk.network`; ADR-0029). It merges its hand-written proxies'
-//! (`proxies.rs`, ADR-0212) signal streams into `main.rs`'s top-level `tokio::select!`, like
-//! `dbus::polkit`, rather than using a dedicated thread like `audio::mixer`.
+//! NetworkManager D-Bus controller (`obelisk.network`; ADR-0029). Its hand-written proxies'
+//! (`proxies.rs`, ADR-0212) signal streams feed its worker task (`capabilities::spawn_worker`), which
+//! rebuilds state and sends it to `main.rs`.
 //!
 //! Forwarder tasks feed one channel: wireless APs/association, each device's state, the manager's
 //! radio switches/default route, its device list, and saved-profile changes. ADR-0082: scan-only
@@ -132,8 +132,8 @@ pub struct PendingNetworkConnect {
     pub hidden: bool,
 }
 
-/// What forwarders report to `main.rs`'s top-level `select!`; `build_state` makes the payload with
-/// a fresh D-Bus round trip.
+/// What forwarders report to the network worker; `build_state` makes the payload with a fresh D-Bus
+/// round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkSignal {
     /// Any non-`scanning` field change: AP set, association, device state, or radio. All trigger

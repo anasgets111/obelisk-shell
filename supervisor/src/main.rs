@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use capabilities::Capabilities;
 use capabilities::lock::{self, LockController};
-use capabilities::network::NetworkController;
 use generation::renderer_binary_path;
 use polkit::PolkitAgent;
 use shared::{Capability, ReevaluateReport, ReevaluateRequest, RendererFrame, SupervisorFrame, Zeroize};
@@ -356,11 +355,8 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
             Some(request) = agent_requests.recv() => supervisor.handle_polkit_request(request),
             Some((cookie, outcome)) = polkit_outcomes.recv() => supervisor.record_polkit_outcome(cookie, outcome),
             Some(generation_id) = connected.recv() => supervisor.hydrate(generation_id),
-            // One arm per snapshot capability (ADR-0076). `Signals::next` is the cancel-safe half
-            // of the bare `recv()`s; `Capabilities::push` runs in the winning body, which
-            // `select!` does not cancel. Thus the two capabilities that await while building state
-            // cannot lose a signal to a busier branch.
-            Some(signal) = signals.next() => supervisor.push_capability_signal(signal).await,
+            // One arm per snapshot capability (ADR-0076); `Signals::next` is cancel-safe.
+            Some(signal) = signals.next() => supervisor.push_capability_signal(signal),
             Some(event) = idle_signals.recv() => {
                 // Route to the generation whose `register_threshold` fired (`event.generation_id`),
                 // not the authoritative one (ADR-0006). Send raw `IdleEvent`, not the
@@ -391,7 +387,7 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                     // `idle` joined the roster with ADR-0141 and uses the generic path.
                     "process" => supervisor.dispatch_process_command(&envelope).await,
                     name => match Capability::from_name(name) {
-                        Some(capability) => supervisor.dispatch_capability_command(capability, &envelope).await,
+                        Some(capability) => supervisor.dispatch_capability_command(capability, &envelope),
                         None => eprintln!("inbound command from generation {}: {:?}", inbound.generation_id, envelope),
                     },
                 },
@@ -402,12 +398,12 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
                 RendererFrame::StartCapability { capability } => {
                     // ADR-0070: config read `obelisk.<capability>` or named it in `secure_submit`.
-                    // Await inline (decision 4). Re-entrant because decision 3 makes each
-                    // generation resend every name; each arm is a no-op after controller creation.
+                    // Re-entrant because decision 3 makes each generation resend every name; each
+                    // arm is a no-op after controller creation.
                     match capability {
                         // Built at boot; starting it registers the agent (ADR-0070 decision 5,
                         // ADR-0114).
-                        Capability::Polkit => polkit_agent.register(&connection).await,
+                        Capability::Polkit => polkit_agent.register(&connection),
                         capability => supervisor.capabilities.start(capability).await,
                     }
                 }
@@ -459,27 +455,10 @@ async fn run_supervisor() -> Result<(), Box<dyn Error>> {
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Network && submit.action == "connect" => {
                     // ADR-0029: empty secret means open network; non-empty is the WPA-PSK password.
-                    // Before the catch-all for the same ordering reason as polkit.
-                    match supervisor.capabilities.network().and_then(NetworkController::take_prompted_intent) {
-                        Some(pending) => {
-                            // `mem::take` gives plaintext to `NetworkController::connect`,
-                            // wrapped so the spawned task scrubs it on cancellation too.
-                            let secret = shared::Zeroizing::new(std::mem::take(&mut submit.secret));
-                            let controller = supervisor
-                                .capabilities
-                                .network()
-                                .cloned()
-                                .expect("take_prompted_intent above only answers from a live controller");
-                            tokio::spawn(async move { controller.connect(pending, secret).await; });
-                        }
-                        None => {
-                            eprintln!(
-                                "generation {}'s secure_submit(network, connect) arrived with no intent for the network the prompt names; dropping",
-                                submit.generation_id
-                            );
-                            submit.secret.zeroize();
-                        }
-                    }
+                    // Before the catch-all for the same ordering reason as polkit. `Zeroizing`
+                    // scrubs it on every path, a dropped request included.
+                    let secret = shared::Zeroizing::new(std::mem::take(&mut submit.secret));
+                    supervisor.capabilities.connect_prompted(submit.generation_id, secret);
                 }
                 RendererFrame::SecureSubmit(mut submit) if submit.capability == Capability::Lock && submit.action == "authenticate" => {
                     // ADR-0042, ADR-0052: this arm and `pam_outcomes` are the only unlock path,

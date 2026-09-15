@@ -6,7 +6,7 @@ pub mod controller;
 pub mod layout;
 pub mod locks;
 
-pub use controller::{KeyboardController, KeyboardSignal};
+pub use controller::{KeyboardController, KeyboardState};
 
 #[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
