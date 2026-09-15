@@ -2857,6 +2857,12 @@ by A/B'ing the binaries: **26 frames dropped before, 0 after**. Twenty-one were 
 capabilities, hidden by inherited controllers. The roadmap called the drop silent, but
 `recv_matching` logged each frame and both generations; the missing step was reading the log.
 
+Amendment (2026-09-15): the "Not built" hole does not exist. A `StartCapability` that fails to leave
+closes the connection, and the Renderer exits (ADR-0059); the listener's other drop points close it too
+or replay the frame. `start(lock)` is a no-op, since the lock controller is built at boot. The one drop
+on a live connection is a decode failure from a mismatched Renderer binary, which breaks every frame,
+not starts alone. No acknowledgement is owed.
+
 ## 0157. The layout pass owns the evaluation memo, because a config's shared computed was answering once per property rather than once per pass
 
 ADR-0044 decision 3 only memoized within one `EvaluationMemo`; `node::resolve_properties` called
