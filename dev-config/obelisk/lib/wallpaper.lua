@@ -251,6 +251,16 @@ function wallpaper.randomize_all()
     end
 end
 
+-- `obelisk call wallpaper.set [PATH]` sets PATH on every screen, or a random wallpaper per screen.
+action("wallpaper.set", function(path)
+    if not path then
+        return wallpaper.randomize_all()
+    end
+    for _, output in ipairs(wallpaper.outputs()) do
+        wallpaper.set(output, path)
+    end
+end)
+
 obelisk.files:invoke("watch", wallpaper.FOLDER, wallpaper.EXTENSIONS)
 obelisk.files:invoke("watch", wallpaper.SHADER_FOLDER, wallpaper.SHADER_EXTENSIONS)
 
