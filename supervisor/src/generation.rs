@@ -1,15 +1,16 @@
 //! A generation's authoritative identity and process handle, sibling Renderer resolution, exit
-//! classification/reporting, and `RestartBrake`. `main.rs` consults the brake before replacement.
+//! classification/reporting, and `RestartBrake`. `Supervisor::respawn_renderer` consults the brake.
 //! Promotion and retirement stay in its `select!` loop (ADR-0037), where the arm shares loop state.
 
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// ADR-0058 decision 3: three deaths in a minute lets transient OOM/GPU-reset crashes recover,
-/// while stopping a config that kills every Renderer before the lock screen flickers forever.
+/// ADR-0058 decision 3: three deaths in a minute respawn at once; a fourth waits the cooldown, so a
+/// config that kills every Renderer cannot strobe the lock screen and a GPU out of memory gets time.
 pub(super) const RESTART_LIMIT: usize = 3;
 pub(super) const RESTART_WINDOW: Duration = Duration::from_secs(60);
+pub(super) const RESTART_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Installed Renderer filename. `renderer` is too generic for a user's `$PATH`; `cargo install`
 /// puts every binary in one directory.
@@ -61,30 +62,27 @@ pub(super) fn classify_departure(status: std::process::ExitStatus) -> RendererDe
     }
 }
 
-/// ADR-0058 decision 3: at most `limit` restarts inside `window`. Without the brake, one dead bar
-/// turns into a lock screen flickering every few hundred milliseconds.
+/// ADR-0058 decision 3: at most `RESTART_LIMIT` restarts inside `RESTART_WINDOW`, then a
+/// `RESTART_COOLDOWN` wait. Without the brake, one dead bar turns into a lock screen flickering
+/// every few hundred milliseconds.
 ///
 /// Sliding window, not total count: a Renderer dying once a day for a month is a logged bug, not a
 /// restart loop; a total would eventually refuse a shell healthy since the last reboot.
+#[derive(Default)]
 pub(super) struct RestartBrake {
-    limit: usize,
-    window: Duration,
-    /// Restart instants in the current window, oldest first; bounded by `limit`.
+    /// Restart instants in the current window, oldest first; bounded by `RESTART_LIMIT`.
     recent: std::collections::VecDeque<std::time::Instant>,
 }
 
 impl RestartBrake {
-    pub(super) fn new(limit: usize, window: Duration) -> Self {
-        RestartBrake { limit, window, recent: std::collections::VecDeque::new() }
-    }
-
-    /// Records an attempt at `now` and says whether it may proceed. Injecting `now` makes the
-    /// window testable without a test that takes an hour.
+    /// Records an attempt at `now` and says whether it may proceed; a refusal clears the window for
+    /// the cooldown. Injecting `now` makes the window testable without a test that takes an hour.
     pub(super) fn allow(&mut self, now: std::time::Instant) -> bool {
-        while self.recent.front().is_some_and(|at| now.duration_since(*at) >= self.window) {
+        while self.recent.front().is_some_and(|at| now.duration_since(*at) >= RESTART_WINDOW) {
             self.recent.pop_front();
         }
-        if self.recent.len() >= self.limit {
+        if self.recent.len() >= RESTART_LIMIT {
+            self.recent.clear();
             return false;
         }
         self.recent.push_back(now);
@@ -164,7 +162,7 @@ mod tests {
     #[test]
     fn the_brake_allows_restarts_up_to_its_limit() {
         let start = std::time::Instant::now();
-        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        let mut brake = RestartBrake::default();
 
         for attempt in 0..3 {
             assert!(brake.allow(start + Duration::from_secs(attempt)), "restart {attempt} is within the limit");
@@ -174,21 +172,22 @@ mod tests {
     #[test]
     fn the_brake_stops_a_crash_loop_once_the_limit_is_reached_inside_the_window() {
         let start = std::time::Instant::now();
-        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        let mut brake = RestartBrake::default();
         for attempt in 0..3 {
             brake.allow(start + Duration::from_secs(attempt));
         }
 
         assert!(
             !brake.allow(start + Duration::from_secs(4)),
-            "a config that kills every Renderer it is handed must stop being handed Renderers"
+            "a config that kills every Renderer it is handed must wait out the cooldown"
         );
+        assert!(brake.allow(start + Duration::from_secs(5)), "a refusal clears the window for the cooldown");
     }
 
     #[test]
     fn the_brake_forgets_restarts_older_than_its_window() {
         let start = std::time::Instant::now();
-        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        let mut brake = RestartBrake::default();
         for attempt in 0..3 {
             brake.allow(start + Duration::from_secs(attempt));
         }
@@ -200,7 +199,7 @@ mod tests {
     #[test]
     fn a_slow_crash_loop_never_trips_the_brake() {
         let start = std::time::Instant::now();
-        let mut brake = RestartBrake::new(3, Duration::from_secs(60));
+        let mut brake = RestartBrake::default();
 
         // One crash per window forever is a logged bug, not a restart loop.
         for attempt in 0..10 {

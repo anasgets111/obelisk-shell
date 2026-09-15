@@ -155,27 +155,6 @@ pub(crate) fn parse_action<A: serde::de::DeserializeOwned>(params: &shared::Comm
         .ok()
 }
 
-/// Why `run_supervisor` returned and its process exit code (ADR-0059 decision 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shutdown {
-    /// `SIGINT`, `SIGTERM`, or every channel closing; rerunning the shell is recovery.
-    Requested,
-    /// `generation::RestartBrake` refused a respawn; the same config would kill each fresh Renderer
-    /// forever.
-    RestartBrakeTripped,
-}
-
-impl Shutdown {
-    /// Deliberately arbitrary except for what it is not: `3` is neither `0` (clean), `1` (`main`'s
-    /// `?` failure), signal codes (128+), nor "not found" (127).
-    fn exit_code(self) -> i32 {
-        match self {
-            Shutdown::Requested => 0,
-            Shutdown::RestartBrakeTripped => 3,
-        }
-    }
-}
-
 /// Enters the PAM worker's tokio-free path (ADR-0028) before any D-Bus, runtime, or audio-thread
 /// setup. The worker must not construct a tokio runtime.
 /// `obelisk -d`: re-exec in a new session and return, so the terminal gets its prompt back.
@@ -254,17 +233,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             // descriptors (ADR-0199). Argument parsing has already had its say above, so a
             // detached run still loses a `-c` substitution notice.
             log::capture()?;
-            // Exit explicitly: `Shutdown`'s code matters, while `main`'s `Result` only yields 0 or
-            // 1 (ADR-0059 decision 3). `run_supervisor` has finished its teardown. Two workers,
-            // not one per core (ADR-0124), cover socket/D-Bus/inotify/timer waits; the blocking
-            // pool is separate. A twenty-core laptop otherwise used twenty bar-serving threads.
+            // Exit explicitly: `run_supervisor` has finished its teardown, and dropping the runtime
+            // would wait on blocking tasks. Two workers, not one per core (ADR-0124), cover
+            // socket/D-Bus/inotify/timer waits; the blocking pool is separate. A twenty-core laptop
+            // otherwise used twenty bar-serving threads.
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-            let shutdown = runtime.block_on(run_supervisor())?;
-            std::process::exit(shutdown.exit_code());
+            runtime.block_on(run_supervisor())?;
+            std::process::exit(0);
         }
     }
 }
-async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
+async fn run_supervisor() -> Result<(), Box<dyn Error>> {
     let connection = capabilities::with_call_timeout(zbus::connection::Builder::system()).await?;
 
     let (tx, mut agent_requests) = tokio::sync::mpsc::unbounded_channel();
@@ -339,8 +318,6 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     // Renderer.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut memory_sampler = memory::sampler_from_env();
-    // Every break leaves this alone except the brake's exit, whose code marks a give-up.
-    let mut shutdown = Shutdown::Requested;
 
     // Frames a swap handshake read off `inbound_frames` without being their reader (ADR-0156).
     // Drained ahead of the socket so they keep their arrival order relative to each other and to
@@ -358,10 +335,15 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
                 break;
             }
             // ADR-0058 decision 1: dead and healthy-idle Renderers both send no frames; without
-            // this arm `select!` cannot distinguish them.
-            status = supervisor.authoritative.child.wait() => {
-                if let Some(reason) = supervisor.replace_departed_renderer(status).await {
-                    shutdown = reason;
+            // this arm `select!` cannot distinguish them. Off during a cooldown: a reaped child's
+            // `wait` answers at once.
+            status = supervisor.authoritative.child.wait(), if supervisor.respawn_at.is_none() => {
+                if supervisor.replace_departed_renderer(status).await {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(supervisor.respawn_at.unwrap_or_else(std::time::Instant::now).into()), if supervisor.respawn_at.is_some() => {
+                if supervisor.respawn_renderer().await {
                     break;
                 }
             }
@@ -390,7 +372,9 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
             Some(()) = reload_events.recv() => supervisor.begin_reload(),
             Some((generation_id, id)) = process_done.recv() => supervisor.reap_exited_process(generation_id, id),
             Some(inbound) = next_inbound(&mut replay, &mut inbound_frames) => {
-                if !frame_may_dispatch(&inbound.frame, inbound.generation_id, supervisor.authoritative.generation_id) {
+                // No Renderer is live during a cooldown, so only control clients and call answers dispatch.
+                let live = supervisor.respawn_at.map_or(supervisor.authoritative.generation_id, |_| shared::CONTROL_CLIENT_GENERATION);
+                if !frame_may_dispatch(&inbound.frame, inbound.generation_id, live) {
                     eprintln!(
                         "dropping a frame from stale generation {} (authoritative is {})",
                         inbound.generation_id, supervisor.authoritative.generation_id
@@ -548,24 +532,12 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
     supervisor.reap().await;
     // Best effort; `socket::bind` removes a missed stale file on the next boot.
     let _ = std::fs::remove_file(&socket_path);
-    Ok(shutdown)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_tripped_restart_brake_exits_with_a_code_distinct_from_a_clean_stop() {
-        assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), Shutdown::Requested.exit_code());
-        assert_ne!(Shutdown::RestartBrakeTripped.exit_code(), 0, "a give-up is not a clean exit");
-    }
-
-    #[test]
-    fn a_requested_shutdown_exits_cleanly() {
-        // SIGTERM at session end must not look like failure.
-        assert_eq!(Shutdown::Requested.exit_code(), 0);
-    }
 
     /// Order is the whole point of holding the frames in a queue rather than pushing them back
     /// onto the socket channel: a deferred `StartCapability` must be handled before whatever

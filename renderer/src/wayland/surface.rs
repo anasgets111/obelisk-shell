@@ -1198,8 +1198,15 @@ impl App {
         if animating && let Some(surface) = self.surfaces[index].role.wl_surface() {
             surface.frame(&self.queue_handle, FrameCallbackData(surface.clone()));
         }
-        if let Err(e) = egl.instance.swap_buffers(egl.display, egl_surface) {
-            log_bind_failure(&surface_id, "eglSwapBuffers", e);
+        // ponytail: only the swap is guarded; khronos-egl's other wrappers (make_current etc.) still unwrap (upstream #25).
+        use khronos_egl::api::EGL1_0;
+        // SAFETY: `egl_surface` was made current on `egl.display` above.
+        if unsafe { khronos_egl::Static.eglSwapBuffers(egl.display.as_ptr(), egl_surface.as_ptr()) }
+            == khronos_egl::FALSE
+        {
+            // SAFETY: reads this thread's last EGL error.
+            let error = unsafe { khronos_egl::Static.eglGetError() };
+            log_bind_failure(&surface_id, "eglSwapBuffers", format!("EGL error {error:#x}"));
             self.exit = true;
             return;
         }

@@ -15,7 +15,8 @@ use crate::capabilities::lock::{self, LockController};
 use crate::capabilities::polkit::{self, Answer, PolkitController};
 use crate::capabilities::{Capabilities, Signal};
 use crate::generation::{
-    Authoritative, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake, classify_departure, departure_report,
+    Authoritative, RESTART_COOLDOWN, RESTART_LIMIT, RESTART_WINDOW, RendererDeparture, RestartBrake,
+    classify_departure, departure_report,
 };
 use crate::pam_worker;
 use crate::polkit::AgentRequest;
@@ -23,7 +24,7 @@ use crate::process::registry::{LiveProcesses, reap_all_processes, wait_and_repor
 use crate::reload_link::SocketCandidateLink;
 use crate::snapshot::push_snapshot;
 use crate::socket::{self, InboundFrame};
-use crate::{SWAP_TIMINGS, Shutdown, begin_reload, memory, process, reload, send_frame_logged};
+use crate::{SWAP_TIMINGS, begin_reload, memory, process, reload, send_frame_logged};
 
 /// Why a generation must take an unrequested lock. Causes differ in logs but both mean the
 /// compositor holds a lock with nothing of ours on it; a named enum beats an ambiguous `bool`.
@@ -87,6 +88,7 @@ pub(crate) struct Supervisor {
     /// Renderer binary for every spawn.
     renderer_path: String,
     restart_brake: RestartBrake,
+    pub(crate) respawn_at: Option<std::time::Instant>,
     /// Set only by [`Supervisor::replace_departed_renderer`]; distinguishes shutdown reaping from
     /// an already-gone Renderer.
     renderer_departed: bool,
@@ -140,7 +142,8 @@ impl Supervisor {
             next_sequence: 0,
             next_generation_id: 1,
             renderer_path,
-            restart_brake: RestartBrake::new(RESTART_LIMIT, RESTART_WINDOW),
+            restart_brake: RestartBrake::default(),
+            respawn_at: None,
             renderer_departed: false,
             relock_when_connected,
             relock_in_flight: None,
@@ -294,12 +297,11 @@ impl Supervisor {
         }
     }
 
-    /// Reports authoritative Renderer death and spawns a replacement (ADR-0058); `Some` stops the
-    /// loop and carries the reason.
+    /// Reports authoritative Renderer death and spawns a replacement (ADR-0058); `true` stops the loop.
     pub(crate) async fn replace_departed_renderer(
         &mut self,
         status: std::io::Result<std::process::ExitStatus>,
-    ) -> Option<Shutdown> {
+    ) -> bool {
         let departure = match status {
             Ok(status) => classify_departure(status),
             Err(err) => {
@@ -312,23 +314,27 @@ impl Supervisor {
         self.renderer_departed = true;
 
         // Before the brake: the session ended under the whole shell, so every replacement would
-        // find the same missing compositor and trip the brake three deaths later, blaming a config
-        // that did nothing. Stop the way a SIGTERM does, because it means the same thing.
+        // find the same missing compositor. Stop the way a SIGTERM does, because it means the same thing.
         if matches!(departure, RendererDeparture::Failed { code } if code == shared::EXIT_COMPOSITOR_GONE) {
             eprintln!("the compositor is gone, so there is nothing to respawn into; shutting down");
-            return Some(Shutdown::Requested);
+            return true;
         }
+        self.respawn_renderer().await
+    }
 
-        // Check before spawning (ADR-0058 decision 3), covering the case where every spawn succeeds
-        // but each Renderer dies on the same config.
+    /// Spawns the replacement unless the brake defers it to `respawn_at` (ADR-0058 decision 3); `true` stops the loop.
+    pub(crate) async fn respawn_renderer(&mut self) -> bool {
         if !self.restart_brake.allow(std::time::Instant::now()) {
             eprintln!(
-                "giving up: {RESTART_LIMIT} renderers have died within {}s, which is a config that kills whatever it is \
-                 handed rather than a transient (ADR-0058 decision 3)",
-                RESTART_WINDOW.as_secs()
+                "{RESTART_LIMIT} renderers died within {RESTART_WINDOW:?}; respawning in {RESTART_COOLDOWN:?} (ADR-0058 decision 3)"
             );
-            return Some(Shutdown::RestartBrakeTripped);
+            self.respawn_at = Some(std::time::Instant::now() + RESTART_COOLDOWN);
+            return false;
         }
+        self.respawn_at = None;
+        // At respawn, not departure, and `requested` counts: a lock asked for during a cooldown is still owed.
+        let state = self.lock.snapshot();
+        let was_locked = state.active || state.requested;
         let replacement_generation_id = self.take_generation_id();
         match process::spawn_group_leader(
             &self.renderer_path,
@@ -363,11 +369,11 @@ impl Supervisor {
                         "the session is still locked, so generation {replacement_generation_id} will be asked to retake the lock once it connects"
                     );
                 }
-                None
+                false
             }
             Err(err) => {
                 eprintln!("could not spawn a replacement renderer: {err}");
-                Some(Shutdown::Requested)
+                true
             }
         }
     }

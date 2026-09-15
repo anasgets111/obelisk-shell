@@ -644,7 +644,7 @@ pub fn run(
         // SAFETY: this is the context every paint bound, on the one thread that ever bound it.
         unsafe { app.shader_stage.destroy(gl) };
     }
-    Ok(())
+    Err("stopped on an EGL/GPU failure, the only thing that sets `app.exit`".into())
 }
 
 impl ProvidesRegistryState for App {

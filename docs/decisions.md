@@ -1275,6 +1275,9 @@ second converter would disagree on null. Decoding null succeeds with nil and no 
 4. Reacquire an active lock on replacement, with a new acquisition identity, only if the on-disk
 config still passes the single-authentication-field predicate. Log denied takeover.
 
+Amendment to decision 3: after three deaths in 60 seconds the Supervisor waits 30 seconds with a
+fresh window instead of exiting; giving up left a locked session blank when a game took the VRAM.
+
 Nested niri takeover was measured working; other compositors may refuse it. Do not pin an older
 config silently, restart the whole stack and lose lock knowledge, or ask a dead client to recover
 itself. Replacement loses named state. Supervisor death remained unhandled in this pass.
@@ -1295,7 +1298,7 @@ session. Compositor startup commands alone do not supervise them.
 Rejected: reconnect to fresh Supervisor state or let the Renderer spawn its own authority. A
 persistent lock marker was not built yet.
 
-Decision 4 is superseded, and 3 keeps only its exit code. Nothing restarts the pair; the service
+Decision 4 is superseded, and 3 by the ADR-0058 amendment. Nothing restarts the pair; the service
 unit is deleted.
 
 ## 0060. A restarted Supervisor learns the session was locked from a file in the runtime directory
