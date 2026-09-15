@@ -23,6 +23,13 @@ local idle = require("lib.idle")
 local store = require("lib.store")
 local compositor = require("lib.compositor")
 
+-- No notification sound while nobody can see the popup; critical still sounds (ADR-0033).
+local function sync_notification_quiet()
+    local lock = obelisk.lock:get()
+    obelisk.notifications:invoke("set_quiet", idle.blanked:get() or (lock ~= nil and lock.active))
+end
+obelisk.lock:on_change(sync_notification_quiet)
+
 -- `CompositorService.setDisplaysPowered`, spelled per compositor in `lib.compositor`. Pair it with
 -- `KeyboardBacklightService.setBlanked`: a lit keyboard under a dark screen means blanking stopped
 -- halfway. `backlight_pct` is `-1` without a device; setting it is a dropped write.
@@ -36,6 +43,7 @@ local function set_displays_powered(powered)
         return
     end
     idle.blanked:set(not powered)
+    sync_notification_quiet()
     obelisk.keyboard:invoke("set_backlight", powered and 100 or 0)
 end
 

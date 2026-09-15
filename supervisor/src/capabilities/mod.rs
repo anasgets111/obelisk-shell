@@ -268,7 +268,7 @@ pub struct Capabilities {
     idle_tx: UnboundedSender<shared::IdleEvent>,
     /// Shared Supervisor system bus (ADR-0034); session-bus capabilities open their own.
     connection: zbus::Connection,
-    sound_tx: std::sync::mpsc::Sender<PathBuf>,
+    sound_tx: std::sync::mpsc::SyncSender<PathBuf>,
     /// Mixer privacy channel (ADR-0034, ADR-0137). `audio` or `privacy` may start the mixer first;
     /// mixer owns the sender and privacy the receiver.
     privacy_tx: Option<UnboundedSender<PrivacySources>>,
@@ -280,7 +280,7 @@ impl Capabilities {
     /// `obelisk` member (ADR-0070 decision 1).
     pub fn new(
         connection: zbus::Connection,
-        sound_tx: std::sync::mpsc::Sender<PathBuf>,
+        sound_tx: std::sync::mpsc::SyncSender<PathBuf>,
         idle_tx: UnboundedSender<shared::IdleEvent>,
     ) -> (Self, Signals) {
         let (senders, signals) = Senders::channels();

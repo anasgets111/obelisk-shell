@@ -23,7 +23,7 @@ use super::queue::{
     Expiry, QueueCleanup, expire_entry, feed_view, next_incarnation, remove_by_id, replace_or_push, resolve_expiry,
     resolve_notification_id, resolve_sound_path, should_play_sound,
 };
-use super::sound::SoundSender;
+use super::sound::{SoundSender, default_trusted_sound_roots, resolve_sound_name};
 use super::{
     MAX_ACTION_LABEL_BYTES, MAX_ACTIONS, MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME,
     NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
@@ -90,12 +90,20 @@ struct NotificationsQueueState {
     next_id: u32,
     next_incarnation: u64,
     dnd: bool,
+    quiet: bool,
     sound_registry: HashMap<Urgency, PathBuf>,
 }
 
 impl NotificationsQueueState {
     fn new() -> Self {
-        Self { queue: VecDeque::new(), next_id: 1, next_incarnation: 1, dnd: false, sound_registry: HashMap::new() }
+        Self {
+            queue: VecDeque::new(),
+            next_id: 1,
+            next_incarnation: 1,
+            dnd: false,
+            quiet: false,
+            sound_registry: HashMap::new(),
+        }
     }
 }
 
@@ -128,6 +136,7 @@ pub struct NotificationsController {
     events: UnboundedSender<NotificationsSignal>,
     sound_tx: SoundSender,
     trusted_roots: Arc<Vec<PathBuf>>,
+    sound_roots: Arc<Vec<PathBuf>>,
     /// Deadline stopping all expiry countdowns, or `None` (ADR-0094). A `watch` wakes spawned
     /// countdowns when it changes; a queue field would only be seen on their next check.
     expiry_hold: watch::Sender<Option<Instant>>,
@@ -170,6 +179,7 @@ impl NotificationsController {
             events,
             sound_tx,
             trusted_roots,
+            sound_roots: Arc::new(default_trusted_sound_roots()),
             expiry_hold: watch::Sender::new(None),
         };
 
@@ -193,6 +203,7 @@ impl NotificationsController {
             events,
             sound_tx,
             trusted_roots: Arc::new(default_trusted_icon_roots()),
+            sound_roots: Arc::new(default_trusted_sound_roots()),
             expiry_hold: watch::Sender::new(None),
         }
     }
@@ -363,10 +374,10 @@ impl NotificationsController {
         let _ = self.events.send(NotificationsSignal::Changed);
     }
 
-    /// `notifications:set_sound(urgency, path)` (ADR-0033) registers a trusted existing path if
-    /// it passes the same path-trust validator as icon references; invalid/untrusted paths log.
+    /// `notifications:set_sound(urgency, path)` (ADR-0033) registers an existing file under the
+    /// sound roots; invalid/untrusted paths log.
     pub fn set_sound(&self, urgency: Urgency, path: &str) {
-        match validate_trusted_path(path, &self.trusted_roots) {
+        match validate_trusted_path(path, &self.sound_roots) {
             Some(validated) => {
                 self.state.lock().unwrap().sound_registry.insert(urgency, validated);
             }
@@ -380,6 +391,12 @@ impl NotificationsController {
     pub fn set_dnd(&self, enabled: bool) {
         self.state.lock().unwrap().dnd = enabled;
         let _ = self.events.send(NotificationsSignal::Changed);
+    }
+
+    /// `notifications:set_quiet(enabled)` gates sound like DND, for a config's own rules (locked,
+    /// displays off); not in the snapshot, so it never shows as the user's DND.
+    pub fn set_quiet(&self, enabled: bool) {
+        self.state.lock().unwrap().quiet = enabled;
     }
 
     /// `notifications:hold_expiry(seconds)` (ADR-0094) pauses all pending countdowns; `0` releases
@@ -500,6 +517,7 @@ impl NotificationsController {
         let icon_data = hints.get("icon_data").and_then(decode_raw_image_data);
         let suppress_sound = hints.get("suppress-sound").and_then(value_as_bool).unwrap_or(false);
         let sound_file = hints.get("sound-file").and_then(value_as_str).map(str::to_string);
+        let sound_name = hints.get("sound-name").and_then(value_as_str).map(str::to_string);
 
         let (id, incarnation) = {
             let mut state = self.state.lock().unwrap();
@@ -565,17 +583,18 @@ impl NotificationsController {
             });
         }
 
-        let (dnd, tier_default_sound) = {
+        let (silenced, tier_default_sound) = {
             let state = self.state.lock().unwrap();
-            (state.dnd, state.sound_registry.get(&urgency).cloned())
+            (state.dnd || state.quiet, state.sound_registry.get(&urgency).cloned())
         };
         let client_sound_file =
-            sound_file.and_then(|path| validate_trusted_path(strip_file_uri(&path), &self.trusted_roots));
-        let sound_path = resolve_sound_path(suppress_sound, client_sound_file, tier_default_sound);
-        if should_play_sound(dnd, urgency, sound_path.is_some())
+            sound_file.and_then(|path| validate_trusted_path(strip_file_uri(&path), &self.sound_roots));
+        let named_sound = sound_name.and_then(|name| resolve_sound_name(&name, &self.sound_roots));
+        let sound_path = resolve_sound_path(suppress_sound, client_sound_file, named_sound, tier_default_sound);
+        if should_play_sound(silenced, urgency, sound_path.is_some())
             && let Some(sound_path) = sound_path
         {
-            let _ = self.sound_tx.send(sound_path);
+            let _ = self.sound_tx.try_send(sound_path);
         }
 
         id
@@ -919,7 +938,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hold_longer_than_the_cap_is_clamped_to_it() {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (sound_tx, _sound_rx) = std::sync::mpsc::channel();
+        let (sound_tx, _sound_rx) = std::sync::mpsc::sync_channel(1);
         let controller = NotificationsController::inert(events, sound_tx);
 
         let before = Instant::now();

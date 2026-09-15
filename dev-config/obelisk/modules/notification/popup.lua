@@ -10,6 +10,12 @@ local util = require("lib.util")
 local ui = require("lib.ui_state")
 local notification_card = require("components.notification_card")
 
+-- Sounds as `NotificationService.qml` played them; the Supervisor is silent until a tier is set.
+local SOUNDS = "/usr/share/sounds/freedesktop/stereo/"
+obelisk.notifications:invoke("set_sound", "low", SOUNDS .. "message.oga")
+obelisk.notifications:invoke("set_sound", "normal", SOUNDS .. "message.oga")
+obelisk.notifications:invoke("set_sound", "critical", SOUNDS .. "bell.oga")
+
 -- Visible stack count matches `maxVisibleNotifications`. The feed carries twenty, too many
 -- for a screen; the rest belong one click away in history.
 local MAX_CARDS = 4

@@ -759,6 +759,15 @@ sound-name without theme resolution. Playback uses an internal PipeWire channel.
 global, gates only sound and resets on restart. Critical notifications bypass DND and automatic
 expiry; Lua owns popup policy.
 
+Amended: sound-name resolves to the freedesktop theme's `sounds/freedesktop/stereo/<name>.oga`, only
+in place of a configured urgency sound, so a config that registers none stays silent. set_sound,
+sound-file and sound-name share sound roots (`/usr/share`, `/usr/local/share`, `/opt`,
+`$XDG_DATA_HOME`), kept apart from the icon roots. Playback decodes Ogg Vorbis only, what the theme
+ships, capped at 4 MiB, 30 seconds, two channels and 8-192 kHz; one sound waits behind the one
+playing and later ones drop, and playback gives up after the sound's length plus two seconds.
+`set_quiet` gates non-critical sounds like DND without changing it, so a config can stay silent while
+locked or blanked. Accepted gap: a client that plays its own sound is heard twice.
+
 Use snapshots because each mutation changes feed or DND state. A 20-entry feed views a 100-entry
 FIFO so actions resolve outside the feed. Replacement without a fresh image deletes the old spool;
 eviction deletes the evicted image. Historical spool:

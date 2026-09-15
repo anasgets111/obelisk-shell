@@ -28,17 +28,18 @@ pub(super) fn should_play_sound(dnd: bool, urgency: Urgency, sound_registered: b
 }
 
 /// Selects one `Notify` sound (ADR-0033): `suppress` wins; otherwise `client_sound_file`, already
-/// validated through the same path-trust boundary as `image-path`, beats the tier default.
-/// `hints["sound-name"]` is not honored; DND/urgency is separate.
+/// validated against the sound roots, beats the tier default. `sound_name` only replaces a tier
+/// default the config registered, so no config stays silent. DND/urgency is separate.
 pub(super) fn resolve_sound_path(
     suppress: bool,
     client_sound_file: Option<PathBuf>,
+    sound_name: Option<PathBuf>,
     tier_default: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if suppress {
         return None;
     }
-    client_sound_file.or(tier_default)
+    client_sound_file.or_else(|| tier_default.map(|tier| sound_name.unwrap_or(tier)))
 }
 
 // Queue mutation is pure `VecDeque` logic; callers delete reported orphaned icons.
@@ -220,31 +221,39 @@ mod tests {
         let client = Some(PathBuf::from("/usr/share/sounds/client.wav"));
         let tier = Some(PathBuf::from("/usr/share/sounds/tier.wav"));
         assert_eq!(
-            resolve_sound_path(true, client.clone(), tier.clone()),
+            resolve_sound_path(true, client.clone(), None, tier.clone()),
             None,
             "suppress-sound must force silence even with both a client file and a tier default present"
         );
-        assert_eq!(resolve_sound_path(true, client, None), None);
-        assert_eq!(resolve_sound_path(true, None, tier), None);
-        assert_eq!(resolve_sound_path(true, None, None), None);
+        assert_eq!(resolve_sound_path(true, client, None, None), None);
+        assert_eq!(resolve_sound_path(true, None, None, tier), None);
+        assert_eq!(resolve_sound_path(true, None, None, None), None);
     }
 
     #[test]
     fn resolve_sound_path_prefers_the_client_file_over_the_tier_default() {
         let client = Some(PathBuf::from("/usr/share/sounds/client.wav"));
         let tier = Some(PathBuf::from("/usr/share/sounds/tier.wav"));
-        assert_eq!(resolve_sound_path(false, client.clone(), tier), client);
+        assert_eq!(resolve_sound_path(false, client.clone(), None, tier), client);
     }
 
     #[test]
     fn resolve_sound_path_falls_back_to_the_tier_default_without_a_client_file() {
         let tier = Some(PathBuf::from("/usr/share/sounds/tier.wav"));
-        assert_eq!(resolve_sound_path(false, None, tier.clone()), tier);
+        assert_eq!(resolve_sound_path(false, None, None, tier.clone()), tier);
+    }
+
+    #[test]
+    fn resolve_sound_path_plays_a_sound_name_only_in_place_of_a_registered_tier() {
+        let named = Some(PathBuf::from("/usr/share/sounds/freedesktop/stereo/bell.oga"));
+        let tier = Some(PathBuf::from("/usr/share/sounds/tier.oga"));
+        assert_eq!(resolve_sound_path(false, None, named.clone(), tier), named);
+        assert_eq!(resolve_sound_path(false, None, named, None), None, "no registered tier stays silent");
     }
 
     #[test]
     fn resolve_sound_path_is_none_when_nothing_is_available() {
-        assert_eq!(resolve_sound_path(false, None, None), None);
+        assert_eq!(resolve_sound_path(false, None, None, None), None);
     }
 
     #[test]

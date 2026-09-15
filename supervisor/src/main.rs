@@ -249,7 +249,7 @@ async fn run_supervisor() -> Result<Shutdown, Box<dyn Error>> {
 
     // Notifications' sound player (ADR-0033): one `std::sync::mpsc` recv loop with no connection,
     // so it stays eager and config cannot gate it.
-    let (sound_tx, sound_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let (sound_tx, sound_rx) = std::sync::mpsc::sync_channel::<PathBuf>(1);
     std::thread::spawn(move || capabilities::notifications::run_sound_player(sound_rx));
 
     // Idle (ADR-0032): notify uses its own Wayland connection so idle authority survives Renderer

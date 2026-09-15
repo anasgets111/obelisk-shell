@@ -1,60 +1,71 @@
-//! Testable WAV decode plus a dedicated one-shot PipeWire playback thread. Split from
+//! Testable Ogg Vorbis decode plus a dedicated one-shot PipeWire playback thread. Split from
 //! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
 use std::path::{Path, PathBuf};
 
 use pipewire as pw;
 
-pub type SoundSender = std::sync::mpsc::Sender<PathBuf>;
+use super::icon::validate_trusted_path;
 
-#[derive(Debug, Clone, PartialEq)]
-struct DecodedWav {
+/// One slot: a sound arriving mid-play waits, so a critical one is not lost; a burst plays at most two.
+pub type SoundSender = std::sync::mpsc::SyncSender<PathBuf>;
+
+struct DecodedSound {
     channels: u32,
     sample_rate: u32,
     samples: Vec<i16>,
 }
 
-#[derive(Debug)]
-enum SoundDecodeError {
-    Wav(hound::Error),
-    UnsupportedFormat { format: hound::SampleFormat, bits: u16 },
+const MAX_SOUND_FILE_BYTES: u64 = 4 << 20;
+const MAX_SOUND_SECONDS: usize = 30;
+
+/// Roots for `set_sound`, `sound-file` and `sound-name`, apart from the icon roots so `image-path`
+/// never reaches `/opt`. Apps ship sounds under `/usr/share/<app>/`; the decode caps bound the rest.
+pub(super) fn default_trusted_sound_roots() -> Vec<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    ["/usr/share", "/usr/local/share", "/opt"].into_iter().map(PathBuf::from).chain(data_home).collect()
 }
 
-impl std::fmt::Display for SoundDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Wav(err) => write!(f, "{err}"),
-            Self::UnsupportedFormat { format, bits } => {
-                write!(f, "unsupported WAV sample format {format:?} at {bits} bits per sample")
-            }
+/// A `sound-name` as the freedesktop theme's `<name>.oga`: the only theme installed, so no
+/// `index.theme` walk. Any client sends it, so no `/` or leading `.` leaves the theme directory.
+pub(super) fn resolve_sound_name(name: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    if name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    roots.iter().find_map(|root| {
+        validate_trusted_path(root.join(format!("sounds/freedesktop/stereo/{name}.oga")).to_str()?, roots)
+    })
+}
+
+/// ponytail: Ogg Vorbis only, what the freedesktop theme ships; WAV, FLAC or Opus need another
+/// decoder. Any client can name the file, so size, length, channels, rate and chaining are capped.
+fn decode_sound(path: &Path) -> Result<DecodedSound, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_SOUND_FILE_BYTES {
+        return Err("larger than 4 MiB".into());
+    }
+    let mut reader = lewton::inside_ogg::OggStreamReader::new(std::io::BufReader::new(file))?;
+    let channels = u32::from(reader.ident_hdr.audio_channels);
+    let sample_rate = reader.ident_hdr.audio_sample_rate;
+    if channels > 2 || !(8_000..=192_000).contains(&sample_rate) {
+        return Err(format!("unsupported {channels} channels at {sample_rate} Hz").into());
+    }
+    // lewton silently rereads headers for a chained stream, which can change channels mid-file.
+    let serial = reader.stream_serial();
+    let mut samples = Vec::new();
+    while let Some(packet) = reader.read_dec_packet_itl()? {
+        if reader.stream_serial() != serial {
+            return Err("chained Ogg stream".into());
+        }
+        samples.extend(packet);
+        if samples.len() > MAX_SOUND_SECONDS * sample_rate as usize * channels as usize {
+            return Err("longer than 30 seconds".into());
         }
     }
-}
-
-impl std::error::Error for SoundDecodeError {}
-
-impl From<hound::Error> for SoundDecodeError {
-    fn from(err: hound::Error) -> Self {
-        Self::Wav(err)
-    }
-}
-
-/// ponytail: WAV only, with 16-bit integer or 32-bit float samples. `hound` is a small pure-Rust
-/// decoder with no transitive bloat, enough for reference daemons' short UI sounds; defer
-/// MP3/OGG/FLAC until a Lua config needs one. Other depths fail via
-/// [`SoundDecodeError::UnsupportedFormat`].
-fn decode_wav_samples(path: &Path) -> Result<DecodedWav, SoundDecodeError> {
-    let mut reader = hound::WavReader::open(path)?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => reader.samples::<i16>().collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Float, 32) => reader
-            .samples::<f32>()
-            .map(|sample| sample.map(|value| (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16))
-            .collect::<Result<_, _>>()?,
-        (format, bits) => return Err(SoundDecodeError::UnsupportedFormat { format, bits }),
-    };
-    Ok(DecodedWav { channels: u32::from(spec.channels), sample_rate: spec.sample_rate, samples })
+    Ok(DecodedSound { channels, sample_rate, samples })
 }
 
 /// Decodes and plays each request through a fresh one-shot PipeWire stream (ADR-0033: no
@@ -64,11 +75,11 @@ fn decode_wav_samples(path: &Path) -> Result<DecodedWav, SoundDecodeError> {
 /// `pw::stream::Stream` writes audio, while `pw::registry` listens for nodes.
 ///
 /// ponytail: real PipeWire I/O is live-test-only, like idle's raw Wayland dispatch (ADR-0032); this
-/// and [`play_one_wav`] have no unit tests. [`decode_wav_samples`] and [`should_play_sound`] are
+/// and [`play_one`] have no unit tests. [`decode_sound`] and [`should_play_sound`] are
 /// the tested seams around it.
 pub fn run_sound_player(requests: std::sync::mpsc::Receiver<PathBuf>) {
     while let Ok(path) = requests.recv() {
-        if let Err(err) = play_one_wav(&path) {
+        if let Err(err) = play_one(&path) {
             eprintln!("notifications: failed to play sound {path:?}: {err}");
         }
     }
@@ -83,8 +94,8 @@ struct PlaybackState {
 
 const CHAN_SIZE: usize = std::mem::size_of::<i16>();
 
-fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let decoded = decode_wav_samples(path)?;
+fn play_one(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let decoded = decode_sound(path)?;
     if decoded.samples.is_empty() {
         return Ok(());
     }
@@ -105,6 +116,9 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    let length = std::time::Duration::from_secs_f64(
+        decoded.samples.len() as f64 / f64::from(decoded.sample_rate * decoded.channels),
+    );
     let playback = PlaybackState {
         samples: decoded.samples,
         position: 0,
@@ -151,11 +165,15 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = stride as _;
                 *chunk.size_mut() = (stride * n_frames) as _;
-                if state.position >= state.samples.len() {
-                    state.main_loop.quit();
+                // Quitting here dropped what PipeWire had not played yet: all of a 0.14s bell. Queue
+                // the last buffer, then drain; `drained` quits on the main loop once it is heard.
+                drop(buffer);
+                if n_frames > 0 && state.position >= state.samples.len() {
+                    let _ = stream.flush(true);
                 }
             }
         })
+        .drained(|_, state| state.main_loop.quit())
         .register()?;
 
     let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
@@ -193,6 +211,12 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         &mut params,
     )?;
 
+    // A stream that never plays (no sink, a stream error, unmapped buffers) never drains.
+    let deadline = main_loop.loop_().add_timer({
+        let main_loop = main_loop.clone();
+        move |_| main_loop.quit()
+    });
+    deadline.update_timer(Some(length + std::time::Duration::from_secs(2)), None).into_sync_result()?;
     main_loop.run();
     Ok(())
 }
@@ -201,70 +225,29 @@ fn play_one_wav(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn write_test_wav(path: &Path, spec: hound::WavSpec, samples: &[i16]) {
-        let mut writer = hound::WavWriter::create(path, spec).unwrap();
-        for &sample in samples {
-            writer.write_sample(sample).unwrap();
-        }
-        writer.finalize().unwrap();
+    #[test]
+    fn decode_sound_reads_the_system_sound_theme() {
+        let decoded = decode_sound(Path::new("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"))
+            .expect("must decode the freedesktop theme");
+        assert!(decoded.channels <= 2 && !decoded.samples.is_empty());
     }
 
     #[test]
-    fn decode_wav_samples_round_trips_16_bit_int_pcm() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: 44100,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let samples = [100i16, -100, 200, -200];
-        write_test_wav(&path, spec, &samples);
-
-        let decoded = decode_wav_samples(&path).expect("must decode a real 16-bit WAV file");
-        assert_eq!(decoded.channels, 2);
-        assert_eq!(decoded.sample_rate, 44100);
-        assert_eq!(decoded.samples, samples);
+    fn decode_sound_refuses_a_file_over_the_size_cap_before_decoding() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_SOUND_FILE_BYTES + 1).unwrap();
+        assert_eq!(decode_sound(file.path()).err().map(|err| err.to_string()), Some("larger than 4 MiB".into()));
     }
 
     #[test]
-    fn decode_wav_samples_decodes_32_bit_float_pcm() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 22050,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        writer.write_sample(0.5f32).unwrap();
-        writer.write_sample(-0.5f32).unwrap();
-        writer.finalize().unwrap();
-
-        let decoded = decode_wav_samples(&path).expect("must decode a real 32-bit float WAV file");
-        assert_eq!(decoded.channels, 1);
-        assert_eq!(decoded.samples.len(), 2);
-        assert!(
-            decoded.samples[0] > 16000 && decoded.samples[0] < 17000,
-            "0.5 should map close to i16::MAX/2, got {}",
-            decoded.samples[0]
-        );
-    }
-
-    #[test]
-    fn decode_wav_samples_rejects_an_unsupported_bit_depth() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sound.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 8000,
-            bits_per_sample: 8,
-            sample_format: hound::SampleFormat::Int,
-        };
-        write_test_wav(&path, spec, &[]);
-
-        assert!(decode_wav_samples(&path).is_err());
+    fn resolve_sound_name_stays_inside_the_theme_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let stereo = root.path().join("sounds/freedesktop/stereo");
+        std::fs::create_dir_all(&stereo).unwrap();
+        std::fs::write(stereo.join("bell.oga"), b"").unwrap();
+        std::fs::write(root.path().join("other.oga"), b"").unwrap();
+        let roots = [root.path().to_path_buf()];
+        assert_eq!(resolve_sound_name("bell", &roots), Some(stereo.join("bell.oga").canonicalize().unwrap()));
+        assert_eq!(resolve_sound_name("../../../other", &roots), None, "a trusted root is not the theme");
     }
 }

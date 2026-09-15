@@ -1,8 +1,8 @@
 //! Notifications capability (`obelisk.notifications`, ADR-0033). Hosts
 //! `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view, global
 //! DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a tier
-//! default for one notification; `suppress-sound` wins; `sound-name` is unhonored because no
-//! theme-resolution capability exists.
+//! default for one notification; `suppress-sound` wins; `sound-name` picks a freedesktop theme
+//! sound in place of a registered tier default.
 //!
 //! Like `dbus::tray`, a controller owns writes, degrades to inert without the session bus, and
 //! delegates decisions to pure helpers. Queue/DND are global Supervisor state (ADR-0033), not
@@ -40,10 +40,12 @@ pub enum NotificationsAction {
     InvokeAction,
     /// (id: integer, text: string) Sends reply text to a notification with `has_reply`.
     Reply,
-    /// (urgency: "low"|"normal"|"critical", path: string) Registers a sound file for an urgency tier.
+    /// (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis sound file for an urgency tier.
     SetSound,
     /// (enabled: boolean) Gates non-critical notification sounds.
     SetDnd,
+    /// (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
+    SetQuiet,
     /// (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
     HoldExpiry,
 }
@@ -89,6 +91,10 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
             Some(enabled) => controller.set_dnd(enabled),
             None => crate::log_malformed_command(params),
         },
+        NotificationsAction::SetQuiet => match crate::capabilities::parse_bool_arg(&params.arguments) {
+            Some(enabled) => controller.set_quiet(enabled),
+            None => crate::log_malformed_command(params),
+        },
         NotificationsAction::HoldExpiry => match parse_hold_expiry_args(&params.arguments) {
             Some(seconds) => controller.hold_expiry(seconds),
             None => crate::log_malformed_command(params),
@@ -129,8 +135,8 @@ const MAX_IMAGE_DIMENSION: i32 = 128;
 const DEFAULT_EXPIRE_MS: u64 = 5000;
 
 /// `GetCapabilities`'s exact 10 strings (ADR-0033). Only `icon-multi` is absent because `Notify`
-/// has no multi-size wire field. `sound` honors `sound-file`/tier default via
-/// [`should_play_sound`]; only `sound-name` is unhonored.
+/// has no multi-size wire field. `sound` honors `sound-file`, `sound-name` and the tier default via
+/// [`should_play_sound`].
 const NOTIFICATIONS_CAPABILITIES: [&str; 10] = [
     "action-icons",
     "actions",
