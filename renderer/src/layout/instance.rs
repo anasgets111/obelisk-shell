@@ -175,14 +175,19 @@ pub struct InstanceReconcile {
 /// Diffs the current instance set against [`expand_instances`]' output. Retained instances carry
 /// over unchanged: `set_instance_size` may have replaced the seeded output size with the
 /// compositor's configured size, such as a bar's 1920x32 on a 1920x1080 output; re-expansion
-/// would persist the wrong size until a configure that never comes.
-pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance]) -> InstanceReconcile {
+/// would persist the wrong size until a configure that never comes. A `rebuilt` declaration changed a
+/// creation-time field, so its instances keep their ids but are both removed and added.
+pub fn reconcile_instances(
+    current: &[SurfaceInstance],
+    fresh: &[SurfaceInstance],
+    rebuilt: &[String],
+) -> InstanceReconcile {
     let mut instances = Vec::with_capacity(fresh.len());
     let mut added = Vec::new();
     for instance in fresh {
         match current.iter().find(|existing| existing.instance_id == instance.instance_id) {
-            Some(existing) => instances.push(existing.clone()),
-            None => {
+            Some(existing) if !rebuilt.contains(&existing.declared_id) => instances.push(existing.clone()),
+            _ => {
                 instances.push(instance.clone());
                 added.push(instance.clone());
             }
@@ -190,7 +195,10 @@ pub fn reconcile_instances(current: &[SurfaceInstance], fresh: &[SurfaceInstance
     }
     let removed = current
         .iter()
-        .filter(|existing| !fresh.iter().any(|instance| instance.instance_id == existing.instance_id))
+        .filter(|existing| {
+            rebuilt.contains(&existing.declared_id)
+                || !fresh.iter().any(|instance| instance.instance_id == existing.instance_id)
+        })
         .map(|existing| existing.instance_id.clone())
         .collect();
     InstanceReconcile { instances, added, removed }
@@ -400,7 +408,7 @@ mod tests {
         let fresh =
             expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0), output("DP-1", 3840.0, 2160.0)]);
 
-        let reconcile = reconcile_instances(&current, &fresh);
+        let reconcile = reconcile_instances(&current, &fresh, &[]);
 
         assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
         assert!(reconcile.removed.is_empty());
@@ -415,7 +423,7 @@ mod tests {
         let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
         let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
 
-        let reconcile = reconcile_instances(&current, &fresh);
+        let reconcile = reconcile_instances(&current, &fresh, &[]);
 
         assert_eq!(reconcile.instances, current);
         assert!(reconcile.added.is_empty());
@@ -430,11 +438,26 @@ mod tests {
         ];
         let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
 
-        let reconcile = reconcile_instances(&current, &fresh);
+        let reconcile = reconcile_instances(&current, &fresh, &[]);
 
         assert_eq!(reconcile.removed, ["bar@DP-1"]);
         assert!(reconcile.added.is_empty());
         assert_eq!(reconcile.instances, [current[0].clone()]);
+    }
+
+    #[test]
+    fn a_rebuilt_declaration_replaces_its_instances_under_the_same_ids_and_leaves_the_rest() {
+        let current = [
+            configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0),
+            configured("dock@eDP-1", "dock", "eDP-1", 64.0, 1080.0),
+        ];
+        let fresh = expand_instances(&[spec("bar", "All"), spec("dock", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
+
+        let reconcile = reconcile_instances(&current, &fresh, &["bar".to_string()]);
+
+        assert_eq!(reconcile.removed, ["bar@eDP-1"]);
+        assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@eDP-1"]);
+        assert_eq!(reconcile.instances[1], current[1], "an untouched declaration keeps its configured size");
     }
 
     #[test]
@@ -444,7 +467,7 @@ mod tests {
             configured("dock@eDP-1", "dock", "eDP-1", 64.0, 1080.0),
         ];
 
-        let reconcile = reconcile_instances(&current, &[]);
+        let reconcile = reconcile_instances(&current, &[], &[]);
 
         assert_eq!(reconcile.removed, ["bar@eDP-1", "dock@eDP-1"]);
         assert!(reconcile.added.is_empty());
@@ -456,7 +479,7 @@ mod tests {
         let current = [configured("bar@eDP-1", "bar", "eDP-1", 1920.0, 32.0)];
         let fresh = expand_instances(&[spec("bar", "All")], &[output("DP-1", 3840.0, 2160.0)]);
 
-        let reconcile = reconcile_instances(&current, &fresh);
+        let reconcile = reconcile_instances(&current, &fresh, &[]);
 
         assert_eq!(reconcile.added.iter().map(|i| i.instance_id.as_str()).collect::<Vec<_>>(), ["bar@DP-1"]);
         assert_eq!(reconcile.removed, ["bar@eDP-1"]);
@@ -467,7 +490,7 @@ mod tests {
     fn a_first_expansion_against_an_empty_current_set_is_all_added() {
         let fresh = expand_instances(&[spec("bar", "All")], &[output("eDP-1", 1920.0, 1080.0)]);
 
-        let reconcile = reconcile_instances(&[], &fresh);
+        let reconcile = reconcile_instances(&[], &fresh, &[]);
 
         assert_eq!(reconcile.added, fresh);
         assert_eq!(reconcile.instances, fresh);

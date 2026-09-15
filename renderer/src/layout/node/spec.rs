@@ -72,10 +72,9 @@ impl SurfaceSpec {
     }
 }
 
-/// Fields `crate::socket::handle_reevaluate` compares for generation swaps (ADR-0001). A `panel`
-/// carries all five creation-time topology fields; `window`, `popup`, and `lock` carry only `id`
-/// because their other fields update live or rebuild per open. Adding/removing any role still
-/// changes topology (ADR-0049 decision 3); lock removal queues the swap until unlock (ADR-0042).
+/// A declaration's creation-time fields: one whose fingerprint changed is rebuilt in place
+/// (ADR-0216). A `panel` carries all five topology fields; `window`, `popup`, and `lock` carry only
+/// `id` because their other fields update live or rebuild per open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceFingerprint {
     Panel(SurfaceTopology),

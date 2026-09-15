@@ -132,15 +132,8 @@ impl App {
     /// Handles an output appearing, changing, or leaving: update `screens` only when its payload
     /// changed. `update_output` also fires for things `screens` does not carry; re-running the
     /// rest for one would ask the Supervisor for an unjustified reload. Reconcile `monitor = "All"`
-    /// instances in place (ADR-0038 decision 3), then ask the Supervisor for a generation swap
-    /// when a config's `screens` loop changes surface ids
-    /// (ADR-0041 decisions 2-3). Candidates build their own set, so the two paths do not conflict.
-    ///
-    /// ponytail: hotplug inside a Candidate's ready window is unsupported. A late surface would
-    /// trip `SwapFailure::UnexpectedEvidence` after the one-shot `maybe_send_ready_signal`; then
-    /// `RequestReload` is skipped while `SocketCandidateLink::recv_matching` drains
-    /// `inbound_frames`. Window: `SWAP_TIMINGS` seconds.
-    /// Upgrade: defer like `apply_visibility` defers `visible`, when this is hit.
+    /// instances in place (ADR-0038 decision 3), then ask the Supervisor for a reload, which
+    /// catches a config's `screens` loop changing surface ids (ADR-0041 decisions 2-3).
     fn handle_output_change(&mut self, qh: &QueueHandle<App>, departing: Option<&wl_output::WlOutput>) {
         let screens = self.screens(departing);
         // Before the early return: an output arriving during the startup burst changes what the
@@ -157,7 +150,7 @@ impl App {
 
         let specs = self.client.applied_surface_specs();
         let fresh = expand_instances(&specs, &geometries_from(&screens));
-        let reconcile = reconcile_instances(self.client.instances(), &fresh);
+        let reconcile = reconcile_instances(self.client.instances(), &fresh, &[]);
 
         for instance_id in &reconcile.removed {
             self.destroy_surface_by_id(instance_id);
@@ -175,6 +168,48 @@ impl App {
         self.client.set_instances(reconcile.instances);
         self.create_surfaces(qh, &specs, &reconcile.added);
         self.client.request_reload();
+    }
+
+    /// Every `ApplyPendingReload` (ADR-0216). The fresh instances reach the scene before the apply,
+    /// which refuses an instance of a removed declaration; protocol objects change only once it
+    /// succeeds, and an unchanged surface set reconciles to no change.
+    pub(super) fn apply_pending(&mut self, qh: &QueueHandle<App>, sequence: u64) {
+        let apply = shared::ApplyPendingReload { sequence };
+        let Some((specs, rebuilt)) = self.client.pending_surfaces(sequence) else {
+            // Stale: this logs and ignores it.
+            self.client.handle_apply_pending(apply);
+            return;
+        };
+        // A renamed lock's new surface lands on an output niri still counts as locked:
+        // `duplicate_output`, killing the connection under the held lock. Removal is vetoed by the apply.
+        let renames_lock = specs.iter().any(|spec| {
+            matches!(spec, crate::layout::node::SurfaceSpec::Lock(_))
+                && rebuilt.iter().any(|id| id == spec.declared_id())
+        });
+        if renames_lock && self.session_lock.is_some() {
+            eprintln!(
+                "[obelisk-renderer] this reload renames the lock surface; refused while locked, save again after unlock"
+            );
+            crate::lua::timer::discard(self.client.lua());
+            return;
+        }
+        let fresh = expand_instances(&specs, &geometries_from(&self.screens(None)));
+        let reconcile = reconcile_instances(self.client.instances(), &fresh, &rebuilt);
+        let previous = self.client.instances().to_vec();
+        self.client.set_instances(reconcile.instances);
+        if !self.client.handle_apply_pending(apply) {
+            self.client.set_instances(previous);
+            return;
+        }
+        for instance_id in &reconcile.removed {
+            if reconcile.added.iter().any(|added| &added.instance_id == instance_id) {
+                // Same id: keep the tree the apply just built.
+                self.untrack_surface(instance_id);
+            } else {
+                self.destroy_surface_by_id(instance_id);
+            }
+        }
+        self.create_surfaces(qh, &specs, &reconcile.added);
     }
 }
 

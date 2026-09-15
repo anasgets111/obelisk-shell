@@ -579,15 +579,21 @@ impl App {
     /// `zwlr_layer_surface_v1::closed` and `OutputHandler::output_destroyed`, in either order; the
     /// no-op handles whichever callback arrives second.
     pub(super) fn destroy_surface_by_id(&mut self, instance_id: &str) {
+        self.untrack_surface(instance_id);
+        // `App::surfaces` and `Scene::surfaces` are different maps. Also for an instance never
+        // tracked, such as a panel refused at creation, which still has a tree.
+        self.client.forget_surface(instance_id);
+    }
+
+    /// Drops one tracked surface's role object and entry, keeping its retained tree for a same-id
+    /// rebuild (ADR-0216).
+    pub(super) fn untrack_surface(&mut self, instance_id: &str) {
         let Some(index) = self.surfaces.iter().position(|s| s.surface_id == instance_id) else {
             return;
         };
-        // Before `remove` invalidates indices and `forget_surface` takes the tree the scrubs read.
+        // Before `remove` invalidates indices; the scrubs read the tree.
         self.drop_role_object(index);
-        let TrackedSurface { surface_id, .. } = self.surfaces.remove(index);
-        // `App::surfaces` and `Scene::surfaces` are different maps; dropping the tracked surface
-        // leaves the retained tree behind unless it is dropped here too.
-        self.client.forget_surface(&surface_id);
+        self.surfaces.remove(index);
     }
 
     /// A configure records the compositor size, updates scene geometry and exclusive zone, binds

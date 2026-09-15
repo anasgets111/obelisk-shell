@@ -4851,3 +4851,31 @@ Amends ADR-0037 and ADR-0052 decision 1.
 3. The stub generator writes one typed `invoke` overload per variant.
 
 38 hand parsers coerced silently 3 times (0eec577). Rejected: named-argument tables, an IDL change.
+
+## 0216. A topology edit rebuilds the changed surfaces in place, not in a new generation
+
+Supersedes ADR-0001's swap path, ADR-0025, ADR-0038 decision 2's swap trigger and ADR-0042's queue of
+topology edits until unlock.
+
+1. **Every successful evaluation reports `Unchanged`.** The Wayland loop takes each
+   `ApplyPendingReload`: it expands instances from the pending specs, applies the scene against
+   them, then destroys removed surfaces and creates added ones. A declaration whose fingerprint
+   changed keeps its instance ids and is rebuilt.
+2. **Protocol objects change only after the scene apply succeeds.** A failed apply restores the
+   previous instances and leaves every surface as it was.
+3. **It applies while locked, except an edit that recreates a lock surface.** `lock_stays_authenticatable`
+   vets the apply as it vets any reload. Renaming the lock declaration recreates its surface, and
+   niri answered that with `duplicate_output` on an output it still counted as locked, killing the
+   connection under the held lock (measured live). That apply is refused with its timers; saving
+   again after unlock applies it. ponytail: editing the lock while locked needs ssh or a script, so
+   nothing re-applies it on unlock.
+4. **What changes for the user:** named state, timers and `process.run` children survive a topology
+   edit. A rebuilt surface shows a gap until its first configure, which the swap's presentation
+   barrier avoided; only the changed surfaces pay it.
+
+ADR-0001 chose a process boundary because Rust could not safely reconcile live native handles. Since
+then every role is created and destroyed at runtime (ADR-0049, ADR-0088) through one teardown
+(ADR-0213), so a topology edit is the monitor-hotplug path with a different instance set. The swap
+had cost two process handshakes per edit and the bugs of ADR-0156 and ADR-0158.
+
+Not yet: deleting the Supervisor's swap orchestration and the handshake frames, now unreachable.

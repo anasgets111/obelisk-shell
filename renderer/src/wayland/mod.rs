@@ -439,6 +439,7 @@ pub fn run(
             match app.client.handle_frame(frame) {
                 FrameOutcome::Handled => {}
                 FrameOutcome::ActivateDraw(nonce) => draw_nonces.push(nonce),
+                FrameOutcome::ApplyPending(sequence) => app.apply_pending(&qh, sequence),
                 // Service immediately: lock declaration is tracked-surface state, not a
                 // capability-push result (ADR-0052 decision 3), and deferring weakens "secure now".
                 FrameOutcome::SetSessionLock(locked) => {
@@ -595,8 +596,13 @@ pub fn run(
         }
         // This is the flush that actually caught the log out: it propagated, `run` returned, and
         // `App`'s destructor then drove EGL into a compositor that was gone.
-        if let Err(wayland_client::backend::WaylandError::Io(err)) = event_queue.flush() {
-            exit_because_the_compositor_is_gone("flushing the Wayland queue", &err);
+        match event_queue.flush() {
+            Err(wayland_client::backend::WaylandError::Io(err)) => {
+                exit_because_the_compositor_is_gone("flushing the Wayland queue", &err)
+            }
+            // A protocol error has already closed the connection; ignored, this loop spun on it.
+            Err(err) => return Err(err.into()),
+            Ok(()) => {}
         }
         if let Some(guard) = event_queue.prepare_read() {
             let fd = guard.connection_fd();
@@ -624,11 +630,17 @@ pub fn run(
                     .wake(idle_profile::Wake { wayland: wayland_ready, waker: woke && fds[1].any().unwrap_or(false) });
             }
             if woke {
-                if wayland_ready && let Err(wayland_client::backend::WaylandError::Io(err)) = guard.read() {
-                    // The read side, and the one a killed compositor actually reaches first: `poll`
-                    // reports the fd readable because the peer closed it, and the read that follows
-                    // is what sees the broken pipe.
-                    exit_because_the_compositor_is_gone("reading from the Wayland connection", &err);
+                if wayland_ready {
+                    match guard.read() {
+                        // The read side, and the one a killed compositor actually reaches first:
+                        // `poll` reports the fd readable because the peer closed it, and the read
+                        // that follows is what sees the broken pipe.
+                        Err(wayland_client::backend::WaylandError::Io(err)) => {
+                            exit_because_the_compositor_is_gone("reading from the Wayland connection", &err)
+                        }
+                        Err(err) => return Err(err.into()),
+                        Ok(_) => {}
+                    }
                 }
                 // Drain before the turn; a wake arriving during the turn remains counted.
                 waker.drain();
