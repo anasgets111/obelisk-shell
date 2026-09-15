@@ -32,7 +32,8 @@ wallpaper.SHADER_FOLDER = obelisk.config_dir .. "/shaders"
 wallpaper.SHADER_EXTENSIONS = { "frag" }
 wallpaper.NO_SHADER = "fade"
 wallpaper.TRANSITION_MS = 1500
-wallpaper.TRANSITION_EASING = "InOutCubic"
+-- Not `InOutCubic`: 99.6% done at t=0.9, so its last 150ms stalls.
+wallpaper.TRANSITION_EASING = "InOutSine"
 
 -- `AnimatedWallpaper.qml`'s `transitionParams.randomize`: a wipe picks a side; a disc and portal
 -- a centre; stripes pick a count and angle. A shader with no row here -- anything dropped into the
@@ -137,13 +138,28 @@ local function is_fit(value)
     return false
 end
 
+-- ponytail: a deleted file draws only the ground; the VM has no `io`, so only `FOLDER` is checked.
+local function missing_in(f, path)
+    local folder = wallpaper.folder_in(f)
+    if not folder or not folder.ready or path:match("^(.*)/") ~= wallpaper.FOLDER then
+        return false
+    end
+    for _, entry in ipairs(folder.entries) do
+        if entry.path == path then
+            return false
+        end
+    end
+    return true
+end
+
 ---Path for `output` from one stored `wallpapers` table. Pure for one `computed` over every screen.
 ---@param w table|nil The `wallpapers` table, or `nil` before the first push.
 ---@param output string
+---@param f FilesState|nil
 ---@return string
-function wallpaper.path_in(w, output)
+function wallpaper.path_in(w, output, f)
     local stored = w and w[output] and w[output].path
-    if type(stored) == "string" and stored ~= "" then
+    if type(stored) == "string" and stored ~= "" and not missing_in(f, stored) then
         return stored
     end
     return wallpaper.DEFAULT
@@ -166,8 +182,8 @@ end
 
 ---@param output string
 function wallpaper.path_of(output)
-    return store.wallpapers:map(function(w)
-        return wallpaper.path_in(w, output)
+    return computed({ store.wallpapers, obelisk.files }, function(w, f)
+        return wallpaper.path_in(w, output, f)
     end)
 end
 
@@ -203,7 +219,7 @@ end
 ---@param output string
 ---@param path string
 function wallpaper.set(output, path)
-    if path == "" or wallpaper.path_in(store.wallpapers:get(), output) == path then
+    if path == "" or missing_in(obelisk.files:get(), path) or wallpaper.path_in(store.wallpapers:get(), output) == path then
         return
     end
     write(output, { path = path })
