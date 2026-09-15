@@ -362,6 +362,9 @@ backgrounded grandchild in the same group.
 Since built: `process.run`'s Lua binding and a process registry in ADR-0026. ADR-0025 first calls
 `reap_process_group` from the swap orchestrator.
 
+Amended: the post-`SIGKILL` wait has its own 2s ceiling instead of `grace`. SIGKILL cannot be
+ignored, yet at load 200 a killed process outran 100ms and was reported unreapable.
+
 ## 0019. Generation swap control-socket transport and Lua AST evaluation are deferred, not built
 
 Phase 8 ships generation swap ordering and gating only, not the surrounding `services.md` § 14

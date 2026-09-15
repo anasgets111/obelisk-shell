@@ -134,8 +134,7 @@ pub enum ReapOutcome {
 ///
 /// `child` must come from [`spawn_group_leader`]: `child.id()` is the pgid only for a group leader.
 ///
-/// Waits roughly `2 * grace` at most. D-state I/O can defer even SIGKILL indefinitely, so the
-/// post-SIGKILL wait is bounded too.
+/// Waits at most `grace` plus 2s; only D-state I/O outlasts SIGKILL that long (ADR-0018).
 pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Result<ReapOutcome> {
     let pid = child.id().ok_or_else(|| io::Error::other("child has no pid; already reaped"))?;
     let pgid = Pid::from_raw(pid as i32);
@@ -146,7 +145,7 @@ pub async fn reap_process_group(child: &mut Child, grace: Duration) -> io::Resul
     }
 
     signal_group_best_effort(pgid, Signal::SIGKILL)?;
-    match wait_or_classify(child, grace).await? {
+    match wait_or_classify(child, Duration::from_secs(2)).await? {
         TimeoutRace::ActuallyExited(status) => Ok(ReapOutcome::Escalated(status)),
         TimeoutRace::StillRunning => {
             Err(io::Error::other("process group did not exit even after SIGKILL (likely stuck in uninterruptible I/O)"))
