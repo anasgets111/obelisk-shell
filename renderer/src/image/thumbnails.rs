@@ -140,7 +140,7 @@ impl Slot {
         // Free stays right underneath it: a thumbnail bounded by the slot size the caller asked
         // for never approaches the pool budget (ADR-0187).
         let decoded =
-            super::decode_within_limits(&self.path, self.px, super::Charge::Free, &|| true).ok()?.into_rgba8();
+            super::decode_within_limits(&self.path, self.px, super::Charge::Free, &|| true).ok()?.0.into_rgba8();
         let (width, height) = decoded.dimensions();
         Some((decoded.into_raw(), width, height))
     }

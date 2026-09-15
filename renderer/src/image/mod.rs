@@ -198,14 +198,11 @@ struct Job {
 /// A worker waits here until its decode fits, so four wallpapers arriving together decode in turn
 /// rather than all at once, and one large file decodes alone rather than not at all.
 ///
-/// ponytail: this counts the decoder's own output and nothing else. `decode_raster` scales and
-/// converts alongside the buffer it charged for, a finished decode keeps its pixels in the result
-/// channel until `poll` and then in `landed` until the next paint uploads them, and an inline
-/// decode charges without waiting. So the real high-water mark is above `DECODE_POOL_BYTES` by the
-/// largest of those, not equal to it -- which is still the first honest figure this has had, the
-/// per-decode cap it replaced having claimed a pool bound it never enforced. Upgrade path: charge
-/// the permit until `upload_landed` consumes the pixels, which makes the permit outlive the worker
-/// and needs it to travel with the result.
+/// ponytail: a decode is charged twice its output plus an RGBA8 copy, which covers a progressive
+/// JPEG's coefficient planes and the conversion, and `decode_raster` holds the charge until it
+/// returns. A source at the ceiling is charged past the pool and runs alone. Still uncharged: pixels
+/// waiting in the result channel and `landed` for upload, and inline decodes, which never wait.
+/// Upgrade path: hold the permit until `upload_landed` consumes the pixels, so it travels with them.
 #[derive(Default)]
 pub(super) struct Budget {
     in_flight: Mutex<u64>,
@@ -217,8 +214,8 @@ impl Budget {
     ///
     /// A decode is admitted when nothing else is in flight, whatever its size, so nothing is ever
     /// too big to run and no set of waiters can deadlock each other. `decode_within_limits` has
-    /// already refused anything larger than the whole budget, so that case admits one decode at the
-    /// ceiling rather than one above it.
+    /// already refused a source whose output alone is past the whole budget, so a larger charge is
+    /// one decode's working copies, run alone.
     ///
     /// A poisoned lock hands back an uncharged permit and lets the decode through: a decode pool
     /// that has stopped accounting is worth less than a shell that has stopped drawing.
@@ -276,16 +273,16 @@ impl<'a> Charge<'a> {
 /// Whether `bytes` may start decoding with `in_flight` already charged.
 ///
 /// Pure so the rule is testable without threads, which is where the deadlock would be. An empty
-/// budget admits any size: `decode_within_limits` has already refused anything past
-/// [`DECODE_POOL_BYTES`], so this admits at most one decode at the ceiling, and never leaves a
-/// decode that nothing can satisfy waiting on waiters that are all waiting on it.
+/// budget admits any size. `decode_within_limits` has already refused any output past
+/// [`DECODE_POOL_BYTES`], so a larger charge runs only alone, and no decode waits on waiters that
+/// are all waiting on it.
 fn admits(in_flight: u64, bytes: u64) -> bool {
     in_flight == 0 || in_flight + bytes <= DECODE_POOL_BYTES
 }
 
 /// Holds a [`Budget`] charge for as long as the pixels it paid for are being produced. RAII because
 /// `decode_raster` has a dozen `?` exits and every one of them has to give the bytes back.
-struct Permit<'a> {
+pub(super) struct Permit<'a> {
     budget: &'a Budget,
     bytes: u64,
 }
@@ -879,7 +876,7 @@ fn decode_raster(
     }
     // Past the thumbnail branch, so the budget is charged for the source actually decoded and a
     // covering thumbnail is never made to wait for room it does not need (ADR-0187).
-    let decoded = decode_within_limits(path, MAX_DECODE_EDGE, charge, still_wanted)?;
+    let (decoded, _permit) = decode_within_limits(path, MAX_DECODE_EDGE, charge, still_wanted)?;
     let (width, height) = (decoded.width(), decoded.height());
     let (stored_width, stored_height) = stored_size(width, height, box_px);
     // The thumbnail this pass writes is also the best source for the texture it is about to make,
@@ -973,12 +970,12 @@ fn refuse_irregular(path: &Path) -> std::io::Result<()> {
 /// read it looks like, reading the whole compressed file for a JPEG (8.7 ms against a PNG's 27 µs
 /// here). Paid once by the decode that follows, it costs nothing; paid by a separate probe first,
 /// it doubles.
-pub(super) fn decode_within_limits(
+pub(super) fn decode_within_limits<'a>(
     path: &Path,
     max_edge: u32,
-    charge: Charge<'_>,
+    charge: Charge<'a>,
     still_wanted: &dyn Fn() -> bool,
-) -> Result<::image::DynamicImage, String> {
+) -> Result<(::image::DynamicImage, Option<Permit<'a>>), String> {
     refuse_irregular(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mut reader = ::image::ImageReader::open(path)
         .map_err(|err| err.to_string())?
@@ -997,13 +994,15 @@ pub(super) fn decode_within_limits(
     if need > DECODE_POOL_BYTES {
         return Err(format!("decodes to {need} bytes, past the {DECODE_POOL_BYTES}-byte pool budget"));
     }
-    let _permit = charge.take(need);
+    // Refused on `need` alone, so a source at the ceiling still decodes alone; see `Budget`.
+    let (width, height) = ::image::ImageDecoder::dimensions(&decoder);
+    let permit = charge.take(2 * need + 4 * u64::from(width) * u64::from(height));
     // Re-asked after the wait, not only before it: waiting is what this added, and an entry can be
     // evicted while a worker sits in `acquire`. Cheap to ask, a whole decode to get wrong.
     if !still_wanted() {
         return Err("evicted while waiting for decode budget".to_string());
     }
-    ::image::DynamicImage::from_decoder(decoder).map_err(|err| err.to_string())
+    Ok((::image::DynamicImage::from_decoder(decoder).map_err(|err| err.to_string())?, permit))
 }
 
 fn rasterize_svg(path: &Path, box_px: u32, tint: Option<Rgba>) -> Result<(Vec<u8>, u32, u32), String> {
@@ -1474,13 +1473,11 @@ mod tests {
 
         let budget = Budget::default();
         let decoded = decode_within_limits(&big, MAX_DECODE_EDGE, Charge::Waiting(&budget), &|| true);
-        assert!(decoded.is_ok(), "a source inside the pool budget must decode: {:?}", decoded.err());
-        assert_eq!(decoded.map(|image| (image.width(), image.height())).ok(), Some((6024, 3401)));
-        assert_eq!(
-            *budget.in_flight.lock().unwrap(),
-            0,
-            "the permit is dropped with the decoder, so nothing stays charged after it returns"
-        );
+        let (image, permit) = decoded.expect("a source inside the pool budget must decode");
+        assert_eq!((image.width(), image.height()), (6024, 3401));
+        assert_eq!(*budget.in_flight.lock().unwrap(), 3 * pixels, "held for the caller's scaling");
+        drop(permit);
+        assert_eq!(*budget.in_flight.lock().unwrap(), 0, "and given back with it");
 
         // And the wait's own hazard: an entry evicted while its worker sat in `acquire` must not
         // then be decoded into a slot that has gone away.

@@ -188,12 +188,8 @@ pub fn deserialize_lua_table(table: &Table) -> Result<VirtualNode, DeserializeEr
     let mut properties = HashMap::new();
     for pair in table.pairs::<Value, Value>() {
         let (key, value) = pair?;
-        if let Value::String(ref key_str) = key
-            && key_str.to_string_lossy() == "kind"
-        {
-            continue;
-        }
         let key = match &key {
+            Value::String(s) if s == "kind" => continue,
             Value::String(s) => s.to_string_lossy(),
             other => other.to_string()?,
         };
