@@ -1,7 +1,7 @@
 //! [`NotificationsController`], the D-Bus interface, write dispatcher, and state owner. Split from
 //! `dbus::notifications`, see `dbus/notifications/mod.rs` for the module-level doc.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -92,6 +92,7 @@ struct NotificationsQueueState {
     dnd: bool,
     quiet: bool,
     sound_registry: HashMap<Urgency, PathBuf>,
+    muted_apps: HashSet<String>,
 }
 
 impl NotificationsQueueState {
@@ -103,6 +104,7 @@ impl NotificationsQueueState {
             dnd: false,
             quiet: false,
             sound_registry: HashMap::new(),
+            muted_apps: HashSet::new(),
         }
     }
 }
@@ -399,6 +401,16 @@ impl NotificationsController {
         self.state.lock().unwrap().quiet = enabled;
     }
 
+    /// `notifications:set_app_muted(app, muted)` silences an app that plays its own sound (ADR-0033).
+    pub fn set_app_muted(&self, app: String, muted: bool) {
+        let mut state = self.state.lock().unwrap();
+        if muted {
+            state.muted_apps.insert(app);
+        } else {
+            state.muted_apps.remove(&app);
+        }
+    }
+
     /// `notifications:hold_expiry(seconds)` (ADR-0094) pauses all pending countdowns; `0` releases
     /// them. A deadline avoids a paused flag: a config that reloads, crashes, or misses an edge
     /// could otherwise pin the feed for the rest of the session. It self-releases, bounding the
@@ -515,7 +527,12 @@ impl NotificationsController {
         // and nothing else, where the hint is a fallback from a field that meant a picture.
         let app_icon = (!app_icon.is_empty()).then_some(app_icon).or(image_name);
         let icon_data = hints.get("icon_data").and_then(decode_raw_image_data);
-        let suppress_sound = hints.get("suppress-sound").and_then(value_as_bool).unwrap_or(false);
+        let app_muted = {
+            let state = self.state.lock().unwrap();
+            state.muted_apps.contains(&app_name)
+                || desktop_entry.as_ref().is_some_and(|entry| state.muted_apps.contains(entry))
+        };
+        let suppress_sound = app_muted || hints.get("suppress-sound").and_then(value_as_bool).unwrap_or(false);
         let sound_file = hints.get("sound-file").and_then(value_as_str).map(str::to_string);
         let sound_name = hints.get("sound-name").and_then(value_as_str).map(str::to_string);
 
@@ -689,6 +706,11 @@ pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency,
     let urgency = parse_urgency_str(arguments.first()?.as_str()?)?;
     let path = arguments.get(1)?.as_str()?.to_string();
     Some((urgency, path))
+}
+
+/// Parses `notifications:set_app_muted(app, muted)`'s `[app, muted]`.
+pub fn parse_set_app_muted_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
+    Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
 }
 
 #[cfg(test)]
@@ -948,5 +970,26 @@ mod tests {
 
         controller.hold_expiry(0);
         assert_eq!(*controller.expiry_hold.borrow(), None, "0 releases");
+    }
+
+    #[tokio::test]
+    async fn a_muted_app_is_silent_by_desktop_entry_or_app_name() {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sound_tx, sound_rx) = std::sync::mpsc::sync_channel(1);
+        let controller = &NotificationsController::inert(events, sound_tx);
+        controller.set_sound(Urgency::Normal, "/usr/share/sounds/freedesktop/stereo/message.oga");
+        controller.set_app_muted("vesktop".into(), true);
+        let notify = move |app_name: &str, desktop_entry: Option<&'static str>| {
+            let hints =
+                desktop_entry.map(|entry| ("desktop-entry".to_string(), Value::from(entry))).into_iter().collect();
+            controller.notify(app_name.into(), 0, String::new(), "s".into(), String::new(), vec![], hints, -1)
+        };
+
+        notify("Vesktop", Some("vesktop")).await;
+        notify("vesktop", None).await;
+        assert!(sound_rx.try_recv().is_err(), "muted by desktop-entry and by app name");
+        controller.set_app_muted("vesktop".into(), false);
+        notify("vesktop", None).await;
+        assert!(sound_rx.try_recv().is_ok(), "unmuting plays the tier sound again");
     }
 }

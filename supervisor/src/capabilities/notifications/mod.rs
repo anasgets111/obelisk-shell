@@ -1,8 +1,8 @@
 //! Notifications capability (`obelisk.notifications`, ADR-0033). Hosts
 //! `org.freedesktop.Notifications` with a 100-item FIFO, a 20-item newest-first feed view, global
 //! DND, and a Lua-configured per-urgency PipeWire sound registry. `sound-file` overrides a tier
-//! default for one notification; `suppress-sound` wins; `sound-name` picks a freedesktop theme
-//! sound in place of a registered tier default.
+//! default for one notification; `suppress-sound` or a `set_app_muted` app wins; `sound-name`
+//! picks a freedesktop theme sound in place of a registered tier default.
 //!
 //! Like `dbus::tray`, a controller owns writes, degrades to inert without the session bus, and
 //! delegates decisions to pure helpers. Queue/DND are global Supervisor state (ADR-0033), not
@@ -26,7 +26,7 @@ pub mod sound;
 
 pub use controller::{
     NotificationsController, parse_dismiss_args, parse_hold_expiry_args, parse_invoke_action_args, parse_reply_args,
-    parse_set_sound_args,
+    parse_set_app_muted_args, parse_set_sound_args,
 };
 pub use sound::run_sound_player;
 
@@ -46,6 +46,8 @@ pub enum NotificationsAction {
     SetDnd,
     /// (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
     SetQuiet,
+    /// (app: string, muted: boolean) Silences all sound from an app matched by `desktop-entry` or app name.
+    SetAppMuted,
     /// (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
     HoldExpiry,
 }
@@ -93,6 +95,10 @@ pub fn dispatch(controller: &NotificationsController, envelope: &shared::Command
         },
         NotificationsAction::SetQuiet => match crate::capabilities::parse_bool_arg(&params.arguments) {
             Some(enabled) => controller.set_quiet(enabled),
+            None => crate::log_malformed_command(params),
+        },
+        NotificationsAction::SetAppMuted => match parse_set_app_muted_args(&params.arguments) {
+            Some((app, muted)) => controller.set_app_muted(app, muted),
             None => crate::log_malformed_command(params),
         },
         NotificationsAction::HoldExpiry => match parse_hold_expiry_args(&params.arguments) {

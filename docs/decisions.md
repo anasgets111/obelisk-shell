@@ -767,7 +767,8 @@ theme ships, and 16-bit PCM WAV, what Telegram's sound-file is, picked by header
 MiB, 30 seconds, two channels and 8-192 kHz; one sound waits behind the one playing and later ones
 drop, and playback gives up after the sound's length plus two seconds.
 `set_quiet` gates non-critical sounds like DND without changing it, so a config can stay silent while
-locked or blanked. Accepted gap: a client that plays its own sound is heard twice.
+locked or blanked. `set_app_muted` silences all sound from an app that plays its own, matched exactly
+on desktop-entry or app name. The app's stream starts after ours, so nothing can detect it.
 
 Use snapshots because each mutation changes feed or DND state. A 20-entry feed views a 100-entry
 FIFO so actions resolve outside the feed. Replacement without a fresh image deletes the old spool;

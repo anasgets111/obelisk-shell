@@ -615,6 +615,7 @@ local IdleCapability = {}
 ---| "set_sound" # (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
 ---| "set_dnd" # (enabled: boolean) Gates non-critical notification sounds.
 ---| "set_quiet" # (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
+---| "set_app_muted" # (app: string, muted: boolean) Silences all sound from an app matched by `desktop-entry` or app name.
 ---| "hold_expiry" # (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
 
 ---@class NotificationsCapability: Capability<NotificationsState>

@@ -15,6 +15,8 @@ local SOUNDS = "/usr/share/sounds/freedesktop/stereo/"
 obelisk.notifications:invoke("set_sound", "low", SOUNDS .. "message.oga")
 obelisk.notifications:invoke("set_sound", "normal", SOUNDS .. "message.oga")
 obelisk.notifications:invoke("set_sound", "critical", SOUNDS .. "bell.oga")
+-- Discord plays its own message sound; ours on top doubles it.
+obelisk.notifications:invoke("set_app_muted", "vesktop", true)
 
 -- Visible stack count matches `maxVisibleNotifications`. The feed carries twenty, too many
 -- for a screen; the rest belong one click away in history.
