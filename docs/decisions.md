@@ -4467,6 +4467,9 @@ Three things the shape settles:
 quickshell keeps a second, structured `log.qslog` beside the plain one so `-r` can re-filter a
 finished run at read time. Not copied: there are no log levels here to filter by.
 
+Amendment (2026-09-15): both binaries replace std's `eprintln!`/`eprint!` with `shared`'s, which drop
+a failed write. A full tmpfs no longer aborts the shell; only a dependency's own write still can.
+
 ## 0200. The active route index is re-read from `info`, because PipeWire never pushes one that appears late
 
 `obelisk` starts from `spawn-at-startup`, before the ALSA card has settled. `bind_device` bound

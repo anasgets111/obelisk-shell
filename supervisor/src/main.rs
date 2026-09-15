@@ -1,3 +1,6 @@
+#[cfg_attr(not(test), macro_use)]
+extern crate shared;
+
 mod capabilities;
 mod cli;
 mod compositor;

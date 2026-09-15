@@ -11,6 +11,26 @@ pub use paths::{
 pub use secure_buffer::SecureBuffer;
 pub use zeroize::{Zeroize, Zeroizing};
 
+/// std's `eprintln!`/`eprint!` panic on a failed write, and under `panic = "abort"` a full log tmpfs
+/// (ADR-0199) would kill lock authority. Both binaries import these over std's with `#[macro_use]`.
+///
+/// ponytail: a dependency's own write or panic still aborts; containing that needs a separate
+/// lock/PAM process.
+#[macro_export]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{}\n", format_args!($($arg)*)));
+    }};
+}
+
+/// See [`eprintln!`].
+#[macro_export]
+macro_rules! eprint {
+    ($($arg:tt)*) => {{
+        let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!($($arg)*));
+    }};
+}
+
 /// The snapshot-hydrated capability roster (ADR-0037; CONTEXT.md). Each [`Capability::as_str`]
 /// name is both the Lua `obelisk.<name>` member and command `capability` field, so
 /// one spelling reaches one capability. Reading a name starts its Supervisor controller
