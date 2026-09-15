@@ -569,13 +569,8 @@ pub(crate) fn send_frame_logged(registry: &GenerationRegistry, generation_id: u3
     let Err(err) = registry.send_frame(generation_id, frame) else {
         return;
     };
-    // This routine failure once logged thirteen `failed to push` lines with full payloads before
-    // the Renderer drew a frame, drowning out meaningful failures.
-    if let (SupervisorFrame::StateSnapshot(snapshot), SendFrameError::NoConnection { .. }) = (frame, &err) {
-        eprintln!(
-            "generation {generation_id} has not connected yet, so {} revision {} waits for the replay",
-            snapshot.capability, snapshot.revision
-        );
+    // Silent: the replay delivers it, and a respawn cooldown logged one line per snapshot for 30s.
+    if let (SupervisorFrame::StateSnapshot(_), SendFrameError::NoConnection { .. }) = (frame, &err) {
         return;
     }
     eprintln!("failed to push {frame:?} to generation {generation_id}: {err}");
