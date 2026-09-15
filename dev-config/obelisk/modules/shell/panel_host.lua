@@ -48,26 +48,19 @@ local screen_recorder_panel = require("modules.bar.panels.screen_recorder_panel"
 local panels = { power_menu, network_panel, bluetooth_panel, notification_history, update_panel, audio_panel,
     media_panel, tray_menu, screen_recorder_panel }
 
--- Build every body, but show only the matching `kind`. Invisible children contribute no size
--- (`resolve_sizes` in scene.rs), so stacked bodies cost the visible panel's height, not their sum.
--- Each section measures itself (`geometry`, ADR-0147). A hidden section keeps its last rect, so the
--- reveal knows its height before it shows, matching the mirror's `panelItem.preferredHeight`; a
--- section never shown yet reads zero.
+-- Only the matching `kind` is a child: a hidden sibling is frozen, not dropped (ADR-0124). A
+-- section's `geometry` (ADR-0147) keeps its last rect while it is gone, so a reveal knows its height,
+-- matching the mirror's `panelItem.preferredHeight`; a section never shown reads zero.
 local sections = {}
 local section_rects = {}
 for _, panel in ipairs(panels) do
     local rect = geometry("panel-section-" .. panel.kind)
     table.insert(section_rects, rect)
-    table.insert(sections, column {
-        width = "Fill",
-        spacing = theme.spacing.xs,
-        visible = ui_state.panel_kind:map(function(kind)
-            return kind == panel.kind
-        end),
-        geometry = rect,
-        children = panel.body,
-    })
+    sections[panel.kind] = column { width = "Fill", spacing = theme.spacing.xs, geometry = rect, children = panel.body }
 end
+local shown_section = ui_state.panel_kind:map(function(kind)
+    return { sections[kind] }
+end)
 
 -- Shared width except history, updates, audio, and media. Those use their own widths because
 -- history is a list, package rows need two version strings, audio sliders need length, and media
@@ -225,7 +218,7 @@ return panel {
                     return { left = x }
                 end),
                 children = {
-                    panel_card(sections, {
+                    panel_card(shown_section, {
                         width = card_width,
                         height = card_height,
                         margin = card_margin,

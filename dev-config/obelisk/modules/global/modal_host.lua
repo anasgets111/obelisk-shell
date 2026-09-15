@@ -21,10 +21,21 @@ end)
 -- Hyprland refocus the last focused window, onto its workspace.
 local shown = util.linger(any_modal, theme.animation_ms)
 
-local cards = {}
+-- Only cards open or fading out are children, which is also what hides a closed one: a hidden card is
+-- frozen, not dropped (ADR-0124). The host unmaps in the pass the last linger ends, keeping that card.
+local lingering = {}
 for _, modal in ipairs(modals) do
-    table.insert(cards, modal.node)
+    table.insert(lingering, util.linger(ui_state.modal_showing(modal.kind), theme.animation_ms))
 end
+local cards = computed(lingering, function(...)
+    local open = {}
+    for index, modal in ipairs(modals) do
+        if select(index, ...) then
+            table.insert(open, modal.node)
+        end
+    end
+    return open
+end)
 
 return panel {
     id = "modal_host",

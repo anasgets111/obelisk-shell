@@ -160,7 +160,7 @@ tables do not resolve, so derive the whole table instead.
 | `min_width`, `min_height` | Numeric size floors on a content-sized axis. A floor above a ceiling wins, as in CSS |
 | `padding`, `margin` | Number or `{ top, right, bottom, left }`; unspecified edges are zero |
 | `align_h`, `align_v` | `"Start"`, `"Center"`, `"End"`, `"Stretch"` |
-| `visible` | Boolean; false removes the node from layout and paint |
+| `visible` | Boolean; false removes the node from layout and paint but keeps its frozen subtree (ADR-0124). For one of several views, choose `children` with a signal instead of hiding siblings |
 | `opacity` | 0–1, default 1; inherited multiplicatively. Zero still occupies space and takes input |
 | `id` | Optional identity unique among siblings; unidentified siblings match positionally |
 | `cursor` | CSS cursor name; innermost explicit/default cursor wins |

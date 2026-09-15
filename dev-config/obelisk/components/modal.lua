@@ -1,9 +1,8 @@
 -- One modal card and the motion `OModal.qml` gives it, for `modules/global/modal_host.lua` to stack
 -- under one scrim. The card fades, scales from 0.97, rises by `spacingMd`, and uses OutCubic
--- opening and InCubic closing (ADR-0146, ADR-0149). The wrapper lingers through exit. A modal
+-- opening and InCubic closing (ADR-0146, ADR-0149). `modal_host` keeps the wrapper through exit. A modal
 -- switch cross-fades the old card against the new one.
 local theme = require("config.theme")
-local util = require("lib.util")
 local ui_state = require("lib.ui_state")
 
 -- `Theme.qml`'s `modalClosedScale`.
@@ -55,12 +54,10 @@ return function(opts)
         kind = opts.kind,
         -- Screen-sized, so the card keeps its own `margin` or centre alignment, and scale pivots on
         -- the screen's centre. Stacking, not a column: columns control child placement, which would
-        -- drop a card's own `align_v` and hang every card from the top. Hidden after exit, subtrees
-        -- freeze and their fields cannot receive keyboard input.
+        -- drop a card's own `align_v` and hang every card from the top.
         node = rect {
             width = "Fill",
             height = "Fill",
-            visible = util.linger(showing, theme.animation_ms),
             scale = showing:map(function(open)
                 return open and 1 or CLOSED_SCALE
             end),

@@ -61,7 +61,7 @@
 ---@field padding? number|Edges|Bound Inner spacing. A bare number is all four edges.
 ---@field align_h? Align|Bound On a stacking parent this places the node in the content box; on a `row` it is read off the row itself as the main-axis distribution and ignored on the children.
 ---@field align_v? Align|Bound The same two jobs as `align_h`, swapped: main axis on a `column`, cross axis on a `row`.
----@field visible? boolean|Bound `false` keeps the node out of the constraint and paint passes, and out of its parent's spacing.
+---@field visible? boolean|Bound `false` keeps the node out of the constraint and paint passes, and out of its parent's spacing. Its subtree is frozen, not dropped (ADR-0124), so it stays in memory and every apply copies it. For one of several views (panels, pages, tabs), choose the parent's `children` with a signal instead of hiding siblings.
 ---@field opacity? number|Bound `[0, 1]`, default `1`. Inherited multiplicatively. Refused outside the range rather than clamped. A node at `0` still lays out and still takes pointer events.
 ---@field scale? number|Axes|Bound A paint-only scale about `origin` (ADR-0149): one factor for both axes, or `{ x, y }` with an absent axis at `1`. `[0, 64]`. Layout, `geometry` and siblings see the unscaled box; hit-testing and input regions follow the painted one.
 ---@field rotate? number|Bound Degrees clockwise about `origin`, paint-only.
