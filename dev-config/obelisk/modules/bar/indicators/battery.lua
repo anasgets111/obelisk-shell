@@ -2,8 +2,7 @@
 -- pill on this bar carries a number.
 --
 -- The percentage-sized `rect` applies `components/meter.lua`'s stacking trick to the whole control.
--- It is not a 6px bar. A `rect` has no main axis, so children stack at its origin; `Fill` puts fill
--- under the text without z-order or an overlay node.
+-- It is not a 6px bar. A `rect` has no main axis, so children stack at its origin.
 --
 -- `clip = "Rounded"` on the pill cuts the square-cornered fill to its arc. Putting the radius on
 -- the fill drew a lozenge inside the pill's left end at low charge because the engine clipped only
@@ -35,15 +34,11 @@ local function battery_color(b)
     return theme.ACCENT
 end
 
--- `textColor: Theme.textContrast(percentage > 0.6 ? batteryColor : bgColor)`. The readout crosses
--- from fill to pill at 60%, so it contrasts against the ground under its centre.
---
--- The old readout used one colour against a 38%-tinted fill because solid `#a6e3a1` at 89% was the
--- bar's brightest object. The mirror uses an opaque accent fill, so remove both the tint and single
--- colour.
-local READOUT = obelisk.battery:map(function(b)
-    local over_fill = b ~= nil and b.present and (b.percent or 0) > 60
-    return theme.text_contrast(over_fill and battery_color(b) or theme.GLASS_CONTROL)
+-- Two copies of the readout, one per ground: the fill's box clips its copy, so the contrast colour
+-- flips at the fill edge, mid-glyph, instead of the mirror's single colour switching at 60%.
+local ON_PILL = theme.text_contrast(theme.GLASS_CONTROL)
+local ON_FILL = obelisk.battery:map(function(b)
+    return theme.text_contrast(battery_color(b))
 end)
 
 -- `onIsPluggedInChanged: if (isPluggedIn) plugFlash.restart()`. `pulse` marks a change and
@@ -56,6 +51,33 @@ end)
 local plug_flash = computed({ pulse(plugged, theme.animation_fast_ms * 4), plugged }, function(fired, on)
     return fired and on
 end)
+
+-- Use `cell`, not `glyph`: both lines are `OText`/`Theme.fontFamily`; `components/glyph.lua` would
+-- force `iconFontFamily` and mismatch the circles beside it. Both `OText`s are `bold: true`, which
+-- keeps dark ink readable over the opaque accent fill, as in the mirror.
+local GLYPH = obelisk.battery:map(function(b)
+    return { { text = util.battery_glyph(b), bold = true } }
+end)
+local PERCENT = util.label(obelisk.battery, function(b)
+    return string.format("%d%%", b.percent)
+end):map(function(shown)
+    return { { text = shown, bold = true } }
+end)
+
+-- `width` is the pill's, so the copy inside the fill lines up with the one under it.
+local function readout(color, width)
+    return row {
+        width = width,
+        height = "Fill",
+        align_h = "Center",
+        align_v = "Center",
+        spacing = theme.spacing.xs,
+        children = {
+            cell(GLYPH, color, theme.icon.md, { align_v = "Center" }),
+            cell(PERCENT, color, theme.font.sm, { align_v = "Center" }),
+        },
+    }
+end
 
 local fill = rect {
     width = obelisk.battery:map(function(b)
@@ -84,29 +106,7 @@ local fill = rect {
         end
         return eases
     end),
-}
-
-local readout = row {
-    width = "Fill",
-    height = "Fill",
-    align_h = "Center",
-    align_v = "Center",
-    spacing = theme.spacing.xs,
-    children = {
-        -- Use `cell`, not `glyph`: both lines are `OText`/`Theme.fontFamily`;
-        -- `components/glyph.lua`
-        -- would force `iconFontFamily` and mismatch the circles beside it. Both `OText`s are
-        -- `bold: true`, which keeps dark ink readable over the opaque accent fill, as in the
-        -- mirror.
-        cell(obelisk.battery:map(function(b)
-            return { { text = util.battery_glyph(b), bold = true } }
-        end), READOUT, theme.icon.md, { align_v = "Center" }),
-        cell(util.label(obelisk.battery, function(b)
-            return string.format("%d%%", b.percent)
-        end):map(function(shown)
-            return { { text = shown, bold = true } }
-        end), READOUT, theme.font.sm, { align_v = "Center" }),
-    },
+    children = { readout(ON_FILL, theme.battery_pill_width) },
 }
 
 local battery_module = rect {
@@ -126,7 +126,8 @@ local battery_module = rect {
     visible = util.shown_when(obelisk.battery, function(b)
         return b.present
     end),
-    children = { fill, readout },
+    -- Pill copy first: the fill paints over it, and shows it again while the plug flash fades.
+    children = { readout(ON_PILL, "Fill"), fill },
 }
 
 local battery_tooltip = tooltip({

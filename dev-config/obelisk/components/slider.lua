@@ -10,8 +10,7 @@
 -- A one-second timer releases it if the snapshot never matches: another writer or a clamped write.
 -- Plain `state` without `on_change` clears on release.
 -- `pending` is numeric because `state()` fixes its type at creation; `nil` has none.
--- `-1` means "nothing held", outside the value range. `children` stack over the fill;
--- `Volume.qml` fills the whole control.
+-- `-1` means "nothing held", outside the value range.
 local theme = require("config.theme")
 
 ---@class SliderOpts
@@ -40,7 +39,7 @@ local theme = require("config.theme")
 ---@field dragging? StateSignal<boolean> True while a drag is held. Default `state(name .. "_dragging")`.
 ---@field visible? boolean|Bound
 ---@field on_click? fun(rect: Rect, button: "left"|"right"|"middle") The left click still lands after the drag ends.
----@field children? Node[] Drawn over the fill.
+---@field label? fun(ground: Color|Bound): Node Built on the track and again inside each bar, which clips its copy, so ink contrasts with the ground under each pixel. Give it the control's width so the copies line up.
 
 local function clamp(value, max)
     return math.max(0, math.min(max, value))
@@ -137,9 +136,13 @@ return function(opts)
             radius = opts.radius or theme.radius.sm,
             background = color,
             visible = opts.fill_visible,
+            -- ponytail: the bar's square box clips its copy, so ink overhangs a pill's rounded end
+            -- by ~1.5px; `clip = "Rounded"` is exact for an offscreen target per bar.
+            children = { opts.label and opts.label(color) or nil },
         }
     end
     local split = opts.split_at or max
+    local track = opts.background or opts.track or theme.SURFACE
     local children = {
         -- Headroom under the fill, drawn only past `split`: the fill's rounded end caps it.
         bar(fill:map(function(value)
@@ -158,8 +161,9 @@ return function(opts)
             },
         },
     }
-    for _, child in ipairs(opts.children or {}) do
-        children[#children + 1] = child
+    -- Under the bars, which cover it with their own copies.
+    if opts.label then
+        table.insert(children, 1, opts.label(track))
     end
 
     return button {
@@ -168,7 +172,7 @@ return function(opts)
         align_v = opts.align_v,
         radius = opts.radius or theme.radius.sm,
         clip = "Rounded",
-        background = opts.background or opts.track or theme.SURFACE,
+        background = track,
         border_width = opts.border_width,
         border_color = opts.border_color,
         animate = opts.animate,

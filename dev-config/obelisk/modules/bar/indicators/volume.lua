@@ -55,17 +55,18 @@ local level = computed({ obelisk.audio, held }, function(a, h)
     return h >= 0 and h or volume(a) or 0
 end)
 
--- `Volume.qml`'s `foregroundAt`: contrast against the fill once it reaches the glyph or percentage,
--- otherwise against the ground. Their thresholds are the first and last quarters of the expanded
--- control.
-local function foreground_past(threshold)
-    return computed({ level, expanded, ground, fill, headroom }, function(v, open, ground_color, fill_color, over)
-        if open and v / util.MAX_VOLUME >= threshold then
-            return theme.text_contrast(threshold * util.MAX_VOLUME > SPLIT and over or fill_color)
-        end
-        return theme.text_contrast(ground_color)
-    end)
-end
+local width = expanded:map(function(is_expanded)
+    return is_expanded and theme.volume_expanded_width or theme.item_width
+end)
+local volume_glyph = obelisk.audio:map(util.volume_glyph)
+local readout = computed({ obelisk.audio, level }, function(a, v)
+    if volume(a) == nil then
+        return "--"
+    elseif a.muted then
+        return "Muted"
+    end
+    return string.format("%d%%", math.floor(v * 100 + 0.5))
+end)
 
 return slider {
     name = "volume_pending",
@@ -78,9 +79,7 @@ return slider {
     split_at = SPLIT,
     pending = held,
     headroom_color = headroom,
-    width = expanded:map(function(is_expanded)
-        return is_expanded and theme.volume_expanded_width or theme.item_width
-    end),
+    width = width,
     height = theme.item_height,
     align_v = "Center",
     hover = hovered,
@@ -104,24 +103,23 @@ return slider {
             ui_state.toggle_panel("audio", rect)
         end
     end,
-    children = { row {
-        width = "Fill",
-        height = "Fill",
-        align_h = "Center",
-        align_v = "Center",
-        spacing = theme.spacing.xs,
-        children = {
-            glyph(obelisk.audio:map(util.volume_glyph), foreground_past(0.25), theme.icon.lg, { align_v = "Center" }),
-            -- A hidden percentage costs no width or spacing: `layout::scene` sums visible child
-            -- footprints and multiplies spacing by their count.
-            cell(computed({ obelisk.audio, level }, function(a, v)
-                if volume(a) == nil then
-                    return "--"
-                elseif a.muted then
-                    return "Muted"
-                end
-                return string.format("%d%%", math.floor(v * 100 + 0.5))
-            end), foreground_past(0.75), theme.font.sm, { align_v = "Center", visible = expanded }),
-        },
-    } },
+    -- Eases with the control, so the copies inside the bars stay on the one under them.
+    label = function(under)
+        ---@cast under Signal<Color>
+        local ink = under:map(theme.text_contrast)
+        return row {
+            width = width,
+            height = "Fill",
+            align_h = "Center",
+            align_v = "Center",
+            spacing = theme.spacing.xs,
+            animate = { width = theme.animation_ms },
+            children = {
+                glyph(volume_glyph, ink, theme.icon.lg, { align_v = "Center" }),
+                -- A hidden percentage costs no width or spacing: `layout::scene` sums visible child
+                -- footprints and multiplies spacing by their count.
+                cell(readout, ink, theme.font.sm, { align_v = "Center", visible = expanded }),
+            },
+        }
+    end,
 }
