@@ -68,12 +68,6 @@ fn read_percent(device_dir: &Path, max: i32) -> u8 {
     percent_from_raw(brightness, max) as u8
 }
 
-/// `brightness:set(pct)`'s `arguments: [pct]`; range validation is deferred to
-/// `scale::raw_from_percent`.
-pub fn parse_set_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_u64()
-}
-
 /// `org.freedesktop.login1.Session.SetBrightness` on fixed `session/auto`, which logind resolves
 /// to the caller's session. Built per [`BrightnessController::set`] call because writes are rare.
 #[zbus::proxy(
@@ -338,19 +332,6 @@ mod tests {
 
         write_entry(root.path(), "bad_attr", &[("brightness", "not-a-number")]);
         assert_eq!(read_percent(&root.path().join("bad_attr"), 100), 0);
-    }
-
-    #[test]
-    fn parse_set_args_reads_the_first_argument_as_a_percent() {
-        let args = vec![serde_json::json!(42)];
-        assert_eq!(parse_set_args(&args), Some(42));
-    }
-
-    #[test]
-    fn parse_set_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_set_args(&[]), None);
-        let args = vec![serde_json::json!("not a number")];
-        assert_eq!(parse_set_args(&args), None);
     }
 
     #[tokio::test]

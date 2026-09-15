@@ -4816,3 +4816,15 @@ Amends ADR-0107 decision 2 and ADR-0109 decision 3.
 
 A transparent `submit` button claimed only its painted label, so 3800 of its 4800 px² passed clicks
 to the window behind, under an arrow cursor.
+
+## 0215. A command decodes into a typed action variant
+
+Amends ADR-0037 and ADR-0052 decision 1.
+
+1. `parse_action` reads `(action, arguments)` as an externally tagged enum: the action names the
+   variant, the arguments fill its fields by position. The wire is unchanged.
+2. Checks beyond a type stay in serde: `non_empty`, `lua_list` (mlua sends an empty table as `{}`),
+   absolute paths.
+3. The stub generator writes one typed `invoke` overload per variant.
+
+38 hand parsers coerced silently 3 times (0eec577). Rejected: named-argument tables, an IDL change.

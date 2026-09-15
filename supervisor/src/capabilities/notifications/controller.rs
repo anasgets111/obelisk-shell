@@ -27,8 +27,7 @@ use super::sound::{SoundSender, default_trusted_sound_roots, resolve_sound_name}
 use super::{
     MAX_ACTION_LABEL_BYTES, MAX_ACTIONS, MAX_APP_NAME_BYTES, MAX_SUMMARY_BYTES, NOTIFICATIONS_BUS_NAME,
     NOTIFICATIONS_CAPABILITIES, NOTIFICATIONS_OBJECT_PATH, Notification, NotificationAction, NotificationsSignal,
-    NotificationsState, Urgency, desktop_entry_from_hint, parse_urgency_str, reply_placeholder_from_hint,
-    urgency_from_hint_byte,
+    NotificationsState, Urgency, desktop_entry_from_hint, reply_placeholder_from_hint, urgency_from_hint_byte,
 };
 use crate::capabilities::system::controller::epoch_seconds;
 use crate::capabilities::truncate_utf8_bytes;
@@ -674,45 +673,6 @@ impl NotificationsController {
     ) -> zbus::Result<()>;
 }
 
-// Write-command argument parsers (ADR-0033); set_dnd calls parse_bool_arg directly.
-
-/// Parses `notifications:dismiss(id)`'s `[id]`.
-pub fn parse_dismiss_args(arguments: &[serde_json::Value]) -> Option<u32> {
-    arguments.first()?.as_u64().and_then(|v| u32::try_from(v).ok())
-}
-
-/// Parses `notifications:reply(id, text)`'s `[id, text]`.
-pub fn parse_reply_args(arguments: &[serde_json::Value]) -> Option<(u32, String)> {
-    let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
-    let text = arguments.get(1)?.as_str()?.to_string();
-    Some((id, text))
-}
-
-/// Parses whole-number `[seconds]`. Reject negative/fractional values: elsewhere `-1` means
-/// "never", and coercing it to `0` would release a requested hold.
-pub fn parse_hold_expiry_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_u64()
-}
-
-/// Parses `notifications:invoke_action(id, key)`'s `[id, key]`.
-pub fn parse_invoke_action_args(arguments: &[serde_json::Value]) -> Option<(u32, String)> {
-    let id = u32::try_from(arguments.first()?.as_u64()?).ok()?;
-    let key = arguments.get(1)?.as_str().filter(|key| !key.is_empty())?.to_string();
-    Some((id, key))
-}
-
-/// Parses `notifications:set_sound(urgency, path)`'s `[urgency, path]`.
-pub fn parse_set_sound_args(arguments: &[serde_json::Value]) -> Option<(Urgency, String)> {
-    let urgency = parse_urgency_str(arguments.first()?.as_str()?)?;
-    let path = arguments.get(1)?.as_str()?.to_string();
-    Some((urgency, path))
-}
-
-/// Parses `notifications:set_app_muted(app, muted)`'s `[app, muted]`.
-pub fn parse_set_app_muted_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
-    Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,67 +785,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_invoke_action_args_needs_an_id_and_a_nonempty_key() {
-        use serde_json::json;
-        assert_eq!(parse_invoke_action_args(&[json!(7), json!("archive")]), Some((7, "archive".to_string())));
-        assert_eq!(parse_invoke_action_args(&[json!(7), json!("")]), None);
-        assert_eq!(parse_invoke_action_args(&[json!(7)]), None);
-        assert_eq!(parse_invoke_action_args(&[json!("seven"), json!("archive")]), None);
-    }
-
-    #[test]
     fn close_reason_maps_to_the_documented_wire_values() {
         assert_eq!(u32::from(CloseReason::Expired), 1);
         assert_eq!(u32::from(CloseReason::Dismissed), 2);
         assert_eq!(u32::from(CloseReason::ClosedByMethod), 3);
         assert_eq!(u32::from(CloseReason::Evicted), 4);
-    }
-
-    #[test]
-    fn parse_dismiss_args_reads_the_id() {
-        assert_eq!(parse_dismiss_args(&[serde_json::json!(42)]), Some(42));
-    }
-
-    #[test]
-    fn parse_dismiss_args_rejects_a_malformed_shape() {
-        assert_eq!(parse_dismiss_args(&[]), None);
-        assert_eq!(parse_dismiss_args(&[serde_json::json!("42")]), None);
-    }
-
-    #[test]
-    fn parse_reply_args_reads_id_and_text() {
-        assert_eq!(
-            parse_reply_args(&[serde_json::json!(7), serde_json::json!("sounds good")]),
-            Some((7, "sounds good".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_reply_args_rejects_a_malformed_shape() {
-        assert_eq!(parse_reply_args(&[serde_json::json!(7)]), None, "missing text");
-        assert_eq!(parse_reply_args(&[serde_json::json!("7"), serde_json::json!("text")]), None, "id is not a number");
-    }
-
-    #[test]
-    fn parse_set_sound_args_reads_urgency_and_path() {
-        assert_eq!(
-            parse_set_sound_args(&[serde_json::json!("critical"), serde_json::json!("/usr/share/sounds/x.wav")]),
-            Some((Urgency::Critical, "/usr/share/sounds/x.wav".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_set_sound_args_rejects_an_invalid_urgency_string() {
-        assert_eq!(parse_set_sound_args(&[serde_json::json!("urgent"), serde_json::json!("/path")]), None);
-    }
-
-    #[test]
-    fn parse_hold_expiry_args_reads_a_whole_number_of_seconds_and_nothing_else() {
-        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(10)]), Some(10));
-        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(0)]), Some(0), "0 is the release, not a malformed hold");
-        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(-1)]), None, "not silently a release");
-        assert_eq!(parse_hold_expiry_args(&[serde_json::json!(1.5)]), None);
-        assert_eq!(parse_hold_expiry_args(&[]), None);
     }
 
     /// Paused tokio time makes this exact and instant: an unheld countdown serves its duration.

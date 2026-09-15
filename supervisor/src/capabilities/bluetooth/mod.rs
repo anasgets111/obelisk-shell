@@ -208,60 +208,41 @@ fn class_to_category(class: u32) -> &'static str {
     }
 }
 
-/// `bluetooth:pair`/`connect`/`disconnect`/`forget`'s `arguments: [mac]`.
-pub fn parse_mac_arg(arguments: &[serde_json::Value]) -> Option<String> {
-    Some(arguments.first()?.as_str()?.to_string())
-}
-
-/// `bluetooth:answer_pairing(mac, accept)`'s `arguments: [mac, accept]`.
-pub fn parse_mac_and_bool_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
-    Some((arguments.first()?.as_str()?.to_string(), arguments.get(1)?.as_bool()?))
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BluetoothAction {
-    /// (enabled: boolean) Powers the adapter on or off.
-    SetEnabled,
-    /// (discoverable: boolean) Lets other devices find this adapter.
-    SetDiscoverable,
-    /// () Starts discovery, clearing `discovered_devices`.
+    /// Powers the adapter on or off.
+    SetEnabled { enabled: bool },
+    /// Lets other devices find this adapter.
+    SetDiscoverable { discoverable: bool },
+    /// Starts discovery, clearing `discovered_devices`.
     StartDiscovery,
-    /// () Stops discovery; `discovered_devices` stays.
+    /// Stops discovery; `discovered_devices` stays.
     StopDiscovery,
-    /// (mac: string) Pairs a discovered device.
-    Pair,
-    /// (mac: string) Connects a paired device.
-    Connect,
-    /// (mac: string) Disconnects a connected device.
-    Disconnect,
-    /// (mac: string) Removes a paired device.
-    Forget,
-    /// (mac: string, accept: boolean) Answers `pairing_request`.
-    AnswerPairing,
+    /// Pairs a discovered device.
+    Pair { mac: String },
+    /// Connects a paired device.
+    Connect { mac: String },
+    /// Disconnects a connected device.
+    Disconnect { mac: String },
+    /// Removes a paired device.
+    Forget { mac: String },
+    /// Answers `pairing_request`.
+    AnswerPairing { mac: String, accept: bool },
 }
 
-/// `obelisk.bluetooth` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
-/// action rather than awaiting inline (ADR-0030). `stop_discovery` leaves the last
-/// `discovered_devices` snapshot.
+/// `obelisk.bluetooth` action dispatch (ADR-0037): `tokio::spawn`s each write action rather than
+/// awaiting inline (ADR-0030). `stop_discovery` leaves the last `discovered_devices` snapshot.
 pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<BluetoothAction>(params) else { return };
+    let Some(action) = crate::parse_action::<BluetoothAction>(&envelope.params) else { return };
+    let controller = controller.clone();
     match action {
-        BluetoothAction::SetEnabled | BluetoothAction::SetDiscoverable => {
-            match crate::capabilities::parse_bool_arg(&params.arguments) {
-                Some(on) => {
-                    let controller = controller.clone();
-                    tokio::spawn(async move {
-                        match action {
-                            BluetoothAction::SetEnabled => controller.set_enabled(on).await,
-                            _ => controller.set_discoverable(on).await,
-                        }
-                    });
-                }
-                None => crate::log_malformed_command(params),
-            }
+        BluetoothAction::SetEnabled { enabled } => {
+            tokio::spawn(async move { controller.set_enabled(enabled).await });
+        }
+        BluetoothAction::SetDiscoverable { discoverable } => {
+            tokio::spawn(async move { controller.set_discoverable(discoverable).await });
         }
         // Not spawned: the intent is stored in dispatch order, so a quick start then stop ends
         // wanting none. The reconcile they trigger is spawned.
@@ -272,28 +253,18 @@ pub fn dispatch(controller: &BluetoothController, envelope: &shared::CommandEnve
         BluetoothAction::StopDiscovery => controller.set_discovery(false),
         // Not spawned: it only answers a waiting agent call, and a late answer could land on the
         // next prompt.
-        BluetoothAction::AnswerPairing => match parse_mac_and_bool_args(&params.arguments) {
-            Some((mac, accept)) => controller.answer_pairing(&mac, accept),
-            None => crate::log_malformed_command(params),
-        },
-        // The four device actions differ only in the method they call. The outer match stays
-        // exhaustive over `BluetoothAction`, so a new variant is still a compile error here.
-        BluetoothAction::Pair | BluetoothAction::Connect | BluetoothAction::Disconnect | BluetoothAction::Forget => {
-            match parse_mac_arg(&params.arguments) {
-                Some(mac) => {
-                    let controller = controller.clone();
-                    tokio::spawn(async move {
-                        match action {
-                            BluetoothAction::Pair => controller.pair(&mac).await,
-                            BluetoothAction::Connect => controller.connect(&mac).await,
-                            BluetoothAction::Disconnect => controller.disconnect(&mac).await,
-                            BluetoothAction::Forget => controller.forget(&mac).await,
-                            other => unreachable!("the arm above admits four actions, not {other:?}"),
-                        }
-                    });
-                }
-                None => crate::log_malformed_command(params),
-            }
+        BluetoothAction::AnswerPairing { mac, accept } => controller.answer_pairing(&mac, accept),
+        BluetoothAction::Pair { mac } => {
+            tokio::spawn(async move { controller.pair(&mac).await });
+        }
+        BluetoothAction::Connect { mac } => {
+            tokio::spawn(async move { controller.connect(&mac).await });
+        }
+        BluetoothAction::Disconnect { mac } => {
+            tokio::spawn(async move { controller.disconnect(&mac).await });
+        }
+        BluetoothAction::Forget { mac } => {
+            tokio::spawn(async move { controller.forget(&mac).await });
         }
     }
 }
@@ -322,14 +293,5 @@ mod tests {
         ] {
             assert_eq!(class_to_category(class), category, "{case}");
         }
-    }
-
-    // ---- arg parsers ----
-
-    #[test]
-    fn parse_mac_arg_reads_the_first_argument() {
-        assert_eq!(parse_mac_arg(&[serde_json::json!("00:1A:7D:DA:71:11")]), Some("00:1A:7D:DA:71:11".to_string()));
-        assert_eq!(parse_mac_arg(&[]), None);
-        assert_eq!(parse_mac_arg(&[serde_json::json!(42)]), None);
     }
 }

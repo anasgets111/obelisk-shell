@@ -14,53 +14,46 @@ pub mod scan;
 pub use controller::{ApplicationsController, ApplicationsSignal, LaunchError, OpenUrlError};
 pub use scan::application_dirs;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationsAction {
-    /// () Rescans installed desktop entries.
+    /// Rescans installed desktop entries.
     Refresh,
-    /// (id: string) Launches the `entries[].id` desktop entry.
-    Launch,
-    /// (url: string) Opens a URL with `xdg-open`.
-    OpenUrl,
+    /// Launches the `entries[].id` desktop entry.
+    Launch { id: String },
+    /// Opens a URL with `xdg-open`.
+    OpenUrl { url: String },
 }
 
 /// `obelisk.applications` action dispatch (ADR-0037). `refresh` calls `spawn_blocking`; `launch`
 /// and `open_url` spawn detached children without waiting.
 pub fn dispatch(controller: &ApplicationsController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<ApplicationsAction>(params) else { return };
+    let Some(action) = crate::parse_action::<ApplicationsAction>(&envelope.params) else { return };
     match action {
         ApplicationsAction::Refresh => controller.refresh(),
-        ApplicationsAction::Launch => match params.arguments.first().and_then(serde_json::Value::as_str) {
-            Some(id) => {
-                if let Err(err) = controller.launch(id) {
-                    let reason = match err {
-                        LaunchError::Unknown => format!("no application entry with id {id:?}"),
-                        LaunchError::NoTerminal => {
-                            format!(
-                                "{id:?} declares Terminal=true and $TERMINAL is unset, so there is no emulator to run it in"
-                            )
-                        }
-                        LaunchError::Spawn(message) => format!("spawning {id:?} failed: {message}"),
-                    };
-                    eprintln!("applications:launch: {reason}");
-                }
+        ApplicationsAction::Launch { id } => {
+            if let Err(err) = controller.launch(&id) {
+                let reason = match err {
+                    LaunchError::Unknown => format!("no application entry with id {id:?}"),
+                    LaunchError::NoTerminal => {
+                        format!(
+                            "{id:?} declares Terminal=true and $TERMINAL is unset, so there is no emulator to run it in"
+                        )
+                    }
+                    LaunchError::Spawn(message) => format!("spawning {id:?} failed: {message}"),
+                };
+                eprintln!("applications:launch: {reason}");
             }
-            None => crate::log_malformed_command(params),
-        },
-        ApplicationsAction::OpenUrl => match params.arguments.first().and_then(serde_json::Value::as_str) {
-            Some(url) => {
-                if let Err(err) = controller.open_url(url) {
-                    let reason = match err {
-                        OpenUrlError::Refused(why) => format!("refused {url:?}: {why}"),
-                        OpenUrlError::Spawn(message) => format!("spawning xdg-open for {url:?} failed: {message}"),
-                    };
-                    eprintln!("applications:open_url: {reason}");
-                }
+        }
+        ApplicationsAction::OpenUrl { url } => {
+            if let Err(err) = controller.open_url(&url) {
+                let reason = match err {
+                    OpenUrlError::Refused(why) => format!("refused {url:?}: {why}"),
+                    OpenUrlError::Spawn(message) => format!("spawning xdg-open for {url:?} failed: {message}"),
+                };
+                eprintln!("applications:open_url: {reason}");
             }
-            None => crate::log_malformed_command(params),
-        },
+        }
     }
 }

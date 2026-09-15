@@ -182,7 +182,7 @@ impl ResolvedNode {
         self.visible && !self.leaving
     }
 
-    /// The input region and the default cursor both ask this (ADR-0214).
+    /// A button with `submit = true` or a pointer handler (ADR-0214).
     pub fn takes_pointer(&self) -> bool {
         self.kind == "button"
             && (matches!(self.properties.get("submit"), Some(Value::Boolean(true)))

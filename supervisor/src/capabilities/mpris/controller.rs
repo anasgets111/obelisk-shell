@@ -31,24 +31,15 @@ pub enum MprisSignal {
 /// it.
 const UNKNOWN_PLAYER: &str = "no MPRIS player with that id is currently tracked";
 
-const VALID_COMMANDS: [&str; 5] = ["play", "pause", "play_pause", "next", "previous"];
-
-/// `mpris:send_command(id, cmd)`'s `arguments: [id, cmd]`; rejects anything outside the IDL's
-/// five command values.
-pub fn parse_control_args(arguments: &[serde_json::Value]) -> Option<(String, String)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let cmd = arguments.get(1)?.as_str()?.to_string();
-    VALID_COMMANDS.contains(&cmd.as_str()).then_some((id, cmd))
-}
-
-/// `arguments: [id, microseconds]`, shared by `mpris:seek` and `mpris:seek_relative`. The two
-/// commands mean different things by the number -- an absolute position and a signed offset -- but
-/// parse it identically, and a second copy of four lines only invited them to drift. Unclamped by
-/// design (ADR-0036); each command clamps, or declines to, where it is executed.
-pub fn parse_seek_args(arguments: &[serde_json::Value]) -> Option<(String, i64)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let microseconds = arguments.get(1)?.as_i64()?;
-    Some((id, microseconds))
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerCommand {
+    Play,
+    Pause,
+    PlayPause,
+    Next,
+    Previous,
 }
 
 /// No `events` field, unlike `TrayController` (ADR-0031): `control`/`seek`/`seek_relative` issue
@@ -80,19 +71,17 @@ impl MprisController {
         MprisState { players: super::player::ordered_players(&self.registry) }
     }
 
-    /// `mpris:send_command(id, cmd)` after [`parse_control_args`] validates the IDL's five values.
-    pub async fn control(&self, id: &str, cmd: &str) {
+    pub async fn control(&self, id: &str, cmd: PlayerCommand) {
         let Some(player) = self.find_player(id) else {
             eprintln!("mpris: send_command({id:?}, {cmd:?}) failed: {}", UNKNOWN_PLAYER);
             return;
         };
         let result = match cmd {
-            "play" => player.play().await,
-            "pause" => player.pause().await,
-            "play_pause" => player.play_pause().await,
-            "next" => player.next().await,
-            "previous" => player.previous().await,
-            _ => unreachable!("parse_control_args already validated cmd against VALID_COMMANDS"),
+            PlayerCommand::Play => player.play().await,
+            PlayerCommand::Pause => player.pause().await,
+            PlayerCommand::PlayPause => player.play_pause().await,
+            PlayerCommand::Next => player.next().await,
+            PlayerCommand::Previous => player.previous().await,
         };
         if let Err(err) = result {
             eprintln!("mpris: send_command({id:?}, {cmd:?}) failed: {err}");
@@ -217,49 +206,4 @@ struct SeekContext {
     player: super::proxies::MprisPlayerProxy<'static>,
     trackid: Option<String>,
     length: i64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_control_args_accepts_every_valid_command() {
-        for cmd in VALID_COMMANDS {
-            let args = vec![serde_json::json!("firefox.instance_1"), serde_json::json!(cmd)];
-            assert_eq!(parse_control_args(&args), Some(("firefox.instance_1".to_string(), cmd.to_string())));
-        }
-    }
-
-    #[test]
-    fn parse_control_args_rejects_an_unrecognized_command() {
-        let args = vec![serde_json::json!("firefox.instance_1"), serde_json::json!("stop")];
-        assert_eq!(parse_control_args(&args), None);
-    }
-
-    #[test]
-    fn parse_control_args_is_none_for_missing_or_wrong_typed_arguments() {
-        assert_eq!(parse_control_args(&[]), None);
-        assert_eq!(parse_control_args(&[serde_json::json!("id")]), None);
-        assert_eq!(parse_control_args(&[serde_json::json!(1), serde_json::json!("play")]), None);
-    }
-
-    #[test]
-    fn parse_seek_args_reads_id_and_absolute_microseconds() {
-        let args = vec![serde_json::json!("firefox.instance_1"), serde_json::json!(1_000_000)];
-        assert_eq!(parse_seek_args(&args), Some(("firefox.instance_1".to_string(), 1_000_000)));
-    }
-
-    #[test]
-    fn parse_seek_args_accepts_a_negative_position() {
-        // Parse unclamped by design (ADR-0036); clamp once at the write.
-        let args = vec![serde_json::json!("id"), serde_json::json!(-500)];
-        assert_eq!(parse_seek_args(&args), Some(("id".to_string(), -500)));
-    }
-
-    #[test]
-    fn parse_seek_args_reads_a_signed_offset_for_the_relative_command() {
-        let args = vec![serde_json::json!("firefox.instance_1"), serde_json::json!(-10_000_000)];
-        assert_eq!(parse_seek_args(&args), Some(("firefox.instance_1".to_string(), -10_000_000)));
-    }
 }

@@ -19,17 +19,6 @@ use super::notify::{
 };
 use super::state::{IdleState, foreign_idle_inhibitors};
 
-/// `idle:register_threshold(sec, on_idle, on_resume)`'s `arguments: [sec]` (ADR-0032). Callbacks
-/// stay Renderer-side; only `sec` crosses the wire.
-pub fn parse_register_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_u64()
-}
-
-/// `idle:inhibit(reason)`'s `arguments: [reason]` (ADR-0032).
-pub fn parse_inhibit_args(arguments: &[serde_json::Value]) -> Option<String> {
-    arguments.first()?.as_str().map(str::to_string)
-}
-
 /// Bound for [`connect_wayland_idle`]'s `spawn_blocking` task (see [`IdleController::new`]). A
 /// local niri roundtrip is well under one second; 5s leaves headroom while bounding the genuine
 /// compositor deadlock observed once at 60+ seconds without a timeout.
@@ -389,34 +378,5 @@ async fn watch_idle_inhibitors(
         if state_tx.send(next_state).is_err() {
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---- parse_register_args / parse_inhibit_args ----
-
-    #[test]
-    fn parse_register_args_reads_the_first_argument_as_seconds() {
-        assert_eq!(parse_register_args(&[serde_json::json!(30)]), Some(30));
-    }
-
-    #[test]
-    fn parse_register_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_register_args(&[]), None);
-        assert_eq!(parse_register_args(&[serde_json::json!("30")]), None);
-    }
-
-    #[test]
-    fn parse_inhibit_args_reads_the_first_argument_as_a_reason_string() {
-        assert_eq!(parse_inhibit_args(&[serde_json::json!("playing a video")]), Some("playing a video".to_string()));
-    }
-
-    #[test]
-    fn parse_inhibit_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_inhibit_args(&[]), None);
-        assert_eq!(parse_inhibit_args(&[serde_json::json!(42)]), None);
     }
 }

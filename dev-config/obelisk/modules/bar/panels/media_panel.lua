@@ -19,7 +19,7 @@
 -- exactly where it landed; the next real reading corrects it.
 --
 -- Stop: `control` takes `play`, `pause`, `play_pause`, `next` and `previous`, and nothing else
--- (`controller.rs`'s `VALID_COMMANDS`). The mirror greys controls from
+-- (`PlayerCommand`). The mirror greys controls from
 -- `canGoNext`/`canSeek`/`canControl`, which `PlayerState` does not carry. See ADR-0164.
 local theme = require("config.theme")
 local icons = require("config.icons")
@@ -146,7 +146,7 @@ end
 ---replaces it.
 ---@param slot string
 ---@param icon string|Bound
----@param command string?
+---@param command PlayerCommand?
 ---@param offset integer?
 ---@param size "sm"|"md"?
 local function transport(slot, icon, command, offset, size)
@@ -162,7 +162,7 @@ local function transport(slot, icon, command, offset, size)
             seek_base:set(math.floor(estimate))
             anchor_now()
             obelisk.mpris:invoke("seek_relative", player.id, offset)
-        else
+        elseif command then
             obelisk.mpris:invoke("control", player.id, command)
         end
     end, { slot = slot, size = size })

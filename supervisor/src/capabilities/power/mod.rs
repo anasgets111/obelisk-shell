@@ -13,30 +13,24 @@
 
 pub mod controller;
 
-pub use controller::{PowerController, PowerSignal, parse_set_profile_args};
+pub use controller::{PowerController, PowerSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PowerAction {
-    /// (name: string) Switches to one of `profiles`.
-    SetProfile,
+    /// Switches to one of `profiles`; the daemon rejects unknown names.
+    SetProfile { name: String },
 }
 
 /// `set_profile` writes a D-Bus property and is spawned (ADR-0037, ADR-0029), like
 /// `brightness::dispatch`.
 pub fn dispatch(controller: &PowerController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<PowerAction>(params) else { return };
+    let Some(action) = crate::parse_action::<PowerAction>(&envelope.params) else { return };
     match action {
-        PowerAction::SetProfile => match parse_set_profile_args(&params.arguments) {
-            Some(profile) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set_profile(&profile).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        PowerAction::SetProfile { name } => {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.set_profile(&name).await });
+        }
     }
 }

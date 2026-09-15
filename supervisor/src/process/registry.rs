@@ -96,7 +96,7 @@ pub(crate) async fn dispatch(
             }
             KillOutcome::NotRegistered => {}
         },
-        _ => crate::log_unknown_action(&envelope.params),
+        _ => eprintln!("process: unknown action {:?} from generation {generation_id}", envelope.params.action),
     }
 }
 

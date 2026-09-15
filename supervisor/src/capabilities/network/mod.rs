@@ -154,128 +154,61 @@ fn root_object_path() -> ObjectPath<'static> {
     ObjectPath::try_from("/").expect("\"/\" is always a valid D-Bus object path")
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAction {
-    /// (enabled: boolean) Turns NetworkManager networking on or off.
-    SetNetworkingEnabled,
-    /// (enabled: boolean) Powers the Wi-Fi radio.
-    SetWifiEnabled,
-    /// (enabled: boolean) Activates or deactivates wired devices.
-    SetEthernetEnabled,
-    /// () Requests a Wi-Fi scan.
+    /// Turns NetworkManager networking on or off.
+    SetNetworkingEnabled { enabled: bool },
+    /// Powers the Wi-Fi radio.
+    SetWifiEnabled { enabled: bool },
+    /// Activates or deactivates wired devices.
+    SetEthernetEnabled { enabled: bool },
+    /// Requests a Wi-Fi scan.
     Scan,
-    /// (ssid: string, hidden: boolean) Joins a network, setting `password_ssid` when it needs a key.
-    Connect,
-    /// () Drops the password request `password_ssid` names.
+    /// Joins a network, setting `password_ssid` when it needs a key.
+    Connect { ssid: String, hidden: bool },
+    /// Drops the password request `password_ssid` names.
     CancelConnect,
-    /// () Stops the join `connecting_ssid` names.
+    /// Stops the join `connecting_ssid` names.
     AbortConnect,
-    /// (ssid: string) Deletes this SSID's saved profile.
-    Forget,
-    /// () Disconnects the Wi-Fi device.
+    /// Deletes this SSID's saved profile.
+    Forget { ssid: String },
+    /// Disconnects the Wi-Fi device.
     DisconnectWifi,
 }
 
 /// `obelisk.network` dispatch (ADR-0037). Writes spawn rather than await inline (ADR-0029);
-/// `connect`
-/// stashes its intent until paired `secure_submit(network, connect)`.
+/// `connect` stashes its intent until paired `secure_submit(network, connect)`.
 pub fn dispatch(controller: &NetworkController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<NetworkAction>(params) else { return };
+    let Some(action) = crate::parse_action::<NetworkAction>(&envelope.params) else { return };
+    let controller = controller.clone();
     match action {
-        NetworkAction::SetNetworkingEnabled | NetworkAction::SetWifiEnabled | NetworkAction::SetEthernetEnabled => {
-            match crate::capabilities::parse_bool_arg(&params.arguments) {
-                Some(enabled) => {
-                    let controller = controller.clone();
-                    tokio::spawn(async move {
-                        match action {
-                            NetworkAction::SetNetworkingEnabled => controller.set_networking_enabled(enabled).await,
-                            NetworkAction::SetWifiEnabled => controller.set_wifi_enabled(enabled).await,
-                            _ => controller.set_ethernet_enabled(enabled).await,
-                        }
-                    });
-                }
-                None => crate::log_malformed_command(params),
-            }
+        NetworkAction::SetNetworkingEnabled { enabled } => {
+            tokio::spawn(async move { controller.set_networking_enabled(enabled).await });
+        }
+        NetworkAction::SetWifiEnabled { enabled } => {
+            tokio::spawn(async move { controller.set_wifi_enabled(enabled).await });
+        }
+        NetworkAction::SetEthernetEnabled { enabled } => {
+            tokio::spawn(async move { controller.set_ethernet_enabled(enabled).await });
         }
         NetworkAction::Scan => {
             controller.mark_scanning();
-            let controller = controller.clone();
-            tokio::spawn(async move {
-                controller.scan().await;
-            });
+            tokio::spawn(async move { controller.scan().await });
         }
-        NetworkAction::Connect => match parse_connect_args(&params.arguments) {
-            Some((ssid, hidden)) => {
-                controller.stash_connect_intent(PendingNetworkConnect { ssid, hidden });
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.resolve_connect_intent().await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        NetworkAction::Connect { ssid, hidden } => {
+            controller.stash_connect_intent(PendingNetworkConnect { ssid, hidden });
+            tokio::spawn(async move { controller.resolve_connect_intent().await });
+        }
         // Not spawned: it touches no D-Bus, and a late cancel would resurrect the prompt.
         NetworkAction::CancelConnect => controller.cancel_connect(),
         NetworkAction::AbortConnect => controller.abort_connect(),
-        NetworkAction::Forget => match parse_ssid_arg(&params.arguments) {
-            Some(ssid) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.forget(&ssid).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        NetworkAction::DisconnectWifi => {
-            let controller = controller.clone();
-            tokio::spawn(async move {
-                controller.disconnect_wifi().await;
-            });
+        NetworkAction::Forget { ssid } => {
+            tokio::spawn(async move { controller.forget(&ssid).await });
         }
-    }
-}
-
-/// `network:connect(ssid, hidden)`'s `arguments: [ssid, hidden]`.
-pub fn parse_connect_args(arguments: &[serde_json::Value]) -> Option<(String, bool)> {
-    let ssid = arguments.first()?.as_str()?.to_string();
-    let hidden = arguments.get(1)?.as_bool()?;
-    Some((ssid, hidden))
-}
-
-/// `network:forget(ssid)`'s `arguments: [ssid]`.
-pub fn parse_ssid_arg(arguments: &[serde_json::Value]) -> Option<String> {
-    Some(arguments.first()?.as_str()?.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_connect_args_parses_ssid_and_hidden() {
-        assert_eq!(
-            parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!(true)]),
-            Some(("HomeWifi".to_string(), true))
-        );
-    }
-
-    #[test]
-    fn parse_connect_args_rejects_a_malformed_shape() {
-        assert_eq!(parse_connect_args(&[]), None, "missing both elements");
-        assert_eq!(parse_connect_args(&[serde_json::json!(1), serde_json::json!(true)]), None, "ssid is not a string");
-        assert_eq!(
-            parse_connect_args(&[serde_json::json!("HomeWifi"), serde_json::json!("nope")]),
-            None,
-            "hidden is not a boolean"
-        );
-    }
-
-    #[test]
-    fn parse_ssid_arg_reads_the_first_argument() {
-        assert_eq!(parse_ssid_arg(&[serde_json::json!("HomeWifi")]), Some("HomeWifi".to_string()));
-        assert_eq!(parse_ssid_arg(&[]), None);
+        NetworkAction::DisconnectWifi => {
+            tokio::spawn(async move { controller.disconnect_wifi().await });
+        }
     }
 }

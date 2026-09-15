@@ -19,48 +19,30 @@ pub mod player;
 pub mod proxies;
 pub mod watcher;
 
-pub use controller::{MprisController, MprisSignal, parse_control_args, parse_seek_args};
+pub use controller::{MprisController, MprisSignal, PlayerCommand};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MprisAction {
-    /// (id: string, command: "play"|"pause"|"play_pause"|"next"|"previous") Controls `players[].id`.
-    Control,
-    /// (id: string, position_us: integer) Seeks to an absolute position in microseconds.
-    Seek,
-    /// (id: string, offset_us: integer) Seeks by a signed offset in microseconds.
-    SeekRelative,
+    /// Controls `players[].id`.
+    Control { id: String, cmd: PlayerCommand },
+    /// Seeks to an absolute position in microseconds.
+    Seek { id: String, position_us: i64 },
+    /// Seeks by a signed offset in microseconds.
+    SeekRelative { id: String, offset_us: i64 },
 }
 
-/// `obelisk.mpris` action dispatch (ADR-0037): matches, parses, and `tokio::spawn`s each write
-/// action (ADR-0036/ADR-0029).
+/// `obelisk.mpris` action dispatch (ADR-0037): `tokio::spawn`s each write action
+/// (ADR-0036/ADR-0029). Seeks are unclamped here; each command clamps, or declines to, where it runs.
 pub fn dispatch(controller: &MprisController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<MprisAction>(params) else { return };
-    match action {
-        MprisAction::Control => match parse_control_args(&params.arguments) {
-            Some((id, cmd)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.control(&id, &cmd).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        // Same wire shape and same spawn; only the controller method differs.
-        MprisAction::Seek | MprisAction::SeekRelative => match parse_seek_args(&params.arguments) {
-            Some((id, position)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    match action {
-                        MprisAction::Seek => controller.seek(&id, position).await,
-                        MprisAction::SeekRelative => controller.seek_relative(&id, position).await,
-                        other => unreachable!("the arm above admits two actions, not {other:?}"),
-                    }
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-    }
+    let Some(action) = crate::parse_action::<MprisAction>(&envelope.params) else { return };
+    let controller = controller.clone();
+    tokio::spawn(async move {
+        match action {
+            MprisAction::Control { id, cmd } => controller.control(&id, cmd).await,
+            MprisAction::Seek { id, position_us } => controller.seek(&id, position_us).await,
+            MprisAction::SeekRelative { id, offset_us } => controller.seek_relative(&id, offset_us).await,
+        }
+    });
 }

@@ -7,31 +7,27 @@ pub mod backend;
 pub mod controller;
 pub mod pacman;
 
-pub use controller::{UpdatesController, UpdatesSignal, parse_configure_args};
+pub use controller::{UpdatesController, UpdatesSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UpdatesAction {
-    /// () Checks for upgrades now.
+    /// Checks for upgrades now.
     Check,
-    /// (config: { interval: integer, checked_at?: integer, packages?: UpdateCandidate[] }) Seconds, `0` for none.
-    Configure,
-    /// () Installs pending upgrades.
+    /// Sets the check schedule.
+    Configure { config: controller::UpdatesConfigure },
+    /// Installs pending upgrades.
     Install,
 }
 
 /// `obelisk.updates` dispatch (ADR-0037): `check`/`configure` send scheduler requests synchronously
 /// (ADR-0034); `install` spawns the package-manager child.
 pub fn dispatch(controller: &UpdatesController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<UpdatesAction>(params) else { return };
+    let Some(action) = crate::parse_action::<UpdatesAction>(&envelope.params) else { return };
     match action {
         UpdatesAction::Check => controller.check_now(),
-        UpdatesAction::Configure => match parse_configure_args(&params.arguments) {
-            Some(configure) => controller.configure(configure),
-            None => crate::log_malformed_command(params),
-        },
+        UpdatesAction::Configure { config } => controller.configure(config),
         UpdatesAction::Install => {
             let controller = controller.clone();
             tokio::spawn(async move {

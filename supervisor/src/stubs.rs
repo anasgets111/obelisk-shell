@@ -8,11 +8,9 @@
 //! field's Rust doc comment its LuaCATS description.
 //!
 //! Commands work the same way: `#[derive(Deserialize, JsonSchema)]` action enums sit beside
-//! `dispatch`, and socket-boundary `parse_action` turns wire strings into them. Mismatches fail
-//! the build rather than the golden test.
-//!
-//! ponytail: argument types stay `...`. Upgrade to a payload enum such as `Set(u32)`, deleting every
-//! `parse_*_args` function, only with an IDL change for named arguments.
+//! `dispatch`, socket-boundary `parse_action` decodes `(action, arguments)` into their variants,
+//! and each variant's fields become one typed `invoke` overload. Mismatches fail the build rather
+//! than the golden test.
 
 use std::collections::BTreeMap;
 
@@ -321,6 +319,42 @@ fn render_class(name: &str, body: &serde_json::Value, out: &mut String) {
     }
 }
 
+/// One `---@field invoke` per action, which LuaLS reads as overloads. External tagging makes a
+/// fieldless action a string branch and any other a one-key object holding its fields.
+///
+/// ponytail: `properties` come back alphabetical, so arguments follow `required` order, then at
+/// most one optional; a second needs serde's field order.
+fn render_invoke(class: &str, actions: &serde_json::Value, out: &mut String) {
+    append_description(actions, out);
+    let branches =
+        actions.get("oneOf").and_then(|o| o.as_array()).map_or_else(|| vec![actions], |b| b.iter().collect());
+    for branch in branches {
+        let description = one_line(branch.get("description"));
+        if let Some(names) = enum_strings(branch).or_else(|| Some(vec![branch.get("const")?.as_str()?])) {
+            for name in names {
+                out.push_str(&format!("---@field invoke fun(self: {class}, command: \"{name}\"){description}\n"));
+            }
+            continue;
+        }
+        let (name, fields) = branch["properties"].as_object().and_then(|p| p.iter().next()).expect("a one-key object");
+        let properties = fields["properties"].as_object().expect("a struct variant");
+        let required: Vec<&str> = fields
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map_or_else(Vec::new, |r| r.iter().filter_map(|v| v.as_str()).collect());
+        let mut params = format!("self: {class}, command: \"{name}\"");
+        for field in &required {
+            params.push_str(&format!(", {field}: {}", lua_type(&properties[*field])));
+        }
+        let optional: Vec<_> = properties.iter().filter(|(field, _)| !required.contains(&field.as_str())).collect();
+        assert!(optional.len() <= 1, "{name} has {} optional arguments; see the ponytail above", optional.len());
+        for (field, fragment) in optional {
+            params.push_str(&format!(", {field}?: {}", lua_type(fragment)));
+        }
+        out.push_str(&format!("---@field invoke fun({params}){description}\n"));
+    }
+}
+
 /// The generated file.
 pub fn render() -> String {
     let mut out = String::new();
@@ -330,7 +364,7 @@ pub fn render() -> String {
 
     // Deduplicate and sort every capability's `$defs`, making output independent of roster order.
     let mut defs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    for (_, schema, _) in &schemas {
+    for schema in schemas.iter().flat_map(|(_, payload, actions)| std::iter::once(payload).chain(actions)) {
         let value = serde_json::to_value(schema).expect("a schema serializes");
         if let Some(entries) = value.get("$defs").and_then(|d| d.as_object()) {
             for (name, body) in entries {
@@ -359,16 +393,10 @@ pub fn render() -> String {
         // Inherit `get`/`map`/`on_change`: repeating them would need a class-specific `self`, and
         // an unbound `---@field` would check nothing.
         let base = if actions.is_none() { "ReadOnlyCapability" } else { "Capability" };
-        if let Some(actions) = actions {
-            render_class(&payload_class(actions), actions.as_value(), &mut out);
-        }
         out.push_str(&format!("\n---@class {class}: {base}<{payload}>\n"));
         out.push_str(hand_written_methods(capability));
         match actions {
-            Some(actions) => out.push_str(&format!(
-                "---@field invoke fun(self: {class}, command: {}, ...: any)\n",
-                payload_class(actions)
-            )),
+            Some(actions) => render_invoke(&class, actions.as_value(), &mut out),
             None => out.push_str(&format!("local {class} = {{}}\n")),
         }
     }
@@ -422,9 +450,6 @@ const GENERATED_HEADER: &str = r#"---@meta
 ---@field on_change fun(self: ReadOnlyCapability<T>, handler: fun(current: T, previous: T?))
 
 ---@class Capability<T>: ReadOnlyCapability<T>
----`:invoke()` sends a command the supervisor dispatches. Each capability narrows `command` to its
----`*Action` alias; hover a command for its arguments.
----@field invoke fun(self: Capability<T>, command: string, ...: any)
 "#;
 
 /// Methods no action schema can describe, appended to the generated class. Only `idle` has them:
@@ -537,18 +562,6 @@ mod tests {
                 .collect();
             assert!(!class.is_empty(), "{header} is missing");
             assert!(!class.iter().any(|line| line.contains("invoke")), "{class:#?}");
-        }
-    }
-
-    /// schemars emits `oneOf` once a variant has a doc comment; both forms must render an alias.
-    #[test]
-    fn every_action_enum_renders_as_an_alias() {
-        for (capability, _, actions) in super::capability_schemas() {
-            if let Some(actions) = actions {
-                let mut out = String::new();
-                super::render_class("A", actions.as_value(), &mut out);
-                assert!(out.starts_with("\n---@alias A"), "{capability}: {out}");
-            }
         }
     }
 

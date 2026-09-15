@@ -238,18 +238,6 @@ impl StatePublisher {
     }
 }
 
-/// `workspaces:focus(id)`'s `arguments: [id]`; only shape is checked. The compositor decides
-/// whether the workspace exists and does nothing otherwise.
-pub fn parse_focus_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_u64()
-}
-
-/// `workspaces:toggle_special(name)`'s `arguments: [name]`, the `special` entry name. Hyprland
-/// refuses unknown names or creates one, which also opens a scratchpad from a keybind.
-pub fn parse_toggle_special_args(arguments: &[serde_json::Value]) -> Option<&str> {
-    arguments.first()?.as_str().filter(|name| !name.is_empty())
-}
-
 /// No `Clone`: adaptors spawn OS threads and move only what they need because niri's socket is a
 /// blocking `std::net::UnixStream`, not tokio-aware.
 pub struct WorkspacesController {
@@ -522,27 +510,5 @@ mod tests {
         assert!(publisher.publish(&workspaces, None, Some(&[])));
         let json = serde_json::to_value(publisher.state.lock().unwrap().clone()).unwrap();
         assert_eq!(json["special"], serde_json::json!([]), "the compositor has specials and none exist right now");
-    }
-
-    #[test]
-    fn parse_toggle_special_args_takes_a_non_empty_name() {
-        assert_eq!(parse_toggle_special_args(&[serde_json::json!("special:term")]), Some("special:term"));
-        assert_eq!(parse_toggle_special_args(&[serde_json::json!("")]), None);
-        assert_eq!(parse_toggle_special_args(&[serde_json::json!(3)]), None);
-        assert_eq!(parse_toggle_special_args(&[]), None);
-    }
-
-    // ---- parse_focus_args ----
-
-    #[test]
-    fn parse_focus_args_reads_the_first_argument_as_a_workspace_id() {
-        assert_eq!(parse_focus_args(&[serde_json::json!(11)]), Some(11));
-    }
-
-    #[test]
-    fn parse_focus_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_focus_args(&[]), None);
-        assert_eq!(parse_focus_args(&[serde_json::json!("3")]), None);
-        assert_eq!(parse_focus_args(&[serde_json::json!(-1)]), None);
     }
 }

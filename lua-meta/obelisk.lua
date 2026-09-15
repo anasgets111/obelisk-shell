@@ -36,9 +36,6 @@
 ---@field on_change fun(self: ReadOnlyCapability<T>, handler: fun(current: T, previous: T?))
 
 ---@class Capability<T>: ReadOnlyCapability<T>
----`:invoke()` sends a command the supervisor dispatches. Each capability narrows `command` to its
----`*Action` alias; hover a command for its arguments.
----@field invoke fun(self: Capability<T>, command: string, ...: any)
 
 --- Payload types ------------------------------------------------------------------------------
 
@@ -242,6 +239,8 @@
 ---@field mac string The device's MAC address.
 ---@field name string The device's advertised name, or empty.
 
+---@alias PlayerCommand "play"|"pause"|"play_pause"|"next"|"previous"
+
 ---@class PlayerState
 ---@field album_art_path string Absolute artwork path, or empty. `mpris:artUrl` must be a `file://` URL canonicalizing to an existing file; remote/stale URLs become empty. Held across same-track updates so covers do not blink.
 ---@field artist string `xesam:artist`, joined with `", "`; empty when absent.
@@ -269,6 +268,15 @@
 ---@field start_error string Why the last `start` produced no process at all -- a command that is not on `PATH`, most often. Empty when it spawned, and cleared by the next `start`. Without this a config waiting on `running` would wait forever with the reason only in the Supervisor's stderr.
 ---@field started_at? integer Unix seconds when the current or last run began; `nil` until the first `start`. Elapsed time is this subtracted from `obelisk.system`'s clock, so nothing here needs a second timer.
 
+---@alias SignalName "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT"
+---The signal names a config may write, without the `SIG` prefix.
+---
+---A closed list rather than a number: a config asking for signal 9 by number is asking for
+---something it cannot have meant, and every name here is one a program documents as an
+---interface: `INT` to finish and save, `USR1`/`USR2` for whatever the program says, `HUP` to reload.
+---`KILL` is included because a config that has decided to be rid of something should not have to
+---go through `process.run` to say so.
+
 ---@class SpecialWorkspace
 ---One special workspace (ADR-0119), identified by `name`, the argument to
 ---`:invoke("toggle_special", name)`; Hyprland uses names and negative ids.
@@ -276,6 +284,13 @@
 ---@field name string Full compositor name, `"special:scratch"` or unnamed `"special"`.
 ---@field populated boolean Whether at least one window sits on it.
 ---@field shown_on? string Connector currently showing it, absent while hidden; a special shows on one output at a time.
+
+---@class SysinfoConfigure
+---`sysinfo:configure`'s table (ADR-0035). Present keys override intervals; absent keys stay
+---unchanged, and one wrong-typed key drops the whole call.
+---@field cpu_interval? integer
+---@field ram_interval? integer
+---@field temp_interval? integer
 
 ---@class TrayItem
 ---@field attention_icon_name? string `NeedsAttention` artwork, resolved like `icon_name`/`icon_path`; draw it instead of the base pair when `status == "NeedsAttention"`. Both are `nil` when undeclared.
@@ -298,6 +313,12 @@
 ---@field name string The package name, as the package manager spells it.
 ---@field new_version string Version offered by synced repositories.
 ---@field old_version string Installed version in the manager's spelling.
+
+---@class UpdatesConfigure
+---What `updates:configure` carries. One wrong-typed key drops the whole call (ADR-0034).
+---@field checked_at? integer Remembered Unix time of the last successful check, likely from `system.state`. Optional seed, not override: used only before this process has checked, so restarts can answer "has an hour passed?" without starting over.
+---@field interval integer Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
+---@field packages? UpdateCandidate[] Remembered list from the check `checked_at` stamps, under the same seed rule: a restart inside the interval skips its first check, and without this it would show "up to date" for the rest of the hour. Ignored without `checked_at`, since a list with no age is unusable.
 
 ---@alias Urgency "low"|"normal"|"critical"
 ---`low`/`normal`/`critical` urgency tier, also used as the sound-registry key.
@@ -499,30 +520,24 @@
 
 --- Capabilities -------------------------------------------------------------------------------
 
----@alias ApplicationsAction
----| "refresh" # () Rescans installed desktop entries.
----| "launch" # (id: string) Launches the `entries[].id` desktop entry.
----| "open_url" # (url: string) Opens a URL with `xdg-open`.
-
 ---@class ApplicationsCapability: Capability<ApplicationsState>
----@field invoke fun(self: ApplicationsCapability, command: ApplicationsAction, ...: any)
-
----@alias AudioAction
----| "set_volume" # (volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.
----| "set_muted" # (muted: boolean) Sets master output mute.
----| "toggle_mute" # () Toggles master output mute.
----| "set_balance" # (balance: number) Sets default output balance, clamped to `[-1.0, 1.0]`; the louder side keeps its level and never passes the cap.
----| "set_default_sink" # (id: integer) Makes this `sinks[].id` the default output.
----| "set_default_source" # (id: integer) Makes this `sources[].id` the default input.
----| "set_source_volume" # (volume: number) Sets default input volume, clamped to `[0.0, 1.0]`.
----| "set_source_muted" # (muted: boolean) Sets default input mute.
----| "toggle_source_mute" # () Toggles default input mute.
----| "set_app_volume" # (id: integer, volume: number) Sets an `apps[].id` stream's volume, clamped to `[0.0, 1.0]`.
----| "set_app_muted" # (id: integer, muted: boolean) Sets an `apps[].id` stream's mute.
----| "set_bluetooth_profile" # (device: integer, index: integer) Switches a `bluetooth[].device` to one of its `codecs[].index`.
+---@field invoke fun(self: ApplicationsCapability, command: "refresh") Rescans installed desktop entries.
+---@field invoke fun(self: ApplicationsCapability, command: "launch", id: string) Launches the `entries[].id` desktop entry.
+---@field invoke fun(self: ApplicationsCapability, command: "open_url", url: string) Opens a URL with `xdg-open`.
 
 ---@class AudioCapability: Capability<AudioState>
----@field invoke fun(self: AudioCapability, command: AudioAction, ...: any)
+---@field invoke fun(self: AudioCapability, command: "set_volume", volume: number) Sets master output volume, clamped to `[0.0, 1.5]`.
+---@field invoke fun(self: AudioCapability, command: "set_muted", muted: boolean) Sets master output mute.
+---@field invoke fun(self: AudioCapability, command: "toggle_mute") Toggles master output mute.
+---@field invoke fun(self: AudioCapability, command: "set_balance", balance: number) Sets default output balance, clamped to `[-1.0, 1.0]`; the louder side keeps its level and never passes the cap.
+---@field invoke fun(self: AudioCapability, command: "set_default_sink", id: integer) Makes this `sinks[].id` the default output.
+---@field invoke fun(self: AudioCapability, command: "set_default_source", id: integer) Makes this `sources[].id` the default input.
+---@field invoke fun(self: AudioCapability, command: "set_source_volume", volume: number) Sets default input volume, clamped to `[0.0, 1.0]`.
+---@field invoke fun(self: AudioCapability, command: "set_source_muted", muted: boolean) Sets default input mute.
+---@field invoke fun(self: AudioCapability, command: "toggle_source_mute") Toggles default input mute.
+---@field invoke fun(self: AudioCapability, command: "set_app_volume", id: integer, volume: number) Sets an `apps[].id` stream's volume, clamped to `[0.0, 1.0]`.
+---@field invoke fun(self: AudioCapability, command: "set_app_muted", id: integer, muted: boolean) Sets an `apps[].id` stream's mute.
+---@field invoke fun(self: AudioCapability, command: "set_bluetooth_profile", device: integer, index: integer) Switches a `bluetooth[].device` to one of its `codecs[].index`.
 
 ---@class BatteryCapability: ReadOnlyCapability<BatteryState>
 local BatteryCapability = {}
@@ -533,149 +548,101 @@ local BatteryCapability = {}
 ---@field release_inhibit fun(self: IdleCapability) Releases one `inhibit` hold. A release with no matching `inhibit` is a no-op.
 local IdleCapability = {}
 
----@alias BluetoothAction
----| "set_enabled" # (enabled: boolean) Powers the adapter on or off.
----| "set_discoverable" # (discoverable: boolean) Lets other devices find this adapter.
----| "start_discovery" # () Starts discovery, clearing `discovered_devices`.
----| "stop_discovery" # () Stops discovery; `discovered_devices` stays.
----| "pair" # (mac: string) Pairs a discovered device.
----| "connect" # (mac: string) Connects a paired device.
----| "disconnect" # (mac: string) Disconnects a connected device.
----| "forget" # (mac: string) Removes a paired device.
----| "answer_pairing" # (mac: string, accept: boolean) Answers `pairing_request`.
-
 ---@class BluetoothCapability: Capability<BluetoothState>
----@field invoke fun(self: BluetoothCapability, command: BluetoothAction, ...: any)
-
----@alias BrightnessAction
----| "set" # (percent: integer) Sets the screen backlight, `0` to `100`.
+---@field invoke fun(self: BluetoothCapability, command: "set_enabled", enabled: boolean) Powers the adapter on or off.
+---@field invoke fun(self: BluetoothCapability, command: "set_discoverable", discoverable: boolean) Lets other devices find this adapter.
+---@field invoke fun(self: BluetoothCapability, command: "start_discovery") Starts discovery, clearing `discovered_devices`.
+---@field invoke fun(self: BluetoothCapability, command: "stop_discovery") Stops discovery; `discovered_devices` stays.
+---@field invoke fun(self: BluetoothCapability, command: "pair", mac: string) Pairs a discovered device.
+---@field invoke fun(self: BluetoothCapability, command: "connect", mac: string) Connects a paired device.
+---@field invoke fun(self: BluetoothCapability, command: "disconnect", mac: string) Disconnects a connected device.
+---@field invoke fun(self: BluetoothCapability, command: "forget", mac: string) Removes a paired device.
+---@field invoke fun(self: BluetoothCapability, command: "answer_pairing", mac: string, accept: boolean) Answers `pairing_request`.
 
 ---@class BrightnessCapability: Capability<BrightnessState>
----@field invoke fun(self: BrightnessCapability, command: BrightnessAction, ...: any)
-
----@alias FilesAction
----| "watch" # (path: string, extensions?: string[]) Lists an absolute folder into `folders[path]`, extensions without the dot.
----| "unwatch" # (path: string) Stops a `watch` on this path.
+---@field invoke fun(self: BrightnessCapability, command: "set", percent: integer) Sets the screen backlight, `0` to `100`.
 
 ---@class FilesCapability: Capability<FilesState>
----@field invoke fun(self: FilesCapability, command: FilesAction, ...: any)
-
----@alias ProcessesAction
----| "declare" # (name: string, stop_signal?: "TERM"|"INT"|"HUP"|"QUIT"|"USR1"|"USR2"|"KILL"|"STOP"|"CONT") Default `TERM`.
----| "start" # (name: string, cmd: string, args?: string[]) Starts a declared program without a shell.
----| "signal" # (name: string, signal: string) Sends one of `declare`'s signal names.
----| "stop" # (name: string) Stops a program with its stop signal.
+---@field invoke fun(self: FilesCapability, command: "watch", path: string, extensions?: string[]) Lists an absolute folder into `folders[path]`. `extensions` are matched case-insensitively, with or without the dot; none means every file.
+---@field invoke fun(self: FilesCapability, command: "unwatch", path: string) Stops a `watch` on this path.
 
 ---@class ProcessesCapability: Capability<ProcessesState>
----@field invoke fun(self: ProcessesCapability, command: ProcessesAction, ...: any)
-
----@alias KeyboardAction
----| "set_backlight" # (percent: integer) Sets the keyboard backlight, `0` to `100`.
----| "switch_layout" # (index: integer) Switches to the 0-based configured layout.
+---@field invoke fun(self: ProcessesCapability, command: "declare", name: string, stop_signal?: SignalName) Default `TERM`, the same default the rest of the Supervisor reaps with.
+---@field invoke fun(self: ProcessesCapability, command: "start", name: string, cmd: string, args?: string[]) Starts a declared program without a shell, so one `args` element is one argument however many spaces it holds.
+---@field invoke fun(self: ProcessesCapability, command: "signal", name: string, signal: SignalName) Sends one of `declare`'s signal names.
+---@field invoke fun(self: ProcessesCapability, command: "stop", name: string) Stops a program with its stop signal.
 
 ---@class KeyboardCapability: Capability<KeyboardState>
----@field invoke fun(self: KeyboardCapability, command: KeyboardAction, ...: any)
+---@field invoke fun(self: KeyboardCapability, command: "set_backlight", percent: integer) Sets the keyboard backlight, `0` to `100`.
+---@field invoke fun(self: KeyboardCapability, command: "switch_layout", index: integer) Switches to the 0-based configured layout.
 
----@alias LockAction
----| "lock" # () Locks the session.
----| "set_unlock_animation" # (ms?: integer) Holds the lock open after PAM says yes, for an animation out (ADR-0190).
+---@class LockCapability: Capability<LockState>
 ---Every action `obelisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
 ---callback would make it a one-click path past PAM, forbidden by ADR-0042. Unknown `"unlock"` is
 ---logged and dropped.
-
----@class LockCapability: Capability<LockState>
----@field invoke fun(self: LockCapability, command: LockAction, ...: any)
-
----@alias MprisAction
----| "control" # (id: string, command: "play"|"pause"|"play_pause"|"next"|"previous") Controls `players[].id`.
----| "seek" # (id: string, position_us: integer) Seeks to an absolute position in microseconds.
----| "seek_relative" # (id: string, offset_us: integer) Seeks by a signed offset in microseconds.
+---@field invoke fun(self: LockCapability, command: "lock") Locks the session.
+---@field invoke fun(self: LockCapability, command: "set_unlock_animation", ms?: integer) Holds the lock open after PAM says yes, for an animation out (ADR-0190). Clamped to `MAX_UNLOCK_ANIMATION`; no `ms` is no animation.
 
 ---@class MprisCapability: Capability<MprisState>
----@field invoke fun(self: MprisCapability, command: MprisAction, ...: any)
-
----@alias NetworkAction
----| "set_networking_enabled" # (enabled: boolean) Turns NetworkManager networking on or off.
----| "set_wifi_enabled" # (enabled: boolean) Powers the Wi-Fi radio.
----| "set_ethernet_enabled" # (enabled: boolean) Activates or deactivates wired devices.
----| "scan" # () Requests a Wi-Fi scan.
----| "connect" # (ssid: string, hidden: boolean) Joins a network, setting `password_ssid` when it needs a key.
----| "cancel_connect" # () Drops the password request `password_ssid` names.
----| "abort_connect" # () Stops the join `connecting_ssid` names.
----| "forget" # (ssid: string) Deletes this SSID's saved profile.
----| "disconnect_wifi" # () Disconnects the Wi-Fi device.
+---@field invoke fun(self: MprisCapability, command: "control", id: string, cmd: PlayerCommand) Controls `players[].id`.
+---@field invoke fun(self: MprisCapability, command: "seek", id: string, position_us: integer) Seeks to an absolute position in microseconds.
+---@field invoke fun(self: MprisCapability, command: "seek_relative", id: string, offset_us: integer) Seeks by a signed offset in microseconds.
 
 ---@class NetworkCapability: Capability<NetworkState>
----@field invoke fun(self: NetworkCapability, command: NetworkAction, ...: any)
-
----@alias NotificationsAction
----| "dismiss" # (id: integer) Removes a queued notification.
----| "invoke_action" # (id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
----| "reply" # (id: integer, text: string) Sends reply text to a notification with `has_reply`.
----| "set_sound" # (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
----| "set_dnd" # (enabled: boolean) Gates non-critical notification sounds.
----| "set_quiet" # (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
----| "set_app_muted" # (app: string, muted: boolean) Silences all sound from an app matched by `desktop-entry` or app name.
----| "hold_expiry" # (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
+---@field invoke fun(self: NetworkCapability, command: "set_networking_enabled", enabled: boolean) Turns NetworkManager networking on or off.
+---@field invoke fun(self: NetworkCapability, command: "set_wifi_enabled", enabled: boolean) Powers the Wi-Fi radio.
+---@field invoke fun(self: NetworkCapability, command: "set_ethernet_enabled", enabled: boolean) Activates or deactivates wired devices.
+---@field invoke fun(self: NetworkCapability, command: "scan") Requests a Wi-Fi scan.
+---@field invoke fun(self: NetworkCapability, command: "connect", ssid: string, hidden: boolean) Joins a network, setting `password_ssid` when it needs a key.
+---@field invoke fun(self: NetworkCapability, command: "cancel_connect") Drops the password request `password_ssid` names.
+---@field invoke fun(self: NetworkCapability, command: "abort_connect") Stops the join `connecting_ssid` names.
+---@field invoke fun(self: NetworkCapability, command: "forget", ssid: string) Deletes this SSID's saved profile.
+---@field invoke fun(self: NetworkCapability, command: "disconnect_wifi") Disconnects the Wi-Fi device.
 
 ---@class NotificationsCapability: Capability<NotificationsState>
----@field invoke fun(self: NotificationsCapability, command: NotificationsAction, ...: any)
-
----@alias PowerAction
----| "set_profile" # (name: string) Switches to one of `profiles`.
+---@field invoke fun(self: NotificationsCapability, command: "dismiss", id: integer) Removes a queued notification.
+---@field invoke fun(self: NotificationsCapability, command: "invoke_action", id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
+---@field invoke fun(self: NotificationsCapability, command: "reply", id: integer, text: string) Sends reply text to a notification with `has_reply`.
+---@field invoke fun(self: NotificationsCapability, command: "set_sound", urgency: Urgency, path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
+---@field invoke fun(self: NotificationsCapability, command: "set_dnd", enabled: boolean) Gates non-critical notification sounds.
+---@field invoke fun(self: NotificationsCapability, command: "set_quiet", enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
+---@field invoke fun(self: NotificationsCapability, command: "set_app_muted", app: string, muted: boolean) Silences all sound from an app matched by `desktop-entry` or app name.
+---@field invoke fun(self: NotificationsCapability, command: "hold_expiry", seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
 
 ---@class PowerCapability: Capability<PowerState>
----@field invoke fun(self: PowerCapability, command: PowerAction, ...: any)
+---@field invoke fun(self: PowerCapability, command: "set_profile", name: string) Switches to one of `profiles`; the daemon rejects unknown names.
 
 ---@class PrivacyCapability: ReadOnlyCapability<PrivacyState>
 local PrivacyCapability = {}
 
----@alias SysinfoAction
----| "configure" # (intervals: { cpu_interval?: integer, ram_interval?: integer, temp_interval?: integer }) Seconds.
-
 ---@class SysinfoCapability: Capability<SysinfoState>
----@field invoke fun(self: SysinfoCapability, command: SysinfoAction, ...: any)
+---@field invoke fun(self: SysinfoCapability, command: "configure", intervals: SysinfoConfigure) Poll intervals in seconds.
 
 ---@class SystemCapability: ReadOnlyCapability<SystemState>
 local SystemCapability = {}
 
----@alias StorageAction
----| "open" # (path: string, defaults?: table) Declares an absolute JSON file; defaults fill missing keys.
----| "set" # (path: string, key: string, value?: any) Writes a key; `nil` deletes it.
-
 ---@class StorageCapability: Capability<StorageState>
----@field invoke fun(self: StorageCapability, command: StorageAction, ...: any)
-
----@alias PolkitAction
----| "cancel" # () Dismisses the prompt and tells polkitd's caller `Cancelled`.
+---@field invoke fun(self: StorageCapability, command: "open", path: string, defaults?: table<string, any>) Declares an absolute JSON file, the Renderer having joined `path` and `name`; `defaults` fill missing keys.
+---@field invoke fun(self: StorageCapability, command: "set", path: string, key: string, value?: any) Writes a key; `nil` deletes it.
 
 ---@class PolkitCapability: Capability<PolkitState>
----@field invoke fun(self: PolkitCapability, command: PolkitAction, ...: any)
-
----@alias TrayAction
----| "activate" # (id: string, x: integer, y: integer) Left-click activation at screen coordinates.
----| "secondary_activate" # (id: string, x: integer, y: integer) Middle-click activation at screen coordinates.
----| "scroll" # (id: string, delta: integer, orientation: string) Passes `"vertical"` or `"horizontal"` verbatim.
----| "activate_menu_item" # (id: string, menu_item_id: integer) Clicks a `MenuItem.id`.
----| "menu_will_show" # (id: string, submenu_id: integer) Tells the application a submenu is opening.
+---@field invoke fun(self: PolkitCapability, command: "cancel") Dismisses the prompt and tells polkitd's caller `Cancelled`.
 
 ---@class TrayCapability: Capability<TrayState>
----@field invoke fun(self: TrayCapability, command: TrayAction, ...: any)
-
----@alias UpdatesAction
----| "check" # () Checks for upgrades now.
----| "configure" # (config: { interval: integer, checked_at?: integer, packages?: UpdateCandidate[] }) Seconds, `0` for none.
----| "install" # () Installs pending upgrades.
+---@field invoke fun(self: TrayCapability, command: "activate", id: string, x: integer, y: integer) Left-click activation at screen coordinates.
+---@field invoke fun(self: TrayCapability, command: "secondary_activate", id: string, x: integer, y: integer) Middle-click activation at screen coordinates (ADR-0074).
+---@field invoke fun(self: TrayCapability, command: "scroll", id: string, delta: integer, orientation: string) Passes `"vertical"` or `"horizontal"` verbatim (ADR-0074).
+---@field invoke fun(self: TrayCapability, command: "activate_menu_item", id: string, menu_item_id: integer) Clicks a `MenuItem.id`.
+---@field invoke fun(self: TrayCapability, command: "menu_will_show", id: string, submenu_id: integer) Tells the application a submenu is opening.
 
 ---@class UpdatesCapability: Capability<UpdatesState>
----@field invoke fun(self: UpdatesCapability, command: UpdatesAction, ...: any)
-
----@alias WorkspacesAction
----| "focus" # (id: integer) Focuses a `WorkspaceEntry.id`.
----| "toggle_special" # (name: string) Shows or hides a special workspace.
+---@field invoke fun(self: UpdatesCapability, command: "check") Checks for upgrades now.
+---@field invoke fun(self: UpdatesCapability, command: "configure", config: UpdatesConfigure) Sets the check schedule.
+---@field invoke fun(self: UpdatesCapability, command: "install") Installs pending upgrades.
 
 ---@class WorkspacesCapability: Capability<WorkspacesState>
----@field invoke fun(self: WorkspacesCapability, command: WorkspacesAction, ...: any)
+---@field invoke fun(self: WorkspacesCapability, command: "focus", id: integer) Focuses a `WorkspaceEntry.id`; the compositor ignores one that does not exist.
+---@field invoke fun(self: WorkspacesCapability, command: "toggle_special", name: string) Shows or hides a special workspace; Hyprland creates an unknown name.
 
 --- Off-roster members ---------------------------------------------------------------------------
 -- Not capabilities and not in `shared::Capability::ALL`, so they have no payload struct to derive

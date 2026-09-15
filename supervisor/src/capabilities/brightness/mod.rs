@@ -8,29 +8,23 @@
 
 pub mod controller;
 
-pub use controller::{BrightnessController, BrightnessSignal, parse_set_args};
+pub use controller::{BrightnessController, BrightnessSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BrightnessAction {
-    /// (percent: integer) Sets the screen backlight, `0` to `100`.
-    Set,
+    /// Sets the screen backlight, `0` to `100`.
+    Set { percent: u64 },
 }
 
 /// `set` makes a logind D-Bus call, so dispatch spawns it (ADR-0037, ADR-0029).
 pub fn dispatch(controller: &BrightnessController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<BrightnessAction>(params) else { return };
+    let Some(action) = crate::parse_action::<BrightnessAction>(&envelope.params) else { return };
     match action {
-        BrightnessAction::Set => match parse_set_args(&params.arguments) {
-            Some(pct) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.set(pct).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        BrightnessAction::Set { percent } => {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.set(percent).await });
+        }
     }
 }

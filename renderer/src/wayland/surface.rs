@@ -814,8 +814,7 @@ impl App {
     ///
     /// Lazily created and never created at all for the common surface, because most surfaces never
     /// set `blur` and an `ext_background_effect_surface_v1` per surface would be an object and a
-    /// destroy for nothing. The object names a `wl_surface`, so [`App::drop_role_object`] destroys
-    /// it with one and the next show makes a fresh pair.
+    /// destroy for nothing.
     ///
     /// A compositor with no manager, or one whose `blur` capability is absent or withdrawn, gets
     /// nothing pushed and the config sees no error -- an unavailable compositor feature is not a
@@ -946,8 +945,7 @@ impl App {
         }
     }
 
-    /// The only teardown (ADR-0213). Blur and child popups need the `wl_surface`, EGL goes before
-    /// the role object, and the input scrubs read the scene tree.
+    /// The only teardown; its order is ADR-0213's.
     pub(super) fn drop_role_object(&mut self, index: usize) {
         self.release_blur_effect(index);
         // xdg-shell rejects a parent destroyed under live popups.

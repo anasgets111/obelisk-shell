@@ -73,10 +73,12 @@ pub enum UpdatesSignal {
     Changed,
 }
 
-/// What `updates:configure({ interval, checked_at, packages })` carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What `updates:configure` carries. One wrong-typed key drops the whole call (ADR-0034).
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdatesConfigure {
     /// Seconds between scheduled checks. Zero is dormant: nothing checks until a `check` asks.
+    #[serde(rename = "interval")]
     pub interval_secs: u64,
     /// Remembered Unix time of the last successful check, likely from `system.state`. Optional
     /// seed, not override: used only before this process has checked, so restarts can answer "has
@@ -85,27 +87,8 @@ pub struct UpdatesConfigure {
     /// Remembered list from the check `checked_at` stamps, under the same seed rule: a restart
     /// inside the interval skips its first check, and without this it would show "up to date" for
     /// the rest of the hour. Ignored without `checked_at`, since a list with no age is unusable.
+    #[serde(default, deserialize_with = "crate::capabilities::lua_list")]
     pub packages: Vec<UpdateCandidate>,
-}
-
-/// `updates:configure({interval})` takes one table argument (ADR-0034). A wrong-typed present key
-/// drops the whole call.
-pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<UpdatesConfigure> {
-    let table = arguments.first()?.as_object()?;
-    let interval_secs = table.get("interval")?.as_u64()?;
-    let checked_at = match table.get("checked_at") {
-        Some(value) => Some(value.as_i64()?),
-        None => None,
-    };
-    let packages = match table.get("packages") {
-        // An empty Lua table has no shape, and mlua sends it as `{}`. That is the empty list
-        // a config's store writes before any check, so read it as one rather than drop the call and
-        // leave the scheduler dormant.
-        None => Vec::new(),
-        Some(serde_json::Value::Object(map)) if map.is_empty() => Vec::new(),
-        Some(value) => serde::Deserialize::deserialize(value).ok()?,
-    };
-    Some(UpdatesConfigure { interval_secs, checked_at, packages })
 }
 
 /// Marker file for [`UpdatesState::reboot_required`], written by a pacman hook.
@@ -517,65 +500,6 @@ mod tests {
         fn parse_install_step(&self, line: &str) -> Option<InstallStep> {
             crate::capabilities::updates::pacman::install::parse_install_step(line)
         }
-    }
-
-    #[test]
-    fn parse_configure_args_reads_the_interval_from_a_table() {
-        let args = vec![serde_json::json!({"interval": 3600})];
-        assert_eq!(
-            parse_configure_args(&args),
-            Some(UpdatesConfigure { interval_secs: 3600, checked_at: None, packages: vec![] })
-        );
-    }
-
-    #[test]
-    fn parse_configure_args_reads_a_remembered_check_time_beside_the_interval() {
-        let args = vec![serde_json::json!({"interval": 3600, "checked_at": 1_800_000_000_i64})];
-        assert_eq!(
-            parse_configure_args(&args),
-            Some(UpdatesConfigure { interval_secs: 3600, checked_at: Some(1_800_000_000), packages: vec![] })
-        );
-    }
-
-    #[test]
-    fn parse_configure_args_reads_a_remembered_package_list_in_the_lua_shape() {
-        // The list is `updates.packages` written back verbatim, so the wire shape is the
-        // `UpdateCandidate` serialization and nothing else.
-        let args = vec![serde_json::json!({
-            "interval": 3600,
-            "checked_at": 1_800_000_000_i64,
-            "packages": [serde_json::to_value(candidate()).unwrap()],
-        })];
-        assert_eq!(
-            parse_configure_args(&args),
-            Some(UpdatesConfigure {
-                interval_secs: 3600,
-                checked_at: Some(1_800_000_000),
-                packages: vec![candidate()]
-            })
-        );
-        assert_eq!(
-            parse_configure_args(&[serde_json::json!({"interval": 3600, "packages": {}})]),
-            Some(UpdatesConfigure { interval_secs: 3600, checked_at: None, packages: vec![] }),
-            "an empty Lua table arrives as an empty object and is the empty list, not a wrong-typed key"
-        );
-        assert_eq!(
-            parse_configure_args(&[serde_json::json!({"interval": 3600, "packages": [{"name": "linux"}]})]),
-            None,
-            "a malformed list drops the call like any other wrong-typed key"
-        );
-    }
-
-    #[test]
-    fn parse_configure_args_is_none_for_a_missing_or_wrong_typed_argument() {
-        assert_eq!(parse_configure_args(&[]), None);
-        assert_eq!(parse_configure_args(&[serde_json::json!(3600)]), None);
-        assert_eq!(parse_configure_args(&[serde_json::json!({"wrong_key": 3600})]), None);
-        assert_eq!(
-            parse_configure_args(&[serde_json::json!({"interval": 3600, "checked_at": "yesterday"})]),
-            None,
-            "a present key with the wrong type drops the call rather than half-applying it"
-        );
     }
 
     fn candidate() -> UpdateCandidate {

@@ -24,87 +24,55 @@ pub mod markup;
 pub mod queue;
 pub mod sound;
 
-pub use controller::{
-    NotificationsController, parse_dismiss_args, parse_hold_expiry_args, parse_invoke_action_args, parse_reply_args,
-    parse_set_app_muted_args, parse_set_sound_args,
-};
+pub use controller::NotificationsController;
 pub use sound::run_sound_player;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationsAction {
-    /// (id: integer) Removes a queued notification.
-    Dismiss,
-    /// (id: integer, key: string) Invokes an `actions[].key`, or `"default"`.
-    InvokeAction,
-    /// (id: integer, text: string) Sends reply text to a notification with `has_reply`.
-    Reply,
-    /// (urgency: "low"|"normal"|"critical", path: string) Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
-    SetSound,
-    /// (enabled: boolean) Gates non-critical notification sounds.
-    SetDnd,
-    /// (enabled: boolean) Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
-    SetQuiet,
-    /// (app: string, muted: boolean) Silences all sound from an app matched by `desktop-entry` or app name.
-    SetAppMuted,
-    /// (seconds: integer) Holds expiry countdowns this long; `0` releases the hold.
-    HoldExpiry,
+    /// Removes a queued notification.
+    Dismiss { id: u32 },
+    /// Invokes an `actions[].key`, or `"default"`.
+    InvokeAction {
+        id: u32,
+        #[serde(deserialize_with = "crate::capabilities::non_empty")]
+        key: String,
+    },
+    /// Sends reply text to a notification with `has_reply`.
+    Reply { id: u32, text: String },
+    /// Registers an Ogg Vorbis or 16-bit WAV sound file for an urgency tier.
+    SetSound { urgency: Urgency, path: String },
+    /// Gates non-critical notification sounds.
+    SetDnd { enabled: bool },
+    /// Gates non-critical sounds like `set_dnd` without changing DND, for a config's own rules.
+    SetQuiet { enabled: bool },
+    /// Silences all sound from an app matched by `desktop-entry` or app name.
+    SetAppMuted { app: String, muted: bool },
+    /// Holds expiry countdowns this long; `0` releases the hold.
+    HoldExpiry { seconds: u64 },
 }
 
 /// Dispatch (ADR-0037): signal-emitting `dismiss`/`invoke_action`/`reply` use `tokio::spawn`
 /// (ADR-0029); locked state writes run inline (ADR-0033).
 pub fn dispatch(controller: &NotificationsController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<NotificationsAction>(params) else { return };
+    let Some(action) = crate::parse_action::<NotificationsAction>(&envelope.params) else { return };
+    let spawned = controller.clone();
     match action {
-        NotificationsAction::Dismiss => match parse_dismiss_args(&params.arguments) {
-            Some(id) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.dismiss(id).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::InvokeAction => match parse_invoke_action_args(&params.arguments) {
-            Some((id, key)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.invoke_action(id, key).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::Reply => match parse_reply_args(&params.arguments) {
-            Some((id, text)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.reply(id, text).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::SetSound => match parse_set_sound_args(&params.arguments) {
-            Some((urgency, path)) => controller.set_sound(urgency, &path),
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::SetDnd => match crate::capabilities::parse_bool_arg(&params.arguments) {
-            Some(enabled) => controller.set_dnd(enabled),
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::SetQuiet => match crate::capabilities::parse_bool_arg(&params.arguments) {
-            Some(enabled) => controller.set_quiet(enabled),
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::SetAppMuted => match parse_set_app_muted_args(&params.arguments) {
-            Some((app, muted)) => controller.set_app_muted(app, muted),
-            None => crate::log_malformed_command(params),
-        },
-        NotificationsAction::HoldExpiry => match parse_hold_expiry_args(&params.arguments) {
-            Some(seconds) => controller.hold_expiry(seconds),
-            None => crate::log_malformed_command(params),
-        },
+        NotificationsAction::Dismiss { id } => {
+            tokio::spawn(async move { spawned.dismiss(id).await });
+        }
+        NotificationsAction::InvokeAction { id, key } => {
+            tokio::spawn(async move { spawned.invoke_action(id, key).await });
+        }
+        NotificationsAction::Reply { id, text } => {
+            tokio::spawn(async move { spawned.reply(id, text).await });
+        }
+        NotificationsAction::SetSound { urgency, path } => controller.set_sound(urgency, &path),
+        NotificationsAction::SetDnd { enabled } => controller.set_dnd(enabled),
+        NotificationsAction::SetQuiet { enabled } => controller.set_quiet(enabled),
+        NotificationsAction::SetAppMuted { app, muted } => controller.set_app_muted(app, muted),
+        NotificationsAction::HoldExpiry { seconds } => controller.hold_expiry(seconds),
     }
 }
 
@@ -202,7 +170,7 @@ pub struct NotificationAction {
 }
 
 /// `low`/`normal`/`critical` urgency tier, also used as the sound-registry key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub enum Urgency {
     #[serde(rename = "low")]
@@ -234,16 +202,6 @@ fn desktop_entry_from_hint(value: Option<&str>) -> Option<String> {
 fn reply_placeholder_from_hint(value: Option<&str>) -> Option<String> {
     let value = value.filter(|value| !value.is_empty())?;
     Some(truncate_utf8_bytes(value, MAX_REPLY_PLACEHOLDER_BYTES))
-}
-
-/// Parses `notifications:set_sound`'s `low`/`normal`/`critical` urgency string.
-fn parse_urgency_str(value: &str) -> Option<Urgency> {
-    match value {
-        "low" => Some(Urgency::Low),
-        "normal" => Some(Urgency::Normal),
-        "critical" => Some(Urgency::Critical),
-        _ => None,
-    }
 }
 
 /// Queued `notifications.feed[]` object (ADR-0033, ADR-0090). `expire_timeout` and
@@ -380,14 +338,6 @@ mod tests {
     fn urgency_from_hint_byte_defaults_to_normal_when_absent_or_malformed() {
         assert_eq!(urgency_from_hint_byte(None), Urgency::Normal);
         assert_eq!(urgency_from_hint_byte(Some(99)), Urgency::Normal);
-    }
-
-    #[test]
-    fn parse_urgency_str_matches_the_three_wire_strings() {
-        assert_eq!(parse_urgency_str("low"), Some(Urgency::Low));
-        assert_eq!(parse_urgency_str("normal"), Some(Urgency::Normal));
-        assert_eq!(parse_urgency_str("critical"), Some(Urgency::Critical));
-        assert_eq!(parse_urgency_str("urgent"), None);
     }
 
     #[test]

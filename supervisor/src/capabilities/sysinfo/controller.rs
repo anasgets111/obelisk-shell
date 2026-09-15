@@ -52,25 +52,14 @@ pub enum SysinfoSignal {
     Changed,
 }
 
-/// Parsed `sysinfo:configure({cpu_interval, ram_interval, temp_interval})` argument (ADR-0035).
-/// Present keys override intervals; absent keys stay unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `sysinfo:configure`'s table (ADR-0035). Present keys override intervals; absent keys stay
+/// unchanged, and one wrong-typed key drops the whole call.
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SysinfoConfigure {
     pub cpu_interval: Option<u64>,
     pub ram_interval: Option<u64>,
     pub temp_interval: Option<u64>,
-}
-
-/// `sysinfo:configure(cfg)`'s `arguments: [cfg]`: `arguments[0]` is a JSON object, and any wrong
-/// present-key type drops the whole call (`None`), with no partial apply.
-pub fn parse_configure_args(arguments: &[serde_json::Value]) -> Option<SysinfoConfigure> {
-    let table = arguments.first()?.as_object()?;
-    let read_seconds = |key: &str| table.get(key).map_or(Some(None), |value| value.as_u64().map(Some));
-    Some(SysinfoConfigure {
-        cpu_interval: read_seconds("cpu_interval")?,
-        ram_interval: read_seconds("ram_interval")?,
-        temp_interval: read_seconds("temp_interval")?,
-    })
 }
 
 /// Owns the three poll tasks and their state. Not `Clone`: synchronous, non-blocking `configure`
@@ -303,46 +292,6 @@ async fn run_temp_task(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn parse_configure_args_reads_all_three_present_intervals() {
-        let cfg = super::parse_configure_args(&[serde_json::json!({
-            "cpu_interval": 2,
-            "ram_interval": 5,
-            "temp_interval": 10,
-        })])
-        .expect("a well-formed configure table must parse");
-        assert_eq!(cfg.cpu_interval, Some(2));
-        assert_eq!(cfg.ram_interval, Some(5));
-        assert_eq!(cfg.temp_interval, Some(10));
-    }
-
-    #[test]
-    fn parse_configure_args_leaves_absent_keys_as_none() {
-        let cfg = super::parse_configure_args(&[serde_json::json!({ "temp_interval": 0 })])
-            .expect("a partial table must still parse");
-        assert_eq!(cfg.cpu_interval, None);
-        assert_eq!(cfg.ram_interval, None);
-        assert_eq!(cfg.temp_interval, Some(0));
-    }
-
-    #[test]
-    fn parse_configure_args_rejects_a_missing_argument() {
-        assert_eq!(super::parse_configure_args(&[]), None);
-    }
-
-    #[test]
-    fn parse_configure_args_rejects_a_non_table_argument() {
-        assert_eq!(super::parse_configure_args(&[serde_json::json!(5)]), None);
-    }
-
-    #[test]
-    fn parse_configure_args_drops_the_whole_call_on_one_wrong_typed_present_key() {
-        assert_eq!(
-            super::parse_configure_args(&[serde_json::json!({ "cpu_interval": "fast", "ram_interval": 5 })]),
-            None
-        );
-    }
-
     #[test]
     fn poll_mode_is_dormant_at_zero_and_ticking_otherwise() {
         assert_eq!(super::poll_mode(std::time::Duration::ZERO), super::PollMode::Dormant);

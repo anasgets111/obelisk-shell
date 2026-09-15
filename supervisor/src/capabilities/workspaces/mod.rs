@@ -15,31 +15,27 @@ pub mod controller;
 pub mod hyprland;
 pub mod niri;
 
-pub use controller::{WorkspacesController, WorkspacesSignal, parse_focus_args, parse_toggle_special_args};
+pub use controller::{WorkspacesController, WorkspacesSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacesAction {
-    /// (id: integer) Focuses a `WorkspaceEntry.id`.
-    Focus,
-    /// (name: string) Shows or hides a special workspace.
-    ToggleSpecial,
+    /// Focuses a `WorkspaceEntry.id`; the compositor ignores one that does not exist.
+    Focus { id: u64 },
+    /// Shows or hides a special workspace; Hyprland creates an unknown name.
+    ToggleSpecial {
+        #[serde(deserialize_with = "crate::capabilities::non_empty")]
+        name: String,
+    },
 }
 
 /// `obelisk.workspaces` action dispatch (ADR-0037): each action writes over a fresh compositor
 /// socket on its own thread, so arms are plain calls rather than `tokio::spawn`.
 pub fn dispatch(controller: &WorkspacesController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<WorkspacesAction>(params) else { return };
+    let Some(action) = crate::parse_action::<WorkspacesAction>(&envelope.params) else { return };
     match action {
-        WorkspacesAction::Focus => match parse_focus_args(&params.arguments) {
-            Some(id) => controller.focus(id),
-            None => crate::log_malformed_command(params),
-        },
-        WorkspacesAction::ToggleSpecial => match parse_toggle_special_args(&params.arguments) {
-            Some(name) => controller.toggle_special(name),
-            None => crate::log_malformed_command(params),
-        },
+        WorkspacesAction::Focus { id } => controller.focus(id),
+        WorkspacesAction::ToggleSpecial { name } => controller.toggle_special(&name),
     }
 }

@@ -6,25 +6,21 @@ pub mod cpu;
 pub mod ram;
 pub mod temp;
 
-pub use controller::{SysinfoController, SysinfoSignal, parse_configure_args};
+pub use controller::{SysinfoController, SysinfoSignal};
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SysinfoAction {
-    /// (intervals: { cpu_interval?: integer, ram_interval?: integer, temp_interval?: integer }) Seconds.
-    Configure,
+    /// Poll intervals in seconds.
+    Configure { intervals: controller::SysinfoConfigure },
 }
 
 /// `configure` is synchronous: it rewrites shared config under its lock and nudges watch channels
 /// (ADR-0037, ADR-0035).
 pub fn dispatch(controller: &SysinfoController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<SysinfoAction>(params) else { return };
+    let Some(action) = crate::parse_action::<SysinfoAction>(&envelope.params) else { return };
     match action {
-        SysinfoAction::Configure => match parse_configure_args(&params.arguments) {
-            Some(cfg) => controller.configure(cfg),
-            None => crate::log_malformed_command(params),
-        },
+        SysinfoAction::Configure { intervals } => controller.configure(intervals),
     }
 }

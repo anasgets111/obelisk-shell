@@ -417,15 +417,18 @@ impl LockController {
 /// Every action `obelisk.lock:invoke(...)` accepts. There is no `unlock`: a lock screen's Lua button
 /// callback would make it a one-click path past PAM, forbidden by ADR-0042. Unknown `"unlock"` is
 /// logged and dropped.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LockAction {
-    /// () Locks the session.
+    /// Locks the session.
     Lock,
-    /// (ms?: integer) Holds the lock open after PAM says yes, for an animation out (ADR-0190).
-    /// Clamped to [`MAX_UNLOCK_ANIMATION`].
-    SetUnlockAnimation,
+    /// Holds the lock open after PAM says yes, for an animation out (ADR-0190). Clamped to
+    /// [`MAX_UNLOCK_ANIMATION`]; no `ms` is no animation.
+    SetUnlockAnimation {
+        #[serde(default)]
+        ms: Option<u64>,
+    },
 }
 
 /// The longest a lock may stay up after a correct password.
@@ -437,19 +440,13 @@ pub enum LockAction {
 /// anything that reads as an animation rather than a fault.
 pub const MAX_UNLOCK_ANIMATION: Duration = Duration::from_millis(600);
 
-/// `obelisk.lock` action dispatch (ADR-0037). `lock` takes no arguments, so it has no `parse_*_args`
-/// sibling.
+/// `obelisk.lock` action dispatch (ADR-0037).
 pub fn dispatch(controller: &LockController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<LockAction>(params) else { return };
+    let Some(action) = crate::parse_action::<LockAction>(&envelope.params) else { return };
     match action {
         LockAction::Lock => controller.lock(),
-        // A missing argument is no animation. The clamp is the setter's.
-        LockAction::SetUnlockAnimation => {
-            match params.arguments.first().filter(|ms| !ms.is_null()).map_or(Some(0), serde_json::Value::as_u64) {
-                Some(millis) => controller.set_unlock_animation(Duration::from_millis(millis)),
-                None => crate::log_malformed_command(params),
-            }
+        LockAction::SetUnlockAnimation { ms } => {
+            controller.set_unlock_animation(Duration::from_millis(ms.unwrap_or_default()))
         }
     }
 }

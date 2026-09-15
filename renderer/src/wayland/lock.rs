@@ -146,10 +146,9 @@ impl App {
     /// has no such window because the compositor already ended the lock.
     fn teardown_lock_surfaces(&mut self) {
         for index in 0..self.surfaces.len() {
-            if !matches!(self.surfaces[index].role, TrackedRole::Lock { surface: Some(_), .. }) {
-                continue;
+            if matches!(self.surfaces[index].role, TrackedRole::Lock { surface: Some(_), .. }) {
+                self.drop_role_object(index);
             }
-            self.drop_role_object(index);
         }
     }
 

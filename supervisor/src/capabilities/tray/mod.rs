@@ -100,100 +100,35 @@ fn unix_timestamp_u32() -> u32 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
 }
 
-/// `tray:activate(id, x, y)`'s `arguments: [id, x, y]`.
-pub fn parse_activate_args(arguments: &[serde_json::Value]) -> Option<(String, i32, i32)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let x = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
-    let y = i32::try_from(arguments.get(2)?.as_i64()?).ok()?;
-    Some((id, x, y))
-}
-
-/// `tray:scroll(id, delta, orientation)`'s `[id, delta, orientation]` (ADR-0074). Separate from
-/// [`parse_activate_args`] because the third argument is a string, not a coordinate.
-pub fn parse_scroll_args(arguments: &[serde_json::Value]) -> Option<(String, i32, String)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let delta = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
-    let orientation = arguments.get(2)?.as_str()?.to_string();
-    Some((id, delta, orientation))
-}
-
-/// `tray:activate_menu_item(id, menu_item_id)`'s `arguments: [id, menu_item_id]`.
-/// Also `tray:menu_will_show(id, submenu_id)`: the wire shape is the same `[id, i32]` pair.
-pub fn parse_activate_menu_item_args(arguments: &[serde_json::Value]) -> Option<(String, i32)> {
-    let id = arguments.first()?.as_str()?.to_string();
-    let menu_item_id = i32::try_from(arguments.get(1)?.as_i64()?).ok()?;
-    Some((id, menu_item_id))
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TrayAction {
-    /// (id: string, x: integer, y: integer) Left-click activation at screen coordinates.
-    Activate,
-    /// (id: string, x: integer, y: integer) Middle-click activation at screen coordinates.
-    SecondaryActivate,
-    /// (id: string, delta: integer, orientation: string) Passes `"vertical"` or `"horizontal"` verbatim.
-    Scroll,
-    /// (id: string, menu_item_id: integer) Clicks a `MenuItem.id`.
-    ActivateMenuItem,
-    /// (id: string, submenu_id: integer) Tells the application a submenu is opening.
-    MenuWillShow,
+    /// Left-click activation at screen coordinates.
+    Activate { id: String, x: i32, y: i32 },
+    /// Middle-click activation at screen coordinates (ADR-0074).
+    SecondaryActivate { id: String, x: i32, y: i32 },
+    /// Passes `"vertical"` or `"horizontal"` verbatim (ADR-0074).
+    Scroll { id: String, delta: i32, orientation: String },
+    /// Clicks a `MenuItem.id`.
+    ActivateMenuItem { id: String, menu_item_id: i32 },
+    /// Tells the application a submenu is opening.
+    MenuWillShow { id: String, submenu_id: i32 },
 }
 
-/// `obelisk.tray` dispatch (ADR-0037): matches, parses, and spawns every write action
-/// (ADR-0031).
+/// `obelisk.tray` dispatch (ADR-0037): spawns every write action (ADR-0031).
 pub fn dispatch(controller: &TrayController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let Some(action) = crate::parse_action::<TrayAction>(params) else { return };
-    match action {
-        TrayAction::Activate => match parse_activate_args(&params.arguments) {
-            Some((id, x, y)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.activate(&id, x, y).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        // Same `[id, x, y]` shape as `Activate` (ADR-0074).
-        TrayAction::SecondaryActivate => match parse_activate_args(&params.arguments) {
-            Some((id, x, y)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.secondary_activate(&id, x, y).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        TrayAction::Scroll => match parse_scroll_args(&params.arguments) {
-            Some((id, delta, orientation)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.scroll(&id, delta, &orientation).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        TrayAction::ActivateMenuItem => match parse_activate_menu_item_args(&params.arguments) {
-            Some((id, menu_item_id)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.activate_menu_item(&id, menu_item_id).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-        TrayAction::MenuWillShow => match parse_activate_menu_item_args(&params.arguments) {
-            Some((id, submenu_id)) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.menu_will_show(&id, submenu_id).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
-    }
+    let Some(action) = crate::parse_action::<TrayAction>(&envelope.params) else { return };
+    let controller = controller.clone();
+    tokio::spawn(async move {
+        match action {
+            TrayAction::Activate { id, x, y } => controller.activate(&id, x, y).await,
+            TrayAction::SecondaryActivate { id, x, y } => controller.secondary_activate(&id, x, y).await,
+            TrayAction::Scroll { id, delta, orientation } => controller.scroll(&id, delta, &orientation).await,
+            TrayAction::ActivateMenuItem { id, menu_item_id } => controller.activate_menu_item(&id, menu_item_id).await,
+            TrayAction::MenuWillShow { id, submenu_id } => controller.menu_will_show(&id, submenu_id).await,
+        }
+    });
 }
 
 #[cfg(test)]
@@ -210,77 +145,5 @@ mod tests {
     #[test]
     fn should_call_activate_is_false_when_item_is_a_menu() {
         assert!(!should_call_activate(true));
-    }
-
-    // ---- arg parsers ----
-
-    #[test]
-    fn parse_scroll_args_reads_id_delta_orientation() {
-        let args = vec![serde_json::json!("1.42"), serde_json::json!(-120), serde_json::json!("vertical")];
-        assert_eq!(parse_scroll_args(&args), Some(("1.42".to_string(), -120, "vertical".to_string())));
-    }
-
-    #[test]
-    fn parse_scroll_args_refuses_a_numeric_orientation() {
-        // The orientation is a string; the coordinate parser would drop valid scrolls.
-        let args = vec![serde_json::json!("1.42"), serde_json::json!(-120), serde_json::json!(3)];
-        assert_eq!(parse_scroll_args(&args), None);
-    }
-
-    #[test]
-    fn every_tray_action_the_idl_names_parses() {
-        // `secondary_activate` and `scroll` are new (ADR-0074); this checks their serde spellings.
-        for name in ["activate", "secondary_activate", "scroll", "activate_menu_item", "menu_will_show"] {
-            let action: Result<TrayAction, _> = serde_json::from_value(serde_json::json!(name));
-            assert!(action.is_ok(), "{name} must deserialize into a TrayAction");
-        }
-    }
-
-    #[test]
-    fn parse_activate_args_reads_id_x_y() {
-        assert_eq!(
-            parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!(10), serde_json::json!(20)]),
-            Some(("1.42".to_string(), 10, 20))
-        );
-    }
-
-    #[test]
-    fn parse_activate_args_rejects_a_malformed_shape() {
-        assert_eq!(parse_activate_args(&[]), None, "missing every element");
-        assert_eq!(
-            parse_activate_args(&[serde_json::json!(1), serde_json::json!(10), serde_json::json!(20)]),
-            None,
-            "id is not a string"
-        );
-        assert_eq!(
-            parse_activate_args(&[serde_json::json!("1.42"), serde_json::json!("x"), serde_json::json!(20)]),
-            None,
-            "x is not a number"
-        );
-        let too_wide = [serde_json::json!("1.42"), serde_json::json!(1u64 << 31), serde_json::json!(20)];
-        assert_eq!(parse_activate_args(&too_wide), None, "x does not fit an i32");
-    }
-
-    #[test]
-    fn parse_activate_menu_item_args_reads_id_and_menu_item_id() {
-        assert_eq!(
-            parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(7)]),
-            Some(("1.42".to_string(), 7))
-        );
-    }
-
-    #[test]
-    fn parse_activate_menu_item_args_rejects_a_malformed_shape() {
-        assert_eq!(parse_activate_menu_item_args(&[]), None);
-        assert_eq!(parse_activate_menu_item_args(&[serde_json::json!("1.42")]), None, "missing menu_item_id");
-        assert_eq!(parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(i64::MIN)]), None);
-    }
-
-    #[test]
-    fn parse_activate_menu_item_args_reads_id_and_submenu_id() {
-        assert_eq!(
-            parse_activate_menu_item_args(&[serde_json::json!("1.42"), serde_json::json!(3)]),
-            Some(("1.42".to_string(), 3))
-        );
     }
 }

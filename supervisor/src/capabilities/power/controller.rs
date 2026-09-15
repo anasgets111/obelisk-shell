@@ -97,12 +97,6 @@ fn profile_names(profiles: &[HashMap<String, OwnedValue>]) -> Vec<String> {
         .collect()
 }
 
-/// `power:set_profile(p)`'s `arguments: [p]`. Checks shape only; the daemon rejects unknown names,
-/// avoiding a second profile-list copy.
-pub fn parse_set_profile_args(arguments: &[serde_json::Value]) -> Option<String> {
-    Some(arguments.first()?.as_str()?.to_string())
-}
-
 #[derive(Clone)]
 pub struct PowerController {
     state: Arc<Mutex<PowerState>>,
@@ -313,17 +307,6 @@ mod tests {
     #[test]
     fn profile_names_is_empty_for_an_empty_list() {
         assert_eq!(profile_names(&[]), Vec::<String>::new());
-    }
-
-    #[test]
-    fn parse_set_profile_args_reads_the_first_argument_as_a_profile_name() {
-        assert_eq!(parse_set_profile_args(&[serde_json::json!("performance")]), Some("performance".to_string()));
-    }
-
-    #[test]
-    fn parse_set_profile_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_set_profile_args(&[]), None);
-        assert_eq!(parse_set_profile_args(&[serde_json::json!(2)]), None);
     }
 
     #[test]

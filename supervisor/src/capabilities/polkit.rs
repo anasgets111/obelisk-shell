@@ -32,7 +32,7 @@ pub struct PolkitState {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PolkitAction {
-    /// () Dismisses the prompt and tells polkitd's caller `Cancelled`.
+    /// Dismisses the prompt and tells polkitd's caller `Cancelled`.
     Cancel,
 }
 

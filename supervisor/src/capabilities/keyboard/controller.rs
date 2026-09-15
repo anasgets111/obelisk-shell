@@ -59,17 +59,6 @@ pub enum KeyboardSignal {
     Changed,
 }
 
-/// `keyboard:set_backlight(pct)`'s `arguments: [pct]`; clamping happens once in
-/// `backlight::raw_from_percent`.
-pub fn parse_set_backlight_args(arguments: &[serde_json::Value]) -> Option<u64> {
-    arguments.first()?.as_u64()
-}
-
-/// `keyboard:switch_layout(index)`'s `arguments: [index]`.
-pub fn parse_switch_layout_args(arguments: &[serde_json::Value]) -> Option<usize> {
-    arguments.first()?.as_u64().map(|v| v as usize)
-}
-
 /// A live UPower `KbdBacklight` with construction-time `GetMaxBrightness()` or `Unavailable` if
 /// UPower exposes none. Brightness step count does not change at runtime.
 enum Backlight {
@@ -301,19 +290,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_set_backlight_args_reads_the_first_argument_as_a_percent() {
-        let args = vec![serde_json::json!(42)];
-        assert_eq!(parse_set_backlight_args(&args), Some(42));
-    }
-
-    #[test]
-    fn parse_set_backlight_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_set_backlight_args(&[]), None);
-        let args = vec![serde_json::json!("not a number")];
-        assert_eq!(parse_set_backlight_args(&args), None);
-    }
-
-    #[test]
     fn keyboard_state_default_is_the_unavailable_sentinel() {
         assert_eq!(
             KeyboardState::default(),
@@ -327,18 +303,5 @@ mod tests {
                 layout_count: 0
             }
         );
-    }
-
-    #[test]
-    fn parse_switch_layout_args_reads_the_first_argument_as_an_index() {
-        let args = vec![serde_json::json!(1)];
-        assert_eq!(parse_switch_layout_args(&args), Some(1));
-    }
-
-    #[test]
-    fn parse_switch_layout_args_is_none_for_an_empty_or_wrong_typed_argument() {
-        assert_eq!(parse_switch_layout_args(&[]), None);
-        let args = vec![serde_json::json!("not a number")];
-        assert_eq!(parse_switch_layout_args(&args), None);
     }
 }

@@ -17,53 +17,47 @@ pub mod inhibit;
 pub mod notify;
 pub mod state;
 
-pub use controller::{IdleController, parse_inhibit_args, parse_register_args};
+pub use controller::IdleController;
 pub use state::IdleState;
 
 /// Actions accepted on an `idle` `CommandEnvelope`; exhaustive dispatch keeps variants and arms in
 /// sync. `obelisk.idle` has no `invoke`; only its methods and the reload path send these.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleAction {
-    Register,
+    /// Only `seconds` crosses the wire; the callbacks stay Renderer-side.
+    Register {
+        seconds: u64,
+    },
     // Sent by the Renderer's `IdleRegistry::forget_thresholds` before each evaluation, not by a
     // config (ADR-0158). It rides the same ordered socket as the registrations that follow it,
     // which is the whole point: a reset the Supervisor ran on its own timing landed after them.
     ForgetThresholds,
-    Inhibit,
+    Inhibit {
+        reason: String,
+    },
     ReleaseInhibit,
 }
 
-/// `obelisk.idle` action dispatch (ADR-0037): matches, parses, and spawns every `idle`
-/// `CommandEnvelope`; each action carries its registering generation id (ADR-0032/ADR-0006).
+/// `obelisk.idle` action dispatch (ADR-0037): matches and spawns every `idle` `CommandEnvelope`;
+/// each action carries its registering generation id (ADR-0032/ADR-0006).
 pub fn dispatch(controller: &IdleController, envelope: &shared::CommandEnvelope) {
-    let params = &envelope.params;
-    let generation_id = params.generation_id;
-    let Some(action) = crate::parse_action::<IdleAction>(params) else { return };
+    let generation_id = envelope.params.generation_id;
+    let Some(action) = crate::parse_action::<IdleAction>(&envelope.params) else { return };
     match action {
         // Both threshold arms run inline rather than in a spawned task. A forget and the
         // registrations that follow it come off one ordered socket, and two tasks would be free to
         // apply them the other way round, which is the whole failure this pair exists to stop
         // (ADR-0158).
-        IdleAction::Register => match parse_register_args(&params.arguments) {
-            Some(sec) => controller.register_threshold(generation_id, sec),
-            None => crate::log_malformed_command(params),
-        },
+        IdleAction::Register { seconds } => controller.register_threshold(generation_id, seconds),
         IdleAction::ForgetThresholds => controller.reset_thresholds(generation_id),
-        IdleAction::Inhibit => match parse_inhibit_args(&params.arguments) {
-            Some(reason) => {
-                let controller = controller.clone();
-                tokio::spawn(async move {
-                    controller.inhibit(generation_id, &reason).await;
-                });
-            }
-            None => crate::log_malformed_command(params),
-        },
+        IdleAction::Inhibit { reason } => {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.inhibit(generation_id, &reason).await });
+        }
         IdleAction::ReleaseInhibit => {
             let controller = controller.clone();
-            tokio::spawn(async move {
-                controller.release_inhibit(generation_id).await;
-            });
+            tokio::spawn(async move { controller.release_inhibit(generation_id).await });
         }
     }
 }
