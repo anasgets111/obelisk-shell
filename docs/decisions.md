@@ -1067,6 +1067,36 @@ it; unchanged seeds preserve runtime writes. Fresh table identities do not count
 Rejected: rerun config on each push, which adds evaluation cost and changes callback identities.
 List expansion remained deferred in this pass.
 
+Amendment (2026-09-16): decision 2's profiling was done, and it does not justify the upgrade. A
+prototype recorded each instance's read set during its resolve and pushed only the instances whose
+set named the written cell. It narrowed almost perfectly -- 409 of 451 passes visited 1 of 22
+surfaces -- and bought 21%: on `dev-config` driven by a 30fps `state` push, 3.30ms to 2.62ms per
+resolve at 48 bound nodes, 4.72ms to 3.89ms at 256, CPU 12.6% to 9.9%. The win is small because
+`bar@eDP-1` is 377 of 458 nodes, and it is the surface that reads the signal. The remaining cost is
+inside one surface, where per-surface invalidation cannot reach; only per-node could.
+
+Two constraints for anyone who tries again, both found by breaking something:
+
+1. **Structural signal properties have no reader to attribute to.** `hover`, `scroll` and `geometry`
+   are copied through raw by `node::resolve_properties` and read later off the retained map, never
+   through `Signal::get_value`, so a hover write names a cell no surface recorded reading and its
+   surface is never invalidated. This broke `socket::tests::a_popup_bound_to_a_hover_slot_opens_for_that_slot_alone_and_closes_when_the_pointer_leaves`:
+   every tooltip and scroll view in the shell. A scheme that tracks reads must record these
+   explicitly at the point they are copied.
+
+2. **The objection is untracked writes, not dynamic dependencies.** ADR-0178 rejected per-surface
+   dirtiness because config getters "may read the clock or a mutable upvalue". Dynamic dependencies
+   are fine: a getter re-records its read set on the pass that answers its input, so the observed set
+   is correct one pass after any tracked input moves. What breaks is a getter reading mutable state
+   that is not a signal. One surface's `map` writes a plain upvalue; another reads only that upvalue,
+   records an empty read set, and is never invalidated. Measured: 297 distinct values displayed on the
+   baseline over 10s, 2 on the prototype, then frozen. Silent staleness, which is worse than the CPU.
+   Closing it needs a stated reactivity contract -- a getter reads only signals and pure data -- not a
+   fallback for function children, because the same hole exists without one.
+
+Kept from that work: `Scene::apply_admitting` snapshots only the instances it visits rather than
+cloning every retained tree, which is 21 needless deep clones per push on `dev-config`.
+
 ## 0045. Nodes reconcile by scoped `id`, and `list` items by `key`
 
 1. Optional node IDs are parent-scoped reconciliation hints, not global addresses. Duplicate sibling
