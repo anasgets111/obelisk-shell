@@ -510,9 +510,13 @@ pub fn run(
                 app.last_focus_key = key;
                 same
             });
-            // Also arm fields that appeared under already-arrived keyboard focus.
-            app.arm_secure_focus_if_the_scope_now_declares_one();
-            app.arm_autofocus_if_nothing_is_typing();
+            // Also arm fields that appeared under already-arrived keyboard focus. One walk serves
+            // both: nothing between them moves focus or popups.
+            if searched {
+                let scope = app.keyboard_focus_scope();
+                app.arm_secure_focus_if_the_scope_now_declares_one(&scope);
+                app.arm_autofocus_if_nothing_is_typing(&scope);
+            }
             if let Some(started) = focus_started
                 && let Some(ended) = thread_cpu_time()
                 && let Some(profile) = profile.as_mut()

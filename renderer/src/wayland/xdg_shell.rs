@@ -592,9 +592,9 @@ impl App {
     /// against siblings under one parent. A popup can hold an object only after its parent does, so
     /// parent cycles, including self-parenting, never open and cannot recurse through this walk.
     pub(super) fn shown_popups_under(&self, index: usize, out: &mut Vec<usize>) {
-        let parent_id = self.surfaces[index].surface_id.clone();
+        let parent_id = self.surfaces[index].surface_id.as_str();
         for child in (0..self.surfaces.len()).filter(|&child| child != index).filter(|&child| {
-            matches!(&self.surfaces[child].role, TrackedRole::Popup { popup: Some(_), spec, .. } if is_instance_of(&parent_id, &spec.parent))
+            matches!(&self.surfaces[child].role, TrackedRole::Popup { popup: Some(_), spec, .. } if is_instance_of(parent_id, &spec.parent))
         }) {
             self.shown_popups_under(child, out);
             out.push(child);

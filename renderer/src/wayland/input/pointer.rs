@@ -106,7 +106,6 @@ fn wheel_button<'a>(path: &[&'a layout::ResolvedNode]) -> Option<(usize, Logical
 
 /// Left press on a button with `on_drag`, held until release (ADR-0116 decision 1). Every Motion
 /// calls it wherever the pointer goes; config clamping keeps a slider pinned at its end.
-#[derive(Clone)]
 pub(in crate::wayland) struct ActiveDrag {
     instance_id: String,
     rect: LogicalRect,
@@ -398,10 +397,11 @@ impl PointerHandler for App {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     let moved = matches!(event.kind, PointerEventKind::Motion { .. });
                     let instance_id = self.surfaces[index].surface_id.clone();
-                    self.pointer_at = Some((instance_id.clone(), event.position));
+                    // Fires before the write: no `on_drag` handler can read `pointer_at`.
                     if moved {
                         self.fire_on_drag(&instance_id, event.position, "move");
                     }
+                    self.pointer_at = Some((instance_id, event.position));
                     // One lookup serves both; `Scene::surface` lends its tree.
                     let tree = self.client.scene().surface(&self.surfaces[index].surface_id);
                     self.sync_hover(index, tree, Some(event.position), moved);
@@ -446,13 +446,14 @@ impl App {
     /// Fire one held drag edge for `instance_id` (ADR-0116 decision 1); `end` clears it before the
     /// callback so re-entry finds nothing held. Handler raises are logged and swallowed.
     fn fire_on_drag(&mut self, instance_id: &str, position: (f64, f64), phase: &str) {
-        let Some(drag) = self.drag.as_ref().filter(|drag| drag.instance_id == instance_id).cloned() else {
+        let Some(drag) = self.drag.as_ref().filter(|drag| drag.instance_id == instance_id) else {
             return;
         };
+        let (rect, handler) = (drag.rect, drag.handler.clone());
         if phase == "end" {
             self.drag = None;
         }
-        if let Err((what, e)) = call_on_drag(self.client.lua(), &drag.handler, drag.rect, position, phase) {
+        if let Err((what, e)) = call_on_drag(self.client.lua(), &handler, rect, position, phase) {
             eprintln!("[obelisk-renderer] {instance_id}: {what}: {e}");
         }
     }

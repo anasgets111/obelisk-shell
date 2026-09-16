@@ -498,7 +498,7 @@ impl App {
     /// "shown under this surface" has one definition. Ids rather than trees: the per-keystroke
     /// caller ([`App::prune_secure_focus`]) needs only the ids, and `Scene::surface` rebuilds an
     /// owned tree per call.
-    fn keyboard_focus_scope(&self) -> Vec<String> {
+    pub(in crate::wayland) fn keyboard_focus_scope(&self) -> Vec<String> {
         let Some(focused) = self.keyboard_focus.as_deref() else {
             return Vec::new();
         };
@@ -539,12 +539,11 @@ impl App {
     /// layer `keyboard_interactivity` instead breaks the popup grab; niri dismissed that popup in
     /// the same frame the field armed. Only arm when empty; [`sole_secure_submit_in_scope`] refuses
     /// to guess among several fields (ADR-0050 decision 4).
-    pub(in crate::wayland) fn arm_secure_focus_if_the_scope_now_declares_one(&mut self) {
+    pub(in crate::wayland) fn arm_secure_focus_if_the_scope_now_declares_one(&mut self, scope: &[String]) {
         if self.focused_secure_submit.is_some() || self.keyboard_focus.is_none() {
             return;
         }
-        let scope = self.keyboard_focus_scope();
-        let Some(field) = self.field_the_scope_declares(&scope, None) else {
+        let Some(field) = self.field_the_scope_declares(scope, None) else {
             return;
         };
         // Destroyed surfaces may retain `keyboard_focus` without a `leave`; arming would scrub and
@@ -598,12 +597,11 @@ impl App {
     /// Arm a newly appearing `autofocus` field under existing focus (ADR-0112), unless a plain
     /// field is typing or a press just stopped that same field. A different field is new; masked
     /// focus wins as on `enter`.
-    pub(in crate::wayland) fn arm_autofocus_if_nothing_is_typing(&mut self) {
+    pub(in crate::wayland) fn arm_autofocus_if_nothing_is_typing(&mut self, scope: &[String]) {
         if self.focused_secure_submit.is_some() || self.keyboard_focus.is_none() {
             return;
         }
         self.prune_text_field_focus();
-        let scope = self.keyboard_focus_scope();
         if let Some(field) = self.focused_text_field.as_ref() {
             if field.typing {
                 return;
@@ -618,23 +616,22 @@ impl App {
                 return;
             }
         }
-        self.arm_autofocus_field(&scope);
+        self.arm_autofocus_field(scope);
     }
 
     /// Drop stale secure focus and scrub its half-typed secret before every keystroke; all
     /// transitions use [`App::focus_secure_submit`], even when no `leave` followed.
     pub(super) fn prune_secure_focus(&mut self) {
-        let scope = self.keyboard_focus_scope();
-        let armed = self
-            .focused_secure_submit
-            .as_ref()
-            .is_some_and(|field| focus_is_still_armed(field, &scope, self.surface_is_live(&field.surface_id)));
-        if self.focused_secure_submit.is_some() && !armed {
-            eprintln!(
-                "[obelisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
-            );
-            self.focus_secure_submit(None);
+        let Some(field) = self.focused_secure_submit.as_ref() else {
+            return;
+        };
+        if focus_is_still_armed(field, &self.keyboard_focus_scope(), self.surface_is_live(&field.surface_id)) {
+            return;
         }
+        eprintln!(
+            "[obelisk-renderer] the focused secure_submit field is no longer the one receiving keys; dropping it and scrubbing its buffer"
+        );
+        self.focus_secure_submit(None);
     }
 
     /// Focus for `surface_id` in `layout::paint::FieldFocus` form. Keep masked `{ capability,
