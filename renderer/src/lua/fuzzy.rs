@@ -50,6 +50,10 @@ fn bonus_for(previous: CharClass, current: CharClass) -> i32 {
     if current == CharClass::NonWord { BONUS_NON_WORD } else { 0 }
 }
 
+fn fold(byte: u8, case_sensitive: bool) -> u8 {
+    if case_sensitive { byte } else { byte.to_ascii_lowercase() }
+}
+
 fn try_skip(input: &[u8], case_sensitive: bool, wanted: u8, start: usize) -> Option<usize> {
     let upper = (!case_sensitive && wanted.is_ascii_lowercase()).then(|| wanted - 32);
     (start..input.len()).find(|&index| input[index] == wanted || Some(input[index]) == upper)
@@ -79,7 +83,6 @@ fn fuzzy_match_v2(case_sensitive: bool, input: &[u8], pattern: &[u8]) -> Option<
     let mut first_row_consecutive = vec![0i16; input.len()];
     let mut bonuses = vec![0i16; input.len()];
     let mut first_match_by_pattern = vec![0usize; pattern.len()];
-    let mut folded = input.to_vec();
 
     let first_pattern_byte = pattern[0];
     let mut current_pattern_byte = first_pattern_byte;
@@ -92,12 +95,8 @@ fn fuzzy_match_v2(case_sensitive: bool, input: &[u8], pattern: &[u8]) -> Option<
     let mut in_gap = false;
 
     for input_index in match_start..input.len() {
-        let mut byte = folded[input_index];
-        let current_class = char_class(byte);
-        if !case_sensitive && current_class == CharClass::Upper {
-            byte += 32;
-        }
-        folded[input_index] = byte;
+        let current_class = char_class(input[input_index]);
+        let byte = fold(input[input_index], case_sensitive);
         bonuses[input_index] = bonus_for(previous_class, current_class) as i16;
         previous_class = current_class;
 
@@ -142,8 +141,9 @@ fn fuzzy_match_v2(case_sensitive: bool, input: &[u8], pattern: &[u8]) -> Option<
         return Some((max_score, max_score_index));
     }
     Some(score_multi_byte_match(
+        case_sensitive,
         pattern,
-        &folded,
+        input,
         &bonuses,
         &first_row_scores,
         &first_row_consecutive,
@@ -157,6 +157,7 @@ fn fuzzy_match_v2(case_sensitive: bool, input: &[u8], pattern: &[u8]) -> Option<
 /// the cell left of it and the one diagonally back, and the row above is the previous slice.
 #[allow(clippy::too_many_arguments)]
 fn score_multi_byte_match(
+    case_sensitive: bool,
     pattern: &[u8],
     input: &[u8],
     bonuses: &[i16],
@@ -189,7 +190,7 @@ fn score_multi_byte_match(
             let mut diagonal = 0;
             let mut consecutive = 0i16;
 
-            if pattern_byte == input[input_index] {
+            if pattern_byte == fold(input[input_index], case_sensitive) {
                 // `first_match_by_pattern` strictly increases, so this never reaches behind the row.
                 let previous_cell = cell - width - 1;
                 diagonal = i32::from(scores[previous_cell]) + SCORE_MATCH;
@@ -284,9 +285,8 @@ pub fn score(haystack: &str, needle: &str) -> Option<(i32, usize)> {
     if needle.is_empty() {
         return Some((0, 0));
     }
-    let lowered = needle.to_lowercase();
-    let case_sensitive = needle != lowered;
-    let needle = if case_sensitive { needle } else { &lowered };
+    // A needle that asks for folding is already all-lowercase, so there is nothing to lower it to.
+    let case_sensitive = needle.chars().any(|c| c.to_lowercase().next() != Some(c));
 
     if haystack.is_ascii() && needle.is_ascii() {
         if needle.len() > haystack.len() {
@@ -373,6 +373,7 @@ mod tests {
         assert!(score("firefox", "FF").is_none());
         assert!(score("FireFox", "FF").is_some());
         assert!(score("FireFox", "ff").is_some());
+        assert!(score("ǆungla", "ǅ").is_none(), "titlecase is not `is_uppercase` but still folds");
     }
 
     /// An empty needle matches everything at zero, which is what an empty launcher query relies on.
