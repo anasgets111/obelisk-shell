@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Runs the half of `just check` a commit can affect, picked from the staged paths:
+# The half of `just check` a commit can affect, picked from the staged paths:
 #
 # - Rust: anything the crates compile or their tests read. `lua-meta/` and `share/starter/shell.lua`
-#   are `include_str!`'d and a test reads `packaging/pam.d`.
-# - Lua: any `.lua`, `.luarc.json`, `.editorconfig` or the formatter.
-# - Anything else (Markdown, docs, justfile, this hook): nothing.
+#   are `include_str!`'d, and `pam_worker.rs` reads `packaging/pam.d`. That one subdirectory, not
+#   `packaging/` whole, which will hold files no test opens.
+# - Lua: any `.lua`, `.luarc.json`, `.editorconfig`, or the formatter.
+# - Everything else, this hook and the justfile included: nothing.
 #
 # A stale `lua-meta/obelisk.lua` is regenerated and the commit refused rather than staged: the stub
 # comes from the working tree, so a partial `git add -p` would commit one describing code it lacks.
@@ -15,19 +16,16 @@ cd "$(git rev-parse --show-toplevel)"
 
 # Deletions stay in: removing a Lua file a component `require`s is what the Lua tests are for.
 staged="$(git diff --cached --name-only -z | tr '\0' '\n')"
-rust=false
-lua=false
+rust=false lua=false
 # Not `grep -q` after a pipe: it exits on the first match, and pipefail reads the SIGPIPE as no match.
 if grep -vE '\.md$' <<<"$staged" |
-    grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|^rustfmt\.toml$|^\.cargo/|^(renderer|supervisor|shared|packaging|lua-meta)/|^share/starter/shell\.lua$' >/dev/null; then
+    grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|^rustfmt\.toml$|^\.cargo/|^(renderer|supervisor|shared|lua-meta)/|^packaging/pam\.d/|^share/starter/shell\.lua$' >/dev/null; then
     rust=true
 fi
 if grep -qE '\.lua$|(^|/)\.luarc\.json$|^\.editorconfig$|^tools/luafmt\.py$' <<<"$staged"; then
     lua=true
 fi
-if ! $rust && ! $lua; then
-    exit 0
-fi
+$rust || $lua || exit 0
 
 if ! command -v cargo >/dev/null || ! command -v just >/dev/null; then
     echo "pre-commit: cargo or just missing, skipping the checks" >&2
@@ -41,17 +39,18 @@ fail() {
 
 if $rust; then
     before="$(git hash-object lua-meta/obelisk.lua)"
-    # Almost always a build error rather than the generator: this is the first compile after an edit.
-    UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null 2>&1 || fail "the stub regeneration (just stubs)"
+    # Almost always a build error rather than the generator: this is the first compile after an
+    # edit, so stderr stays on screen. Only the pass list is noise.
+    UPDATE_STUBS=1 cargo test --quiet -p supervisor stubs >/dev/null || fail "the stub regeneration (just stubs)"
     if [ "$before" != "$(git hash-object lua-meta/obelisk.lua)" ]; then
         echo "pre-commit: lua-meta/obelisk.lua was stale and has been regenerated. Review it, then: git add lua-meta/obelisk.lua" >&2
         exit 1
     fi
-    cargo fmt --all -- --check || fail "cargo fmt --check"
+    just fmt-check || fail "cargo fmt --check"
     just test lint docs || fail "the Rust checks"
 fi
 
 if $lua; then
-    python3 tools/luafmt.py --check dev-config lua-meta share || fail "the Lua format check"
+    # No luafmt call here: `just lua` formats as well as parses.
     just lua types || fail "the Lua checks"
 fi

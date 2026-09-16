@@ -1,22 +1,15 @@
-# Recipes for building, running and gating Obelisk.
+# Recipes for building, running and gating Obelisk. `just` alone runs `check`.
 #
-# Two of these exist because doing them by hand goes wrong in ways nothing else catches.
+# `run` depends on `build` because the Supervisor finds the Renderer as a filesystem sibling
+# (`supervisor/src/generation.rs`), not as a Cargo dependency. `cargo run -p supervisor` rebuilds
+# half the stack, launches whatever `target/debug/obelisk-renderer` happens to be, and reports the
+# mismatch as a config error in `shell.lua`, the last place the fault is.
 #
-# `run` depends on `build` because the Supervisor finds the Renderer as a filesystem sibling of its
-# own binary (`supervisor/src/generation.rs`'s `renderer_binary_path`), not as a Cargo dependency.
-# `cargo run -p supervisor` therefore rebuilds one half of the stack and launches whatever
-# `target/debug/renderer` happens to be, and a stale Renderer reports the mismatch as a *config*
-# error pointing at `shell.lua`, which is the last place the fault actually is.
-#
-# `docs` exists because clippy does not check intra-doc links. A doc comment pointing at an item
-# that moved a module away passes every other gate silently. The baselines below predate the check;
-# fix a new one by demoting the link to a plain backtick path, never by widening visibility.
-#
-# `lua` catches a stub that does not parse, which the language server ignores with no error anywhere.
+# `just --list` shows only the last comment line, hence `[doc(...)]` on the multi-line blocks.
 
 default: check
 
-# Both binaries. Required before `run`, and not optional.
+# Both binaries. Required before `run`.
 build:
     cargo build --workspace
 
@@ -30,8 +23,7 @@ run: build
 # Everything a change has to pass before it is done.
 check: fmt-check test lint docs lua types
 
-# Point git at the tracked hooks in `.githooks`. Once per clone: git does not version `.git/hooks`,
-# so a hook only exists for whoever ran this.
+# Once per clone: git does not version `.git/hooks`.
 hooks:
     git config core.hooksPath .githooks
     @echo "core.hooksPath -> .githooks"
@@ -42,42 +34,36 @@ test:
 lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-renderer_doc_baseline := "3"
-supervisor_doc_baseline := "23"
-
-# Unresolved intra-doc links per crate, against a baseline of "no new ones" rather than zero.
+# Unresolved intra-doc links, which clippy does not check. The baseline is exact in both
+# directions: over it hides a link that moved, under it means someone fixed links and never
+# committed the smaller number, leaving room for the next regression to sit in unreported.
+[doc('Unresolved intra-doc links, against an exact per-crate baseline.')]
 docs:
     #!/usr/bin/env bash
     set -euo pipefail
     out=$(cargo doc --workspace --no-deps 2>&1)
-    for crate in renderer supervisor; do
-        baseline=$([ "$crate" = renderer ] && echo {{renderer_doc_baseline}} || echo {{supervisor_doc_baseline}})
+    for pair in renderer:3 supervisor:23; do
+        crate=${pair%:*} baseline=${pair#*:}
         count=$(echo "$out" | grep -A1 "unresolved link" | grep -cE "^\s*--> $crate/" || true)
-        if [ "$count" -gt "$baseline" ]; then
-            echo "$crate: $count unresolved doc links, baseline $baseline. Fix by demoting the link to a plain backtick path with the module prefix, never by widening visibility to satisfy rustdoc." >&2
+        if [ "$count" -ne "$baseline" ]; then
+            echo "$crate: $count unresolved doc links, baseline $baseline. Over: demote the link to a plain backtick path with the module prefix, never widen visibility for rustdoc. Under: lower the baseline here." >&2
             echo "$out" | grep -B1 -A2 "unresolved link" >&2
             exit 1
         fi
         echo "$crate: $count unresolved doc links (baseline $baseline)"
     done
 
-# The config type-checked against the stubs, and the stubs type-checked against themselves.
+# `lua` proves a file parses. This proves `dev-config` and `share/starter` agree with `lua-meta`,
+# through the engine and `.luarc.json` the author's editor uses. It is why `nodes.lua` spells
+# `|Signal` on all 21 unions that take one (ADR-0081).
 #
-# `lua` above proves a file parses. This proves `dev-config` agrees with `lua-meta`, which is what
-# an author's editor will tell them: same engine, same `.luarc.json`, same stub directory. It is
-# the reason `lua-meta/nodes.lua` now spells `|Signal` on every union that takes one -- 21 of them
-# did not, and each was a red squiggle under working config code (ADR-0081).
+# `lua-meta` is also checked alone, because a library's own diagnostics are suppressed. That hid
+# `---@return Signal Read-only, like `map``, where the comma made `like` a second return type.
+# Single-return prose is written `---@return T # ...`.
 #
-# `lua-meta` is checked as its own workspace as well as being the others' library, because a
-# library's own diagnostics are suppressed. That hole hid a real one: `---@return T a, b` is two
-# returns, so a comma in a single return's prose makes the next word a type, and
-# `---@return Signal Read-only, like `map`` declared a return of type `like`. Checking the config
-# said nothing, because the config was fine. Single-return prose is written `---@return T # ...`.
-#
-# Required, like `luac` for `lua`: a skip let `just check` go green having checked no stub.
-#
-# The PATH lookup falls back to the copy Zed's Lua extension downloads for itself, the only copy on
-# the machine this was written on. Newest version wins; the glob survives Zed updates.
+# Missing server is a failure, not a skip: a skip once let `just check` go green having checked no
+# stub. The Zed glob is the only other copy on this machine.
+[doc('The config and the stubs type-checked against each other.')]
 types:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -91,21 +77,14 @@ types:
     fi
     log=$(mktemp -d)
     trap 'rm -rf "$log"' EXIT
-    # `share/starter` ships no `.luarc.json` on purpose: `obelisk init` writes one pointing at the
-    # *installed* stub directory (`setup.rs`'s `luarc_json`), so a checked-in copy would be a second
-    # answer that init immediately overwrites. This is that file, with an absolute library path
-    # because a relative one resolves against the workspace being checked, not against this config.
+    # `share/starter` ships no `.luarc.json`: `obelisk init` writes one pointing at the *installed*
+    # stubs (`setup.rs`'s `luarc_json`), which would overwrite a checked-in copy. Absolute library
+    # path, because a relative one resolves against the workspace being checked.
     printf '{"runtime.version":"Lua 5.4","workspace.library":["%s/lua-meta"],"workspace.checkThirdParty":false}\n' "$PWD" >"$log/starter.luarc.json"
-    # `--check` exits non-zero when it finds anything and prints the diagnostics -- file, line,
-    # column, the offending source line and a caret run -- to stdout, mixed in with a progress bar
-    # it redraws with carriage returns. So the output is captured rather than discarded, and
-    # replayed only on failure with the progress chunks filtered out.
-    #
-    # This used to read a `$log/check.json` that was never written: the JSON report needs
-    # `--check_format=json`, which was not passed, so the report block was dead and a failure
-    # surfaced as `set -e` alone -- a bare "recipe failed with exit code 1" and not one word about
-    # what was wrong. The human-readable form is better than the JSON here anyway, because it
-    # carries the source line.
+    # `--check` exits non-zero and prints file, line, column, source line and caret run to stdout,
+    # mixed with a progress bar it redraws with carriage returns. Capture it, replay it without the
+    # progress chunks only on failure. Not `--check_format=json`: the human form carries the source
+    # line, and the JSON report block sat dead for months because nobody passed that flag.
     check() {
         local out
         if out=$("$luals" --check "$PWD/$1" --checklevel=Warning --logpath="$log" "${@:2}" 2>&1); then
@@ -116,79 +95,77 @@ types:
             sed -E '/^[[:space:]]*$/d; /^[[:space:]]*Initializing/d; /^[[:space:]]*[>=]+[[:space:]]*[0-9]+\/[0-9]+/d; /^[[:space:]]*Diagnosis complet/d' >&2
         exit 1
     }
-    # `dev-config/obelisk` has its own `.luarc.json`, which the language server finds on its own and
-    # which also carries the `runtime.path` its `require`s need.
+    # No `--configpath`: `dev-config/obelisk` has its own, carrying the `runtime.path` its
+    # `require`s need.
     check dev-config/obelisk
     check share/starter --configpath "$log/starter.luarc.json"
-    # No library: these files declare everything they reference, which is the point of checking
-    # them on their own.
+    # No library, which is the point: these files declare everything they reference.
     printf '{"runtime.version":"Lua 5.4","workspace.checkThirdParty":false}\n' >"$log/meta.luarc.json"
     check lua-meta --configpath "$log/meta.luarc.json"
     echo "lua-meta type-checks, and dev-config and the starter type-check against it"
 
-# Every Lua file parses, config and stubs alike.
+lua_dirs := "dev-config lua-meta share"
+
+# The formatter is here, not beside `cargo fmt`, so `lua_dirs` is written once and a Lua-only
+# commit is gated by `just lua types` alone (`.githooks/pre-commit`). `tools/luafmt.py` says why
+# the formatter is a language server; `.editorconfig` holds its rules.
+[doc('Every Lua file parses and is formatted.')]
 lua:
     #!/usr/bin/env bash
     set -euo pipefail
-    find lua-meta dev-config share -name '*.lua' -print0 | xargs -0 -n1 luac -p
+    find {{lua_dirs}} -name '*.lua' -print0 | xargs -0 -n1 luac -p
     echo "all lua parses"
+    python3 tools/luafmt.py --check {{lua_dirs}}
 
 # Regenerate `lua-meta/obelisk.lua` from the supervisor's payload types, then show what moved.
 stubs:
     UPDATE_STUBS=1 cargo test -p supervisor stubs
     @git diff --stat -- lua-meta/obelisk.lua
 
-# Formatting as a gate, not a habit. `just fmt` fixes whatever this reports.
-#
-# Separate from `lint` because rustfmt and clippy fail differently: one is a diff, the other is a
-# warning, and folding them together buries the diff. This recipe exists because 71266cb and c83e79e
-# landed four unformatted files between them with `just check` green on both. `just fmt` was there
-# the whole time and nothing made anyone run it.
-#
-# Both languages now. The Lua half is the larger half by file count and had no gate at all, so this
-# recipe was green over config a reviewer would have sent back. `tools/luafmt.py` explains why the
-# Lua formatter is a language server rather than a formatter binary; `.editorconfig` holds its
-# rules. It fails when that server is missing, on the same terms as `types` above.
+# Separate from `lint` because a diff and a warning fail differently, and folding them buries the
+# diff. 71266cb and c83e79e landed four unformatted files with `just check` green on both.
+[doc('rustfmt as a gate. `just fmt` fixes it.')]
 fmt-check:
     cargo fmt --all -- --check
-    python3 tools/luafmt.py --check dev-config lua-meta share
 
+# Both languages, unlike the gates, because nobody wants two commands to fix a diff.
 fmt:
     cargo fmt --all
-    python3 tools/luafmt.py dev-config lua-meta share
+    python3 tools/luafmt.py {{lua_dirs}}
 
 clean:
     cargo clean
 
-# Install layout. `PREFIX` is where it goes, `DESTDIR` is a staging root for a package build, so a
-# PKGBUILD is `just install PREFIX=/usr DESTDIR="$pkgdir"` and nothing else.
+# Install layout, for a real install only. `just run` is the dev path and reads `target/debug` and
+# the repo's own `lua-meta`, so nothing here is on it.
 #
-# The Renderer lands in `lib/obelisk`, off `$PATH`, and `bin/obelisk` is a symlink into it. That works
-# because `current_exe` reads `/proc/self/exe`, which is already symlink-resolved, so the Supervisor
-# still finds its sibling. One command on the user's path, and the pair cannot drift apart.
+# `prefix` is where it goes, `destdir` stages it for a package:
+# `just --no-deps prefix=/usr destdir="$pkgdir" install`. Overrides are case-sensitive and go
+# before the recipe name; both are errors, not silent defaults.
 #
-# No service unit. Obelisk is started from the compositor's own config, the way a bar is:
-# `spawn-at-startup "obelisk"` in niri, `exec-once = obelisk` in Hyprland, `exec obelisk` in sway.
+# Everything under `$PREFIX` and nothing else. `packaging/pam.d/obelisk` goes to /etc and the
+# licence to `share/licenses`, so a package installs those two itself.
+#
+# The Renderer sits in `lib/obelisk`, off `$PATH`, and `bin/obelisk` is a symlink into it:
+# `current_exe` reads symlink-resolved `/proc/self/exe`, so the Supervisor still finds its sibling.
+# One command on `$PATH`, and the pair cannot drift apart.
+#
+# No service unit. The compositor starts it: `spawn-at-startup "obelisk"` in niri,
+# `exec-once = obelisk` in Hyprland, `exec obelisk` in sway.
 prefix := "/usr/local"
 destdir := ""
+# `assert` because `just prefix= uninstall` would otherwise `rm -rf /lib/obelisk /share/obelisk`.
+root := assert(prefix != "", "prefix must not be empty") + destdir + prefix
 
+[doc('Install under `prefix`, staged into `destdir`.')]
 install: release
-    #!/usr/bin/env bash
-    set -euo pipefail
-    root="{{destdir}}{{prefix}}"
-    install -Dm755 target/release/obelisk          "$root/lib/obelisk/obelisk"
-    install -Dm755 target/release/obelisk-renderer "$root/lib/obelisk/obelisk-renderer"
-    install -dm755                                "$root/bin"
-    ln -sfn ../lib/obelisk/obelisk                  "$root/bin/obelisk"
-    for stub in lua-meta/*.lua; do
-        install -Dm644 "$stub" "$root/share/obelisk/lua-meta/$(basename "$stub")"
-    done
-    install -Dm644 share/starter/shell.lua        "$root/share/obelisk/starter/shell.lua"
-    echo "installed to $root"
+    install -Dm755 target/release/obelisk          "{{root}}/lib/obelisk/obelisk"
+    install -Dm755 target/release/obelisk-renderer "{{root}}/lib/obelisk/obelisk-renderer"
+    install -dm755                                 "{{root}}/bin"
+    ln -sfn ../lib/obelisk/obelisk                 "{{root}}/bin/obelisk"
+    install -Dm644 -t "{{root}}/share/obelisk/lua-meta" lua-meta/*.lua
+    install -Dm644 share/starter/shell.lua         "{{root}}/share/obelisk/starter/shell.lua"
 
+[doc('Remove what `install` put under `prefix`.')]
 uninstall:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    root="{{destdir}}{{prefix}}"
-    rm -rf "$root/lib/obelisk" "$root/share/obelisk" "$root/bin/obelisk"
-    echo "removed from $root"
+    rm -rf "{{root}}/lib/obelisk" "{{root}}/share/obelisk" "{{root}}/bin/obelisk"
