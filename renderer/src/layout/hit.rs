@@ -124,12 +124,8 @@ pub fn contains_node(root: &ResolvedNode, id: crate::layout::scene::NodeId) -> b
 /// parent-relative origins; pass a prefix to recover an intermediate node's rect.
 pub fn absolute_rect(path: &[&ResolvedNode]) -> Option<LogicalRect> {
     let last = path.last()?;
-    Some(LogicalRect {
-        x: path.iter().map(|node| node.rect.x).sum(),
-        y: path.iter().map(|node| node.rect.y).sum(),
-        width: last.rect.width,
-        height: last.rect.height,
-    })
+    let (x, y) = path.iter().fold((0.0, 0.0), |(x, y), node| (x + node.rect.x, y + node.rect.y));
+    Some(LogicalRect { x, y, width: last.rect.width, height: last.rect.height })
 }
 
 fn descend<'a>(

@@ -318,13 +318,11 @@ impl ShapingHandle {
         font_size: f32,
         font: Option<&Arc<str>>,
     ) -> Vec<(usize, ShapeResult)> {
-        let mut lines: Vec<Range<usize>> = LineIter::new(text).map(|(range, _)| range).collect();
         // A trailing line ending opens one more, empty line, as `Buffer::set_text` does.
-        if text.is_empty() || text.ends_with(['\n', '\r']) {
-            lines.push(text.len()..text.len());
-        }
-        lines
-            .into_iter()
+        let trailing = text.is_empty() || text.ends_with(['\n', '\r']);
+        LineIter::new(text)
+            .map(|(range, _)| range)
+            .chain(trailing.then_some(text.len()..text.len()))
             .map(|range| {
                 let runs = runs
                     .iter()

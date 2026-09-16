@@ -191,6 +191,7 @@ impl TextPainter {
         // so on a fractional or 2x output every glyph in this shell draws at logical size. Upgrade
         // path: shape at the scaled size; only reachable with a HiDPI output to verify against.
         let step = crate::text::shaping::line_height(font_size);
+        let thickness = (font_size / 16.0).max(1.0).round();
         let mut row = 0;
         for (line_start, shaped) in self.shaping.shape_lines(text, &font_runs(runs), font_size, font) {
             for laid in shaped.shaped.iter() {
@@ -215,7 +216,6 @@ impl TextPainter {
                     for (x0, x1) in
                         underline_spans(&laid.glyphs, |glyph| run.range.contains(&(line_start + glyph.start)))
                     {
-                        let thickness = (font_size / 16.0).max(1.0).round();
                         let mut path = Path::new();
                         path.rect(left + x0, (baseline + thickness).round(), x1 - x0, thickness);
                         self.canvas.fill_path(&path, &Paint::color(Color::rgbaf(tint.r, tint.g, tint.b, tint.a)));

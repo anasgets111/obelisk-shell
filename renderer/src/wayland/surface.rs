@@ -666,14 +666,17 @@ impl App {
                 return;
             };
             let role = &self.surfaces[index].role;
+            // Both regions are tree walks, and the pushes below discard them on exactly these two
+            // conditions: no `wl_surface` to set them on, and for blur, no compositor support.
+            let live = role.wl_surface().is_some();
             (
                 matches!(role, TrackedRole::Panel { .. }).then(|| node::panel_spec(&tree.properties)),
                 matches!(role, TrackedRole::Window { .. }).then(|| node::window_spec(&tree.properties)),
                 matches!(role, TrackedRole::Popup { .. }).then(|| node::popup_spec(&tree.properties)),
                 tree.rect,
-                layout::overlay_input_regions(tree, 1.0),
+                if live { layout::overlay_input_regions(tree, 1.0) } else { Vec::new() },
                 tree.visible,
-                layout::blur_regions(tree, 1.0),
+                if live && self.blur_supported { layout::blur_regions(tree, 1.0) } else { Vec::new() },
             )
         };
 

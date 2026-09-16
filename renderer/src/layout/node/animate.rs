@@ -607,7 +607,8 @@ pub fn parse_animate(
         if property == "animate" || !crate::lua::nodes::accepts(kind, &property) {
             return Err(invalid("animate", format!("`{property}` is not a property of a `{kind}` node")));
         }
-        out.insert(property.clone(), parse_spec(&property, &entry)?);
+        let spec = parse_spec(&property, &entry)?;
+        out.insert(property, spec);
     }
     Ok(out)
 }

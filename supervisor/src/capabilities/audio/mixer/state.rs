@@ -181,12 +181,12 @@ impl MixerState {
         let master = master::compute_master(
             self.default_sink_name.as_deref(),
             self.sinks.iter().map(|(&id, sink)| (id, sink.names.node_name.as_str())),
-            |id| self.sinks.get(&id).and_then(|sink| sink.props.clone()),
+            |id| self.sinks.get(&id).and_then(|sink| sink.props.as_ref()),
         );
         let source = master::compute_master(
             self.default_source_name.as_deref(),
             self.sources.iter().map(|(&id, source)| (id, source.names.node_name.as_str())),
-            |id| self.sources.get(&id).and_then(|source| source.props.clone()),
+            |id| self.sources.get(&id).and_then(|source| source.props.as_ref()),
         );
         // Join here: identity and volume arrive on unordered PipeWire `info` and `param` events;
         // folding volume in at info time could overwrite a reading already landed.

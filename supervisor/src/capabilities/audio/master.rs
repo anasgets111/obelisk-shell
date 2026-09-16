@@ -105,12 +105,12 @@ pub fn resolve_default_device<'a>(
 /// Combines default-name resolution with tracked [`RawSinkProps`]. `None` while resolution or
 /// `Props` is still missing; the maps update from separate PipeWire events. The raw props stay
 /// tracked because writes scale the current channels.
-pub fn compute_master<'a>(
+pub fn compute_master<'a, 'p>(
     default_name: Option<&str>,
     names: impl Iterator<Item = (u32, &'a str)>,
-    props: impl Fn(u32) -> Option<RawSinkProps>,
+    props: impl Fn(u32) -> Option<&'p RawSinkProps>,
 ) -> Option<MasterVolume> {
-    resolve_default_device(default_name, names).and_then(props).map(|raw| master_volume_from_props(&raw))
+    resolve_default_device(default_name, names).and_then(props).map(master_volume_from_props)
 }
 
 /// Inverse of [`master_volume_from_props`]'s cube root: scales `current` so its loudest channel
@@ -729,9 +729,8 @@ mod tests {
     fn compute_master_combines_resolution_and_lookup() {
         let sinks = HashMap::from([(59, "alsa_output.pci-...analog-stereo".to_string())]);
         let props = HashMap::from([(59, raw(&[0.027, 0.027], &[]))]);
-        let master =
-            compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id).cloned())
-                .expect("a resolved sink with Props has a volume");
+        let master = compute_master(Some("alsa_output.pci-...analog-stereo"), names(&sinks), |id| props.get(&id))
+            .expect("a resolved sink with Props has a volume");
         assert!((master.volume - 0.3).abs() < 1e-6, "expected ~0.3, got {}", master.volume);
         assert!(!master.muted);
     }

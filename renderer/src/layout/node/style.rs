@@ -33,10 +33,7 @@ pub(super) fn parse_percent(s: &str) -> Option<f32> {
 pub fn parse_size_mode(properties: &HashMap<String, Value>, property: &str) -> Result<SizeMode, LayoutError> {
     // Deferred on the evaluation pass: `width`/`height` are live layer-shell `set_size`
     // fields (ADR-0038 decision 2), so `App::apply_spec_change` re-derives them each pass.
-    if is_deferred_signal(properties, property) {
-        return Ok(SizeMode::Content);
-    }
-    let Some(value) = properties.get(property) else {
+    let Some(value) = non_deferred_property(properties, property) else {
         return Ok(SizeMode::Content);
     };
     if let Some(n) = value_as_f32(property, value)? {
@@ -98,10 +95,7 @@ pub(super) fn table_number(property: &str, table: &mlua::Table, key: &str) -> Re
 pub fn parse_edge_insets(properties: &HashMap<String, Value>, property: &str) -> Result<EdgeInsets, LayoutError> {
     // Deferred on the evaluation pass: a panel root's `margin` is the live layer-shell anchor
     // offset (`set_margin`, ADR-0038 decision 2), so zero is the absent-key placeholder.
-    if is_deferred_signal(properties, property) {
-        return Ok(EdgeInsets::default());
-    }
-    let Some(value) = properties.get(property) else {
+    let Some(value) = non_deferred_property(properties, property) else {
         return Ok(EdgeInsets::default());
     };
     if let Some(n) = value_as_f32(property, value)? {

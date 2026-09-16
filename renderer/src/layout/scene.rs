@@ -1270,11 +1270,10 @@ fn prepare(
     // trusting a call site, notably `children_of`'s `unreachable!` arm below.
     ensure_node_admissible(kind, depth)?;
 
-    let id = retained.as_ref().map(|r| r.id);
-    let displayed_source = retained.as_ref().and_then(|r| r.displayed_source.clone());
-    let dissolve = retained.as_ref().and_then(|r| r.dissolve.clone());
-    let old_children = retained.map(|r| r.children).unwrap_or_default();
-    let id = id.unwrap_or_else(|| scene.alloc_id());
+    let (id, displayed_source, dissolve, old_children) = match retained {
+        Some(r) => (r.id, r.displayed_source, r.dissolve, r.children),
+        None => (scene.alloc_id(), None, None, Vec::new()),
+    };
     // Already leaving children are not paired again: a re-added id is a new node beside the one
     // still fading (QML makes a fresh delegate too).
     let (leaving, old_children): (Vec<ResolvedNode>, Vec<ResolvedNode>) =
@@ -1508,18 +1507,14 @@ fn finish(
 /// the number a scroll offset is clamped against. The same footprint the sizing pass used, which
 /// keeps a scroll limit and the layout it scrolls in agreement.
 fn extent_along(children: &[ResolvedNode], axis: MainAxis, spacing: f32) -> f32 {
-    let visible: Vec<&ResolvedNode> = children.iter().filter(|c| c.in_flow()).collect();
-    let extents: f32 = visible
-        .iter()
-        .map(|c| {
-            let extent = match axis {
-                MainAxis::Horizontal => c.rect.width,
-                MainAxis::Vertical => c.rect.height,
-            };
-            extent + c.margin_on(axis)
-        })
-        .sum();
-    extents + spacing * visible.len().saturating_sub(1) as f32
+    let (extents, visible) = children.iter().filter(|c| c.in_flow()).fold((0.0f32, 0usize), |(sum, count), c| {
+        let extent = match axis {
+            MainAxis::Horizontal => c.rect.width,
+            MainAxis::Vertical => c.rect.height,
+        };
+        (sum + extent + c.margin_on(axis), count + 1)
+    });
+    extents + spacing * visible.saturating_sub(1) as f32
 }
 
 /// taffy's own errors are all "you handed me a node id I do not have", which this module cannot do:

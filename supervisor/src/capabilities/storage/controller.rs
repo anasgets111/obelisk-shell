@@ -63,7 +63,7 @@ impl StorageController {
         };
 
         if changed {
-            self.schedule_save(&path);
+            self.schedule_save(path);
         }
         let _ = self.signal_tx.send(StorageSignal::Changed);
     }
@@ -108,7 +108,7 @@ impl StorageController {
             }
         };
 
-        self.schedule_save(&path);
+        self.schedule_save(path);
         if changed {
             let _ = self.signal_tx.send(StorageSignal::Changed);
         }
@@ -118,10 +118,10 @@ impl StorageController {
     ///
     /// ponytail: a save still in the window at session end is lost. The mirror's `saveTimer` has
     /// the same one-second hole. Upgrade with a Supervisor shutdown flush shared by controllers.
-    fn schedule_save(&self, path: &Path) {
+    fn schedule_save(&self, path: PathBuf) {
         let state = Arc::clone(&self.state);
         let key = path.to_string_lossy().into_owned();
-        let target = path.to_path_buf();
+        let target = path.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(SAVE_DEBOUNCE).await;
             let Some(contents) = state.lock().expect("storage state mutex poisoned").files.get(&key).cloned() else {
@@ -136,9 +136,7 @@ impl StorageController {
             })
             .await;
         });
-        if let Some(previous) =
-            self.saves.lock().expect("storage saves mutex poisoned").insert(path.to_path_buf(), handle)
-        {
+        if let Some(previous) = self.saves.lock().expect("storage saves mutex poisoned").insert(path, handle) {
             previous.abort();
         }
     }

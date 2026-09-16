@@ -450,14 +450,13 @@ fn is_deferred_signal(properties: &HashMap<String, Value>, property: &str) -> bo
 
 /// The value under `property`, or `None` when it is absent *or* a deferred `Signal`.
 ///
-/// Seven parsers take the same default for both, so they read the property through this
+/// Nine parsers take the same default for both, so they read the property through this
 /// instead of writing [`is_deferred_signal`] and `properties.get` one after the other. Order does
 /// not matter: a deferred property missing from the map takes the default either way. Parsers whose
 /// deferred and absent answers differ -- `parse_anchor_rect`, `parse_popup_extent` -- keep both
 /// checks, because for them the distinction is the point.
 fn non_deferred_property<'a>(properties: &'a HashMap<String, Value>, property: &str) -> Option<&'a Value> {
-    let value = properties.get(property)?;
-    (!is_deferred_signal(properties, property)).then_some(value)
+    properties.get(property).filter(|value| !matches!(value, Value::UserData(ud) if is_signal(ud)))
 }
 
 #[cfg(test)]

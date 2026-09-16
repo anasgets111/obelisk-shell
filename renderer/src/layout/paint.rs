@@ -665,6 +665,7 @@ fn draw_for(
                 Some(dissolve) => Some(dissolve.from.clone()),
                 None => retained.filter(|_| *retain).filter(|last| *last != source.as_str()).map(str::to_string),
             };
+            let has_cover = cover.is_some();
             Draw::Image {
                 node: node_id,
                 // Mid-dissolve the node draws the run's own destination, not whatever a later pass
@@ -675,7 +676,7 @@ fn draw_for(
                 box_px: (physical_edge(rect.width, scale), physical_edge(rect.height, scale)),
                 alpha: opacity,
                 load: *load,
-                retained: cover.clone(),
+                retained: cover,
                 shader: dissolve
                     .and_then(|dissolve| dissolve.spec.shader.clone().map(|path| (path, dissolve.spec.params.clone()))),
                 dissolve: match dissolve {
@@ -685,7 +686,7 @@ fn draw_for(
                     // the draw is the only way to prove it (ADR-0183). Drawing the incoming at full
                     // alpha on that frame and starting the cross on the next one shows it whole,
                     // snaps back to the outgoing, and only then crosses.
-                    None => (transition.is_some() && cover.is_some()).then_some(0.0),
+                    None => (transition.is_some() && has_cover).then_some(0.0),
                 },
             }
         }),

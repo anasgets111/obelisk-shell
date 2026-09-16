@@ -103,7 +103,9 @@ pub fn parse_children(properties: &HashMap<String, Value>) -> Result<Vec<Virtual
     let Value::Table(table) = value else {
         return Err(invalid("children", format!("expected an array table, got {}", preview_for_error(value))));
     };
-    let mut children = Vec::new();
+    // A config controls `#children`, and a sparse table's border can be enormous, so the hint is
+    // capped at what the loop below accepts.
+    let mut children = Vec::with_capacity(table.raw_len().min(MAX_ARRAY_ELEMENTS));
     for entry in table.sequence_values::<mlua::Table>() {
         if children.len() == MAX_ARRAY_ELEMENTS {
             return Err(invalid("children", format!("more than {MAX_ARRAY_ELEMENTS} children in one node")));
@@ -145,7 +147,7 @@ pub fn parse_list_children(properties: &HashMap<String, Value>) -> Result<Vec<Vi
         None => None,
     };
 
-    let mut children = Vec::new();
+    let mut children = Vec::with_capacity(source.raw_len().min(MAX_ARRAY_ELEMENTS));
     let mut seen_keys: HashSet<String> = HashSet::new();
     for element in source.sequence_values::<Value>() {
         if children.len() == MAX_ARRAY_ELEMENTS {
