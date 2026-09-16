@@ -291,8 +291,9 @@ impl Scene {
     /// pre-call state because a failing getter may already have changed `next_id` or
     /// the trees (`CONTEXT.md`, Rollback; `socket.rs::reevaluate`).
     ///
-    /// ponytail: every apply deep-clones the tree, even on success; the dirty flag limits this to
-    /// capability-push cadence. The structural clone is O(nodes), not O(Lua heap).
+    /// ponytail: every visited instance's tree is deep-cloned as rollback, even on success; the
+    /// dirty flag limits this to capability-push cadence. The structural clone is O(nodes), not
+    /// O(Lua heap).
     pub fn apply_admitting(
         &mut self,
         fresh_surfaces: &[VirtualNode],
@@ -302,9 +303,13 @@ impl Scene {
         admit: impl Fn(&Scene) -> Result<(), LayoutError>,
     ) -> Result<(), LayoutError> {
         let next_id_snapshot = self.next_id;
-        let surfaces_snapshot = self.surfaces.clone();
-        // One clock reading for the pass, so every tween it starts shares a start.
-        let now = Instant::now();
+        // `apply_one_instance` inserts and removes at one key, its own instance id, so the other
+        // retained trees cannot change and do not need saving.
+        let surfaces_snapshot: HashMap<String, ResolvedNode> = instances
+            .iter()
+            .filter_map(|instance| self.surfaces.get_key_value(&instance.instance_id))
+            .map(|(key, tree)| (key.clone(), tree.clone()))
+            .collect();
 
         // One budget for the whole pass: the hook covers gaps where a resolved table's `__index`
         // runs, and individually legal 5ms getters cannot add up without a pass deadline.
@@ -312,6 +317,32 @@ impl Scene {
             Ok(budget) => budget,
             Err(err) => return Err(node::invalid("layout", err.to_string())),
         };
+        let outcome = self.apply_visiting(fresh_surfaces, instances, shaping, lua, &budget, admit);
+        if outcome.is_err() {
+            for instance in instances {
+                match surfaces_snapshot.get(&instance.instance_id) {
+                    Some(tree) => self.surfaces.insert(instance.instance_id.clone(), tree.clone()),
+                    None => self.surfaces.remove(&instance.instance_id),
+                };
+            }
+            self.next_id = next_id_snapshot;
+        }
+        outcome
+    }
+
+    /// [`Self::apply_admitting`] minus the snapshot and rollback, so the three failure exits are
+    /// one `?` each rather than three copies of the restore.
+    fn apply_visiting(
+        &mut self,
+        fresh_surfaces: &[VirtualNode],
+        instances: &[SurfaceInstance],
+        shaping: &ShapingHandle,
+        lua: &Lua,
+        budget: &crate::lua::signal::LayoutPassBudget,
+        admit: impl Fn(&Scene) -> Result<(), LayoutError>,
+    ) -> Result<(), LayoutError> {
+        // One clock reading for the pass, so every tween it starts shares a start.
+        let now = Instant::now();
         // A hook interruption can look like an arbitrary `InvalidProperty`; report the pass budget
         // instead whenever the deadline was exceeded.
         let blame_the_budget =
@@ -319,8 +350,6 @@ impl Scene {
 
         for instance in instances {
             if let Err(err) = self.apply_one_instance(fresh_surfaces, instance, shaping, lua, now) {
-                self.surfaces = surfaces_snapshot;
-                self.next_id = next_id_snapshot;
                 // Blame first: a hook interruption is about the pass, not this instance.
                 return Err(match blame_the_budget(err) {
                     LayoutError::PassBudgetExceeded => LayoutError::PassBudgetExceeded,
@@ -328,15 +357,9 @@ impl Scene {
                 });
             }
         }
-        if let Err(err) = admit(self) {
-            self.surfaces = surfaces_snapshot;
-            self.next_id = next_id_snapshot;
-            return Err(blame_the_budget(err));
-        }
+        admit(self).map_err(blame_the_budget)?;
         // Lua can catch the hook error with `pcall`; the final deadline check cannot be caught.
         if budget.exceeded() {
-            self.surfaces = surfaces_snapshot;
-            self.next_id = next_id_snapshot;
             return Err(LayoutError::PassBudgetExceeded);
         }
         Ok(())
