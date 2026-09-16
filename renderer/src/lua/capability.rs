@@ -53,9 +53,10 @@ impl CommandSender {
     /// Supervisor drops repeats (ADR-0070 decision 3); the local set also stops a `map` over
     /// `obelisk.audio` from writing a frame on every layout pass.
     pub(crate) fn start_capability(&self, capability: &str) {
-        if !self.started.borrow_mut().insert(capability.to_string()) {
+        if self.started.borrow().contains(capability) {
             return;
         }
+        self.started.borrow_mut().insert(capability.to_string());
         // After the insert, so an unknown name logs once per generation.
         let Some(capability) = shared::Capability::from_name(capability) else {
             eprintln!("obelisk.{capability}: not a capability, so nothing starts");
