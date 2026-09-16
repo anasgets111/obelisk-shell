@@ -43,7 +43,7 @@ lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 renderer_doc_baseline := "3"
-supervisor_doc_baseline := "24"
+supervisor_doc_baseline := "23"
 
 # Unresolved intra-doc links per crate, against a baseline of "no new ones" rather than zero.
 docs:

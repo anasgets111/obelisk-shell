@@ -69,13 +69,13 @@ fn read_percent(device_dir: &Path, max: i32) -> u8 {
 }
 
 /// `org.freedesktop.login1.Session.SetBrightness` on fixed `session/auto`, which logind resolves
-/// to the caller's session. Built per [`BrightnessController::set`] call because writes are rare.
+/// to the caller's session. Built per write because writes are rare; `keyboard` reuses it for LEDs.
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Session",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1/session/auto"
 )]
-trait Login1Session {
+pub(crate) trait Login1Session {
     #[zbus(name = "SetBrightness")]
     fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> zbus::Result<()>;
 }

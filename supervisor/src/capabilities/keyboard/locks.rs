@@ -16,7 +16,7 @@ pub struct LockLeds {
 
 /// Finds a `leds_root` directory ending in `::<suffix>`; LED-class names are
 /// `<device>::<function>`.
-fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
+pub(super) fn find_led(leds_root: &Path, suffix: &str) -> Option<PathBuf> {
     std::fs::read_dir(leds_root)
         .ok()?
         .flatten()

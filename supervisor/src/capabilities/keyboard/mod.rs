@@ -1,7 +1,6 @@
-//! `obelisk.keyboard` combines UPower backlight, lock state, and compositor layout (ADR-0034) in
+//! `obelisk.keyboard` combines LED backlight, lock state, and compositor layout (ADR-0034) in
 //! one `Arc<Mutex<KeyboardState>>` and signal channel.
 
-pub mod backlight;
 pub mod controller;
 pub mod layout;
 pub mod locks;

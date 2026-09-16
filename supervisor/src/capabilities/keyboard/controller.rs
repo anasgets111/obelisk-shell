@@ -1,18 +1,21 @@
 //! [`KeyboardController`] owns `obelisk.keyboard` state and write actions. Backlight, lock state,
 //! and layout share one `Arc<Mutex<KeyboardState>>` and signal channel (ADR-0034).
 
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use futures_util::StreamExt;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::compositor::{CompositorKind, detect_compositor, hyprland_signature, unsupported_session_report};
 
+use super::super::brightness::controller::Login1SessionProxy;
+use super::super::read_attr;
 use super::super::scale::{percent_from_raw, raw_from_percent};
-use super::backlight::KbdBacklightProxy;
 use super::layout::{CompositorLink, HyprlandLink, NiriLink};
-use super::locks::{read_led_on, resolve_lock_leds};
+use super::locks::{find_led, read_led_on, resolve_lock_leds};
 
 /// `obelisk.keyboard`'s combined payload. `backlight_pct` is `-1` without keyboard-backlight
 /// hardware. Lock booleans have no sentinel: they default and remain `false` if neither evdev nor
@@ -59,24 +62,25 @@ pub enum KeyboardSignal {
     Changed,
 }
 
-/// A live UPower `KbdBacklight` with construction-time `GetMaxBrightness()` or `Unavailable` if
-/// UPower exposes none. Brightness step count does not change at runtime.
-enum Backlight {
-    Live { proxy: KbdBacklightProxy<'static>, max: i32 },
-    Unavailable,
+/// A `*::kbd_backlight` LED and its `max_brightness`, which does not change at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedBacklight {
+    dir: PathBuf,
+    max: i32,
 }
 
 #[derive(Clone)]
 pub struct KeyboardController {
     state: Arc<Mutex<KeyboardState>>,
-    backlight: Arc<Backlight>,
+    backlight: Arc<Option<LedBacklight>>,
     layout: Arc<Option<Box<dyn CompositorLink>>>,
+    system_bus: zbus::Connection,
+    events: UnboundedSender<KeyboardSignal>,
 }
 
 impl KeyboardController {
-    /// `system_bus` is the Supervisor's system bus, used by `KbdBacklightProxy`
-    /// (ADR-0034). A failed `GetMaxBrightness()` yields [`Backlight::Unavailable`]. `leds_root`
-    /// (default `/sys/class/leds`) is the test-injected sysfs fallback root. Layout selects one
+    /// `system_bus` carries logind backlight writes. `leds_root` (default `/sys/class/leds`) is
+    /// test-injected and holds the backlight and the sysfs lock fallback. Layout selects one
     /// [`CompositorLink`] via `crate::compositor`'s env probe, or `None` without an implementor.
     pub async fn new(
         system_bus: zbus::Connection,
@@ -84,7 +88,13 @@ impl KeyboardController {
         events_tx: UnboundedSender<KeyboardSignal>,
     ) -> Self {
         let state = Arc::new(Mutex::new(KeyboardState::default()));
-        let backlight = resolve_backlight(&system_bus, &state, events_tx.clone()).await;
+        let backlight = find_backlight(leds_root);
+        match &backlight {
+            Some(led) => watch_backlight(led.clone(), Arc::clone(&state), events_tx.clone()),
+            None => eprintln!(
+                "keyboard: no usable *::kbd_backlight LED under {leds_root:?}; backlight reporting disabled for this run"
+            ),
+        }
         resolve_locks(leds_root, &state, events_tx.clone()).await;
         let layout: Option<Box<dyn CompositorLink>> = match detect_compositor() {
             Some(CompositorKind::Hyprland) => match hyprland_signature() {
@@ -106,20 +116,25 @@ impl KeyboardController {
         if let Some(link) = &layout {
             eprintln!("keyboard: detected {:?} for layout tracking", link.kind());
         }
-        Self { state, backlight: Arc::new(backlight), layout: Arc::new(layout) }
+        Self { state, backlight: Arc::new(backlight), layout: Arc::new(layout), system_bus, events: events_tx }
     }
 
     /// `keyboard:set_backlight(pct)`. Logs and returns without keyboard-backlight hardware.
     pub async fn set_backlight(&self, pct: u64) {
-        let Backlight::Live { proxy, max } = self.backlight.as_ref() else {
+        let Some(led) = self.backlight.as_ref() else {
             eprintln!("keyboard: set_backlight called but this machine has no keyboard backlight; ignored");
             return;
         };
-        let raw = raw_from_percent(pct, *max);
-        if let Err(err) = proxy.set_brightness(raw).await {
-            eprintln!("keyboard: SetBrightness failed: {err}");
+        let name = led.dir.file_name().unwrap_or_default().to_string_lossy();
+        let raw = raw_from_percent(pct, led.max) as u32;
+        let result =
+            async { Login1SessionProxy::new(&self.system_bus).await?.set_brightness("leds", &name, raw).await }.await;
+        if let Err(err) = result {
+            eprintln!("keyboard: SetBrightness(leds, {name}, {raw}) failed: {err}");
         }
-        // State changes arrive through `BrightnessChanged`, not this call.
+        // `brightness_hw_changed` reports only hardware changes, so read this write back.
+        self.state.lock().unwrap().backlight_pct = read_backlight_pct(led);
+        let _ = self.events.send(KeyboardSignal::Changed);
     }
 
     /// `keyboard:switch_layout(index)`. Logs and returns without a supported compositor.
@@ -136,59 +151,50 @@ impl KeyboardController {
     }
 }
 
-/// Binds `KbdBacklightProxy`, then returns [`Backlight::Live`] or [`Backlight::Unavailable`]. For
-/// the live case, subscribe before `GetBrightness()` or a signal in that gap is lost. A failed
-/// initial read leaves `backlight_pct` at `-1` until the next `BrightnessChanged`.
-async fn resolve_backlight(
-    system_bus: &zbus::Connection,
-    state: &Arc<Mutex<KeyboardState>>,
-    events: UnboundedSender<KeyboardSignal>,
-) -> Backlight {
-    let proxy = match KbdBacklightProxy::new(system_bus).await {
-        Ok(proxy) => proxy,
-        Err(err) => {
-            eprintln!("keyboard: failed to bind UPower KbdBacklight; backlight reporting disabled for this run: {err}");
-            return Backlight::Unavailable;
-        }
-    };
-    let max = match proxy.get_max_brightness().await {
-        Ok(max) if max > 0 => max,
-        Ok(_) | Err(_) => {
-            eprintln!(
-                "keyboard: no usable KbdBacklight found on this system bus; backlight reporting disabled for this run"
-            );
-            return Backlight::Unavailable;
-        }
-    };
-    let mut changed = match proxy.receive_brightness_changed().await {
-        Ok(changed) => changed,
+fn find_backlight(leds_root: &Path) -> Option<LedBacklight> {
+    let dir = find_led(leds_root, "::kbd_backlight")?;
+    let max = read_attr(&dir, "max_brightness")?.parse().ok().filter(|max| *max > 0)?;
+    Some(LedBacklight { dir, max })
+}
+
+/// `-1` when `brightness` cannot be read.
+fn read_backlight_pct(led: &LedBacklight) -> i32 {
+    read_attr(&led.dir, "brightness").and_then(|raw| raw.parse().ok()).map_or(-1, |raw| percent_from_raw(raw, led.max))
+}
+
+/// Opens `brightness_hw_changed` before the initial read so a hotkey in between is not lost, then
+/// re-reads on each `POLLPRI`, which the kernel raises only for hardware changes (ADR-0034.1).
+fn watch_backlight(led: LedBacklight, state: Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) {
+    let watch = std::fs::File::open(led.dir.join("brightness_hw_changed"))
+        .and_then(|file| AsyncFd::with_interest(file, Interest::PRIORITY));
+    state.lock().unwrap().backlight_pct = read_backlight_pct(&led);
+    let watch = match watch {
+        Ok(watch) => watch,
         Err(err) => {
             eprintln!(
-                "keyboard: failed to subscribe to BrightnessChanged; backlight reporting disabled for this run: {err}"
+                "keyboard: cannot watch {:?}/brightness_hw_changed; hotkey changes will not show: {err}",
+                led.dir
             );
-            return Backlight::Unavailable;
+            return;
         }
     };
-
-    match proxy.get_brightness().await {
-        Ok(brightness) => state.lock().unwrap().backlight_pct = percent_from_raw(brightness, max),
-        Err(err) => eprintln!(
-            "keyboard: failed to read initial KbdBacklight brightness; will pick up from the next BrightnessChanged: {err}"
-        ),
-    }
-
-    let forward_state = Arc::clone(state);
     tokio::spawn(async move {
-        while let Some(signal) = changed.next().await {
-            let Ok(args) = signal.args() else { continue };
-            forward_state.lock().unwrap().backlight_pct = percent_from_raw(args.value, max);
+        loop {
+            match watch.ready(Interest::PRIORITY).await {
+                Ok(mut guard) => guard.clear_ready(),
+                Err(err) => {
+                    eprintln!("keyboard: backlight watch failed; hotkey changes will no longer show: {err}");
+                    break;
+                }
+            }
+            // Reading from offset 0 re-arms kernfs's `POLLPRI`.
+            let _ = watch.get_ref().read_at(&mut [0; 8], 0);
+            state.lock().unwrap().backlight_pct = read_backlight_pct(&led);
             if events.send(KeyboardSignal::Changed).is_err() {
                 break;
             }
         }
     });
-
-    Backlight::Live { proxy, max }
 }
 
 /// Picks the first `evdev::enumerate()` device whose LEDs include `LED_CAPSL`, leaving it open.
@@ -201,7 +207,7 @@ fn find_keyboard_led_device() -> Option<evdev::Device> {
 }
 
 /// Uses evdev first (ADR-0034): `EV_LED` carries live changes, queued per open fd from
-/// `Device::open`, so it has no UPower-style subscribe-before-read race. Sysfs
+/// `Device::open`, so it has no subscribe-before-read race. Sysfs
 /// (`locks::resolve_lock_leds`) is a static read-once fallback; neither source leaves all locks at
 /// their logged `false` defaults.
 async fn resolve_locks(leds_root: &Path, state: &Arc<Mutex<KeyboardState>>, events: UnboundedSender<KeyboardSignal>) {
@@ -303,5 +309,20 @@ mod tests {
                 layout_count: 0
             }
         );
+    }
+
+    #[test]
+    fn find_backlight_skips_lock_leds_and_scales_brightness() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("input3::capslock")).unwrap();
+        let dir = root.path().join("asus::kbd_backlight");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("max_brightness"), "0\n").unwrap();
+        assert_eq!(find_backlight(root.path()), None);
+
+        std::fs::write(dir.join("max_brightness"), "3\n").unwrap();
+        std::fs::write(dir.join("brightness"), "2\n").unwrap();
+        let led = find_backlight(root.path()).expect("kbd_backlight with max > 0");
+        assert_eq!(read_backlight_pct(&led), 67);
     }
 }

@@ -786,14 +786,24 @@ and structured body spans.
 Add domain-named hardware capabilities rather than a generic adapter abstraction before any caller
 needs polymorphic dispatch.
 
-### 0034.1. Keyboard backlight rides UPower, not sysfs
+### 0034.1. Keyboard backlight reads the sysfs LED and writes through logind
 
-Use the fixed UPower keyboard-backlight object. It was verified on the development machine, not
-universally.
+Amended: UPower 1.91.4 emitted no `BrightnessChanged` for the firmware hotkey on the development
+machine, so the OSD never moved. The kernel does notify, so UPower is dropped.
 
-1. Convert cached raw steps to rounded, clamped percentages and back.
-2. Missing hardware yields -1 and no-op writes, with one diagnostic.
-3. Reuse the system-bus connection.
+1. Use the first `*::kbd_backlight` LED under `/sys/class/leds` with `max_brightness > 0`.
+2. `brightness_hw_changed` raises `POLLPRI` for hardware changes such as the hotkey. Open it before
+   the initial read and re-read `brightness` on each one.
+3. Write through logind `SetBrightness("leds", …)` on the reused system bus, as screen brightness
+   does. The kernel does not notify software writes, so a write reads `brightness` back.
+4. Convert raw steps to rounded, clamped percentages and back.
+5. Missing hardware yields -1 and no-op writes, with one diagnostic.
+
+Known limitation: another process's software write (e.g. `brightnessctl`) shows at the next hardware
+change or Obelisk write. A driver without `brightness_hw_changed` shows only Obelisk's writes.
+
+Rejected: polling `brightness`, as Quickshell does every 100ms. It sees everything, at ten wakeups a
+second forever, for a change the kernel already announces.
 
 ### 0034.2. Keyboard lock state uses evdev, keyboard layout gets its own narrow compositor trait
 

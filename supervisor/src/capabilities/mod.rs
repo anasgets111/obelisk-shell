@@ -532,7 +532,7 @@ impl Capabilities {
                     ));
                 }
             }
-            // Missing KbdBacklight -> -1; missing lock source -> `false` (ADR-0034).
+            // No `*::kbd_backlight` LED -> -1; missing lock source -> `false` (ADR-0034).
             Capability::Keyboard => {
                 if self.keyboard.is_none() {
                     let (events, signals) = unbounded_channel();

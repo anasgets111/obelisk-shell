@@ -1,4 +1,4 @@
-//! Raw-brightness/percent conversion for `keyboard`'s UPower backlight (ADR-0034) and
+//! Raw-brightness/percent conversion for `keyboard`'s LED backlight (ADR-0034) and
 //! `brightness`'s sysfs backlight (ADR-0053), both scaled from `[0, max]` to `[0, 100]`.
 
 /// Converts raw `[0, max]` to `[0, 100]`, rounding half away from zero. `max <= 0` returns the
